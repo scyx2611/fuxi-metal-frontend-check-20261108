@@ -1,0 +1,26 @@
+name: Verify FuxiMetal frontend
+'on':
+  workflow_dispatch:
+permissions: {}
+jobs:
+  frontend:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Fetch exact public source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source remote add origin https://github.com/zgl97/ios-fuxi.git
+          git -C source fetch --no-tags --depth=1 origin 4b8faded6e76a4730832144fc3cae34c4419fa51
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = 4b8faded6e76a4730832144fc3cae34c4419fa51
+      - name: Run frontend and model tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          xcodebuild -version
+          python3 --version
+          python3 tools/test-fuxi-metal-frontend.py
