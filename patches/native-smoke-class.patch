@@ -1,0 +1,16 @@
+diff --git a/tools/fuxi-metal-smoke.m b/tools/fuxi-metal-smoke.m
+index c2eda68..0e5ab6d 100644
+--- a/tools/fuxi-metal-smoke.m
++++ b/tools/fuxi-metal-smoke.m
+@@ -241,7 +241,10 @@ int main(int argc,char **argv) {
+    printf("FUXI MTL: jetsam limit before %d/%d MB attr %u/%u (rc %d) -> 1024 MB non-fatal rc %d errno %d footprint %llu KiB\n",before.active,before.inactive,before.active_attr,before.inactive_attr,g,r,e,footprint());}
+   id<MTLDevice>device=MTLCreateSystemDefaultDevice();if(!device)fail("MTLCreateSystemDefaultDevice returned nil");
+   Class base=objc_getClass("_MTLDevice");
+-  if(!base || class_getInstanceSize(base)!=528 || strcmp(class_getName(object_getClass(device)),"FuxiMTLDevice") || ![(id)device isKindOfClass:base] || !device.registryID)fail("class/size/registryID guard");
++  const char *deviceClass=class_getName(object_getClass(device));
++  if(!base || class_getInstanceSize(base)!=528 || !deviceClass ||
++     (strcmp(deviceClass,"FuxiMTLDevice") && strcmp(deviceClass,"NativeBridgeMetalDevice")) ||
++     ![(id)device isKindOfClass:base] || !device.registryID)fail("class/size/registryID guard");
+   printf("FUXI MTL: stage 0 discovery PASS name %s class %s base-size %zu instance-size %zu registryID %llu\n",device.name.UTF8String,class_getName(object_getClass(device)),class_getInstanceSize(base),class_getInstanceSize(object_getClass(device)),device.registryID);
+   if(maximum) {
+    stage=1;name="fill";arm(30);id<MTLCommandQueue>q=[device newCommandQueue];

@@ -28,6 +28,8 @@ jobs:
           git -C source apply --check ../harness/patches/native-patch-stack.patch
           git -C source apply ../harness/patches/native-patch-stack.patch
           python3 harness/tests/test-native-patch-stack.py source
+          git -C source apply --check ../harness/patches/native-smoke-class.patch
+          git -C source apply ../harness/patches/native-smoke-class.patch
       - name: Build and audit NativeMetal
         shell: bash
         run: |
