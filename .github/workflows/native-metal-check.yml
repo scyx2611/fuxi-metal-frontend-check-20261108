@@ -1,0 +1,37 @@
+name: Build and test the NativeMetal alternative
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-metal:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      FUXI_CI_TESTS: full
+    steps:
+      - name: Fetch exact public source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source remote add origin https://github.com/zgl97/ios-fuxi.git
+          git -C source fetch --no-tags --depth=1 origin 4b8faded6e76a4730832144fc3cae34c4419fa51
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = 4b8faded6e76a4730832144fc3cae34c4419fa51
+      - name: Build and audit NativeMetal
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          xcodebuild -version
+          bash tools/ci/build.sh nativemetal
+      - name: Upload public-source build outputs and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuxi-nativemetal-4b8f
+          path: source/tools/out/ci/nativemetal/
+          if-no-files-found: warn
+          retention-days: 7
