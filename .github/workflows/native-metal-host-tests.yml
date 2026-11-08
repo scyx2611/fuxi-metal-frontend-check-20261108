@@ -10,6 +10,11 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
+      - name: Check out public test harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
       - name: Fetch pinned public sources and build host bridge
         shell: bash
         run: |
@@ -19,6 +24,9 @@ jobs:
           git -C source fetch --no-tags --depth=1 origin 4b8faded6e76a4730832144fc3cae34c4419fa51
           git -C source checkout --detach FETCH_HEAD
           test "$(git -C source rev-parse HEAD)" = 4b8faded6e76a4730832144fc3cae34c4419fa51
+          git -C source apply --check ../harness/patches/native-patch-stack.patch
+          git -C source apply ../harness/patches/native-patch-stack.patch
+          python3 harness/tests/test-native-patch-stack.py source
           cd source
           source tools/ci/pins.env
           git init deps/host-mesa

@@ -1,0 +1,56 @@
+diff --git a/tools/build-fuxi-nativemetal.py b/tools/build-fuxi-nativemetal.py
+index c5a5b98..2ae69ff 100755
+--- a/tools/build-fuxi-nativemetal.py
++++ b/tools/build-fuxi-nativemetal.py
+@@ -60,8 +60,8 @@ def checkout(source, url, pin, sparse=False):
+ 
+ def apply_stack(source, patches):
+     """Accept only exact clean/patched prefixes, including overlapping patches."""
+-    if git(source, 'diff', '--cached', '--exit-code') or git(source, 'ls-files', '--others', '--exclude-standard'):
+-        raise SystemExit(f'Staged/untracked source changes: {source.name}')
++    if git(source, 'diff', '--cached', '--exit-code'):
++        raise SystemExit(f'Staged source changes: {source.name}')
+     with tempfile.TemporaryDirectory(prefix='fuxi-native-index-') as tmp:
+         env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp)/'index'))
+         git(source, 'read-tree', 'HEAD', env=env)
+@@ -70,14 +70,32 @@ def apply_stack(source, patches):
+             git(source, 'apply', '--cached', '--check', patch, env=env)
+             git(source, 'apply', '--cached', patch, env=env)
+             states.append(git(source, 'diff', '--cached', '--no-ext-diff', '--binary', 'HEAD', env=env))
+-    actual = git(source, 'diff', '--no-ext-diff', '--binary', 'HEAD')
+-    if actual not in states:
+-        raise SystemExit(f'Unexpected edits beyond pinned patch stack: {source.name}')
+-    for patch in patches[states.index(actual):]:
+-        git(source, 'apply', '--check', patch)
+-        git(source, 'apply', patch)
+-    if git(source, 'diff', '--no-ext-diff', '--binary', 'HEAD') != states[-1]:
+-        raise SystemExit('Patched source mismatch')
++        added = set(git(source, 'diff', '--cached', '--name-only', '--diff-filter=A', 'HEAD', env=env).splitlines())
++
++        def working_diff():
++            # git diff omits untracked files, including files just created by a
++            # patch. Include only expected additions via a disposable index;
++            # this leaves the caller's actual staging area untouched.
++            untracked = set(git(source, 'ls-files', '--others', '--exclude-standard').splitlines())
++            if untracked - added:
++                raise SystemExit(f'Unexpected untracked source changes: {source.name}')
++            index = Path(git(source, 'rev-parse', '--git-path', 'index').strip())
++            if not index.is_absolute():
++                index = source/index
++            work_env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp)/'work-index'))
++            shutil.copyfile(index, work_env['GIT_INDEX_FILE'])
++            if untracked:
++                git(source, 'add', '--intent-to-add', '--', *sorted(untracked), env=work_env)
++            return git(source, 'diff', '--no-ext-diff', '--binary', 'HEAD', env=work_env)
++
++        actual = working_diff()
++        if actual not in states:
++            raise SystemExit(f'Unexpected edits beyond pinned patch stack: {source.name}')
++        for patch in patches[states.index(actual):]:
++            git(source, 'apply', '--check', patch)
++            git(source, 'apply', patch)
++        if working_diff() != states[-1]:
++            raise SystemExit('Patched source mismatch')
+ 
+ 
+ def prepare(native, m2v, build):
