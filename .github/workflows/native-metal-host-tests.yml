@@ -1,0 +1,35 @@
+name: Test NativeMetal host integration
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-host:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - name: Fetch pinned public sources and build host bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source remote add origin https://github.com/zgl97/ios-fuxi.git
+          git -C source fetch --no-tags --depth=1 origin 4b8faded6e76a4730832144fc3cae34c4419fa51
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = 4b8faded6e76a4730832144fc3cae34c4419fa51
+          cd source
+          source tools/ci/pins.env
+          git init deps/host-mesa
+          git -C deps/host-mesa remote add origin https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa
+          git -C deps/host-mesa fetch --no-tags --depth=1 origin "$MESA_SHA"
+          git -C deps/host-mesa checkout --detach FETCH_HEAD
+          python3 tools/build-fuxi-nativemetal.py --target host --native deps/host-native --metal2vulkan deps/host-m2v --build deps/host-build --out deps/host-output --headers deps/host-mesa/include
+      - name: Run native bridge and frontend tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          python3 tools/test-fuxi-metal-frontend.py
+          python3 tools/test-fuxi-nativemetal.py --native deps/host-native --metal2vulkan deps/host-m2v --bridge deps/host-output/libnative_metal_bridge.dylib
