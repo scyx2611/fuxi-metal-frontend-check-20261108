@@ -19,3 +19,14 @@ jobs:
           "$RUNNER_TEMP/fuxi-unwind-register-test"
           xcrun clang++ -std=c++17 -O2 -Wall -Wextra -Werror tests/NocopyObjectMetadataTests.cpp -o "$RUNNER_TEMP/fuxi-object-metadata-test"
           "$RUNNER_TEMP/fuxi-object-metadata-test"
+          xcrun clang++ -std=c++17 -O2 -Wall -Wextra -Werror tests/NocopySafeReadTests.cpp -o "$RUNNER_TEMP/fuxi-safe-read-test"
+          "$RUNNER_TEMP/fuxi-safe-read-test"
+          xcrun --sdk iphoneos clang++ -std=c++17 -O2 -Wall -Wextra -Werror -target arm64-apple-ios16.0 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" tests/NocopySafeReadTests.cpp -o "$RUNNER_TEMP/fuxi-safe-read-ios"
+          codesign -f -s - "$RUNNER_TEMP/fuxi-safe-read-ios"
+          codesign --verify --strict "$RUNNER_TEMP/fuxi-safe-read-ios"
+          xcrun vtool -show-build "$RUNNER_TEMP/fuxi-safe-read-ios"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fuxi-safe-read-ios
+          path: ${{ runner.temp }}/fuxi-safe-read-ios
+          if-no-files-found: error
