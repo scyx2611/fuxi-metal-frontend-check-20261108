@@ -17,3 +17,5 @@ jobs:
           uname -m
           xcrun clang++ -std=c++17 -O2 -fno-omit-frame-pointer tests/UnwindRegisterTests.cpp -o "$RUNNER_TEMP/fuxi-unwind-register-test"
           "$RUNNER_TEMP/fuxi-unwind-register-test"
+          xcrun clang++ -std=c++17 -O2 -Wall -Wextra -Werror tests/NocopyObjectMetadataTests.cpp -o "$RUNNER_TEMP/fuxi-object-metadata-test"
+          "$RUNNER_TEMP/fuxi-object-metadata-test"
