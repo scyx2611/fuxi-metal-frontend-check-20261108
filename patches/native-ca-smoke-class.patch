@@ -1,0 +1,17 @@
+diff --git a/tools/fuxi-ca-smoke.m b/tools/fuxi-ca-smoke.m
+index 48a1af4..12c633d 100644
+--- a/tools/fuxi-ca-smoke.m
++++ b/tools/fuxi-ca-smoke.m
+@@ -394,7 +394,11 @@ int main(int argc,char **argv) {
+   printf("FUXI CA: jetsam before=%d/%dMB get=%d set=1024MB rc=%d errno=%d\n",before.active,before.inactive,get,set,saved);
+   if(set)fail("jetsam limit raise failed");
+   id<MTLDevice>device=MTLCreateSystemDefaultDevice();
+-  if(!device || strcmp(object_getClassName(device),"FuxiMTLDevice"))fail("Fuxi Metal device required");
++  Class base=objc_getClass("_MTLDevice");
++  const char *deviceClass=device?object_getClassName(device):NULL;
++  if(!device || !base || class_getInstanceSize(base)!=528 || !deviceClass ||
++     (strcmp(deviceClass,"FuxiMTLDevice") && strcmp(deviceClass,"NativeBridgeMetalDevice")) ||
++     ![(id)device isKindOfClass:base] || !device.registryID)fail("Fuxi Metal device required");
+   void *plugin=dlopen("/System/Library/Extensions/FuxiMetal.bundle/FuxiMetal",RTLD_NOW|RTLD_NOLOAD);
+   uint64_t (*failures)(void)=plugin?(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_failure_count"):NULL;
+   uint64_t (*draws)(void)=plugin?(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_completed_draws"):NULL;
