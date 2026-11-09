@@ -1,0 +1,24 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1363,7 +1363,19 @@
+ - (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator { try { @try {
+  // Bounded metadata only: do not dereference or claim ownership of the caller's memory.
+  static std::atomic<unsigned> logged{0};
+- if(logged.fetch_add(1)<8){
++ const unsigned logIndex=logged.fetch_add(1);
++ if(logIndex==0){
++  // Stack metadata only: never read the caller's texture memory or change ownership.
++  void *frames[12]={};int count=backtrace(frames,12);
++  for(int i=0;i<count;i++){
++   Dl_info info={};
++   if(dladdr(frames[i],&info) && info.dli_fbase && info.dli_fname)
++    NSLog(@"FUXI NOCOPY CALL: frame=%d image=%s offset=0x%llx",i,info.dli_fname,
++          (unsigned long long)((uintptr_t)frames[i]-(uintptr_t)info.dli_fbase));
++   else NSLog(@"FUXI NOCOPY CALL: frame=%d image=unknown",i);
++  }
++ }
++ if(logIndex<8){
+   const size_t page=(size_t)getpagesize();
+   NSLog(@"FUXI NOCOPY: length=%lu aligned=%u deallocator=%u descriptor=%u type=%lu format=%lu size=%lux%lux%lu mips=%lu array=%lu samples=%lu storage=%lu cache=%lu hazard=%lu usage=0x%lx options=0x%lx",
+    (unsigned long)length,(unsigned)(bytes && page && !((uintptr_t)bytes%page)),(unsigned)(deallocator!=nil),(unsigned)(d!=nil),

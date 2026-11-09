@@ -1,0 +1,99 @@
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -101,6 +101,8 @@
+ uint64_t nmb_buffer_set_purgeable_state(const NmbBuffer *, uint64_t state);
+ void nmb_texture_release(NmbTexture *);
+ void nmb_texture_describe(const NmbTexture *, struct NmbTextureDescriptor *out);
++bool nmb_texture_copy_span(const NmbTexture *, const uint64_t region[6], uint64_t level, uint64_t slice,
++                           uint64_t bytes_per_row, uint64_t bytes_per_image, bool write, uint64_t *out);
+ bool nmb_texture_replace(NmbTexture *, const uint64_t region[6], uint64_t level, uint64_t slice, const void *bytes, uint64_t bytes_per_row,
+                          uint64_t bytes_per_image, uint64_t length);
+ bool nmb_texture_get_bytes(const NmbTexture *, void *bytes, uint64_t bytes_per_row, uint64_t bytes_per_image, uint64_t length,
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -859,6 +859,22 @@
+ }
+ 
+ /// # Safety
++/// `region_words` has six readable words and `out` has one writable word.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_texture_copy_span(texture: *const NmbTexture, region_words: *const u64,
++                                                level: u64, slice: u64, bytes_per_row: u64,
++                                                bytes_per_image: u64, write: bool, out: *mut u64) -> bool {
++    guard(false, || {
++        let out = unsafe { out.as_mut() }.ok_or("null span output")?;
++        let needed = get(texture)?.0.host_copy_required_bytes(region(region_words)?, level, slice,
++                                                                bytes_per_row, bytes_per_image, write)
++            .map_err(e("texture copy span"))?;
++        *out = needed as u64;
++        Ok(true)
++    })
++}
++
++/// # Safety
+ /// `bytes` holds `length` bytes.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn nmb_texture_replace(texture: *mut NmbTexture, region_words: *const u64, level: u64, slice: u64,
+@@ -867,9 +883,14 @@
+         if bytes.is_null() {
+             return Err("null bytes".into());
+         }
+-        // SAFETY: the caller's contract.
+-        let bytes = unsafe { std::slice::from_raw_parts(bytes as *const u8, length as usize) };
+-        get(texture)?.0.replace_region(region(region_words)?, level, slice, bytes, bytes_per_row, bytes_per_image)
++        let texture = get(texture)?;
++        let region = region(region_words)?;
++        let needed = texture.0.host_copy_required_bytes(region, level, slice, bytes_per_row, bytes_per_image, true)
++            .map_err(e("replace region span"))?;
++        if needed as u64 > length { return Err("short source bytes".into()); }
++        // SAFETY: the caller promises the requested copy's bytes; no extra row padding is borrowed.
++        let bytes = unsafe { std::slice::from_raw_parts(bytes as *const u8, needed) };
++        texture.0.replace_region(region, level, slice, bytes, bytes_per_row, bytes_per_image)
+             .map_err(e("replace region"))?;
+         Ok(true)
+     })
+@@ -884,9 +905,14 @@
+         if bytes.is_null() {
+             return Err("null bytes".into());
+         }
+-        // SAFETY: the caller's contract.
+-        let bytes = unsafe { std::slice::from_raw_parts_mut(bytes as *mut u8, length as usize) };
+-        get(texture)?.0.get_bytes(bytes, bytes_per_row, bytes_per_image, region(region_words)?, level, slice)
++        let texture = get(texture)?;
++        let region = region(region_words)?;
++        let needed = texture.0.host_copy_required_bytes(region, level, slice, bytes_per_row, bytes_per_image, false)
++            .map_err(e("get bytes span"))?;
++        if needed as u64 > length { return Err("short destination bytes".into()); }
++        // SAFETY: the caller promises the requested copy's bytes; no extra row padding is borrowed.
++        let bytes = unsafe { std::slice::from_raw_parts_mut(bytes as *mut u8, needed) };
++        texture.0.get_bytes(bytes, bytes_per_row, bytes_per_image, region, level, slice)
+             .map_err(e("get bytes"))?;
+         Ok(true)
+     })
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -269,8 +269,9 @@
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image { try { @try {
+  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
+- const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
+  if(fuxiBlocked()){noteProblem(@"survey skipped texture upload after latch");return;}
++ uint64_t length=0;
++ if(!nmb_texture_copy_span(_handle,region,level,slice,row,image,true,&length)){NBLOG(@"native-metal: replaceRegion span refused: %@",lastError());return;}
+  if(!nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length))NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row { try { @try {
+@@ -278,8 +279,9 @@
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice { try { @try {
+  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
+- const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
+  if(fuxiBlocked()){noteProblem(@"survey skipped texture readback after latch");return;}
++ uint64_t length=0;
++ if(!nmb_texture_copy_span(_handle,region,level,slice,row,image,false,&length)){NBLOG(@"native-metal: getBytes span refused: %@",lastError());return;}
+  if(!nmb_texture_get_bytes(_handle,bytes,row,image,length,region,level,slice))NBLOG(@"native-metal: getBytes refused: %@",lastError());
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level { try { @try {

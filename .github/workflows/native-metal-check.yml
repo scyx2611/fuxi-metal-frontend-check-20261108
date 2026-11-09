@@ -27,7 +27,11 @@ jobs:
           test "$(git -C source rev-parse HEAD)" = 4b8faded6e76a4730832144fc3cae34c4419fa51
           git -C source apply --check ../harness/patches/native-patch-stack.patch
           git -C source apply ../harness/patches/native-patch-stack.patch
+          git -C source apply --check ../harness/patches/fuxi-copy-span-builder.patch
+          git -C source apply ../harness/patches/fuxi-copy-span-builder.patch
           python3 harness/tests/test-native-patch-stack.py source
+          git -C source apply --check ../harness/patches/astc-pixel-smoke.patch
+          git -C source apply ../harness/patches/astc-pixel-smoke.patch
           git -C source apply --check ../harness/patches/native-smoke-class.patch
           git -C source apply ../harness/patches/native-smoke-class.patch
           git -C source apply --check ../harness/patches/native-ca-smoke-class.patch
@@ -36,6 +40,9 @@ jobs:
           cp harness/patches/nativemetal-fuxi-0005-completion-handlers.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0006-uchar3-constant.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0007-nocopy-diagnostics.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0008-nocopy-callers.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0009-copy-span.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0001-copy-span.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |

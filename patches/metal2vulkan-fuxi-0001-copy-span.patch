@@ -1,0 +1,89 @@
+diff --git a/crates/metal2vulkan-runtime/src/copy_plan.rs b/crates/metal2vulkan-runtime/src/copy_plan.rs
+--- a/crates/metal2vulkan-runtime/src/copy_plan.rs
++++ b/crates/metal2vulkan-runtime/src/copy_plan.rs
+@@ -462,6 +462,16 @@
+ }
+ 
+ impl HostLayout {
++    /// The exact caller buffer span, with checked arithmetic for FFI boundaries.
++    pub(super) fn checked_host_len(&self) -> Option<u64> {
++        if self.row_bytes == 0 || self.rows == 0 || self.images == 0 {
++            return Some(0);
++        }
++        (self.images - 1).checked_mul(self.bytes_per_image)?
++            .checked_add((self.rows - 1).checked_mul(self.bytes_per_row)?)?
++            .checked_add(self.row_bytes)
++    }
++
+     /// The bytes of the tightly packed staging layout.
+     pub(super) fn packed_len(&self) -> u64 {
+         self.row_bytes * self.rows * self.images
+@@ -518,6 +528,34 @@
+         for (h, p) in self.rows() {
+             host[h..h + n].copy_from_slice(&packed[p..p + n]);
+         }
++    }
++}
++
++#[cfg(test)]
++mod ffi_span_tests {
++    use super::HostLayout;
++
++    fn layout(row_bytes: u64, rows: u64, images: u64, bytes_per_row: u64, bytes_per_image: u64) -> HostLayout {
++        HostLayout { row_bytes, rows, images, bytes_per_row, bytes_per_image }
++    }
++
++    #[test]
++    fn compressed_and_padded_rows_only_reach_the_last_block() {
++        // 1125 x 2436 ASTC 4x4: 282 blocks of 16 bytes in each of 609 block rows.
++        assert_eq!(layout(4512, 609, 1, 4512, 0).checked_host_len(), Some(2_747_808));
++        assert_eq!(layout(16, 2, 1, 64, 0).checked_host_len(), Some(80));
++        assert_eq!(layout(16, 4, 1, 0, 0).checked_host_len(), Some(16));
++    }
++
++    #[test]
++    fn image_stride_empty_regions_and_overflow_are_checked() {
++        assert_eq!(layout(16, 3, 2, 32, 128).checked_host_len(), Some(208));
++        assert_eq!(layout(16, 3, 2, 32, 0).checked_host_len(), Some(80));
++        assert_eq!(layout(0, 9, 2, u64::MAX, u64::MAX).checked_host_len(), Some(0));
++        assert_eq!(layout(16, 0, 2, u64::MAX, u64::MAX).checked_host_len(), Some(0));
++        assert_eq!(layout(16, 3, 2, u64::MAX, 0).checked_host_len(), None);
++        assert_eq!(layout(16, 1, 3, 0, u64::MAX).checked_host_len(), None);
++        assert_eq!(layout(16, 2, 2, 1, u64::MAX).checked_host_len(), None);
+     }
+ }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -5294,6 +5294,30 @@
+         ))
+     }
+ 
++    /// Validate a CPU texture copy and return the exact caller memory span it reaches.
++    /// This lets FFI clients construct a slice without including unused row or block padding.
++    pub fn host_copy_required_bytes(
++        &self,
++        region: Region,
++        level: u64,
++        slice: u64,
++        bytes_per_row: u64,
++        bytes_per_image: u64,
++        write: bool,
++    ) -> Result<usize, Error> {
++        let call = if write { "replace_region" } else { "get_bytes" };
++        let Some(copy) = self.host_copy(call, &region, level, slice, bytes_per_row, bytes_per_image)? else {
++            return Ok(0);
++        };
++        let invalid_range = || invalid(call, Problem::Copy(CopyProblem::BufferRange));
++        let bytes = copy.host.checked_host_len().ok_or_else(invalid_range)?;
++        let bytes = usize::try_from(bytes).map_err(|_| invalid_range())?;
++        if bytes > isize::MAX as usize {
++            return Err(invalid_range());
++        }
++        Ok(bytes)
++    }
++
+     /// `replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:`: write `region`
+     /// of the texture's `level` and `slice` from `bytes`, rows `bytes_per_row` apart and images
+     /// `bytes_per_image` apart (read only for a region of more than one image).

@@ -51,6 +51,12 @@ int main(){@autoreleasepool{
  assert(![(id)dev newTextureWithBytesNoCopy:rawBytes length:sizeof(rawBytes) descriptor:rawDesc deallocator:^(void *,NSUInteger){++freed;}]);
  assert(latched && freed==0 && failures.back().find("newTextureWithBytesNoCopy")!=std::string::npos);
  failures.clear();latched=false;
+ // The device's observed ASTC descriptor remains refused: caller memory is not consumed.
+ MTLTextureDescriptor *astc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_LDR width:1125 height:2436 mipmapped:NO];
+ astc.usage=MTLTextureUsageShaderRead;
+ assert(![(id)dev newTextureWithBytesNoCopy:rawBytes length:2752512 descriptor:astc deallocator:^(void *,NSUInteger){++freed;}]);
+ assert(latched && freed==0 && failures.back().find("newTextureWithBytesNoCopy")!=std::string::npos);
+ failures.clear();latched=false;
  Class known=objc_allocateClassPair([NBDeviceMethods class],"NativeKnownAnswerTest",0);
  objc_registerClassPair(known);answerMode=0;installAnswers(known);
  id knownDevice=[known new];assert(((NSUInteger (*)(id,SEL))objc_msgSend)(knownDevice,sel_registerName("fuxiTestAnswer"))==7 && failures.empty());
