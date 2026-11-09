@@ -20,4 +20,5 @@ int main() {
  for(uint8_t b:copied)assert(b==0xcc);
  assert(vm_deallocate(mach_task_self(),region,page*2)==KERN_SUCCESS);
  std::puts("PASS: bounded self-memory copy refuses invalid and protected ranges");
+ return 0;
 }

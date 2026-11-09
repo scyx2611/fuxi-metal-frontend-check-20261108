@@ -55,4 +55,5 @@ int main() {
  assert(caller(first));
  assert(caller(second));
  std::puts("PASS: native unwinder recovered each caller's preserved register");
+ return 0;
 }
