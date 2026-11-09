@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstring>
 
+static constexpr size_t kNocopyMaxFrames = 128;
+
 struct NocopyFrame {
  const char *imagePath;
  uint64_t returnOffset;
@@ -16,7 +18,7 @@ struct NocopyFrame {
 inline bool selectNocopyObjectFrame(const NocopyFrame *frames, size_t count, uintptr_t *out) {
  static constexpr char path[]="/System/Library/Frameworks/QuartzCore.framework/QuartzCore";
  static constexpr uint8_t uuid[16]={0x9e,0x40,0xb2,0xeb,0x26,0x0c,0x3a,0xf1,0xae,0x45,0xa1,0xa5,0x51,0xa8,0xc1,0xb9};
- if(!frames || !out || count>32) return false;
+ if(!frames || !out || count>kNocopyMaxFrames) return false;
  size_t matches=0;uintptr_t value=0;
  for(size_t i=0;i<count;i++) {
   if(frames[i].imagePath && std::strcmp(frames[i].imagePath,path)==0 && frames[i].returnOffset==0x200000 &&

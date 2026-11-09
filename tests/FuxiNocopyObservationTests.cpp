@@ -5,6 +5,15 @@
 
 template<typename T> static void put(uint8_t *p,size_t offset,T value) {std::memcpy(p+offset,&value,sizeof value);}
 int main() {
+ static_assert(static_cast<unsigned>(FuxiNocopyStatus::StackLimit)==1);
+ static_assert(static_cast<unsigned>(FuxiNocopyStatus::FrameCount)==2);
+ static_assert(static_cast<unsigned>(FuxiNocopyStatus::ImageRead)==3);
+ static_assert(static_cast<unsigned>(FuxiNocopyStatus::Identity)==4);
+ static_assert(static_cast<unsigned>(FuxiNocopyStatus::ObjectRead)==5);
+ static_assert(static_cast<unsigned>(FuxiNocopyStatus::ObjectChanged)==6);
+ static_assert(static_cast<unsigned>(FuxiNocopyStatus::PointerMismatch)==9);
+ static_assert(static_cast<unsigned>(FuxiNocopyStatus::DimensionMismatch)==10);
+ static_assert(static_cast<unsigned>(FuxiNocopyStatus::LinearFlag)==11);
  vm_address_t region=0;vm_size_t page=vm_page_size;
  assert(page>=4096 && vm_allocate(mach_task_self(),&region,page*2,VM_FLAGS_ANYWHERE)==KERN_SUCCESS);
  assert(vm_protect(mach_task_self(),region+page,page,false,VM_PROT_NONE)==KERN_SUCCESS);
@@ -19,7 +28,15 @@ int main() {
  assert(!fuxiSafeRead(region+page-4,copy,sizeof copy));assert(!fuxiSafeRead(0,copy,sizeof copy));
  assert(!fuxiSafeRead(region,copy,65569));
  FuxiNocopyObservation result{};result.metadata.flags=0xa5;result.metadata.claimedBytes=0x1234;
- assert(!fuxiObserveNocopy(p,1125,2436,result));
+ FuxiUnwindFrames frames{};
+ assert(fuxiObserveFrames(frames,p,1125,2436,result)==FuxiNocopyStatus::FrameCount);
+ frames.overflow=true;
+ assert(fuxiObserveFrames(frames,p,1125,2436,result)==FuxiNocopyStatus::StackLimit);
+ frames.overflow=false;frames.count=kNocopyMaxFrames;
+ assert(fuxiObserveFrames(frames,p,1125,2436,result)==FuxiNocopyStatus::FrameCount);
+ frames.count=kNocopyMaxFrames+1;
+ assert(fuxiObserveFrames(frames,p,1125,2436,result)==FuxiNocopyStatus::StackLimit);
+ assert(fuxiObserveNocopy(p,1125,2436,result)!=FuxiNocopyStatus::Match);
  assert(result.metadata.flags==0xa5 && result.metadata.claimedBytes==0x1234);
  assert(vm_deallocate(mach_task_self(),region,page*2)==KERN_SUCCESS);
  std::puts("PASS: observation rejects unknown callers and bounds image reads");

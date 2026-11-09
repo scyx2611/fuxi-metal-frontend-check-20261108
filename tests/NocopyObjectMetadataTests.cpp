@@ -21,7 +21,7 @@ int main() {
  assert(!selectNocopyObjectFrame(frames,1,&selected));frames[0].imagePath=path;
  frames[0].objectRegister=0x200001;
  assert(!selectNocopyObjectFrame(frames,1,&selected));
- assert(!selectNocopyObjectFrame(frames,33,&selected));
+ assert(!selectNocopyObjectFrame(frames,kNocopyMaxFrames+1,&selected));
  assert(!selectNocopyObjectFrame(nullptr,1,&selected));
  assert(!selectNocopyObjectFrame(frames,1,nullptr));
  uint8_t object[0xb0]={}; NocopyObjectMetadata out{0xaa,0xbb,0xcc};

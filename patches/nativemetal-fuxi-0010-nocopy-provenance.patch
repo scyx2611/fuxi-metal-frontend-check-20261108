@@ -9,7 +9,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  #include <mach/mach.h>
  #include "bridge/NativeMetalObjects.h"
  #include "NativeBridgeMetalFrontend.h"
-@@ -1376,6 +1377,21 @@
+@@ -1376,6 +1377,22 @@
            (unsigned long long)((uintptr_t)frames[i]-(uintptr_t)info.dli_fbase));
     else NSLog(@"FUXI NOCOPY CALL: frame=%d image=unknown",i);
    }
@@ -18,7 +18,8 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 + if(bytes && !deallocator && d && d.pixelFormat==204 && d.width==1125 && d.height==2436 &&
 +    d.depth==1 && d.mipmapLevelCount==1 && length==2752512 && !observed.exchange(true)) {
 +  FuxiNocopyObservation observation{};
-+  if(fuxiObserveNocopy(bytes,1125,2436,observation)) {
++  const auto status=fuxiObserveNocopy(bytes,1125,2436,observation);
++  if(status==FuxiNocopyStatus::Match) {
 +   const uintptr_t cleanup=observation.metadata.cleanupFunction;
 +   Dl_info info{};
 +   if(cleanup && dladdr(reinterpret_cast<void *>(cleanup),&info) && info.dli_fbase && info.dli_fname &&
@@ -27,7 +28,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +    NSLog(@"FUXI NOCOPY META: flags=0x%x cleanup-image=%s offset=0x%llx",observation.metadata.flags,
 +          info.dli_fname,(unsigned long long)(cleanup-reinterpret_cast<uintptr_t>(info.dli_fbase)));
 +   else NSLog(@"FUXI NOCOPY META: flags=0x%x cleanup=%s",observation.metadata.flags,cleanup?"unknown":"null");
-+  } else NSLog(@"FUXI NOCOPY META: identity or safe read did not match");
++  } else NSLog(@"FUXI NOCOPY META: validation=%u",static_cast<unsigned>(status));
   }
   if(logIndex<8){
    const size_t page=(size_t)getpagesize();
@@ -35,7 +36,7 @@ diff --git a/FuxiNocopyObservation.h b/FuxiNocopyObservation.h
 new file mode 100644
 --- /dev/null
 +++ b/FuxiNocopyObservation.h
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,81 @@
 +#pragma once
 +// Observation only. No texture bytes are read, no pointers are retained, and
 +// an unrecognised frame or object leaves the existing no-copy refusal intact.
@@ -46,10 +47,10 @@ new file mode 100644
 +#include <unwind.h>
 +#include <cstdlib>
 +
-+struct FuxiUnwindFrames { uintptr_t pc[32]{}; uintptr_t x19[32]{}; size_t count=0; bool overflow=false; };
++struct FuxiUnwindFrames { uintptr_t pc[kNocopyMaxFrames]{}; uintptr_t x19[kNocopyMaxFrames]{}; size_t count=0; bool overflow=false; };
 +static _Unwind_Reason_Code fuxiCollectFrame(_Unwind_Context *context, void *arg) {
 + auto &f=*static_cast<FuxiUnwindFrames *>(arg);
-+ if(f.count==32){f.overflow=true;return _URC_END_OF_STACK;}
++ if(f.count==kNocopyMaxFrames){f.overflow=true;return _URC_END_OF_STACK;}
 + f.pc[f.count]=static_cast<uintptr_t>(_Unwind_GetIP(context));
 + Dl_info info{};
 + if(f.pc[f.count] && dladdr(reinterpret_cast<void *>(f.pc[f.count]),&info) && info.dli_fbase && info.dli_fname &&
@@ -80,10 +81,10 @@ new file mode 100644
 + std::free(table);return ok;
 +}
 +struct FuxiNocopyObservation { NocopyObjectMetadata metadata{}; };
-+static bool fuxiObserveNocopy(void *bytes,uint32_t width,uint32_t height,FuxiNocopyObservation &out) {
-+ FuxiUnwindFrames f{};_Unwind_Backtrace(fuxiCollectFrame,&f);
-+ if(f.overflow)return false;
-+ NocopyFrame candidates[32]{};size_t matchingFrames=0;bool badImage=false;
++enum class FuxiNocopyStatus { Match, StackLimit, FrameCount, ImageRead, Identity, ObjectRead, ObjectChanged, ObjectArgs, ShortHeader, PointerMismatch, DimensionMismatch, LinearFlag };
++static FuxiNocopyStatus fuxiObserveFrames(const FuxiUnwindFrames &f,void *bytes,uint32_t width,uint32_t height,FuxiNocopyObservation &out) {
++ if(f.overflow || f.count>kNocopyMaxFrames)return FuxiNocopyStatus::StackLimit;
++ NocopyFrame candidates[kNocopyMaxFrames]{};size_t matchingFrames=0;bool badImage=false;
 + for(size_t i=0;i<f.count;i++) {
 +  Dl_info info{};
 +  if(!f.pc[i] || !dladdr(reinterpret_cast<void *>(f.pc[i]),&info) || !info.dli_fbase || !info.dli_fname)continue;
@@ -95,14 +96,27 @@ new file mode 100644
 +  candidates[i].imagePath=info.dli_fname;candidates[i].returnOffset=f.pc[i]-image;
 +  std::memcpy(candidates[i].imageUUID,uuid,sizeof uuid);candidates[i].objectRegister=f.x19[i];
 + }
-+ if(matchingFrames!=1 || badImage)return false;
-+ uintptr_t object=0;if(!selectNocopyObjectFrame(candidates,f.count,&object))return false;
++ if(matchingFrames!=1)return FuxiNocopyStatus::FrameCount;
++ if(badImage)return FuxiNocopyStatus::ImageRead;
++ uintptr_t object=0;if(!selectNocopyObjectFrame(candidates,f.count,&object))return FuxiNocopyStatus::Identity;
 + uint8_t header[0xb0]{},second[0xb0]{};
-+ if(!copyNocopyObjectHeader(object,header) || !copyNocopyObjectHeader(object,second) ||
-+    std::memcmp(header,second,sizeof header)!=0)return false;
++ if(!copyNocopyObjectHeader(object,header) || !copyNocopyObjectHeader(object,second))return FuxiNocopyStatus::ObjectRead;
++ if(std::memcmp(header,second,sizeof header)!=0)return FuxiNocopyStatus::ObjectChanged;
 + NocopyObjectMetadata metadata{};
-+ if(inspectNocopyObjectHeader(header,sizeof header,reinterpret_cast<uintptr_t>(bytes),width,height,&metadata)!=NocopyObjectResult::Match)return false;
-+ out.metadata=metadata;return true;
++ switch(inspectNocopyObjectHeader(header,sizeof header,reinterpret_cast<uintptr_t>(bytes),width,height,&metadata)) {
++  case NocopyObjectResult::InvalidArgument: return FuxiNocopyStatus::ObjectArgs;
++  case NocopyObjectResult::ShortHeader: return FuxiNocopyStatus::ShortHeader;
++  case NocopyObjectResult::PointerMismatch: return FuxiNocopyStatus::PointerMismatch;
++  case NocopyObjectResult::DimensionMismatch: return FuxiNocopyStatus::DimensionMismatch;
++  case NocopyObjectResult::LinearFlag: return FuxiNocopyStatus::LinearFlag;
++  case NocopyObjectResult::Match: break;
++ }
++ out.metadata=metadata;return FuxiNocopyStatus::Match;
++}
++
++static FuxiNocopyStatus fuxiObserveNocopy(void *bytes,uint32_t width,uint32_t height,FuxiNocopyObservation &out) {
++ FuxiUnwindFrames f{};_Unwind_Backtrace(fuxiCollectFrame,&f);
++ return fuxiObserveFrames(f,bytes,width,height,out);
 +}
 diff --git a/NocopyMachOUUID.h b/NocopyMachOUUID.h
 new file mode 100644
@@ -139,11 +153,13 @@ diff --git a/NocopyObjectMetadata.h b/NocopyObjectMetadata.h
 new file mode 100644
 --- /dev/null
 +++ b/NocopyObjectMetadata.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,58 @@
 +#pragma once
 +#include <cstddef>
 +#include <cstdint>
 +#include <cstring>
++
++static constexpr size_t kNocopyMaxFrames = 128;
 +
 +struct NocopyFrame {
 + const char *imagePath;
@@ -158,7 +174,7 @@ new file mode 100644
 +inline bool selectNocopyObjectFrame(const NocopyFrame *frames, size_t count, uintptr_t *out) {
 + static constexpr char path[]="/System/Library/Frameworks/QuartzCore.framework/QuartzCore";
 + static constexpr uint8_t uuid[16]={0x9e,0x40,0xb2,0xeb,0x26,0x0c,0x3a,0xf1,0xae,0x45,0xa1,0xa5,0x51,0xa8,0xc1,0xb9};
-+ if(!frames || !out || count>32) return false;
++ if(!frames || !out || count>kNocopyMaxFrames) return false;
 + size_t matches=0;uintptr_t value=0;
 + for(size_t i=0;i<count;i++) {
 +  if(frames[i].imagePath && std::strcmp(frames[i].imagePath,path)==0 && frames[i].returnOffset==0x200000 &&
