@@ -1,0 +1,219 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -21,6 +21,7 @@
+ #include <CommonCrypto/CommonDigest.h>
+ #include <dlfcn.h>
+ #include <execinfo.h>
++#include "FuxiNocopyObservation.h"
+ #include <mach/mach.h>
+ #include "bridge/NativeMetalObjects.h"
+ #include "NativeBridgeMetalFrontend.h"
+@@ -1376,6 +1377,22 @@
+           (unsigned long long)((uintptr_t)frames[i]-(uintptr_t)info.dli_fbase));
+    else NSLog(@"FUXI NOCOPY CALL: frame=%d image=unknown",i);
+   }
++ }
++ static std::atomic<bool> observed{false};
++ if(bytes && !deallocator && d && d.pixelFormat==204 && d.width==1125 && d.height==2436 &&
++    d.depth==1 && d.mipmapLevelCount==1 && length==2752512 && !observed.exchange(true)) {
++  FuxiNocopyObservation observation{};
++  if(fuxiObserveNocopy(bytes,1125,2436,observation)) {
++   const uintptr_t cleanup=observation.metadata.cleanupFunction;
++   Dl_info info{};
++   if(cleanup && dladdr(reinterpret_cast<void *>(cleanup),&info) && info.dli_fbase && info.dli_fname &&
++      cleanup>=reinterpret_cast<uintptr_t>(info.dli_fbase))
++    NSLog(@"FUXI NOCOPY META: flags=0x%x field60=%llu cleanup-image=%s offset=0x%llx",observation.metadata.flags,
++          (unsigned long long)observation.metadata.claimedBytes,info.dli_fname,
++          (unsigned long long)(cleanup-reinterpret_cast<uintptr_t>(info.dli_fbase)));
++   else NSLog(@"FUXI NOCOPY META: flags=0x%x field60=%llu cleanup=%s",observation.metadata.flags,
++              (unsigned long long)observation.metadata.claimedBytes,cleanup?"unknown":"null");
++  } else NSLog(@"FUXI NOCOPY META: identity or safe read did not match");
+  }
+  if(logIndex<8){
+   const size_t page=(size_t)getpagesize();
+diff --git a/FuxiNocopyObservation.h b/FuxiNocopyObservation.h
+new file mode 100644
+--- /dev/null
++++ b/FuxiNocopyObservation.h
+@@ -0,0 +1,68 @@
++#pragma once
++// Observation only. No texture bytes are read, no pointers are retained, and
++// an unrecognised frame or object leaves the existing no-copy refusal intact.
++#include "NocopyMachOUUID.h"
++#include "NocopyObjectMetadata.h"
++#include "NocopySafeRead.h"
++#include <dlfcn.h>
++#include <unwind.h>
++#include <cstdlib>
++
++struct FuxiUnwindFrames { uintptr_t pc[32]{}; uintptr_t x19[32]{}; size_t count=0; bool overflow=false; };
++static _Unwind_Reason_Code fuxiCollectFrame(_Unwind_Context *context, void *arg) {
++ auto &f=*static_cast<FuxiUnwindFrames *>(arg);
++ if(f.count==32){f.overflow=true;return _URC_END_OF_STACK;}
++ f.pc[f.count]=static_cast<uintptr_t>(_Unwind_GetIP(context));
++ Dl_info info{};
++ if(f.pc[f.count] && dladdr(reinterpret_cast<void *>(f.pc[f.count]),&info) && info.dli_fbase && info.dli_fname &&
++    f.pc[f.count]>=reinterpret_cast<uintptr_t>(info.dli_fbase) &&
++    f.pc[f.count]-reinterpret_cast<uintptr_t>(info.dli_fbase)==0x200000 &&
++    std::strcmp(info.dli_fname,"/System/Library/Frameworks/QuartzCore.framework/QuartzCore")==0)
++#if defined(__arm64__) || defined(__aarch64__)
++  f.x19[f.count]=static_cast<uintptr_t>(_Unwind_GetGR(context,19));
++#else
++  f.x19[f.count]=0;
++#endif
++ ++f.count;return _URC_NO_REASON;
++}
++static bool fuxiSafeRead(uintptr_t address,void *out,size_t count) {
++ if(!address || !out || !count || count>65568 || address>UINTPTR_MAX-count) return false;
++ vm_size_t copied=0;
++ return vm_read_overwrite(mach_task_self(),static_cast<vm_address_t>(address),static_cast<vm_size_t>(count),
++                          reinterpret_cast<vm_address_t>(out),&copied)==KERN_SUCCESS && copied==count;
++}
++static bool fuxiImageUUID(uintptr_t image, uint8_t (&uuid)[16]) {
++ uint8_t header[32]{};
++ if(!fuxiSafeRead(image,header,sizeof header))return false;
++ uint32_t size=0;std::memcpy(&size,header+20,sizeof size);
++ if(size>65536)return false;
++ const size_t count=32+static_cast<size_t>(size);
++ auto *table=static_cast<uint8_t *>(std::malloc(count));if(!table)return false;
++ bool ok=fuxiSafeRead(image,table,count) && copyMachOUUID(table,count,uuid);
++ std::free(table);return ok;
++}
++struct FuxiNocopyObservation { NocopyObjectMetadata metadata{}; };
++static bool fuxiObserveNocopy(void *bytes,uint32_t width,uint32_t height,FuxiNocopyObservation &out) {
++ FuxiUnwindFrames f{};_Unwind_Backtrace(fuxiCollectFrame,&f);
++ if(f.overflow)return false;
++ NocopyFrame candidates[32]{};size_t matchingFrames=0;bool badImage=false;
++ for(size_t i=0;i<f.count;i++) {
++  Dl_info info{};
++  if(!f.pc[i] || !dladdr(reinterpret_cast<void *>(f.pc[i]),&info) || !info.dli_fbase || !info.dli_fname)continue;
++  const uintptr_t image=reinterpret_cast<uintptr_t>(info.dli_fbase);
++  if(f.pc[i]<image || f.pc[i]-image!=0x200000 ||
++     std::strcmp(info.dli_fname,"/System/Library/Frameworks/QuartzCore.framework/QuartzCore")!=0)continue;
++  ++matchingFrames;
++  uint8_t uuid[16]{};if(!fuxiImageUUID(image,uuid)){badImage=true;continue;}
++  candidates[i].imagePath=info.dli_fname;candidates[i].returnOffset=f.pc[i]-image;
++  std::memcpy(candidates[i].imageUUID,uuid,sizeof uuid);candidates[i].objectRegister=f.x19[i];
++ }
++ if(matchingFrames!=1 || badImage)return false;
++ uintptr_t object=0;if(!selectNocopyObjectFrame(candidates,f.count,&object))return false;
++ uint8_t header[0xb0]{},second[0xb0]{};
++ if(!copyNocopyObjectHeader(object,header) || !copyNocopyObjectHeader(object,second) ||
++    std::memcmp(header,second,sizeof header)!=0)return false;
++ NocopyObjectMetadata metadata{};
++ if(inspectNocopyObjectHeader(header,sizeof header,reinterpret_cast<uintptr_t>(bytes),width,height,&metadata)!=NocopyObjectResult::Match)return false;
++ out.metadata=metadata;return true;
++}
+diff --git a/NocopyMachOUUID.h b/NocopyMachOUUID.h
+new file mode 100644
+--- /dev/null
++++ b/NocopyMachOUUID.h
+@@ -0,0 +1,26 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++// Decode a copied little-endian Mach-O header and load-command table.
++// Caller provides a stable local copy, never an untrusted remote pointer.
++inline bool copyMachOUUID(const uint8_t *bytes,size_t length,uint8_t (&uuid)[16]) {
++ if(!bytes || length<32) return false;
++ uint32_t magic=0,ncmds=0,commandBytes=0;
++ std::memcpy(&magic,bytes,4);std::memcpy(&ncmds,bytes+16,4);std::memcpy(&commandBytes,bytes+20,4);
++ if(magic!=0xfeedfacf || !ncmds || ncmds>4096 || commandBytes>65536 || commandBytes>length-32) return false;
++ size_t offset=32,end=32+static_cast<size_t>(commandBytes);unsigned matches=0;uint8_t found[16]{};
++ for(uint32_t i=0;i<ncmds;i++) {
++  if(offset>end || end-offset<8)return false;
++  uint32_t cmd=0,size=0;std::memcpy(&cmd,bytes+offset,4);std::memcpy(&size,bytes+offset+4,4);
++  if(size<8 || size%8 || size>end-offset)return false;
++  if(cmd==0x1b) {
++   if(size!=24)return false;
++   ++matches;std::memcpy(found,bytes+offset+8,16);
++  }
++  offset+=size;
++ }
++ if(offset!=end || matches!=1)return false;
++ std::memcpy(uuid,found,sizeof found);return true;
++}
+diff --git a/NocopyObjectMetadata.h b/NocopyObjectMetadata.h
+new file mode 100644
+--- /dev/null
++++ b/NocopyObjectMetadata.h
+@@ -0,0 +1,56 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++struct NocopyFrame {
++ const char *imagePath;
++ uint64_t returnOffset;
++ uint8_t imageUUID[16];
++ uintptr_t objectRegister;
++};
++
++// This fixed identity is for the locally inspected QuartzCore image only.
++// Duplicate matches fail closed, as do unknown images and excessive frames.
++// Each non-null imagePath must be a readable NUL-terminated loader-owned string.
++inline bool selectNocopyObjectFrame(const NocopyFrame *frames, size_t count, uintptr_t *out) {
++ static constexpr char path[]="/System/Library/Frameworks/QuartzCore.framework/QuartzCore";
++ static constexpr uint8_t uuid[16]={0x9e,0x40,0xb2,0xeb,0x26,0x0c,0x3a,0xf1,0xae,0x45,0xa1,0xa5,0x51,0xa8,0xc1,0xb9};
++ if(!frames || !out || count>32) return false;
++ size_t matches=0;uintptr_t value=0;
++ for(size_t i=0;i<count;i++) {
++  if(frames[i].imagePath && std::strcmp(frames[i].imagePath,path)==0 && frames[i].returnOffset==0x200000 &&
++     std::memcmp(frames[i].imageUUID,uuid,sizeof uuid)==0) {++matches;value=frames[i].objectRegister;}
++ }
++ if(matches!=1 || !value || value%alignof(uintptr_t)) return false;
++ *out=value;return true;
++}
++
++// Decode a *copied* object header only after caller identity is checked.
++// This never reads texture bytes, calls object methods, or takes ownership.
++struct NocopyObjectMetadata {
++ uint8_t flags;
++ uint64_t claimedBytes;
++ uintptr_t cleanupFunction;
++};
++
++enum class NocopyObjectResult { Match, InvalidArgument, ShortHeader, PointerMismatch, DimensionMismatch, LinearFlag };
++
++inline NocopyObjectResult inspectNocopyObjectHeader(const uint8_t *header, size_t size, uintptr_t expectedBytes,
++                                                    uint32_t width, uint32_t height, NocopyObjectMetadata *out) {
++ if(!header || !out || !expectedBytes || !width || !height) return NocopyObjectResult::InvalidArgument;
++ if(size < 0xb0) return NocopyObjectResult::ShortHeader;
++ uint32_t actualWidth=0,actualHeight=0;
++ uintptr_t actualBytes=0,cleanup=0;
++ uint64_t claimed=0;
++ std::memcpy(&actualWidth,header+0x10,sizeof actualWidth);
++ std::memcpy(&actualHeight,header+0x14,sizeof actualHeight);
++ std::memcpy(&actualBytes,header+0x58,sizeof actualBytes);
++ std::memcpy(&claimed,header+0x60,sizeof claimed);
++ std::memcpy(&cleanup,header+0x68,sizeof cleanup);
++ if(actualBytes!=expectedBytes) return NocopyObjectResult::PointerMismatch;
++ if(actualWidth!=width || actualHeight!=height) return NocopyObjectResult::DimensionMismatch;
++ if(header[0xa8]&1) return NocopyObjectResult::LinearFlag;
++ *out={header[0xa8],claimed,cleanup};
++ return NocopyObjectResult::Match;
++}
+diff --git a/NocopySafeRead.h b/NocopySafeRead.h
+new file mode 100644
+--- /dev/null
++++ b/NocopySafeRead.h
+@@ -0,0 +1,15 @@
++#pragma once
++#include <mach/mach.h>
++#include <cstdint>
++#include <cstring>
++
++// Read a bounded metadata header from this process without dereferencing it.
++// On error or short read, leave the caller's output untouched.
++inline bool copyNocopyObjectHeader(uintptr_t address, uint8_t (&out)[0xb0]) {
++ if(!address || address % alignof(uintptr_t)) return false;
++ uint8_t copy[0xb0];vm_size_t copied=0;
++ kern_return_t result=vm_read_overwrite(mach_task_self(),static_cast<vm_address_t>(address),
++    sizeof copy,reinterpret_cast<vm_address_t>(copy),&copied);
++ if(result!=KERN_SUCCESS || copied!=sizeof copy) return false;
++ std::memcpy(out,copy,sizeof copy);return true;
++}
