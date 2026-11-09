@@ -9,7 +9,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  #include <mach/mach.h>
  #include "bridge/NativeMetalObjects.h"
  #include "NativeBridgeMetalFrontend.h"
-@@ -1376,6 +1377,22 @@
+@@ -1376,6 +1377,21 @@
            (unsigned long long)((uintptr_t)frames[i]-(uintptr_t)info.dli_fbase));
     else NSLog(@"FUXI NOCOPY CALL: frame=%d image=unknown",i);
    }
@@ -22,12 +22,11 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +   const uintptr_t cleanup=observation.metadata.cleanupFunction;
 +   Dl_info info{};
 +   if(cleanup && dladdr(reinterpret_cast<void *>(cleanup),&info) && info.dli_fbase && info.dli_fname &&
++      (!std::strncmp(info.dli_fname,"/System/Library/",16) || !std::strncmp(info.dli_fname,"/usr/lib/",9)) &&
 +      cleanup>=reinterpret_cast<uintptr_t>(info.dli_fbase))
-+    NSLog(@"FUXI NOCOPY META: flags=0x%x field60=%llu cleanup-image=%s offset=0x%llx",observation.metadata.flags,
-+          (unsigned long long)observation.metadata.claimedBytes,info.dli_fname,
-+          (unsigned long long)(cleanup-reinterpret_cast<uintptr_t>(info.dli_fbase)));
-+   else NSLog(@"FUXI NOCOPY META: flags=0x%x field60=%llu cleanup=%s",observation.metadata.flags,
-+              (unsigned long long)observation.metadata.claimedBytes,cleanup?"unknown":"null");
++    NSLog(@"FUXI NOCOPY META: flags=0x%x cleanup-image=%s offset=0x%llx",observation.metadata.flags,
++          info.dli_fname,(unsigned long long)(cleanup-reinterpret_cast<uintptr_t>(info.dli_fbase)));
++   else NSLog(@"FUXI NOCOPY META: flags=0x%x cleanup=%s",observation.metadata.flags,cleanup?"unknown":"null");
 +  } else NSLog(@"FUXI NOCOPY META: identity or safe read did not match");
   }
   if(logIndex<8){
