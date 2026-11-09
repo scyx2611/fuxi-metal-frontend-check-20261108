@@ -1,0 +1,19 @@
+name: Check preserved register unwind
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unwind-register:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and test caller register recovery
+        run: |
+          set -euo pipefail
+          uname -m
+          xcrun clang++ -std=c++17 -O2 -fno-omit-frame-pointer tests/UnwindRegisterTests.cpp -o "$RUNNER_TEMP/fuxi-unwind-register-test"
+          "$RUNNER_TEMP/fuxi-unwind-register-test"
