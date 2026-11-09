@@ -31,9 +31,14 @@ static _Unwind_Reason_Code collect(struct _Unwind_Context *context, void *argume
 }
 
 __attribute__((noinline)) static bool observe(uintptr_t expected) {
+ // Force the callee to use the same register for a different value. The
+ // unwinder must recover the caller's saved value, not the callee's live one.
+ register uintptr_t overwritten asm(TEST_REGISTER) = expected ^ UINT64_C(0x5555555555555555);
+ asm volatile("" : "+r"(overwritten) : : "memory");
  Probe probe{reinterpret_cast<uintptr_t>(__builtin_return_address(0)), 0, 0};
  _Unwind_Backtrace(collect, &probe);
- return probe.matches == 1 && probe.recovered == expected;
+ asm volatile("" : "+r"(overwritten) : : "memory");
+ return probe.matches == 1 && probe.recovered == expected && overwritten != expected;
 }
 
 __attribute__((noinline)) static bool caller(uintptr_t value) {
