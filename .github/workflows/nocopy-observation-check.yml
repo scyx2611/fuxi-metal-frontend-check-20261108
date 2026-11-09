@@ -1,0 +1,29 @@
+name: Check bounded no-copy observation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  controls:
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Extract proposed observation headers and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init "$RUNNER_TEMP/observation"
+          git -C "$RUNNER_TEMP/observation" apply --include=FuxiNocopyObservation.h --include=NocopyMachOUUID.h --include=NocopyObjectMetadata.h --include=NocopySafeRead.h "$GITHUB_WORKSPACE/patches/nativemetal-fuxi-0010-nocopy-provenance.patch"
+          for name in NocopyObjectMetadata NocopyMachOUUID NocopySafeRead; do
+            cp "tests/${name}Tests.cpp" "$RUNNER_TEMP/observation/"
+            xcrun clang++ -std=c++17 -O2 -Wall -Wextra -Werror "$RUNNER_TEMP/observation/${name}Tests.cpp" -o "$RUNNER_TEMP/${name}"
+            "$RUNNER_TEMP/${name}"
+          done
+          xcrun clang++ -std=c++17 -O2 -Wall -Wextra -Werror -I "$RUNNER_TEMP/observation" tests/FuxiNocopyObservationTests.cpp -o "$RUNNER_TEMP/observation-test"
+          "$RUNNER_TEMP/observation-test"
+          xcrun --sdk iphoneos clang++ -std=c++17 -O2 -Wall -Wextra -Werror -target arm64-apple-ios16.0 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -I "$RUNNER_TEMP/observation" -c tests/FuxiNocopyObservationTests.cpp -o "$RUNNER_TEMP/observation-ios.o"
