@@ -1,0 +1,77 @@
+diff --git a/xnu/fuxi-scanout/SweetSurface.cpp b/xnu/fuxi-scanout/SweetSurface.cpp
+index d1125ba..208d071 100644
+--- a/xnu/fuxi-scanout/SweetSurface.cpp
++++ b/xnu/fuxi-scanout/SweetSurface.cpp
+@@ -1117,6 +1117,9 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		put32(p, 0x04, pl->height);
+ 		put32(p, 0x08, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
++		/* IOSurface 16.7 reads the per-plane row stride at client +0xe0
++		 * (result +0x78); keep the legacy +0x08 field unchanged. */
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
+diff --git a/xnu/patches/0046-sweet-iosurface-iomfb.patch b/xnu/patches/0046-sweet-iosurface-iomfb.patch
+index 35b320a..9c87be8 100644
+--- a/xnu/patches/0046-sweet-iosurface-iomfb.patch
++++ b/xnu/patches/0046-sweet-iosurface-iomfb.patch
+@@ -116,7 +116,7 @@
+ +#endif /* _SWEET_SURFACE_H */
+ --- /dev/null
+ +++ b/iokit/Kernel/arm/SweetSurface.cpp
+-@@ -0,0 +1,872 @@
++@@ -0,0 +1,875 @@
+ +/*
+ + * Built-in IOSurface for SWEET.
+ + *
+@@ -703,6 +703,9 @@
+ +		put32(p, 0x04, pl->height);
+ +		put32(p, 0x08, pl->bytesPerRow);
+ +		put32(p, 0x0c, pl->offset);
+++		/* IOSurface 16.7 reads the per-plane row stride at client +0xe0
+++		 * (result +0x78); keep the legacy +0x08 field unchanged. */
+++		put32(p, 0x10, pl->bytesPerRow);
+ +		put32(p, 0x14, pl->size);
+ +		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ +		p[0x1a] = pl->elementWidth;
+diff --git a/xnu/patches/0108-fuxi-gpu-scanout.patch b/xnu/patches/0108-fuxi-gpu-scanout.patch
+index d9700b9..ae1d910 100644
+--- a/xnu/patches/0108-fuxi-gpu-scanout.patch
++++ b/xnu/patches/0108-fuxi-gpu-scanout.patch
+@@ -524,7 +524,7 @@
+  	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+  	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+  	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+-@@ -882,6 +1236,14 @@
++@@ -885,6 +1239,14 @@
+  		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+  		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+  	}
+@@ -539,7 +539,7 @@
+  	props->release();
+  	if (ret != kIOReturnSuccess) {
+  		s->release();
+-@@ -956,11 +1318,34 @@
++@@ -959,11 +1321,34 @@
+  	}
+  }
+  
+@@ -579,7 +579,7 @@
+  }
+  
+  static IOReturn
+-@@ -1001,7 +1386,7 @@
++@@ -1004,7 +1389,7 @@
+  		return kIOReturnNotFound;
+  	}
+  #if defined(FUXI)
+@@ -588,7 +588,7 @@
+    s->release(); return kIOReturnNotReady;
+   }
+  #endif
+-@@ -1041,8 +1426,8 @@
++@@ -1044,8 +1429,8 @@
+  }
+  
+  static IOExternalTrap sweet_surface_traps[] = {
