@@ -35,6 +35,16 @@ static void failed(const char *why){failures.emplace_back(why);latched=true;}
 int main(){@autoreleasepool{
  FuxiNativeHooks hooks={FUXI_NATIVE_ABI,sizeof(FuxiNativeHooks),failed,[](){return latched;},[](uint64_t,double,uint64_t,bool){++completions;}};
  fuxi_native_metal_set_hooks(&hooks);
+ assert(constantBytes(MTLDataTypeUChar3)==3 && constantBytes(47)==0 && constantBytes(55)==0);
+ MTLFunctionConstantValues *constantValues=[MTLFunctionConstantValues new];
+ assert(methodABI(constantValues,@selector(newNamedConstantArray),"@16@0:8"));
+ uint8_t components[4]={17,29,43,0xee};
+ [constantValues setConstantValue:components type:MTLDataTypeUChar3 withName:@"triplet"];
+ NSArray *named=[constantValues newNamedConstantArray];assert(named.count==1);
+ id<NBOriginalConstantValue> constant=named[0];
+ assert(methodABI(constant,@selector(dataType),"Q16@0:8") && methodABI(constant,@selector(data),"^v16@0:8"));
+ assert(constant.dataType==MTLDataTypeUChar3 && [constant.name isEqualToString:@"triplet"]);
+ assert(constant.data && !memcmp(constant.data,components,constantBytes(constant.dataType)));
  NBDeviceMethods *methods=[NBDeviceMethods new];id<MTLDevice> dev=(id)methods;
  Class known=objc_allocateClassPair([NBDeviceMethods class],"NativeKnownAnswerTest",0);
  objc_registerClassPair(known);answerMode=0;installAnswers(known);

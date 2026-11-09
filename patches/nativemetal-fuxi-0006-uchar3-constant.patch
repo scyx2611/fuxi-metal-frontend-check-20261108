@@ -1,0 +1,21 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 3aae81b..639194e 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -364,7 +364,7 @@ static bool methodABI(id object,SEL selector,const char *encoding) {
+  Method method=class_getInstanceMethod(object_getClass(object),selector);
+  return method && !strcmp(method_getTypeEncoding(method),encoding);
+ }
+-// Bytes of a function constant of MTLDataType `type` (scalars and 2/4-wide vectors; 3-wide vectors are not qualified).
++// Bytes of a function constant of MTLDataType `type` (three-wide values contain only their component bytes).
+ static uint64_t constantBytes(uint64_t type) {
+  switch(type) {
+   case 3:case 29:case 33:return 4;
+@@ -375,6 +375,7 @@ static uint64_t constantBytes(uint64_t type) {
+   case 19:case 40:case 44:return 8;
+   case 45:case 49:case 53:return 1;
+   case 46:case 50:case 54:return 2;
++  case 51:return 3;
+   case 48:case 52:case 56:return 4;
+   case 81:case 85:return 8;
+   case 82:case 86:return 16;
