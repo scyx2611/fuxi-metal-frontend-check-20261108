@@ -57,6 +57,10 @@ int main(){@autoreleasepool{
  assert(![(id)dev newTextureWithBytesNoCopy:rawBytes length:2752512 descriptor:astc deallocator:^(void *,NSUInteger){++freed;}]);
  assert(latched && freed==0 && failures.back().find("newTextureWithBytesNoCopy")!=std::string::npos);
  failures.clear();latched=false;
+ // Even the observed nil-deallocator request must refuse an unknown caller.
+ assert(![(id)dev newTextureWithBytesNoCopy:rawBytes length:2752512 descriptor:astc deallocator:nil]);
+ assert(latched && freed==0 && failures.back().find("newTextureWithBytesNoCopy")!=std::string::npos);
+ failures.clear();latched=false;
  Class known=objc_allocateClassPair([NBDeviceMethods class],"NativeKnownAnswerTest",0);
  objc_registerClassPair(known);answerMode=0;installAnswers(known);
  id knownDevice=[known new];assert(((NSUInteger (*)(id,SEL))objc_msgSend)(knownDevice,sel_registerName("fuxiTestAnswer"))==7 && failures.empty());
