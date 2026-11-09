@@ -1,0 +1,22 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 639194e..d65987f 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1361,7 +1361,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+ // Not made here: a texture over raw memory in Apple's layout, and Apple's texture layout object. Both are refused, with the reason, rather than
+ // answered with a guessed shape.
+ - (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator { try { @try {
+- (void)bytes;(void)length;(void)d;(void)deallocator;
++ // Bounded metadata only: do not dereference or claim ownership of the caller's memory.
++ static std::atomic<unsigned> logged{0};
++ if(logged.fetch_add(1)<8){
++  const size_t page=(size_t)getpagesize();
++  NSLog(@"FUXI NOCOPY: length=%lu aligned=%u deallocator=%u descriptor=%u type=%lu format=%lu size=%lux%lux%lu mips=%lu array=%lu samples=%lu storage=%lu cache=%lu hazard=%lu usage=0x%lx options=0x%lx",
++   (unsigned long)length,(unsigned)(bytes && page && !((uintptr_t)bytes%page)),(unsigned)(deallocator!=nil),(unsigned)(d!=nil),
++   (unsigned long)d.textureType,(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.depth,
++   (unsigned long)d.mipmapLevelCount,(unsigned long)d.arrayLength,(unsigned long)d.sampleCount,(unsigned long)d.storageMode,
++   (unsigned long)d.cpuCacheMode,(unsigned long)d.hazardTrackingMode,(unsigned long)d.usage,(unsigned long)d.resourceOptions);
++ }
+  NBLOG(@"native-metal: newTextureWithBytesNoCopy:length:descriptor:deallocator: is not implemented (Apple's texture layout of raw memory is not known)");
+  return nil;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }

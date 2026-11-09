@@ -46,6 +46,11 @@ int main(){@autoreleasepool{
  assert(constant.dataType==MTLDataTypeUChar3 && [constant.name isEqualToString:@"triplet"]);
  assert(constant.data && !memcmp(constant.data,components,constantBytes(constant.dataType)));
  NBDeviceMethods *methods=[NBDeviceMethods new];id<MTLDevice> dev=(id)methods;
+ MTLTextureDescriptor *rawDesc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:16 height:8 mipmapped:NO];
+ rawDesc.usage=MTLTextureUsageShaderRead;__block unsigned freed=0;uint8_t rawBytes[512]={};
+ assert(![(id)dev newTextureWithBytesNoCopy:rawBytes length:sizeof(rawBytes) descriptor:rawDesc deallocator:^(void *,NSUInteger){++freed;}]);
+ assert(latched && freed==0 && failures.back().find("newTextureWithBytesNoCopy")!=std::string::npos);
+ failures.clear();latched=false;
  Class known=objc_allocateClassPair([NBDeviceMethods class],"NativeKnownAnswerTest",0);
  objc_registerClassPair(known);answerMode=0;installAnswers(known);
  id knownDevice=[known new];assert(((NSUInteger (*)(id,SEL))objc_msgSend)(knownDevice,sel_registerName("fuxiTestAnswer"))==7 && failures.empty());

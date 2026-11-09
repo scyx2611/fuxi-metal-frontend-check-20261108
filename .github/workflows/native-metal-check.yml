@@ -35,6 +35,7 @@ jobs:
           cp harness/patches/nativemetal-fuxi-0004-optional-answers.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0005-completion-handlers.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0006-uchar3-constant.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0007-nocopy-diagnostics.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |
