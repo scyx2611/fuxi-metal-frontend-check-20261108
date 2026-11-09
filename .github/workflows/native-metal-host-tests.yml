@@ -27,6 +27,8 @@ jobs:
           git -C source apply --check ../harness/patches/native-patch-stack.patch
           git -C source apply ../harness/patches/native-patch-stack.patch
           python3 harness/tests/test-native-patch-stack.py source
+          cp harness/patches/nativemetal-fuxi-0004-optional-answers.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0005-completion-handlers.patch source/tools/patches/
           cd source
           source tools/ci/pins.env
           git init deps/host-mesa
@@ -39,5 +41,6 @@ jobs:
         run: |
           set -euo pipefail
           cd source
+          cp ../harness/tests/NativePortTests.mm tools/fuxi-metal/NativePortTests.mm
           python3 tools/test-fuxi-metal-frontend.py
           python3 tools/test-fuxi-nativemetal.py --native deps/host-native --metal2vulkan deps/host-m2v --bridge deps/host-output/libnative_metal_bridge.dylib

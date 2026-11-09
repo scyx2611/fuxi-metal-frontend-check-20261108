@@ -1,0 +1,37 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 7d01e49..f83d607 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1544,13 +1544,30 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+ }
+ static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
+ static BOOL flagArgAnswer(id,SEL cmd,NSUInteger arg) {return askAnswer(cmd,arg)!=0;}
++static bool unavailableOptionalAnswer(const char *name,const char *reason) {
++ return name && reason && std::string(reason)==std::string("the device has no answer for ")+name;
++}
++#ifndef FUXI_NMB_ANSWER_SELECTOR
++#define FUXI_NMB_ANSWER_SELECTOR nmb_device_answer_selector
++#endif
++#ifndef FUXI_NMB_DEVICE_ANSWER
++#define FUXI_NMB_DEVICE_ANSWER nmb_device_answer
++#endif
++#ifndef FUXI_NMB_LAST_ERROR
++#define FUXI_NMB_LAST_ERROR nmb_last_error
++#endif
+ static void installAnswers(Class cls) {
+  uint32_t kind=0;
+- for(size_t i=0;const char *name=nmb_device_answer_selector(i,&kind);i++) {
++ for(size_t i=0;const char *name=FUXI_NMB_ANSWER_SELECTOR(i,&kind);i++) {
+   SEL sel=sel_registerName(name);uint64_t value=0;
+   switch(kind) {
+   case NMB_ANSWER_COUNT: case NMB_ANSWER_FLAG:
+-   if(!nmb_device_answer(gDevice,name,0,&value)){NBLOG(@"native-metal: no device answer: %@",lastError());continue;}
++   if(!FUXI_NMB_DEVICE_ANSWER(gDevice,name,0,&value)){
++    const char *reason=FUXI_NMB_LAST_ERROR();
++    if(unavailableOptionalAnswer(name,reason))NSLog(@"native-metal: optional device answer unavailable: %s",name);
++    else NBLOG(@"native-metal: no device answer: %@",lastError());
++    continue;
++   }
+    // Extended-range 10-bit (XR10) framebuffers are withheld: this display chain presents 8-bit BGRX scanout only. The render server picks its
+    // wide-gamut 64-bit (and Apple-compressed) framebuffer when a device offers them, and the display driver could not show it (int-089: the
+    // swap's surface was '&w4a', 8 bytes per pixel, and every swap was refused).

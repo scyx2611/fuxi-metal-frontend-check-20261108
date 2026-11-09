@@ -30,6 +30,8 @@ jobs:
           python3 harness/tests/test-native-patch-stack.py source
           git -C source apply --check ../harness/patches/native-smoke-class.patch
           git -C source apply ../harness/patches/native-smoke-class.patch
+          cp harness/patches/nativemetal-fuxi-0004-optional-answers.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0005-completion-handlers.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |

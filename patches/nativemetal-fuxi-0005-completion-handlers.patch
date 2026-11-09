@@ -1,0 +1,49 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index f83d607..3aae81b 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -555,6 +555,7 @@ static void notified(void *context,uint64_t value) {
+ @property(nonatomic,strong) dispatch_group_t handlers;
+ @property(nonatomic,strong) dispatch_group_t schedulingHandlers;
+ @property(nonatomic) BOOL schedulingDelivered;
++@property(nonatomic) BOOL completionDelivered;
+ - (void)refuse:(NSString *)what;
+ @end
+ @interface NBEncoder : NBObject
+@@ -917,7 +918,12 @@ static void scheduled(void *context);
+  return [self encoder:encoder handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)addScheduledHandler:(MTLCommandBufferHandler)block { try { @try {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (void)addCompletedHandler:(MTLCommandBufferHandler)block { try { @try {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)addCompletedHandler:(MTLCommandBufferHandler)block { try { @try {
++ if(!block)return;
++ BOOL delivered;
++ @synchronized(self){delivered=_completionDelivered;if(!delivered)[_completedHandlers addObject:[block copy]];}
++ if(delivered)block((id<MTLCommandBuffer>)self);
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
+ - (void)presentDrawable:(id<MTLDrawable>)drawable { try { @try {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time { try { @try {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -960,14 +966,19 @@ static void scheduled(void *context);
+  // release point. A retained completed command must not pin every old frame.
+  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
+  @synchronized(gInFlight){[gInFlight removeObject:self];}
+- NSArray *completedHandlers;
+  @synchronized(self){
+   // A frontend refusal or a failed submission never scheduled. Unblock its waiter without inventing a scheduled event.
+   if(!_schedulingDelivered){_schedulingDelivered=YES;[_scheduledHandlers removeAllObjects];dispatch_group_leave(_schedulingHandlers);}
+-  completedHandlers=[_completedHandlers copy];[_completedHandlers removeAllObjects];
+  }
+  void (^run)(void)=^{
+-  for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
++  for(;;){
++   NSArray *pending;
++   @synchronized(self){
++    if(!self->_completedHandlers.count){self->_completionDelivered=YES;break;}
++    pending=[self->_completedHandlers copy];[self->_completedHandlers removeAllObjects];
++   }
++   for(MTLCommandBufferHandler block in pending)block((id<MTLCommandBuffer>)self);
++  }
+   dispatch_group_leave(self->_handlers);
+  };
+  dispatch_queue_t queue=_queue.completionQueue;
