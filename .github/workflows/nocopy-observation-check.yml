@@ -27,3 +27,46 @@ jobs:
           xcrun clang++ -std=c++17 -O2 -Wall -Wextra -Werror -I "$RUNNER_TEMP/observation" tests/FuxiNocopyObservationTests.cpp -o "$RUNNER_TEMP/observation-test"
           "$RUNNER_TEMP/observation-test"
           xcrun --sdk iphoneos clang++ -std=c++17 -O2 -Wall -Wextra -Werror -target arm64-apple-ios16.0 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -I "$RUNNER_TEMP/observation" -c tests/FuxiNocopyObservationTests.cpp -o "$RUNNER_TEMP/observation-ios.o"
+  block-layout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check arithmetic and padded block copies
+        run: |
+          set -euo pipefail
+          clang++ -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined tests/FuxiBlockLayoutTests.cpp -o "$RUNNER_TEMP/block-layout"
+          "$RUNNER_TEMP/block-layout"
+  frontend-syntax:
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare exact frontend patch stack
+        run: |
+          set -euo pipefail
+          git init native
+          git -C native remote add origin https://github.com/UniXNU/AdrenoMetal.git
+          git -C native fetch --no-tags --depth=1 origin a96feceda55e8fed1e20c0a2998736cef7aab006
+          git -C native checkout --detach FETCH_HEAD
+          root=https://raw.githubusercontent.com/zgl97/ios-fuxi/4b8faded6e76a4730832144fc3cae34c4419fa51/tools
+          curl --fail --location --retry 3 "$root/fuxi-metal/FuxiNativeABI.h" -o native/FuxiNativeABI.h
+          for name in 0001-ios16-plugin 0002-safety-hooks 0003-no-production-fixtures; do
+            curl --fail --location --retry 3 "$root/patches/nativemetal-fuxi-$name.patch" -o "$RUNNER_TEMP/$name.patch"
+            git -C native apply "$RUNNER_TEMP/$name.patch"
+          done
+          for patch in patches/nativemetal-fuxi-*.patch; do git -C native apply "$PWD/$patch"; done
+          cmp native/FuxiBlockLayout.h tests/FuxiBlockLayout.h
+      - name: Compile host and iOS 16 interfaces
+        run: |
+          set -euo pipefail
+          flags=(-std=c++17 -O1 -Wall -Wextra -Werror -Wno-deprecated-declarations -fobjc-arc -fblocks -I native -fsyntax-only)
+          xcrun clang++ "${flags[@]}" native/NativeBridgeMetalFrontend.mm
+          xcrun clang++ "${flags[@]}" '-DFUXI_NATIVE_FRONTEND="NativeBridgeMetalFrontend.mm"' tests/FuxiLinearLayoutTests.mm
+          xcrun --sdk iphoneos clang++ "${flags[@]}" -target arm64-apple-ios16.0 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -Werror=unguarded-availability-new native/NativeBridgeMetalFrontend.mm

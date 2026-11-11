@@ -38,6 +38,7 @@ jobs:
           cp harness/patches/nativemetal-fuxi-0008-nocopy-callers.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0009-copy-span.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0010-nocopy-provenance.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0011-linear-layout.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0001-copy-span.patch source/tools/patches/
           cd source
           source tools/ci/pins.env
@@ -57,5 +58,7 @@ jobs:
           xcrun clang++ -std=c++17 -O2 -Wall -Wextra -Werror -I deps/host-native ../harness/tests/FuxiNocopyObservationTests.cpp -o "$RUNNER_TEMP/fuxi-observation-test"
           "$RUNNER_TEMP/fuxi-observation-test"
           xcrun --sdk iphoneos clang++ -std=c++17 -O2 -Wall -Wextra -Werror -target arm64-apple-ios16.0 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -I deps/host-native -c ../harness/tests/FuxiNocopyObservationTests.cpp -o "$RUNNER_TEMP/fuxi-observation-ios.o"
+          xcrun clang++ -std=c++17 -O1 -g -Wall -Wextra -Werror -Wno-deprecated-declarations -fobjc-arc -fblocks -fsanitize=address,undefined -I tools/fuxi-metal -DFUXI_NATIVE_FRONTEND=\"$PWD/deps/host-native/NativeBridgeMetalFrontend.mm\" ../harness/tests/FuxiLinearLayoutTests.mm deps/host-output/libnative_metal_bridge.dylib -framework Foundation -framework Metal -framework IOSurface -o "$RUNNER_TEMP/linear-layout-host"
+          ASAN_OPTIONS=detect_leaks=0 "$RUNNER_TEMP/linear-layout-host"
           source tools/ci/pins.env
           cargo +"$RUST_VERSION" test --manifest-path deps/host-m2v/Cargo.toml -p metal2vulkan-runtime --lib ffi_span_tests
