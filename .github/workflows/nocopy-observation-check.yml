@@ -1,11 +1,19 @@
 name: Check bounded no-copy observation
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Standard macOS runner architecture
+        type: choice
+        default: macos-15
+        options:
+          - macos-15
+          - macos-15-intel
 permissions:
   contents: read
 jobs:
   controls:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 15
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
@@ -40,7 +48,7 @@ jobs:
           clang++ -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined tests/FuxiBlockLayoutTests.cpp -o "$RUNNER_TEMP/block-layout"
           "$RUNNER_TEMP/block-layout"
   frontend-syntax:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 15
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
