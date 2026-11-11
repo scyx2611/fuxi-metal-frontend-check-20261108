@@ -90,7 +90,7 @@ jobs:
           git init source
           git -C source remote add origin https://github.com/zgl97/ios-fuxi.git
           git -C source sparse-checkout init --cone
-          git -C source sparse-checkout set tools/fuxi-metal
+          git -C source sparse-checkout set tools/fuxi-metal xnu/fuxi-adreno
           git -C source fetch --no-tags --depth=1 --filter=blob:none origin 4b8faded6e76a4730832144fc3cae34c4419fa51
           git -C source checkout --detach FETCH_HEAD
       - name: Capture Intel census failure independently
