@@ -78,3 +78,31 @@ jobs:
           xcrun clang++ "${flags[@]}" native/NativeBridgeMetalFrontend.mm
           xcrun clang++ "${flags[@]}" '-DFUXI_NATIVE_FRONTEND="NativeBridgeMetalFrontend.mm"' tests/FuxiLinearLayoutTests.mm
           xcrun --sdk iphoneos clang++ "${flags[@]}" -target arm64-apple-ios16.0 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -Werror=unguarded-availability-new native/NativeBridgeMetalFrontend.mm
+  census-abi-diagnostic:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - name: Fetch unchanged census fixture
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source remote add origin https://github.com/zgl97/ios-fuxi.git
+          git -C source sparse-checkout init --cone
+          git -C source sparse-checkout set tools/fuxi-metal
+          git -C source fetch --no-tags --depth=1 --filter=blob:none origin 4b8faded6e76a4730832144fc3cae34c4419fa51
+          git -C source checkout --detach FETCH_HEAD
+      - name: Capture Intel census failure independently
+        run: |
+          set -euo pipefail
+          xcrun clang++ -std=c++17 -O1 -g -Wall -Wextra -Werror -Wmissing-field-initializers -fno-objc-arc -fblocks -fsanitize=address,undefined source/tools/fuxi-metal/CensusTests.mm -framework Foundation -framework Metal -framework IOSurface -o "$RUNNER_TEMP/census"
+          set +e
+          ASAN_OPTIONS=detect_leaks=0 "$RUNNER_TEMP/census" > "$RUNNER_TEMP/census.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/census.log"
+          echo "Unchanged census exit status: $result"
+          if [ "$result" -ne 0 ]; then
+            xcrun lldb --batch -o 'settings set target.env-vars ASAN_OPTIONS=detect_leaks=0' -o run -o 'bt all' -- "$RUNNER_TEMP/census"
+          fi
