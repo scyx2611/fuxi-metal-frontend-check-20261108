@@ -26,6 +26,32 @@ format. Actual ImageIO/QuartzCore cache regeneration must be qualified on device
 Success messages use NSLog, because this port's NBLOG invokes the failure gate.
 `FUXI_NATIVE_LINEAR_LAYOUT=0` disables both new entry points.
 
+## Cross-process snapshots (patch 0012)
+
+Device result for 0011 (2026-11-13): the refusal was unchanged. The refused
+1125x2436 ASTC 4x4 request does not come from this process's producer. A client
+that cannot open a Metal device (SpringBoard and the poster extensions on this
+port) has no layout object; ImageIO writes its wallpaper snapshot as an ATX file
+(`AAPL` signature, `HEAD`, `FILL` padding, `astc` chunk) whose payload starts at
+a page-aligned file offset, maps it, and QuartzCore sends the mapping to the
+render server flagged as texture-layout data. The render server passes that
+mapping straight to `newTextureWithBytesNoCopy`.
+
+The five ATX snapshots found on the device image were checked offline: the
+payload is exactly 282 x 609 blocks x 16 bytes = 2747808 bytes at file offset
+0x4000, and only a row width of 282 blocks makes every row self-consistent
+(609 of 609 rows; neighbouring widths give at most 80). The data is plain
+row-major ASTC.
+
+Patch 0012 therefore admits an allocation with no producer record when all of
+these hold: ASTC 4x4 LDR/sRGB, ShaderRead only, exactly one level and one slice,
+a base aligned to 16384, and a length covering every block. The bytes are
+copied with bounded self-memory reads into an owned snapshot and uploaded
+through the same checked bridge call as 0011. Anything else still reaches the
+diagnostic refusal. Multi-level and multi-slice foreign data stays refused
+because its serialized order has not been observed.
+`FUXI_NATIVE_FOREIGN_LINEAR=0` disables only this path.
+
 ## Validation
 
 - Portable arithmetic, observed 1125x2436 extent, odd mip/slice offsets, padded
