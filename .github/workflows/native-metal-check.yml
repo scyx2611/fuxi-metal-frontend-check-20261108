@@ -57,6 +57,7 @@ jobs:
           cp harness/patches/nativemetal-fuxi-0014-lost-reason.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0001-copy-span.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0002-fresh-zero.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0003-fetch-order.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |
