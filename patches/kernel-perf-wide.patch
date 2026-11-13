@@ -1,0 +1,75 @@
+diff --git a/xnu/fuxi-perf/fuxi_perf.c b/xnu/fuxi-perf/fuxi_perf.c
+index 1785ecd..2418596 100644
+--- a/xnu/fuxi-perf/fuxi_perf.c
++++ b/xnu/fuxi-perf/fuxi_perf.c
+@@ -62,6 +62,9 @@ static unsigned fp_rate_ms = 200;
+  * blocked; a blocked guard still drops to the legacy cool level.
+  * fuxiperfmax=dC: moves the ceiling (up to 80 C) and hot/start/resume with it. */
+ static unsigned fp_base_mhz, fp_max, fp_base[3], fp_base_khz[3];
++/* fuxiperf=2: the governor with fuxiperfmax=720 and fuxiperfbudget=1000 as its defaults (one argument where the boot-args
++ * field has no room for three); explicit fuxiperfmax/fuxiperfbudget still win. */
++static unsigned fp_wide;
+ static uint64_t fp_budget, fp_duty_window, fp_recovery;
+ static uint64_t fp_recover_since, fp_above_time, fp_cuts, fp_active_start;
+ static uint64_t fp_duty_begin[16], fp_duty_end[16];
+@@ -544,6 +547,7 @@ static void fp_configure(void)
+  fp_arg("fuxiperfidlekhz",&fp_idle_floor,100000,3000000);
+  nanoseconds_to_absolutetime((uint64_t)fp_idle_ms*NSEC_PER_MSEC,&fp_idle_after);
+  fp_arg("fuxiperfbase",&fp_base_mhz,1402,2400);
++ if (fp_wide) { fp_max = 720; fp_budget_ms = 1000; }
+  fp_arg("fuxiperfmax",&fp_max,620,800);
+  if (fp_max) {
+   fp_limit = fp_max; fp_hot = fp_max-60; fp_resume = fp_max-100; fp_start = fp_max-80;
+@@ -694,8 +698,9 @@ void fuxi_perf_start(void)
+ {
+  unsigned enable = 0;
+  (void)PE_parse_boot_argn("fuxiperf",&enable,sizeof(enable));
+- if (enable != 1 || fp_started) return;
++ if ((enable != 1 && enable != 2) || fp_started) return;
+  fp_started = 1;
++ fp_wide = enable == 2;
+  (void)PE_parse_boot_argn("fuxitp",&fp_pressure_enabled,sizeof(fp_pressure_enabled));
+  fp_pressure_enabled = fp_pressure_enabled == 1;
+  nanoseconds_to_absolutetime(10*NSEC_PER_SEC,&fp_pressure_dwell);
+diff --git a/xnu/patches/0097-fuxi-touch-boost.patch b/xnu/patches/0097-fuxi-touch-boost.patch
+index eaecf0c..c7da6a8 100644
+--- a/xnu/patches/0097-fuxi-touch-boost.patch
++++ b/xnu/patches/0097-fuxi-touch-boost.patch
+@@ -79,7 +79,7 @@
+   *
+ --- a/bsd/dev/fuxi_perf.c
+ +++ b/bsd/dev/fuxi_perf.c
+-@@ -0,0 +1,732 @@
++@@ -0,0 +1,737 @@
+ +/* Opt-in touch/compile boost for SM8550. One serialized worker owns MMIO.
+ + * Input/swap hooks only publish timestamps and queue work; no MMIO or sleeps.
+ + * No voltage, PLL, thermal-trip or power-collapse registers are programmed.
+@@ -144,6 +144,9 @@
+ + * blocked; a blocked guard still drops to the legacy cool level.
+ + * fuxiperfmax=dC: moves the ceiling (up to 80 C) and hot/start/resume with it. */
+ +static unsigned fp_base_mhz, fp_max, fp_base[3], fp_base_khz[3];
+++/* fuxiperf=2: the governor with fuxiperfmax=720 and fuxiperfbudget=1000 as its defaults (one argument where the boot-args
+++ * field has no room for three); explicit fuxiperfmax/fuxiperfbudget still win. */
+++static unsigned fp_wide;
+ +static uint64_t fp_budget, fp_duty_window, fp_recovery;
+ +static uint64_t fp_recover_since, fp_above_time, fp_cuts, fp_active_start;
+ +static uint64_t fp_duty_begin[16], fp_duty_end[16];
+@@ -626,6 +629,7 @@
+ + fp_arg("fuxiperfidlekhz",&fp_idle_floor,100000,3000000);
+ + nanoseconds_to_absolutetime((uint64_t)fp_idle_ms*NSEC_PER_MSEC,&fp_idle_after);
+ + fp_arg("fuxiperfbase",&fp_base_mhz,1402,2400);
+++ if (fp_wide) { fp_max = 720; fp_budget_ms = 1000; }
+ + fp_arg("fuxiperfmax",&fp_max,620,800);
+ + if (fp_max) {
+ +  fp_limit = fp_max; fp_hot = fp_max-60; fp_resume = fp_max-100; fp_start = fp_max-80;
+@@ -776,8 +780,9 @@
+ +{
+ + unsigned enable = 0;
+ + (void)PE_parse_boot_argn("fuxiperf",&enable,sizeof(enable));
+-+ if (enable != 1 || fp_started) return;
+++ if ((enable != 1 && enable != 2) || fp_started) return;
+ + fp_started = 1;
+++ fp_wide = enable == 2;
+ + (void)PE_parse_boot_argn("fuxitp",&fp_pressure_enabled,sizeof(fp_pressure_enabled));
+ + fp_pressure_enabled = fp_pressure_enabled == 1;
+ + nanoseconds_to_absolutetime(10*NSEC_PER_SEC,&fp_pressure_dwell);

@@ -11,6 +11,7 @@ on:
       - patches/kernel-surfrow-mode2.patch
       - patches/kernel-perf-governor.patch
       - patches/kernel-ib-profile.patch
+      - patches/kernel-perf-wide.patch
       - tests/test-perf-governor.py
       - tests/test-ib-profile.py
       - tests/test-surface-plane-result.py
@@ -56,6 +57,9 @@ jobs:
           git -C source apply --check ../harness/patches/kernel-ib-profile.patch
           git -C source apply ../harness/patches/kernel-ib-profile.patch
           python3 harness/tests/test-ib-profile.py source
+          git -C source apply --check ../harness/patches/kernel-perf-wide.patch
+          git -C source apply ../harness/patches/kernel-perf-wide.patch
+          python3 source/tools/sync-fuxi-perf.py --check
       - name: Build and audit kernel
         shell: bash
         run: |
