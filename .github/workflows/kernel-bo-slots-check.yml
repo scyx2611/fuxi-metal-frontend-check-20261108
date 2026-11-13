@@ -1,0 +1,58 @@
+name: Build kernel with 4096 BO slots
+on:
+  workflow_dispatch:
+  # A workflow that is not on the default branch cannot be dispatched by hand, so the branch push starts it.
+  push:
+    branches:
+      - codex/kernel-bo-slots
+    paths:
+      - patches/kernel-surface-stride.patch
+      - patches/kernel-bo-slots.patch
+      - tests/test-surface-plane-result.py
+      - tests/test-bo-slots.py
+      - .github/workflows/kernel-bo-slots-check.yml
+permissions:
+  contents: read
+jobs:
+  kernel:
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      FUXI_IIG_MODE: replay
+    steps:
+      - name: Check out public test harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Fetch pinned public kernel source and apply patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source remote add origin https://github.com/zgl97/ios-fuxi.git
+          git -C source fetch --no-tags --depth=1 origin 979e2f08c704677bb75934ae96d4686ba9d1692b
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = 979e2f08c704677bb75934ae96d4686ba9d1692b
+          git -C source apply --check ../harness/patches/kernel-surface-stride.patch
+          git -C source apply ../harness/patches/kernel-surface-stride.patch
+          git -C source apply --check ../harness/patches/kernel-bo-slots.patch
+          git -C source apply ../harness/patches/kernel-bo-slots.patch
+          python3 harness/tests/test-surface-plane-result.py source
+          python3 harness/tests/test-bo-slots.py source
+      - name: Build and audit kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          xcodebuild -version
+          bash tools/ci/build.sh kernel-metal4
+      - name: Upload public-source kernel outputs and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuxi-kernel-bo-slots
+          path: source/tools/out/ci/kernel-metal4/
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,35 @@
+diff --git a/xnu/fuxi-adreno/fuxi_abi_wire.h b/xnu/fuxi-adreno/fuxi_abi_wire.h
+index eecec30..39e3a66 100644
+--- a/xnu/fuxi-adreno/fuxi_abi_wire.h
++++ b/xnu/fuxi-adreno/fuxi_abi_wire.h
+@@ -10,7 +10,7 @@
+ #define FG_ABI_PA_BITS 36u /* Fuxi ID2.OAS=1; existing present mapper has the same limit. */
+ #define FG_ABI_MAX_BYTES (UINT64_C(1) << 28)
+ /* Internal quotas, independent of the unchanged per-object wire limit. */
+-#define FG_ABI_MAX_BOS 1024u
++#define FG_ABI_MAX_BOS 4096u
+ #define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
+ #define FG_ABI_CONTIG_TRY_BYTES (UINT64_C(1) << 20)
+ #define FG_ABI_MAX_IMPORTS 512u
+diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
+index cd06d61..1bedb0e 100644
+--- a/xnu/patches/0098-fuxi-native-adreno-abi.patch
++++ b/xnu/patches/0098-fuxi-native-adreno-abi.patch
+@@ -5985,7 +5985,7 @@
+ +#define FG_ABI_PA_BITS 36u /* Fuxi ID2.OAS=1; existing present mapper has the same limit. */
+ +#define FG_ABI_MAX_BYTES (UINT64_C(1) << 28)
+ +/* Internal quotas, independent of the unchanged per-object wire limit. */
+-+#define FG_ABI_MAX_BOS 1024u
+++#define FG_ABI_MAX_BOS 4096u
+ +#define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
+ +#define FG_ABI_CONTIG_TRY_BYTES (UINT64_C(1) << 20)
+ +#define FG_ABI_MAX_IMPORTS 512u
+@@ -6402,7 +6402,7 @@
+ +#define FG_ABI_PA_BITS 36u /* Fuxi ID2.OAS=1; existing present mapper has the same limit. */
+ +#define FG_ABI_MAX_BYTES (UINT64_C(1) << 28)
+ +/* Internal quotas, independent of the unchanged per-object wire limit. */
+-+#define FG_ABI_MAX_BOS 1024u
+++#define FG_ABI_MAX_BOS 4096u
+ +#define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
+ +#define FG_ABI_CONTIG_TRY_BYTES (UINT64_C(1) << 20)
+ +#define FG_ABI_MAX_IMPORTS 512u
