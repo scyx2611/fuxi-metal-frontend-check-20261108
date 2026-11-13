@@ -1,0 +1,200 @@
+diff --git a/tools/test-fuxi-prof.py b/tools/test-fuxi-prof.py
+index eff5bec..5a98ede 100644
+--- a/tools/test-fuxi-prof.py
++++ b/tools/test-fuxi-prof.py
+@@ -12,6 +12,7 @@ import subprocess
+ import tempfile
+ ROOT = Path(__file__).resolve().parents[1]
+ MOCK = r'''
++#define SP_NO_LIVE 1 /* the live-register cross-call (FUXI) is kernel-only; the model keeps the saved-state path */
+ #include <assert.h>
+ #include <stdint.h>
+ #include <stdio.h>
+diff --git a/xnu/fuxi-prof/sweet_prof_sample.c b/xnu/fuxi-prof/sweet_prof_sample.c
+index 0a6d128..88dfbda 100644
+--- a/xnu/fuxi-prof/sweet_prof_sample.c
++++ b/xnu/fuxi-prof/sweet_prof_sample.c
+@@ -14,6 +14,47 @@
+ #include <vm/vm_shared_region.h>
+ #include <string.h>
+ #include "sweet_prof_logic.h"
++#ifndef SP_NO_LIVE
++#include <kern/processor.h>
++#include <kern/cpu_number.h>
++#include <machine/machine_routines.h>
++/* Live user registers (FUXI). A thread on a core saves its user registers only at an exception, so the saved pc/lr of a thread
++ * running user code are its last trap's. For a thread on a core the sweep cross-calls that core: the handler, in interrupt
++ * context, copies the registers the IPI's own exception saved when it came from user mode (the last trap's when the core was in
++ * the kernel) and reads no user memory; the sweep then walks the frames from that fp as before. One request per core at a
++ * time: a core that has not answered its last request is skipped, so cpu_xcall never waits on one of ours. Such samples carry
++ * x16 = 0x7fffffff; "PROF live" counts requests, answers from the thread, answers from another thread, and skips. */
++#define SP_CPUS 16
++struct sp_live { thread_t thread; uint64_t pc,lr,fp; uint32_t gen,done,ok; };
++static struct sp_live sp_lives[SP_CPUS];
++static uint32_t sp_live_gen;
++static unsigned long long sp_live_n[4];
++static uint64_t sp_live_wait;
++static void sp_live_ipi(void *arg) {
++ struct sp_live *l=arg;
++ uint32_t g=__atomic_load_n(&l->gen,__ATOMIC_ACQUIRE),ok=0;
++ thread_t t=current_thread();
++ if(t==l->thread) {
++  arm_saved_state_t *ss=find_user_regs(t);
++  if(ss && is_saved_state64(ss)){l->pc=get_saved_state_pc(ss);l->lr=get_saved_state_lr(ss);l->fp=get_saved_state_fp(ss);ok=1;}
++ }
++ l->ok=ok;
++ __atomic_store_n(&l->done,g,__ATOMIC_RELEASE);
++}
++static int sp_live(thread_t thread,int cpu,uint64_t *pc,uint64_t *lr,uint64_t *fp) {
++ if(cpu<0 || cpu>=SP_CPUS || cpu==(int)cpu_number()){sp_live_n[3]++;return 0;}
++ struct sp_live *l=&sp_lives[cpu];
++ if(__atomic_load_n(&l->done,__ATOMIC_ACQUIRE)!=__atomic_load_n(&l->gen,__ATOMIC_RELAXED)){sp_live_n[3]++;return 0;}
++ uint32_t g=++sp_live_gen;if(!g)g=++sp_live_gen;
++ l->thread=thread;__atomic_store_n(&l->gen,g,__ATOMIC_RELEASE);sp_live_n[0]++;
++ if(cpu_xcall(cpu,sp_live_ipi,l)!=KERN_SUCCESS){__atomic_store_n(&l->done,g,__ATOMIC_RELEASE);sp_live_n[3]++;return 0;}
++ uint64_t until=mach_absolute_time()+sp_live_wait;
++ while(__atomic_load_n(&l->done,__ATOMIC_ACQUIRE)!=g && mach_absolute_time()<until){}
++ if(__atomic_load_n(&l->done,__ATOMIC_ACQUIRE)!=g){sp_live_n[3]++;return 0;}
++ if(!l->ok){sp_live_n[2]++;return 0;}
++ sp_live_n[1]++;*pc=l->pc;*lr=l->lr;*fp=l->fp;return 1;
++}
++#endif
+ void sweet_prof_task(task_t task,int pid);
+ static void sp_sleep(uint64_t deadline,uint64_t leeway) {
+  static int event;
+@@ -31,9 +72,16 @@ static void sp_sweep(task_t task,struct sp_table *p) {
+   if(state&TH_TERMINATE){thread_unlock(thread);splx(level);p->skipped++;continue;}
+   s.tid=thread->thread_id;s.event=thread->wait_event;s.wr=thread->wait_result;
+   s.state=machine_thread_on_core(thread)?0:(state&TH_WAIT)?1:(state&TH_RUN)?2:3;
++#ifndef SP_NO_LIVE
++  int cpu=s.state==0 && thread->last_processor ? thread->last_processor->cpu_id : -1;
++#endif
+   thread_unlock(thread);splx(level);
+   s.pc=get_saved_state_pc(ss);s.lr=get_saved_state_lr(ss);s.x16=(int32_t)get_saved_state_reg(ss,16);
+-  uint64_t fp=get_saved_state_fp(ss),base=fp;
++  uint64_t fp=get_saved_state_fp(ss);
++#ifndef SP_NO_LIVE
++  if(s.state==0 && sp_live(thread,cpu,&s.pc,&s.lr,&fp))s.x16=0x7fffffff;
++#endif
++  uint64_t base=fp;
+   for(unsigned n=0;n<8 && fp && !(fp&7) && fp>=base && fp-base<1024*1024;n++) {
+    uint64_t frame[2];
+    if(vm_map_read_user(map,fp,frame,sizeof(frame))!=KERN_SUCCESS)break;
+@@ -72,6 +120,9 @@ void sweet_prof_task(task_t task,int pid) {
+  task_lock(task);uint64_t mh=task->mach_header_vm_address;task_unlock(task);
+  nanoseconds_to_absolutetime(2*NSEC_PER_MSEC,&period);nanoseconds_to_absolutetime(100*NSEC_PER_USEC,&leeway);
+  nanoseconds_to_absolutetime(60ULL*NSEC_PER_SEC,&duration);
++#ifndef SP_NO_LIVE
++ nanoseconds_to_absolutetime(200*NSEC_PER_USEC,&sp_live_wait);
++#endif
+  uint64_t start=mach_absolute_time(),end=start+duration;deadline=start;
+  while(mach_absolute_time()<end) {
+   sp_sweep(task,p);
+@@ -82,5 +133,8 @@ void sweet_prof_task(task_t task,int pid) {
+  }
+  printf("PROF backboardd[%d] slide 0x%llx mh 0x%llx\n",pid,(unsigned long long)slide,(unsigned long long)mh);
+  sp_print(p);kfree_data(p,sizeof(*p));
++#ifndef SP_NO_LIVE
++ printf("PROF live asked=%llu thread=%llu other=%llu skipped=%llu\n",sp_live_n[0],sp_live_n[1],sp_live_n[2],sp_live_n[3]);
++#endif
+ }
+ #endif
+diff --git a/xnu/patches/0111-fuxi-user-profiler.patch b/xnu/patches/0111-fuxi-user-profiler.patch
+index a8af625..4705bc1 100644
+--- a/xnu/patches/0111-fuxi-user-profiler.patch
++++ b/xnu/patches/0111-fuxi-user-profiler.patch
+@@ -90,7 +90,7 @@
+ +#endif
+ --- /dev/null
+ +++ b/osfmk/kern/sweet_prof_sample.c
+-@@ -0,0 +1,86 @@
++@@ -0,0 +1,140 @@
+ +/* Saved user stacks are approximate; no target suspension or logging per sweep. */
+ +#include <pexpert/arm64/board_config.h>
+ +#if defined(FUXI)
+@@ -107,6 +107,47 @@
+ +#include <vm/vm_shared_region.h>
+ +#include <string.h>
+ +#include "sweet_prof_logic.h"
+++#ifndef SP_NO_LIVE
+++#include <kern/processor.h>
+++#include <kern/cpu_number.h>
+++#include <machine/machine_routines.h>
+++/* Live user registers (FUXI). A thread on a core saves its user registers only at an exception, so the saved pc/lr of a thread
+++ * running user code are its last trap's. For a thread on a core the sweep cross-calls that core: the handler, in interrupt
+++ * context, copies the registers the IPI's own exception saved when it came from user mode (the last trap's when the core was in
+++ * the kernel) and reads no user memory; the sweep then walks the frames from that fp as before. One request per core at a
+++ * time: a core that has not answered its last request is skipped, so cpu_xcall never waits on one of ours. Such samples carry
+++ * x16 = 0x7fffffff; "PROF live" counts requests, answers from the thread, answers from another thread, and skips. */
+++#define SP_CPUS 16
+++struct sp_live { thread_t thread; uint64_t pc,lr,fp; uint32_t gen,done,ok; };
+++static struct sp_live sp_lives[SP_CPUS];
+++static uint32_t sp_live_gen;
+++static unsigned long long sp_live_n[4];
+++static uint64_t sp_live_wait;
+++static void sp_live_ipi(void *arg) {
+++ struct sp_live *l=arg;
+++ uint32_t g=__atomic_load_n(&l->gen,__ATOMIC_ACQUIRE),ok=0;
+++ thread_t t=current_thread();
+++ if(t==l->thread) {
+++  arm_saved_state_t *ss=find_user_regs(t);
+++  if(ss && is_saved_state64(ss)){l->pc=get_saved_state_pc(ss);l->lr=get_saved_state_lr(ss);l->fp=get_saved_state_fp(ss);ok=1;}
+++ }
+++ l->ok=ok;
+++ __atomic_store_n(&l->done,g,__ATOMIC_RELEASE);
+++}
+++static int sp_live(thread_t thread,int cpu,uint64_t *pc,uint64_t *lr,uint64_t *fp) {
+++ if(cpu<0 || cpu>=SP_CPUS || cpu==(int)cpu_number()){sp_live_n[3]++;return 0;}
+++ struct sp_live *l=&sp_lives[cpu];
+++ if(__atomic_load_n(&l->done,__ATOMIC_ACQUIRE)!=__atomic_load_n(&l->gen,__ATOMIC_RELAXED)){sp_live_n[3]++;return 0;}
+++ uint32_t g=++sp_live_gen;if(!g)g=++sp_live_gen;
+++ l->thread=thread;__atomic_store_n(&l->gen,g,__ATOMIC_RELEASE);sp_live_n[0]++;
+++ if(cpu_xcall(cpu,sp_live_ipi,l)!=KERN_SUCCESS){__atomic_store_n(&l->done,g,__ATOMIC_RELEASE);sp_live_n[3]++;return 0;}
+++ uint64_t until=mach_absolute_time()+sp_live_wait;
+++ while(__atomic_load_n(&l->done,__ATOMIC_ACQUIRE)!=g && mach_absolute_time()<until){}
+++ if(__atomic_load_n(&l->done,__ATOMIC_ACQUIRE)!=g){sp_live_n[3]++;return 0;}
+++ if(!l->ok){sp_live_n[2]++;return 0;}
+++ sp_live_n[1]++;*pc=l->pc;*lr=l->lr;*fp=l->fp;return 1;
+++}
+++#endif
+ +void sweet_prof_task(task_t task,int pid);
+ +static void sp_sleep(uint64_t deadline,uint64_t leeway) {
+ + static int event;
+@@ -124,9 +165,16 @@
+ +  if(state&TH_TERMINATE){thread_unlock(thread);splx(level);p->skipped++;continue;}
+ +  s.tid=thread->thread_id;s.event=thread->wait_event;s.wr=thread->wait_result;
+ +  s.state=machine_thread_on_core(thread)?0:(state&TH_WAIT)?1:(state&TH_RUN)?2:3;
+++#ifndef SP_NO_LIVE
+++  int cpu=s.state==0 && thread->last_processor ? thread->last_processor->cpu_id : -1;
+++#endif
+ +  thread_unlock(thread);splx(level);
+ +  s.pc=get_saved_state_pc(ss);s.lr=get_saved_state_lr(ss);s.x16=(int32_t)get_saved_state_reg(ss,16);
+-+  uint64_t fp=get_saved_state_fp(ss),base=fp;
+++  uint64_t fp=get_saved_state_fp(ss);
+++#ifndef SP_NO_LIVE
+++  if(s.state==0 && sp_live(thread,cpu,&s.pc,&s.lr,&fp))s.x16=0x7fffffff;
+++#endif
+++  uint64_t base=fp;
+ +  for(unsigned n=0;n<8 && fp && !(fp&7) && fp>=base && fp-base<1024*1024;n++) {
+ +   uint64_t frame[2];
+ +   if(vm_map_read_user(map,fp,frame,sizeof(frame))!=KERN_SUCCESS)break;
+@@ -165,6 +213,9 @@
+ + task_lock(task);uint64_t mh=task->mach_header_vm_address;task_unlock(task);
+ + nanoseconds_to_absolutetime(2*NSEC_PER_MSEC,&period);nanoseconds_to_absolutetime(100*NSEC_PER_USEC,&leeway);
+ + nanoseconds_to_absolutetime(60ULL*NSEC_PER_SEC,&duration);
+++#ifndef SP_NO_LIVE
+++ nanoseconds_to_absolutetime(200*NSEC_PER_USEC,&sp_live_wait);
+++#endif
+ + uint64_t start=mach_absolute_time(),end=start+duration;deadline=start;
+ + while(mach_absolute_time()<end) {
+ +  sp_sweep(task,p);
+@@ -175,6 +226,9 @@
+ + }
+ + printf("PROF backboardd[%d] slide 0x%llx mh 0x%llx\n",pid,(unsigned long long)slide,(unsigned long long)mh);
+ + sp_print(p);kfree_data(p,sizeof(*p));
+++#ifndef SP_NO_LIVE
+++ printf("PROF live asked=%llu thread=%llu other=%llu skipped=%llu\n",sp_live_n[0],sp_live_n[1],sp_live_n[2],sp_live_n[3]);
+++#endif
+ +}
+ +#endif
+ --- /dev/null

@@ -12,6 +12,7 @@ on:
       - patches/kernel-perf-governor.patch
       - patches/kernel-ib-profile.patch
       - patches/kernel-perf-wide.patch
+      - patches/kernel-prof-live.patch
       - tests/test-perf-governor.py
       - tests/test-ib-profile.py
       - tests/test-surface-plane-result.py
@@ -60,6 +61,9 @@ jobs:
           git -C source apply --check ../harness/patches/kernel-perf-wide.patch
           git -C source apply ../harness/patches/kernel-perf-wide.patch
           python3 source/tools/sync-fuxi-perf.py --check
+          git -C source apply --check ../harness/patches/kernel-prof-live.patch
+          git -C source apply ../harness/patches/kernel-prof-live.patch
+          (cd source && python3 tools/test-fuxi-prof.py)
       - name: Build and audit kernel
         shell: bash
         run: |
