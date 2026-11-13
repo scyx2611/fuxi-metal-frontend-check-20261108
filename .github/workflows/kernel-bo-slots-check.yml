@@ -10,7 +10,9 @@ on:
       - patches/kernel-bo-slots.patch
       - patches/kernel-surfrow-mode2.patch
       - patches/kernel-perf-governor.patch
+      - patches/kernel-ib-profile.patch
       - tests/test-perf-governor.py
+      - tests/test-ib-profile.py
       - tests/test-surface-plane-result.py
       - tests/test-bo-slots.py
       - tests/test-surfrow-mode2.py
@@ -51,6 +53,9 @@ jobs:
           git -C source apply --check ../harness/patches/kernel-perf-governor.patch
           git -C source apply ../harness/patches/kernel-perf-governor.patch
           python3 harness/tests/test-perf-governor.py source
+          git -C source apply --check ../harness/patches/kernel-ib-profile.patch
+          git -C source apply ../harness/patches/kernel-ib-profile.patch
+          python3 harness/tests/test-ib-profile.py source
       - name: Build and audit kernel
         shell: bash
         run: |
