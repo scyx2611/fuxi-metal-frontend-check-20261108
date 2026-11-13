@@ -1,0 +1,79 @@
+diff --git a/crates/metal2vulkan-runtime/src/families/mod.rs b/crates/metal2vulkan-runtime/src/families/mod.rs
+index 025f8a9..0748bb9 100644
+--- a/crates/metal2vulkan-runtime/src/families/mod.rs
++++ b/crates/metal2vulkan-runtime/src/families/mod.rs
+@@ -398,18 +398,74 @@ pub(super) fn audit(family: GpuFamily, facts: &Facts<'_>) -> Vec<RowAudit> {
+     rows
+ }
+ 
++/// FUXI: a cache of family answers, keyed by the device's shared state (one per `Device`).
++type FuxiCache<K, V> = std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<K, V>>>;
++
++/// FUXI: the cache's lock, whether or not a holder panicked (the map stays consistent).
++fn fuxi_lock<K, V>(
++    map: &std::sync::Mutex<std::collections::HashMap<K, V>>,
++) -> std::sync::MutexGuard<'_, std::collections::HashMap<K, V>> {
++    map.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
++}
++
++/// FUXI: whether family answers are kept (`Device::family_rows`): on iOS unless
++/// `FUXI_M2V_FAMILY_CACHE` is 0; elsewhere only where it is 1.
++fn fuxi_family_cache() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| match std::env::var_os("FUXI_M2V_FAMILY_CACHE") {
++        Some(value) => value != "0",
++        None => cfg!(target_os = "ios"),
++    })
++}
++
+ impl Device {
+     /// `supportsFamily:`: true only where every row of the family's column in Apple's tables is
+     /// exact on this device (or names a framework layered on Metal); false for a value that names
+     /// no family. The module docs say how each family's rows are chosen and judged;
+     /// [`family_blockers`](Device::family_blockers) names what keeps a family false.
+     pub fn supports_family(&self, family: i64) -> bool {
++        // FUXI: answered once per device and family (`fuxi_family_cache`).
++        if fuxi_family_cache() {
++            static ANSWERS: FuxiCache<(usize, i64), bool> = std::sync::OnceLock::new();
++            let key = (self.shared() as *const _ as usize, family);
++            let map = ANSWERS.get_or_init(Default::default);
++            if let Some(answer) = fuxi_lock(map).get(&key) {
++                return *answer;
++            }
++            let answer = GpuFamily::from_raw(family)
++                .is_some_and(|family| self.family_rows(family).iter().all(|r| !r.state.blocks()));
++            fuxi_lock(map).insert(key, answer);
++            return answer;
++        }
+         GpuFamily::from_raw(family)
+             .is_some_and(|family| self.family_rows(family).iter().all(|r| !r.state.blocks()))
+     }
+ 
+     /// Every row `family` lists, with its state on this device.
+     pub fn family_rows(&self, family: GpuFamily) -> Vec<RowAudit> {
++        // FUXI: the rows are the device's fixed facts (its profile, properties and format
++        // answers), so they are audited once per device and family. On the phone Metal asks
++        // `supportsFamily:` from `MTLPixelFormatGetInfoForDevice` each time CoreAnimation checks
++        // a surface's texture (`CA::OGL::MetalContext::is_viable_texture_from_iosurface`), many
++        // times a frame, and each audit judged every feature, limit and format row anew and
++        // allocated their list: a fifth of the display thread's time under a sustained drag
++        // (sweetprof). `FUXI_M2V_FAMILY_CACHE` 0 audits every call (the default elsewhere).
++        if fuxi_family_cache() {
++            static ROWS: FuxiCache<(usize, GpuFamily), Vec<RowAudit>> = std::sync::OnceLock::new();
++            let key = (self.shared() as *const _ as usize, family);
++            let map = ROWS.get_or_init(Default::default);
++            if let Some(rows) = fuxi_lock(map).get(&key) {
++                return rows.clone();
++            }
++            let rows = self.family_rows_audited(family);
++            fuxi_lock(map).insert(key, rows.clone());
++            return rows;
++        }
++        self.family_rows_audited(family)
++    }
++
++    /// [`family_rows`](Device::family_rows), audited now.
++    fn family_rows_audited(&self, family: GpuFamily) -> Vec<RowAudit> {
+         let compile = self.compile_device();
+         let format = |pf: PixelFormat| self.format_answers(pf);
+         audit(
