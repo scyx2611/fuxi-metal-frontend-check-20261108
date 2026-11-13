@@ -59,6 +59,9 @@ jobs:
           cp harness/patches/metal2vulkan-fuxi-0002-fresh-zero.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0004-surface-alias.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0005-family-cache.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0006-keep-draw.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0007-mesa-log-level.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0008-shadow-log.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |

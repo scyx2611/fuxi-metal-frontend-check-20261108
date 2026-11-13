@@ -1,0 +1,123 @@
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index 9e37fb9..5cafe7e 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -111,6 +111,82 @@ use metal2vulkan::metal::PixelFormat;
+ use std::ops::Range;
+ use std::sync::Arc;
+ 
++/// FUXI: whether shadow copies are counted and logged (`fuxi_note_copy_in`): on iOS unless
++/// `FUXI_M2V_SHADOW_LOG` is 0; elsewhere only where it is 1. A diagnostic: which shadows the
++/// encoders copy in, how often and how many texels (the kernel's per-IB profile measured several
++/// full screens of buffer-to-image copies before the first pass of every CoreAnimation frame).
++pub(super) fn fuxi_shadow_log() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| match std::env::var_os("FUXI_M2V_SHADOW_LOG") {
++        Some(value) => value != "0",
++        None => cfg!(target_os = "ios"),
++    })
++}
++
++/// FUXI: the copy-ins of the current window, by shadow image: its first region's width, height
++/// and buffer row length (bit 31: through a staging buffer), copies and texels.
++struct FuxiCopyIns {
++    copies: u64,
++    texels: u64,
++    by_image: std::collections::HashMap<u64, (u32, u32, u32, u64, u64)>,
++}
++
++/// FUXI: note one copy-in of `regions` into `image`; every 2000 copy-ins, log the window's
++/// count, texels and the ten shadows that took the most texels, then start a new window.
++fn fuxi_note_copy_in(image: vk::Image, regions: &[vk::BufferImageCopy], staged: bool) {
++    use ash::vk::Handle;
++    static STATE: std::sync::Mutex<Option<FuxiCopyIns>> = std::sync::Mutex::new(None);
++    let Some(first) = regions.first() else {
++        return;
++    };
++    let texels: u64 = regions
++        .iter()
++        .map(|r| {
++            let e = r.image_extent;
++            u64::from(e.width) * u64::from(e.height) * u64::from(e.depth.max(1))
++        })
++        .sum();
++    let mut guard = STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
++    let state = guard.get_or_insert_with(|| FuxiCopyIns {
++        copies: 0,
++        texels: 0,
++        by_image: std::collections::HashMap::new(),
++    });
++    state.copies += 1;
++    state.texels += texels;
++    let row = first.buffer_row_length | if staged { 0x8000_0000 } else { 0 };
++    let entry = state.by_image.entry(image.as_raw()).or_insert((
++        first.image_extent.width,
++        first.image_extent.height,
++        row,
++        0,
++        0,
++    ));
++    entry.3 += 1;
++    entry.4 += texels;
++    if state.copies % 2000 == 0 {
++        let mut top: Vec<(u32, u32, u32, u64, u64)> = state.by_image.values().copied().collect();
++        top.sort_by(|a, b| b.4.cmp(&a.4));
++        let list: Vec<String> = top
++            .iter()
++            .take(10)
++            .map(|(w, h, row, n, t)| {
++                let staged = if row & 0x8000_0000 != 0 { "s" } else { "" };
++                format!("{w}x{h}/r{}{staged} x{n} {}K", row & 0x7fff_ffff, t / 1024)
++            })
++            .collect();
++        eprintln!(
++            "FUXI M2V: shadow copy-ins {} texels {}K images {} top {}",
++            state.copies,
++            state.texels / 1024,
++            state.by_image.len(),
++            list.join(", ")
++        );
++        state.texels = 0;
++        state.by_image.clear();
++    }
++}
++
+ /// What a shadowed texture's copies need: its truth, its shadow, and the copies between them.
+ pub(super) struct ShadowCopies {
+     /// What the shadow holds a copy of, and the copies.
+@@ -817,6 +893,9 @@ impl ShadowCopy {
+         let texels = staging.map_or(buffer, ShadowStaging::raw);
+         // SAFETY: the caller's contract; the regions lie in the buffers and the image (checked
+         // when the texture was made), and the staging buffer lives with the texture.
++        if into_shadow && fuxi_shadow_log() {
++            fuxi_note_copy_in(image, &regions, staging.is_some());
++        }
+         unsafe {
+             if into_shadow {
+                 if let Some(staging) = staging {
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 34817ed..b288cb3 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2052,6 +2052,21 @@ impl Device {
+         // Its copies keep its own image, which it presents again once the bytes lie in pages.
+         self.stand_in_while_detached(&texels.buffer, &image)?;
+         let (offset, bytes_per_row) = (texels.layout.offset, texels.layout.row_pitch);
++        // FUXI: every shadow of at least 64x64 texels is logged as it is made, with why no image
++        // aliases its bytes (`crate::shadow::fuxi_shadow_log`), the first 400.
++        if crate::shadow::fuxi_shadow_log() {
++            static MADE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++            let [width, height, _] = layout.extent;
++            if width * height >= 64 * 64
++                && MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400
++            {
++                eprintln!(
++                    "FUXI M2V: shadow made {call} {:?} {width}x{height} offset {offset} rows \
++                     {bytes_per_row} usage {:?}: {why}",
++                    descriptor.pixel_format, descriptor.usage
++                );
++            }
++        }
+         self.degrade(Degradation::ShadowedTexture, || {
+             let format = descriptor.pixel_format;
+             let [width, height, _] = layout.extent;

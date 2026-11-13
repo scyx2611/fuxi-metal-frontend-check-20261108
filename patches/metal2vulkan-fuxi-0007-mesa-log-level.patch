@@ -1,0 +1,18 @@
+diff --git a/crates/metal2vulkan-runtime/src/device/create.rs b/crates/metal2vulkan-runtime/src/device/create.rs
+index 77ac8af..a3d4114 100644
+--- a/crates/metal2vulkan-runtime/src/device/create.rs
++++ b/crates/metal2vulkan-runtime/src/device/create.rs
+@@ -483,6 +483,13 @@ pub(crate) fn default_loaders(vulkan_sdk: Option<&Path>) -> Vec<PathBuf> {
+ /// The Vulkan loader: `loader` where the options name one, else the first of
+ /// [`default_loaders`] that opens. [`Error::LoaderNotFound`] names each library tried.
+ pub(crate) fn open_loader(loader: Option<&Path>) -> Result<ash::Entry, Error> {
++    // FUXI: on the phone Turnip's Darwin KMD logs every submit at info level ("FUXI KMD: submit
++    // IBs N fence N"), a line through backboardd's stderr into the kernel's log for each frame's
++    // submits; warnings and errors stay. Set before the driver logs anything (Mesa reads it at
++    // its first message); `MESA_LOG_LEVEL` set by the environment wins.
++    if cfg!(target_os = "ios") && std::env::var_os("MESA_LOG_LEVEL").is_none() {
++        std::env::set_var("MESA_LOG_LEVEL", "warning");
++    }
+     let tried = match loader {
+         Some(path) => vec![path.to_path_buf()],
+         None => default_loaders(std::env::var_os("VULKAN_SDK").as_deref().map(Path::new)),
