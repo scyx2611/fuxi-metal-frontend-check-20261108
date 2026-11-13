@@ -1,0 +1,34 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 9a72860..67c6031 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1080,7 +1080,10 @@ static void completed(void *context) {
+  gCompleted++;
+  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
+  if(nmb_command_buffer_status(commandBuffer.handle)==MTLCommandBufferStatusError){
+-  char text[512]={};nmb_command_buffer_error(commandBuffer.handle,text,sizeof(text));fuxiFailure(text);
++  char text[512]={};nmb_command_buffer_error(commandBuffer.handle,text,sizeof(text));
++  // Patch 0014: only a relayed failure has a description; name the rest instead of reporting an empty reason.
++  if(!text[0])snprintf(text,sizeof(text),"native-metal: command buffer completed with an error and no description (last: %s)",nmb_last_error());
++  fuxiFailure(text);
+  }else if(gFuxiHooks.completed){
+   // Report actual completion counters; only stored IOSurface passes qualify the gate.
+   double start=nmb_command_buffer_gpu_time(commandBuffer.handle,false),end=nmb_command_buffer_gpu_time(commandBuffer.handle,true);
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 657e4e0..fb8102d 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -200,6 +200,13 @@ fn observe_message(message: &DebugMessage) {
+         return;
+     }
+     if message.severity >= MessageSeverity::Warning {
++        // Lost-device diagnostic (patch 0014): with a messenger registered the driver's errors (Turnip's
++        // vk_device_set_lost reason among them) come only here, never to stderr. Print the first 32.
++        static ERRORS_SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++        if message.severity >= MessageSeverity::Error && ERRORS_SHOWN.fetch_add(1, Relaxed) < 32 {
++            let text: String = message.text.chars().take(400).collect();
++            eprintln!("FUXI NMB VK ERROR: [{}] {}", message.id_name, text);
++        }
+         OTHER_MESSAGES[1].fetch_add(1, Relaxed);
+         if let Ok(mut last) = LAST_WARNING.lock() {
+             *last = message.text.chars().take(160).collect();
