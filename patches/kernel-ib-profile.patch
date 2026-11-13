@@ -1,8 +1,8 @@
 diff --git a/xnu/fuxi-adreno/fuxi_gpu_abi_backend.inc b/xnu/fuxi-adreno/fuxi_gpu_abi_backend.inc
-index 4035e38..f9379c1 100644
+index 4035e38..d2b321b 100644
 --- a/xnu/fuxi-adreno/fuxi_gpu_abi_backend.inc
 +++ b/xnu/fuxi-adreno/fuxi_gpu_abi_backend.inc
-@@ -343,6 +343,189 @@ static int fg_abi_switch(uint64_t root)
+@@ -343,6 +343,200 @@ static int fg_abi_switch(uint64_t root)
   return !g4_tlb(tlb) && !fg_access_failed &&
       g3_sr(cb+0x20)==(uint32_t)ttbr && g3_sr(cb+0x24)==(uint32_t)(ttbr>>32);
  }
@@ -12,7 +12,7 @@ index 4035e38..f9379c1 100644
 + * the CP thread selection as the stream has it: one Turnip command buffer can span IBs and end one inside a render pass on BR alone,
 + * and on both threads the BR write, the later one, stays. At submit each IB and the IB2s it calls are read (bounded, fault-contained,
 + * through the BO's kernel mapping) for what they do: draws, 2D blits and their area, dispatches, IB2 calls, WFIs, waits, draw-state
-+ * groups, the window scissor of each render pass (its count and area), the last colour attachment 0 (RB_MRT[0] BUF_INFO and PITCH) and
++ * groups, event writes (all, CCU and cache ones), CP_WAIT_FOR_ME, the window scissor of each render pass (its count and area), the last colour attachment 0 (RB_MRT[0] BUF_INFO and PITCH) and
 + * the last 2D destination and source. At retirement: one line per sampled job (its time per kind of IB) and its FG_IBP_TOP longest
 + * IBs; every 16 samples the time per kind over them. Diagnostic only: the WFIs serialize the IBs. */
 +#define FG_IBP_OFF 1536u
@@ -26,7 +26,7 @@ index 4035e38..f9379c1 100644
 +enum { FG_IBP_K_EMPTY, FG_IBP_K_FULL, FG_IBP_K_PART, FG_IBP_K_BLIT, FG_IBP_K_CS, FG_IBP_K_BAD, FG_IBP_KINDS };
 +struct fg_ibp_ib {
 + uint32_t dw, ib2, ib2dw, draws, blits, blit_kpx, cs, wfi, waits, sds, rps, rp_kpx, rt_w, rt_h, rt_info, rt_pitch, d2_info, s2_info, s2_size,
-+     tl2, br2, flags; /* flags: 1 not in a mapping, 2 out of budget, 4 read fault, 8 unknown packet type, 16 IB chain, 32 IB3 */
++     tl2, br2, ev, ev_ccu, ev_cache, wfm, flags; /* flags: 1 not in a mapping, 2 out of budget, 4 read fault, 8 unknown packet type, 16 IB chain, 32 IB3 */
 +};
 +static struct fg_ibp_ib fg_ibp_ibs[NativeAdrenoAbiMaxBuffers];
 +static unsigned fg_ibp_on, fg_ibp_count, fg_ibp_active, fg_ibp_scanned;
@@ -93,7 +93,18 @@ index 4035e38..f9379c1 100644
 +     break; }
 +    case 0x33: case 0x41: r->cs++; break;
 +    case 0x26: r->wfi++; break;
-+    case 0x3c: case 0x12: r->waits++; break;
++    case 0x3c: case 0x12: case 0x14: r->waits++; break;
++    case 0x13: r->wfm++; break;
++    case 0x46: {
++     uint32_t ev=0;
++     r->ev++;
++     if (cnt && i+1<dwords && *budget) {
++      if (!fg_ibp_rd(m,iova+4ull*(i+1),&ev)) { r->flags|=4; return; }
++      --*budget; ev&=0xffu;
++      if (ev==0x18 || ev==0x19 || ev==0x1a || ev==0x1c || ev==0x1d || ev==0x20 || ev==0x21) r->ev_ccu++;
++      else if (ev>=0x30 && ev<=0x33) r->ev_cache++;
++     }
++     break; }
 +    case 0x43: r->sds++; break;
 +    case 0x57: r->flags|=16; break;
 +    case 0x3f:
@@ -176,9 +187,9 @@ index 4035e38..f9379c1 100644
 +  for (unsigned i=0;i<n;i++) if (!used[i] && (best==n || fg_ibp_d[i]>fg_ibp_d[best])) best=i;
 +  used[best]=1;
 +  const struct fg_ibp_ib *r=&fg_ibp_ibs[best];
-+  printf("FUXI IBPROF: job %u ib %u/%u %lluus dw %u ib2 %u/%u dr %u rp %u/%uK rt %ux%u info %x pitch %u bl %u/%uK d2 %x s2 %x/%x cs %u wfi %u wt %u sds %u fl %x\n",
++  printf("FUXI IBPROF: job %u ib %u/%u %lluus dw %u ib2 %u/%u dr %u rp %u/%uK rt %ux%u info %x pitch %u bl %u/%uK d2 %x s2 %x/%x cs %u wfi %u wt %u wfm %u ev %u/%u/%u sds %u fl %x\n",
 +      fg_ibp_seq,best,n,FG_IBP_US(fg_ibp_d[best]),r->dw,r->ib2,r->ib2dw,r->draws,r->rps,r->rp_kpx,r->rt_w,r->rt_h,r->rt_info,r->rt_pitch,
-+      r->blits,r->blit_kpx,r->d2_info,r->s2_info,r->s2_size,r->cs,r->wfi,r->waits,r->sds,r->flags);
++      r->blits,r->blit_kpx,r->d2_info,r->s2_info,r->s2_size,r->cs,r->wfi,r->waits,r->wfm,r->ev,r->ev_ccu,r->ev_cache,r->sds,r->flags);
 + }
 + if (!(fg_ibp_samples%16u)) {
 +  printf("FUXI IBPROF: per 16 samples span_us avg %llu; us/job (IBs/job) empty %llu (%llu) full_rt %llu (%llu) part_rt %llu (%llu) blit %llu (%llu) compute %llu (%llu) unread %llu (%llu); unusable %u\n",
@@ -192,7 +203,7 @@ index 4035e38..f9379c1 100644
  /* 16 words of the mapped range that holds `at`, from `start` (clamped to the range): the CP stops on a bad word a few before the one it
   * reports (NativeAdreno peekIb/peekFetch, MIT). Fault-contained reads of the BO's kernel mapping; no register access. */
  static void fg_abi_peek(const char *tag, uint64_t at, uint64_t start)
-@@ -544,6 +727,7 @@ static int fg_abi_observe(void)
+@@ -544,6 +738,7 @@ static int fg_abi_observe(void)
    fg_abi_import_cache(1); /* before fence success, even without a user wait */
    if (fg_abi_stage) fg_abi_stall_done();
    if (fg_js_on) fg_js_retire(fg_abi_completed, fg_abi_seq);
@@ -200,7 +211,7 @@ index 4035e38..f9379c1 100644
    fg_abi_completed = fg_abi_seq;
    FG_ABI_WAKE(); fg_client_busy = 0; if (!fg_abi_hold) fg_abi_present_wait = 0; /* hold: the waiting present, not the next client job, takes the idle GPU */
    return 0;
-@@ -555,6 +739,7 @@ static int fg_abi_observe(void)
+@@ -555,6 +750,7 @@ static int fg_abi_observe(void)
      fg_abi_import_cache(1); fg_abi_host_handoff=1; /* the newer job's handoff is still open */
      if (fg_abi_stage) fg_abi_stall_done();
      if (fg_js_on) fg_js_retire(fg_abi_completed, f);
@@ -208,7 +219,7 @@ index 4035e38..f9379c1 100644
      fg_abi_completed=f; fg_client_deadline=rsr("cntpct_el0")+rsr("cntfrq_el0")/10;
      return 1;
     } }
-@@ -582,7 +767,9 @@ static int fg_abi_init(void)
+@@ -582,7 +778,9 @@ static int fg_abi_init(void)
   fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hard=(bits>>18)&1; fg_abi_dirty=(bits>>19)&1; fg_abi_cbo=(bits>>29)&1; fg_abi_cbo_on=0; fg_abi_cbo_said=NULL; fg_abi_inline=((bits>>21)&1) && ((bits>>9)&1); fg_abi_cf=fg_abi_inline && ((bits>>4)&1); fg_abi_pk=fg_abi_cf && ((bits>>27)&1); fg_irq_want=(bits>>26)&1; fg_cf_reset(); fg_pk_reset(); fg_inl_ready=fg_root_client=fg_inl_busy=fg_inl_fbmask=0; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
   if (fg_abi_pk) printf("FUXI GPU: copy_first_park=1 idle_us=%u cap=2 periods (fuxigpuncimport 134217728 with 16, inline mode)\n", FG_PK_IDLE_US);
   { unsigned early=0; fg_js_on=PE_parse_boot_argn("fuxiearly",&early,sizeof(early)) && (early&8u); fg_js_n=fg_js_bad=0; memset(fg_js_sum,0,sizeof(fg_js_sum)); memset(fg_js_max,0,sizeof(fg_js_max));
@@ -219,7 +230,7 @@ index 4035e38..f9379c1 100644
   fg_abi_coh=fg_abi_coh_tries=0;
   for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
   /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
-@@ -1029,6 +1216,7 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
+@@ -1029,6 +1227,7 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
   if (!inl && fg_abi_present_held()) { fg_abi_q_stats[4]++; FG_REFUSE(1); }
   if (fg_pk_n) { int r=fg_pk_flush(FG_PK_SUBMIT); if (r) return r; } /* bit 27: the parked job keeps its place, ahead of this one */
   if (inl && !fg_abi_pk && fg_abi_copy_first()) FG_REFUSE(1); /* bit 16: the due copy goes first (bit 27 parks below instead) */
@@ -227,7 +238,7 @@ index 4035e38..f9379c1 100644
   /* Why a submit needed an idle GPU: (1) it installs the client root with a full-ASID invalidate, which would pull the page tables from
    * under a running present job; (2) the ring was assumed empty (RPTR==WPTR) and one fence tracked one job; (3) a frame opens with a
    * CP context reset, which is safe only after the previous frame's WFI. Behind a running *client* job (1) is moot, (3) is ordered by
-@@ -1041,7 +1229,7 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
+@@ -1041,7 +1240,7 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
    if (!inl && fg_abi_present_wait) { fg_abi_q_stats[2]++; FG_REFUSE(3); }
    uint32_t used=(g3_wptr-g3_gr(0x806))&8191;
    if (fg_access_failed) return fg_abi_fault("client queue ring read");
@@ -236,7 +247,7 @@ index 4035e38..f9379c1 100644
    if (g3_faulted()) return fg_abi_fault("client pre-queue fault");
    queued=idle>0;
   } else if (g3_faulted() || g3_gr(0x806)!=g3_wptr || g3_gr(0x807)!=g3_wptr || (g3_gr(0x210)&~1u))
-@@ -1051,6 +1239,8 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
+@@ -1051,6 +1250,8 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
   unsigned n=fg_abi_frame(words+(fg_js_on ? 4 : 0),iovas,sizes,count,G3_FENCE_VA+FG_ABI_FENCE_OFF,fg_abi_seq,fg_abi_seq+1,1);
   if (!n) return -1;
   if (fg_js_on) n=fg_js_wrap(words,n,fg_abi_seq+1);
@@ -245,7 +256,7 @@ index 4035e38..f9379c1 100644
   FG_SS(FG_SS_FRAME);
   fg_abi_ibs[0]++; fg_abi_ibs[1]+=count; if (count>fg_abi_ibs[2]) fg_abi_ibs[2]=count; if (count>16) fg_abi_ibs[3]++;
   uint32_t pk_writer=0;
-@@ -1086,6 +1276,8 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
+@@ -1086,6 +1287,8 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
   fg_abi_submit_map_seq=fg_abi_map_seq;
   if (!fg_ring_doorbell() || fg_access_failed) return fg_abi_fault("client doorbell");
   *fence=++fg_abi_seq;
@@ -255,7 +266,7 @@ index 4035e38..f9379c1 100644
   if (queued) {
    fg_abi_q_stats[0]++;
 diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
-index 1bedb0e..72cbd92 100644
+index 1bedb0e..f191f2e 100644
 --- a/xnu/patches/0098-fuxi-native-adreno-abi.patch
 +++ b/xnu/patches/0098-fuxi-native-adreno-abi.patch
 @@ -4041,7 +4041,7 @@
@@ -263,11 +274,11 @@ index 1bedb0e..72cbd92 100644
  --- a/bsd/dev/fuxi_gpu_abi_backend.inc
  +++ b/bsd/dev/fuxi_gpu_abi_backend.inc
 -@@ -0,0 +1,1287 @@
-+@@ -0,0 +1,1479 @@
++@@ -0,0 +1,1490 @@
  +/* Built into fuxi_adreno.c, with access to its proven SMMU/ring helpers.
  + * Single privileged diagnostic client, not a security boundary for PM4.
  + * Its root has no scanout or surface-cache mappings. The kernel-only runtime
-@@ -4387,6 +4387,189 @@
+@@ -4387,6 +4387,200 @@
  + return !g4_tlb(tlb) && !fg_access_failed &&
  +     g3_sr(cb+0x20)==(uint32_t)ttbr && g3_sr(cb+0x24)==(uint32_t)(ttbr>>32);
  +}
@@ -277,7 +288,7 @@ index 1bedb0e..72cbd92 100644
 ++ * the CP thread selection as the stream has it: one Turnip command buffer can span IBs and end one inside a render pass on BR alone,
 ++ * and on both threads the BR write, the later one, stays. At submit each IB and the IB2s it calls are read (bounded, fault-contained,
 ++ * through the BO's kernel mapping) for what they do: draws, 2D blits and their area, dispatches, IB2 calls, WFIs, waits, draw-state
-++ * groups, the window scissor of each render pass (its count and area), the last colour attachment 0 (RB_MRT[0] BUF_INFO and PITCH) and
+++ * groups, event writes (all, CCU and cache ones), CP_WAIT_FOR_ME, the window scissor of each render pass (its count and area), the last colour attachment 0 (RB_MRT[0] BUF_INFO and PITCH) and
 ++ * the last 2D destination and source. At retirement: one line per sampled job (its time per kind of IB) and its FG_IBP_TOP longest
 ++ * IBs; every 16 samples the time per kind over them. Diagnostic only: the WFIs serialize the IBs. */
 ++#define FG_IBP_OFF 1536u
@@ -291,7 +302,7 @@ index 1bedb0e..72cbd92 100644
 ++enum { FG_IBP_K_EMPTY, FG_IBP_K_FULL, FG_IBP_K_PART, FG_IBP_K_BLIT, FG_IBP_K_CS, FG_IBP_K_BAD, FG_IBP_KINDS };
 ++struct fg_ibp_ib {
 ++ uint32_t dw, ib2, ib2dw, draws, blits, blit_kpx, cs, wfi, waits, sds, rps, rp_kpx, rt_w, rt_h, rt_info, rt_pitch, d2_info, s2_info, s2_size,
-++     tl2, br2, flags; /* flags: 1 not in a mapping, 2 out of budget, 4 read fault, 8 unknown packet type, 16 IB chain, 32 IB3 */
+++     tl2, br2, ev, ev_ccu, ev_cache, wfm, flags; /* flags: 1 not in a mapping, 2 out of budget, 4 read fault, 8 unknown packet type, 16 IB chain, 32 IB3 */
 ++};
 ++static struct fg_ibp_ib fg_ibp_ibs[NativeAdrenoAbiMaxBuffers];
 ++static unsigned fg_ibp_on, fg_ibp_count, fg_ibp_active, fg_ibp_scanned;
@@ -358,7 +369,18 @@ index 1bedb0e..72cbd92 100644
 ++     break; }
 ++    case 0x33: case 0x41: r->cs++; break;
 ++    case 0x26: r->wfi++; break;
-++    case 0x3c: case 0x12: r->waits++; break;
+++    case 0x3c: case 0x12: case 0x14: r->waits++; break;
+++    case 0x13: r->wfm++; break;
+++    case 0x46: {
+++     uint32_t ev=0;
+++     r->ev++;
+++     if (cnt && i+1<dwords && *budget) {
+++      if (!fg_ibp_rd(m,iova+4ull*(i+1),&ev)) { r->flags|=4; return; }
+++      --*budget; ev&=0xffu;
+++      if (ev==0x18 || ev==0x19 || ev==0x1a || ev==0x1c || ev==0x1d || ev==0x20 || ev==0x21) r->ev_ccu++;
+++      else if (ev>=0x30 && ev<=0x33) r->ev_cache++;
+++     }
+++     break; }
 ++    case 0x43: r->sds++; break;
 ++    case 0x57: r->flags|=16; break;
 ++    case 0x3f:
@@ -441,9 +463,9 @@ index 1bedb0e..72cbd92 100644
 ++  for (unsigned i=0;i<n;i++) if (!used[i] && (best==n || fg_ibp_d[i]>fg_ibp_d[best])) best=i;
 ++  used[best]=1;
 ++  const struct fg_ibp_ib *r=&fg_ibp_ibs[best];
-++  printf("FUXI IBPROF: job %u ib %u/%u %lluus dw %u ib2 %u/%u dr %u rp %u/%uK rt %ux%u info %x pitch %u bl %u/%uK d2 %x s2 %x/%x cs %u wfi %u wt %u sds %u fl %x\n",
+++  printf("FUXI IBPROF: job %u ib %u/%u %lluus dw %u ib2 %u/%u dr %u rp %u/%uK rt %ux%u info %x pitch %u bl %u/%uK d2 %x s2 %x/%x cs %u wfi %u wt %u wfm %u ev %u/%u/%u sds %u fl %x\n",
 ++      fg_ibp_seq,best,n,FG_IBP_US(fg_ibp_d[best]),r->dw,r->ib2,r->ib2dw,r->draws,r->rps,r->rp_kpx,r->rt_w,r->rt_h,r->rt_info,r->rt_pitch,
-++      r->blits,r->blit_kpx,r->d2_info,r->s2_info,r->s2_size,r->cs,r->wfi,r->waits,r->sds,r->flags);
+++      r->blits,r->blit_kpx,r->d2_info,r->s2_info,r->s2_size,r->cs,r->wfi,r->waits,r->wfm,r->ev,r->ev_ccu,r->ev_cache,r->sds,r->flags);
 ++ }
 ++ if (!(fg_ibp_samples%16u)) {
 ++  printf("FUXI IBPROF: per 16 samples span_us avg %llu; us/job (IBs/job) empty %llu (%llu) full_rt %llu (%llu) part_rt %llu (%llu) blit %llu (%llu) compute %llu (%llu) unread %llu (%llu); unusable %u\n",
@@ -457,7 +479,7 @@ index 1bedb0e..72cbd92 100644
  +/* 16 words of the mapped range that holds `at`, from `start` (clamped to the range): the CP stops on a bad word a few before the one it
  + * reports (NativeAdreno peekIb/peekFetch, MIT). Fault-contained reads of the BO's kernel mapping; no register access. */
  +static void fg_abi_peek(const char *tag, uint64_t at, uint64_t start)
-@@ -4588,6 +4771,7 @@
+@@ -4588,6 +4782,7 @@
  +  fg_abi_import_cache(1); /* before fence success, even without a user wait */
  +  if (fg_abi_stage) fg_abi_stall_done();
  +  if (fg_js_on) fg_js_retire(fg_abi_completed, fg_abi_seq);
@@ -465,7 +487,7 @@ index 1bedb0e..72cbd92 100644
  +  fg_abi_completed = fg_abi_seq;
  +  FG_ABI_WAKE(); fg_client_busy = 0; if (!fg_abi_hold) fg_abi_present_wait = 0; /* hold: the waiting present, not the next client job, takes the idle GPU */
  +  return 0;
-@@ -4599,6 +4783,7 @@
+@@ -4599,6 +4794,7 @@
  +    fg_abi_import_cache(1); fg_abi_host_handoff=1; /* the newer job's handoff is still open */
  +    if (fg_abi_stage) fg_abi_stall_done();
  +    if (fg_js_on) fg_js_retire(fg_abi_completed, f);
@@ -473,7 +495,7 @@ index 1bedb0e..72cbd92 100644
  +    fg_abi_completed=f; fg_client_deadline=rsr("cntpct_el0")+rsr("cntfrq_el0")/10;
  +    return 1;
  +   } }
-@@ -4626,7 +4811,9 @@
+@@ -4626,7 +4822,9 @@
  + fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hard=(bits>>18)&1; fg_abi_dirty=(bits>>19)&1; fg_abi_cbo=(bits>>29)&1; fg_abi_cbo_on=0; fg_abi_cbo_said=NULL; fg_abi_inline=((bits>>21)&1) && ((bits>>9)&1); fg_abi_cf=fg_abi_inline && ((bits>>4)&1); fg_abi_pk=fg_abi_cf && ((bits>>27)&1); fg_irq_want=(bits>>26)&1; fg_cf_reset(); fg_pk_reset(); fg_inl_ready=fg_root_client=fg_inl_busy=fg_inl_fbmask=0; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
  + if (fg_abi_pk) printf("FUXI GPU: copy_first_park=1 idle_us=%u cap=2 periods (fuxigpuncimport 134217728 with 16, inline mode)\n", FG_PK_IDLE_US);
  + { unsigned early=0; fg_js_on=PE_parse_boot_argn("fuxiearly",&early,sizeof(early)) && (early&8u); fg_js_n=fg_js_bad=0; memset(fg_js_sum,0,sizeof(fg_js_sum)); memset(fg_js_max,0,sizeof(fg_js_max));
@@ -484,7 +506,7 @@ index 1bedb0e..72cbd92 100644
  + fg_abi_coh=fg_abi_coh_tries=0;
  + for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
  + /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
-@@ -5073,6 +5260,7 @@
+@@ -5073,6 +5271,7 @@
  + if (!inl && fg_abi_present_held()) { fg_abi_q_stats[4]++; FG_REFUSE(1); }
  + if (fg_pk_n) { int r=fg_pk_flush(FG_PK_SUBMIT); if (r) return r; } /* bit 27: the parked job keeps its place, ahead of this one */
  + if (inl && !fg_abi_pk && fg_abi_copy_first()) FG_REFUSE(1); /* bit 16: the due copy goes first (bit 27 parks below instead) */
@@ -492,7 +514,7 @@ index 1bedb0e..72cbd92 100644
  + /* Why a submit needed an idle GPU: (1) it installs the client root with a full-ASID invalidate, which would pull the page tables from
  +  * under a running present job; (2) the ring was assumed empty (RPTR==WPTR) and one fence tracked one job; (3) a frame opens with a
  +  * CP context reset, which is safe only after the previous frame's WFI. Behind a running *client* job (1) is moot, (3) is ordered by
-@@ -5085,7 +5273,7 @@
+@@ -5085,7 +5284,7 @@
  +  if (!inl && fg_abi_present_wait) { fg_abi_q_stats[2]++; FG_REFUSE(3); }
  +  uint32_t used=(g3_wptr-g3_gr(0x806))&8191;
  +  if (fg_access_failed) return fg_abi_fault("client queue ring read");
@@ -501,7 +523,7 @@ index 1bedb0e..72cbd92 100644
  +  if (g3_faulted()) return fg_abi_fault("client pre-queue fault");
  +  queued=idle>0;
  + } else if (g3_faulted() || g3_gr(0x806)!=g3_wptr || g3_gr(0x807)!=g3_wptr || (g3_gr(0x210)&~1u))
-@@ -5095,6 +5283,8 @@
+@@ -5095,6 +5294,8 @@
  + unsigned n=fg_abi_frame(words+(fg_js_on ? 4 : 0),iovas,sizes,count,G3_FENCE_VA+FG_ABI_FENCE_OFF,fg_abi_seq,fg_abi_seq+1,1);
  + if (!n) return -1;
  + if (fg_js_on) n=fg_js_wrap(words,n,fg_abi_seq+1);
@@ -510,7 +532,7 @@ index 1bedb0e..72cbd92 100644
  + FG_SS(FG_SS_FRAME);
  + fg_abi_ibs[0]++; fg_abi_ibs[1]+=count; if (count>fg_abi_ibs[2]) fg_abi_ibs[2]=count; if (count>16) fg_abi_ibs[3]++;
  + uint32_t pk_writer=0;
-@@ -5130,6 +5320,8 @@
+@@ -5130,6 +5331,8 @@
  + fg_abi_submit_map_seq=fg_abi_map_seq;
  + if (!fg_ring_doorbell() || fg_access_failed) return fg_abi_fault("client doorbell");
  + *fence=++fg_abi_seq;
