@@ -53,6 +53,7 @@ jobs:
           cp harness/patches/nativemetal-fuxi-0010-nocopy-provenance.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0011-linear-layout.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0012-foreign-linear.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0013-swap-wait.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0001-copy-span.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash

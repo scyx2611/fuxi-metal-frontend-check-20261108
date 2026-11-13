@@ -1,0 +1,78 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 5bdcbd1..9a72860 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -18,6 +18,7 @@
+ #include <unordered_map>
+ #include <vector>
+ #include <sys/mman.h>
++#include <sys/sysctl.h>
+ #include <CommonCrypto/CommonDigest.h>
+ #include <dlfcn.h>
+ #include <execinfo.h>
+@@ -58,6 +59,31 @@ static Timed gTimeResourceWait;
+ static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
+ static Timed gTimeSurfaceFlush;
+ static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
++// Swap wait (patch 0013): CoreAnimation calls commitAndWaitUntilSubmitted right before the IOMFB swap. The display
++// has no writer lease to consult here, so a command buffer that stored an IOSurface waits for GPU completion
++// before that call returns. FUXI_NATIVE_SWAP_WAIT=0 or the boot argument fuxiswapwait=0 turns it off.
++static Timed gTimeSwapWait;
++static std::atomic<uint64_t> gSwapWaitRefused;
++// True when args holds token as one whole whitespace-delimited word.
++static bool fuxiBootArgsHaveToken(const char *args,const char *token) {
++ if(!args || !token || !*token)return false;
++ const size_t length=strlen(token);
++ for(const char *at=args;*at;) {
++  while(*at==' ' || *at=='\t' || *at=='\n')at++;
++  const char *end=at;while(*end && *end!=' ' && *end!='\t' && *end!='\n')end++;
++  if((size_t)(end-at)==length && !strncmp(at,token,length))return true;
++  at=end;
++ }
++ return false;
++}
++static bool fuxiSwapWaitEnabled() {
++ if(const char *value=getenv("FUXI_NATIVE_SWAP_WAIT"))return strcmp(value,"0")!=0;
++ static const bool bootEnabled=[]{
++  char args[4096]={};size_t size=sizeof(args)-1;
++  return sysctlbyname("kern.bootargs",args,&size,nullptr,0)!=0 || !fuxiBootArgsHaveToken(args,"fuxiswapwait=0");
++ }();
++ return bootEnabled;
++}
+ struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;bool storedSurface;};
+ struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
+ static CommitRecord gCommitRing[32];
+@@ -561,6 +587,7 @@ static void notified(void *context,uint64_t value) {
+ @property(nonatomic) BOOL schedulingDelivered;
+ @property(nonatomic) BOOL completionDelivered;
+ - (void)refuse:(NSString *)what;
++- (void)fuxiWaitStoredSurface;
+ @end
+ @interface NBEncoder : NBObject
+ @property(nonatomic) NmbEncoder *handle;
+@@ -862,7 +889,7 @@ static void scheduled(void *context);
+ // The kernel driver's own submission times are not recorded: 0 is Metal's answer where they are unavailable.
+ - (CFTimeInterval)kernelStartTime { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (CFTimeInterval)kernelEndTime { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (BOOL)commitAndWaitUntilSubmitted { try { @try {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)commitAndWaitUntilSubmitted { try { @try {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];[self fuxiWaitStoredSurface];return !self.failedLocally;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (CFTimeInterval)GPUStartTime { try { @try {return nmb_command_buffer_gpu_time(_handle,false);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (CFTimeInterval)GPUEndTime { try { @try {return nmb_command_buffer_gpu_time(_handle,true);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)what { try { @try {
+@@ -1020,6 +1047,16 @@ static void scheduled(void *context);
+  self.failedLocally=YES;gCommitFailures++;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[self finish];});
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++// Waits for the GPU only, not for the completed handlers: the caller may hold what a handler needs.
++- (void)fuxiWaitStoredSurface { try { @try {
++ if(!self.committed || self.failedLocally || self.fuxiNoop || !encodedWork.storedSurface || !fuxiSwapWaitEnabled())return;
++ const uint64_t began=nowUs();
++ if(nmb_command_buffer_wait(_handle,0)!=0){gSwapWaitRefused++;NBLOG(@"native-metal: swap wait refused: %@",lastError());return;}
++ gTimeSwapWait.add(began);
++ const uint64_t n=gTimeSwapWait.count.load();
++ if(n==1 || n%600==0)fprintf(stderr,"FUXI MTL: native swap wait n=%llu avg_us=%llu max_us=%llu refused=%llu\n",(unsigned long long)n,
++  (unsigned long long)(gTimeSwapWait.total.load()/n),(unsigned long long)gTimeSwapWait.slowest.load(),(unsigned long long)gSwapWaitRefused.load());
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)waitUntilCompleted { try { @try {
+  if(!self.committed)return;
+  const uint64_t began=nowUs();
