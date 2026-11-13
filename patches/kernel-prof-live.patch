@@ -11,10 +11,10 @@ index eff5bec..5a98ede 100644
  #include <stdint.h>
  #include <stdio.h>
 diff --git a/xnu/fuxi-prof/sweet_prof_sample.c b/xnu/fuxi-prof/sweet_prof_sample.c
-index 0a6d128..88dfbda 100644
+index 0a6d128..d13a531 100644
 --- a/xnu/fuxi-prof/sweet_prof_sample.c
 +++ b/xnu/fuxi-prof/sweet_prof_sample.c
-@@ -14,6 +14,47 @@
+@@ -14,6 +14,75 @@
  #include <vm/vm_shared_region.h>
  #include <string.h>
  #include "sweet_prof_logic.h"
@@ -58,11 +58,39 @@ index 0a6d128..88dfbda 100644
 + if(!l->ok){sp_live_n[2]++;return 0;}
 + sp_live_n[1]++;*pc=l->pc;*lr=l->lr;*fp=l->fp;return 1;
 +}
++/* Flat profile of the live samples: counts per (thread, 64-byte pc bucket), the top SP_PC_TOP printed at the end as
++ * "PROFPC t<tid> 0x<bucket> <count>", so a thread's whole on-core time maps to functions offline (the keyed rows above
++ * keep only each thread's twelve most frequent exact stacks). */
++#define SP_PC_BUCKETS 8192u
++#define SP_PC_TOP 300u
++struct sp_pc { uint64_t tid,pc; unsigned n; };
++static struct sp_pc sp_pcs[SP_PC_BUCKETS];
++static unsigned sp_pc_dropped;
++static void sp_pc_add(uint64_t tid,uint64_t pc) {
++ pc&=~(uint64_t)63;
++ uint64_t h=(pc>>6)^(tid*0x9e3779b97f4a7c15ULL);
++ for(unsigned i=0;i<64;i++){
++  struct sp_pc *e=&sp_pcs[(h+i)%SP_PC_BUCKETS];
++  if(!e->n){e->tid=tid;e->pc=pc;e->n=1;return;}
++  if(e->tid==tid && e->pc==pc){e->n++;return;}
++ }
++ sp_pc_dropped++;
++}
++static void sp_pc_print(void) {
++ for(unsigned k=0;k<SP_PC_TOP;k++){
++  unsigned best=SP_PC_BUCKETS;
++  for(unsigned i=0;i<SP_PC_BUCKETS;i++)if(sp_pcs[i].n && (best==SP_PC_BUCKETS || sp_pcs[i].n>sp_pcs[best].n))best=i;
++  if(best==SP_PC_BUCKETS)break;
++  printf("PROFPC t%llu 0x%llx %u\n",(unsigned long long)sp_pcs[best].tid,(unsigned long long)sp_pcs[best].pc,sp_pcs[best].n);
++  sp_pcs[best].n=0;
++ }
++ printf("PROFPC done dropped=%u\n",sp_pc_dropped);
++}
 +#endif
  void sweet_prof_task(task_t task,int pid);
  static void sp_sleep(uint64_t deadline,uint64_t leeway) {
   static int event;
-@@ -31,9 +72,16 @@ static void sp_sweep(task_t task,struct sp_table *p) {
+@@ -31,9 +100,16 @@ static void sp_sweep(task_t task,struct sp_table *p) {
    if(state&TH_TERMINATE){thread_unlock(thread);splx(level);p->skipped++;continue;}
    s.tid=thread->thread_id;s.event=thread->wait_event;s.wr=thread->wait_result;
    s.state=machine_thread_on_core(thread)?0:(state&TH_WAIT)?1:(state&TH_RUN)?2:3;
@@ -74,33 +102,35 @@ index 0a6d128..88dfbda 100644
 -  uint64_t fp=get_saved_state_fp(ss),base=fp;
 +  uint64_t fp=get_saved_state_fp(ss);
 +#ifndef SP_NO_LIVE
-+  if(s.state==0 && sp_live(thread,cpu,&s.pc,&s.lr,&fp))s.x16=0x7fffffff;
++  if(s.state==0 && sp_live(thread,cpu,&s.pc,&s.lr,&fp)){s.x16=0x7fffffff;sp_pc_add(s.tid,s.pc);}
 +#endif
 +  uint64_t base=fp;
    for(unsigned n=0;n<8 && fp && !(fp&7) && fp>=base && fp-base<1024*1024;n++) {
     uint64_t frame[2];
     if(vm_map_read_user(map,fp,frame,sizeof(frame))!=KERN_SUCCESS)break;
-@@ -72,6 +120,9 @@ void sweet_prof_task(task_t task,int pid) {
+@@ -72,6 +148,10 @@ void sweet_prof_task(task_t task,int pid) {
   task_lock(task);uint64_t mh=task->mach_header_vm_address;task_unlock(task);
   nanoseconds_to_absolutetime(2*NSEC_PER_MSEC,&period);nanoseconds_to_absolutetime(100*NSEC_PER_USEC,&leeway);
   nanoseconds_to_absolutetime(60ULL*NSEC_PER_SEC,&duration);
 +#ifndef SP_NO_LIVE
 + nanoseconds_to_absolutetime(200*NSEC_PER_USEC,&sp_live_wait);
++ memset(sp_pcs,0,sizeof(sp_pcs));sp_pc_dropped=0;
 +#endif
   uint64_t start=mach_absolute_time(),end=start+duration;deadline=start;
   while(mach_absolute_time()<end) {
    sp_sweep(task,p);
-@@ -82,5 +133,8 @@ void sweet_prof_task(task_t task,int pid) {
+@@ -82,5 +162,9 @@ void sweet_prof_task(task_t task,int pid) {
   }
   printf("PROF backboardd[%d] slide 0x%llx mh 0x%llx\n",pid,(unsigned long long)slide,(unsigned long long)mh);
   sp_print(p);kfree_data(p,sizeof(*p));
 +#ifndef SP_NO_LIVE
 + printf("PROF live asked=%llu thread=%llu other=%llu skipped=%llu\n",sp_live_n[0],sp_live_n[1],sp_live_n[2],sp_live_n[3]);
++ sp_pc_print();
 +#endif
  }
  #endif
 diff --git a/xnu/patches/0111-fuxi-user-profiler.patch b/xnu/patches/0111-fuxi-user-profiler.patch
-index a8af625..4705bc1 100644
+index a8af625..cbaf9e3 100644
 --- a/xnu/patches/0111-fuxi-user-profiler.patch
 +++ b/xnu/patches/0111-fuxi-user-profiler.patch
 @@ -90,7 +90,7 @@
@@ -108,11 +138,11 @@ index a8af625..4705bc1 100644
  --- /dev/null
  +++ b/osfmk/kern/sweet_prof_sample.c
 -@@ -0,0 +1,86 @@
-+@@ -0,0 +1,140 @@
++@@ -0,0 +1,170 @@
  +/* Saved user stacks are approximate; no target suspension or logging per sweep. */
  +#include <pexpert/arm64/board_config.h>
  +#if defined(FUXI)
-@@ -107,6 +107,47 @@
+@@ -107,6 +107,75 @@
  +#include <vm/vm_shared_region.h>
  +#include <string.h>
  +#include "sweet_prof_logic.h"
@@ -156,11 +186,39 @@ index a8af625..4705bc1 100644
 ++ if(!l->ok){sp_live_n[2]++;return 0;}
 ++ sp_live_n[1]++;*pc=l->pc;*lr=l->lr;*fp=l->fp;return 1;
 ++}
+++/* Flat profile of the live samples: counts per (thread, 64-byte pc bucket), the top SP_PC_TOP printed at the end as
+++ * "PROFPC t<tid> 0x<bucket> <count>", so a thread's whole on-core time maps to functions offline (the keyed rows above
+++ * keep only each thread's twelve most frequent exact stacks). */
+++#define SP_PC_BUCKETS 8192u
+++#define SP_PC_TOP 300u
+++struct sp_pc { uint64_t tid,pc; unsigned n; };
+++static struct sp_pc sp_pcs[SP_PC_BUCKETS];
+++static unsigned sp_pc_dropped;
+++static void sp_pc_add(uint64_t tid,uint64_t pc) {
+++ pc&=~(uint64_t)63;
+++ uint64_t h=(pc>>6)^(tid*0x9e3779b97f4a7c15ULL);
+++ for(unsigned i=0;i<64;i++){
+++  struct sp_pc *e=&sp_pcs[(h+i)%SP_PC_BUCKETS];
+++  if(!e->n){e->tid=tid;e->pc=pc;e->n=1;return;}
+++  if(e->tid==tid && e->pc==pc){e->n++;return;}
+++ }
+++ sp_pc_dropped++;
+++}
+++static void sp_pc_print(void) {
+++ for(unsigned k=0;k<SP_PC_TOP;k++){
+++  unsigned best=SP_PC_BUCKETS;
+++  for(unsigned i=0;i<SP_PC_BUCKETS;i++)if(sp_pcs[i].n && (best==SP_PC_BUCKETS || sp_pcs[i].n>sp_pcs[best].n))best=i;
+++  if(best==SP_PC_BUCKETS)break;
+++  printf("PROFPC t%llu 0x%llx %u\n",(unsigned long long)sp_pcs[best].tid,(unsigned long long)sp_pcs[best].pc,sp_pcs[best].n);
+++  sp_pcs[best].n=0;
+++ }
+++ printf("PROFPC done dropped=%u\n",sp_pc_dropped);
+++}
 ++#endif
  +void sweet_prof_task(task_t task,int pid);
  +static void sp_sleep(uint64_t deadline,uint64_t leeway) {
  + static int event;
-@@ -124,9 +165,16 @@
+@@ -124,9 +193,16 @@
  +  if(state&TH_TERMINATE){thread_unlock(thread);splx(level);p->skipped++;continue;}
  +  s.tid=thread->thread_id;s.event=thread->wait_event;s.wr=thread->wait_result;
  +  s.state=machine_thread_on_core(thread)?0:(state&TH_WAIT)?1:(state&TH_RUN)?2:3;
@@ -172,28 +230,30 @@ index a8af625..4705bc1 100644
 -+  uint64_t fp=get_saved_state_fp(ss),base=fp;
 ++  uint64_t fp=get_saved_state_fp(ss);
 ++#ifndef SP_NO_LIVE
-++  if(s.state==0 && sp_live(thread,cpu,&s.pc,&s.lr,&fp))s.x16=0x7fffffff;
+++  if(s.state==0 && sp_live(thread,cpu,&s.pc,&s.lr,&fp)){s.x16=0x7fffffff;sp_pc_add(s.tid,s.pc);}
 ++#endif
 ++  uint64_t base=fp;
  +  for(unsigned n=0;n<8 && fp && !(fp&7) && fp>=base && fp-base<1024*1024;n++) {
  +   uint64_t frame[2];
  +   if(vm_map_read_user(map,fp,frame,sizeof(frame))!=KERN_SUCCESS)break;
-@@ -165,6 +213,9 @@
+@@ -165,6 +241,10 @@
  + task_lock(task);uint64_t mh=task->mach_header_vm_address;task_unlock(task);
  + nanoseconds_to_absolutetime(2*NSEC_PER_MSEC,&period);nanoseconds_to_absolutetime(100*NSEC_PER_USEC,&leeway);
  + nanoseconds_to_absolutetime(60ULL*NSEC_PER_SEC,&duration);
 ++#ifndef SP_NO_LIVE
 ++ nanoseconds_to_absolutetime(200*NSEC_PER_USEC,&sp_live_wait);
+++ memset(sp_pcs,0,sizeof(sp_pcs));sp_pc_dropped=0;
 ++#endif
  + uint64_t start=mach_absolute_time(),end=start+duration;deadline=start;
  + while(mach_absolute_time()<end) {
  +  sp_sweep(task,p);
-@@ -175,6 +226,9 @@
+@@ -175,6 +255,10 @@
  + }
  + printf("PROF backboardd[%d] slide 0x%llx mh 0x%llx\n",pid,(unsigned long long)slide,(unsigned long long)mh);
  + sp_print(p);kfree_data(p,sizeof(*p));
 ++#ifndef SP_NO_LIVE
 ++ printf("PROF live asked=%llu thread=%llu other=%llu skipped=%llu\n",sp_live_n[0],sp_live_n[1],sp_live_n[2],sp_live_n[3]);
+++ sp_pc_print();
 ++#endif
  +}
  +#endif
