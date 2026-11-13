@@ -8,8 +8,10 @@ on:
     paths:
       - patches/kernel-surface-stride.patch
       - patches/kernel-bo-slots.patch
+      - patches/kernel-surfrow-mode2.patch
       - tests/test-surface-plane-result.py
       - tests/test-bo-slots.py
+      - tests/test-surfrow-mode2.py
       - .github/workflows/kernel-bo-slots-check.yml
 permissions:
   contents: read
@@ -39,8 +41,11 @@ jobs:
           git -C source apply ../harness/patches/kernel-surface-stride.patch
           git -C source apply --check ../harness/patches/kernel-bo-slots.patch
           git -C source apply ../harness/patches/kernel-bo-slots.patch
+          git -C source apply --check ../harness/patches/kernel-surfrow-mode2.patch
+          git -C source apply ../harness/patches/kernel-surfrow-mode2.patch
           python3 harness/tests/test-surface-plane-result.py source
           python3 harness/tests/test-bo-slots.py source
+          python3 harness/tests/test-surfrow-mode2.py source
       - name: Build and audit kernel
         shell: bash
         run: |

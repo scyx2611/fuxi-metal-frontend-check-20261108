@@ -1,0 +1,86 @@
+diff --git a/xnu/fuxi-scanout/SweetSurface.cpp b/xnu/fuxi-scanout/SweetSurface.cpp
+index 208d071..99a608f 100644
+--- a/xnu/fuxi-scanout/SweetSurface.cpp
++++ b/xnu/fuxi-scanout/SweetSurface.cpp
+@@ -70,7 +70,7 @@ enum {
+  * left them unrendered and the opaque App Library background stayed black.
+  * Explicit rows are a minimum (clients query the row back), and the allocation
+  * covers the height padded to 4 rows that a Turnip linear import requires;
+- * sweetsurfrow=0 keeps the requested layout. */
++ * sweetsurfrow: 2 (default) rounds only rows that are not 64-byte aligned, 1 every row, 0 none. */
+ #define SWEET_SURFACE_GPU_ROW_ALIGN     256
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_USE         0x18
+@@ -773,16 +773,16 @@ sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
+ 	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
+ }
+ 
+-static bool
++static int
+ sweet_surface_gpu_rows(void)
+ {
+ 	static int enabled = -1;
+ 	if (enabled < 0) {
+-		uint32_t v = 1;
++		uint32_t v = 2;
+ 		(void)PE_parse_boot_argn("sweetsurfrow", &v, sizeof(v));
+-		enabled = v != 0;
++		enabled = v <= 2 ? (int)v : 2;
+ 	}
+-	return enabled != 0;
++	return enabled;
+ }
+ 
+ /* Geometry from the creation properties (IOSurface.h keys). */
+@@ -810,7 +810,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	}
+ 	uint32_t rows = sweet_div_up(s->height, s->elementHeight);
+ 	if (s->bytesPerElement == 4 && props->getObject("IOSurfacePlaneInfo") == NULL && sweet_surface_gpu_rows()) {
+-		if ((s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0) {
++		if ((s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0 && (sweet_surface_gpu_rows() != 2 || (s->bytesPerRow & 63) != 0)) {
+ 			s->bytesPerRow = (s->bytesPerRow + SWEET_SURFACE_GPU_ROW_ALIGN - 1) & ~(uint32_t)(SWEET_SURFACE_GPU_ROW_ALIGN - 1);
+ 		}
+ 		/* Turnip sizes a linear image's last level for a height padded to 4 rows
+diff --git a/xnu/patches/0108-fuxi-gpu-scanout.patch b/xnu/patches/0108-fuxi-gpu-scanout.patch
+index ae1d910..baa2d7e 100644
+--- a/xnu/patches/0108-fuxi-gpu-scanout.patch
++++ b/xnu/patches/0108-fuxi-gpu-scanout.patch
+@@ -18,7 +18,7 @@
+ + * left them unrendered and the opaque App Library background stayed black.
+ + * Explicit rows are a minimum (clients query the row back), and the allocation
+ + * covers the height padded to 4 rows that a Turnip linear import requires;
+-+ * sweetsurfrow=0 keeps the requested layout. */
+++ * sweetsurfrow: 2 (default) rounds only rows that are not 64-byte aligned, 1 every row, 0 none. */
+ +#define SWEET_SURFACE_GPU_ROW_ALIGN     256
+  #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ +#define SWEET_SURFACE_STATE_USE         0x18
+@@ -461,16 +461,16 @@
+  	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
+  }
+  
+-+static bool
+++static int
+ +sweet_surface_gpu_rows(void)
+ +{
+ +	static int enabled = -1;
+ +	if (enabled < 0) {
+-+		uint32_t v = 1;
+++		uint32_t v = 2;
+ +		(void)PE_parse_boot_argn("sweetsurfrow", &v, sizeof(v));
+-+		enabled = v != 0;
+++		enabled = v <= 2 ? (int)v : 2;
+ +	}
+-+	return enabled != 0;
+++	return enabled;
+ +}
+ +
+  /* Geometry from the creation properties (IOSurface.h keys). */
+@@ -483,7 +483,7 @@
+ -	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ +	uint32_t rows = sweet_div_up(s->height, s->elementHeight);
+ +	if (s->bytesPerElement == 4 && props->getObject("IOSurfacePlaneInfo") == NULL && sweet_surface_gpu_rows()) {
+-+		if ((s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0) {
+++		if ((s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0 && (sweet_surface_gpu_rows() != 2 || (s->bytesPerRow & 63) != 0)) {
+ +			s->bytesPerRow = (s->bytesPerRow + SWEET_SURFACE_GPU_ROW_ALIGN - 1) & ~(uint32_t)(SWEET_SURFACE_GPU_ROW_ALIGN - 1);
+ +		}
+ +		/* Turnip sizes a linear image's last level for a height padded to 4 rows
