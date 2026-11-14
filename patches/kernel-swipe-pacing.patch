@@ -1,0 +1,44 @@
+diff --git a/xnu/fuxi-h1/fuxi_keys.c b/xnu/fuxi-h1/fuxi_keys.c
+index bee2719..d7c5d28 100644
+--- a/xnu/fuxi-h1/fuxi_keys.c
++++ b/xnu/fuxi-h1/fuxi_keys.c
+@@ -492,13 +492,13 @@ static unsigned fk_touch_loops = 10;
+ static void
+ fk_swipe(int x0, int y0, int x1, int y1, unsigned ms)
+ {
+-	unsigned steps = ms / 8u ? ms / 8u : 1u;
++	unsigned steps = ms / 8u ? ms / 8u : 1u; /* steps on an absolute 8 ms grid (125 Hz; a real finger reports every ~8.4 ms) */
++	uint64_t step, due = mach_absolute_time(); nanoseconds_to_absolutetime(8ULL * NSEC_PER_MSEC, &step);
+ 	for (unsigned i = 0; i <= steps; ++i) {
+-		int x = x0 + (x1 - x0) * (int)i / (int)steps;
+-		int y = y0 + (y1 - y0) * (int)i / (int)steps;
++		int x = x0 + (x1 - x0) * (int)i / (int)steps, y = y0 + (y1 - y0) * (int)i / (int)steps;
+ 		fuxi_perf_input();
+ 		sweet_hid_touch(0, 1, x, y);
+-		fk_script_sleep(8);
++		due += step; uint64_t now = mach_absolute_time(); if (due > now) { (void)assert_wait_deadline(&fk_script_chan, THREAD_UNINT, due); thread_block(THREAD_CONTINUE_NULL); } else due = now; /* late: no burst */
+ 	}
+ 	sweet_hid_touch(0, 0, x1, y1);
+ }
+diff --git a/xnu/patches/0103-fuxi-kernel-h1.patch b/xnu/patches/0103-fuxi-kernel-h1.patch
+index 884de01..78e4c02 100644
+--- a/xnu/patches/0103-fuxi-kernel-h1.patch
++++ b/xnu/patches/0103-fuxi-kernel-h1.patch
+@@ -456,13 +456,13 @@
+ +static void
+ +fk_swipe(int x0, int y0, int x1, int y1, unsigned ms)
+ +{
+-+	unsigned steps = ms / 8u ? ms / 8u : 1u;
+++	unsigned steps = ms / 8u ? ms / 8u : 1u; /* steps on an absolute 8 ms grid (125 Hz; a real finger reports every ~8.4 ms) */
+++	uint64_t step, due = mach_absolute_time(); nanoseconds_to_absolutetime(8ULL * NSEC_PER_MSEC, &step);
+ +	for (unsigned i = 0; i <= steps; ++i) {
+-+		int x = x0 + (x1 - x0) * (int)i / (int)steps;
+-+		int y = y0 + (y1 - y0) * (int)i / (int)steps;
+++		int x = x0 + (x1 - x0) * (int)i / (int)steps, y = y0 + (y1 - y0) * (int)i / (int)steps;
+ +		fuxi_perf_input();
+ +		sweet_hid_touch(0, 1, x, y);
+-+		fk_script_sleep(8);
+++		due += step; uint64_t now = mach_absolute_time(); if (due > now) { (void)assert_wait_deadline(&fk_script_chan, THREAD_UNINT, due); thread_block(THREAD_CONTINUE_NULL); } else due = now; /* late: no burst */
+ +	}
+ +	sweet_hid_touch(0, 0, x1, y1);
+ +}
