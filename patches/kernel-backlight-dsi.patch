@@ -1,0 +1,1167 @@
+diff --git a/docs-lanes/backlight.md b/docs-lanes/backlight.md
+index bb85abc..8fa9ce7 100644
+--- a/docs-lanes/backlight.md
++++ b/docs-lanes/backlight.md
+@@ -909,3 +909,66 @@ frame came at 9.0 s, compared with 12.4–13.3 s with `fuxibacklight=1`.
+ Recommended: `fuxiautolock=30` without `fuxibacklight`. It also locks
+ while a video plays with no input, because it does not see iOS idle-timer
+ assertions.
++
++## Panel brightness (`fuxibacklight=4`)
++
++Modes 1–3 never received a brightness level: CoreBrightness takes the
++built-in display's backlight only when the service has `backlight-control =
++true` **and** conforms to `AppleARMBacklight` (`-[CBDisplayContaineriOS
++findBacklight]`). This kernel has no Apple `AppleARMBacklight` class, so mode
++4 publishes a service of that class itself (`xnu/fuxi-backlight/
++FuxiDsiBacklight.cpp`), the way AppleCLCD is provided here. Two other
++Xiaomi 13 ports (UniXNU `fuxi-backlight=dsi`, iPadOS 17 / iOS 17) drive the
++same panel with the same DCS command and report working brightness; their
++DSI code is not used here.
++
++```text
++AppleCLCD
++  AppleARMBacklight : IOService
++    backlight-control = true (OSBoolean)
++    IODisplayParameters = { brightness = { min = 0, max = 2047, value = n } }
++```
++
++0–2047 is the panel's normal DBV range (`mi,mdss-dsi-fac-bl-max-level` 0x7ff;
++HBM 0xfff is not offered). `setProperties` accepts `brightness` as a number
++or `{ value = n }`, flat or inside `IODisplayParameters`, plus `FadePeriod`
++(16.16 seconds, capped at 5 s); other keys are accepted and logged. A set
++sign bit is a request for 0. The first request is applied at once (the boot
++loader's level is not read back; 1023 is published until then), later ones
++fade in 16 ms steps on the service's own work loop. Levels below 8 are sent
++as 8 (the panel goes fully dark below that). `setProperties` never waits for
++the work loop.
++
++The service performs no MMIO. Each level goes to the display owner
++(`fuxi_gpu_scanout_backlight`), which sends one DCS 0x51 long write (level
++high byte first) through the same command-DMA FIFO register sequence as the
++panel120 switch, with one packet. It is sent only under `FG_GUARD`, with
++autorefresh off, CTL START clear, the write line idle and the DSI controller
++idle (status, command engine, TPG, no pending error), so no START — always
++written under `FG_GUARD` by `fg_scanout_publish` — can begin a transfer while
++the command is on the link. A waiting level goes out right before the next
++START, or from a thread call retried every 4 ms for about 48 ms on a static
++screen. A newer level replaces one not yet sent. Requirements:
++`fuxigpuscanout=1` (ownership) and `fuxipanel120=1` (the DSI0 window is
++mapped only then); otherwise the level is never sent and one line says so.
++
++After an uncertain command (error status, or no completion within 2 ms) the
++registers are restored as after a good one and brightness stops for that
++boot; if the controller is then still busy after 20 ms, scanout stops with
++the panel held, as after a failed panel120 switch.
++
++Look for:
++
++```text
++FUXI BACKLIGHT DSI: published AppleARMBacklight min=0 max=2047 value=1023; ...
++FUXI BACKLIGHT DSI: setProperties #n process=backboardd keys=k
++FUXI BACKLIGHT DSI: setProperties #n brightness number=... bits=...
++FUXI BACKLIGHT DSI: brightness #n goal=... sent=... fade_ms=... published=1
++FUXI BACKLIGHT DSI: level=... sent=... via=start|timer us=... max_us=... deferred owner/panel120/ar/xfer/dsi/gave_up=...
++```
++
++**Not yet observed on device.** Open questions for the first boot: whether
++iOS 16 CoreBrightness sends levels in the published range and with which
++keys, whether the conformance changes the backboardd startup time seen with
++mode 1, and the DCS time added before a START. Modes 1–3 and the default
++(no argument) are unchanged; mode 4 sends no logical power notifications.
+diff --git a/tools/sync-fuxi-backlight.py b/tools/sync-fuxi-backlight.py
+index 45a91f9..90a5caf 100755
+--- a/tools/sync-fuxi-backlight.py
++++ b/tools/sync-fuxi-backlight.py
+@@ -10,7 +10,7 @@ import tempfile
+ ROOT = Path(__file__).resolve().parents[1]
+ SRC = ROOT / 'xnu/fuxi-backlight'
+ PATCH = ROOT / 'xnu/patches/0109-fuxi-backlight.patch'
+-FILES = ('FuxiBacklight.cpp', 'fuxi_backlight_logic.h')
++FILES = ('FuxiBacklight.cpp', 'fuxi_backlight_logic.h', 'FuxiDsiBacklight.cpp', 'fuxi_dsi_backlight_logic.h')
+ BUILD = 'iokit/conf/files.arm64'
+ 
+ 
+@@ -34,7 +34,8 @@ def expected():
+     anchor = next(line for line in before[BUILD].splitlines(True)
+                   if line.startswith('iokit/Kernel/arm/SweetFramebuffer.cpp '))
+     after = {BUILD: before[BUILD].replace(anchor, anchor +
+-        'iokit/Kernel/arm/FuxiBacklight.cpp                                optional iokitcpp\n')}
++        'iokit/Kernel/arm/FuxiBacklight.cpp                                optional iokitcpp\n'
++        'iokit/Kernel/arm/FuxiDsiBacklight.cpp                             optional iokitcpp\n')}
+     for name in FILES:
+         path = 'iokit/Kernel/arm/' + name
+         before[path] = ''
+diff --git a/xnu/fuxi-adreno/fuxi_gpu_scanout.inc b/xnu/fuxi-adreno/fuxi_gpu_scanout.inc
+index 6a5a5d4..5d17fe5 100644
+--- a/xnu/fuxi-adreno/fuxi_gpu_scanout.inc
++++ b/xnu/fuxi-adreno/fuxi_gpu_scanout.inc
+@@ -1794,6 +1794,194 @@ uncertain:
+  printf("FUXI SCANOUT: panel120 aborted; panel state uncertain, reboot required\n");
+  return fg_scanout_stop("panel120 switch incomplete");
+ }
++/* fuxibacklight=4: panel brightness. One DCS set_display_brightness (0x51, 11-bit level, high byte first; 0x7ff is the panel's
++ * normal maximum, mi,mdss-dsi-fac-bl-max-level) through the command-DMA FIFO sequence of fg_panel120_switch, with a single long
++ * packet. Only the display owner sends it, under FG_GUARD, between transfers: autorefresh off, CTL START clear, the write line idle
++ * and the DSI controller idle. Every START is written under FG_GUARD (fg_scanout_publish), so no transfer can begin while the
++ * command is on the link. A waiting level goes out right before the next START (animated screens) or from a short thread call
++ * (static screens); a newer level replaces one not sent yet. The AppleARMBacklight service (FuxiDsiBacklight.cpp) only stores the
++ * level here and never touches the hardware. Needs fuxigpuscanout=1 (ownership) and fuxipanel120=1 (only then is the DSI0 window
++ * mapped). After an uncertain command (error raised, or no completion) the registers are restored as after a good one and no
++ * further level is sent this boot; if the controller is then not idle, scanout stops (panel held) as after a failed panel120. */
++#define FG_BL_PENDING 0x80000000u
++#define FG_BL_MAX 2047u
++#define FG_BL_IDLE_US 50u      /* MDP engine finishing the last lines after the write line went idle */
++#define FG_BL_DONE_US 2000u    /* a 3-byte HS long write completes in microseconds */
++#define FG_BL_RETRY_US 4000u   /* static screen: retry while a transfer still runs */
++#define FG_BL_TRIES 12u        /* ~48 ms, longer than one 60 Hz transfer; later the next START sends it */
++enum { FG_BL_D_OWNER, FG_BL_D_PANEL120, FG_BL_D_AR, FG_BL_D_XFER, FG_BL_D_DSI, FG_BL_D_GAVE_UP, FG_BL_D_N };
++static unsigned fg_bl_want, fg_bl_tries, fg_bl_halted, fg_bl_call_setup, fg_bl_sent, fg_bl_said, fg_bl_defer[FG_BL_D_N];
++static uint64_t fg_bl_ticks_max;
++static thread_call_data_t fg_bl_call;
++/* The two FIFO words of one DCS long write: header (flags 0xc0 = long packet + last of the batch, data type 0x39, 3 bytes), then
++ * the payload bytes 0x51, level high byte, level low byte and one pad byte 0xff (the FIFO takes word pairs). */
++static void fg_bl_words(unsigned level, uint32_t words[2])
++{
++ words[0] = 3u | (0x39u << 16) | (0xc0u << 24);
++ words[1] = 0x51u | (((level >> 8) & 0xffu) << 8) | ((level & 0xffu) << 16) | (0xffu << 24);
++}
++/* Bounded poll of a DSI register: 1 (status & mask) == want, 0 timeout, -1 MMIO failure. any=1: done when (status & mask) != 0. */
++static int fg_bl_poll(unsigned offset, unsigned mask, unsigned want, unsigned any, unsigned limit_us, unsigned *status)
++{
++ uint64_t deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")*limit_us/1000000;
++ for (unsigned n = 0; n <= limit_us; n++) {
++  if (!fg_scanout_read(FG_SCAN_DSI+offset, status)) return -1;
++  if (any ? (*status & mask) != 0 : (*status & mask) == want) return 1;
++  if (rsr("cntpct_el0") >= deadline) break;
++  delay(1);
++ }
++ return 0;
++}
++/* 1 sent, 0 not sent (a stale DMA-done that would not clear; registers restored), 2 uncertain (triggered without a clean
++ * completion; registers restored), -1 MMIO failure. trigger/dma/irq/length are the values read before. */
++static int fg_bl_send(unsigned level, unsigned trigger, unsigned dma, unsigned irq, unsigned length)
++{
++ uint32_t words[2];
++ unsigned masks = irq & 0xaaaaaaaau, status = 0, triggered = 0;
++ int result = 0;
++ fg_bl_words(level, words);
++ /* Software DMA trigger 4, MDP/TE trigger fields kept; DMA_TRG_MUX bit16 and BLOCK_DMA_WITHIN_FRAME bit12 cleared while idle. */
++ if (!fg_scanout_write(FG_SCAN_DSI+0x084, (trigger & ~0x1100fu) | 4) ||
++     !fg_scanout_write(FG_SCAN_DSI+0x110, (masks & ~2u) | 1u)) return -1;
++ int cleared = fg_bl_poll(0x110, 1, 0, 0, FG_BL_IDLE_US, &status); /* the stale DMA-done must read clear before the trigger */
++ if (cleared < 0) return -1;
++ if (cleared) {
++  if (!fg_scanout_write(FG_SCAN_DSI+0x1ec, 1)) return -1;
++  __asm__ volatile("dsb sy" ::: "memory");
++  delay(1);
++  if (!fg_scanout_write(FG_SCAN_DSI+0x1ec, 0) ||
++      !fg_scanout_write(FG_SCAN_DSI+0x15c, 0x00030006) ||
++      !fg_scanout_write(FG_SCAN_DSI+0x17c, words[0]) ||
++      !fg_scanout_write(FG_SCAN_DSI+0x17c, words[1]) ||
++      /* Embedded register FIFO, unicast HS: broadcast/master/LP all clear. */
++      !fg_scanout_write(FG_SCAN_DSI+0x03c, (dma & ~0xc4000000u) | 0x10000000u) ||
++      !fg_scanout_write(FG_SCAN_DSI+0x04c, 8)) return -1;
++  __asm__ volatile("dsb sy" ::: "memory");
++  if (!fg_scanout_write(FG_SCAN_DSI+0x090, 1)) return -1;
++  triggered = 1;
++  int done = fg_bl_poll(0x110, 1u | (1u << 24), 0, 1, FG_BL_DONE_US, &status);
++  if (done < 0) return -1;
++  result = done && !(status & (1u << 24)) ? 1 : 2;
++  if (result == 1) {
++   int idle = fg_bl_poll(0x008, 0x1f, 0, 0, FG_BL_DONE_US, &status);
++   if (idle < 0) return -1;
++   if (!idle) result = 2;
++  }
++ }
++ /* Same restore as a completed panel120 switch: done status cleared, TPG off, FIFO reset, ABL's command settings back. */
++ if (!fg_scanout_write(FG_SCAN_DSI+0x110, (masks & ~2u) | 1u) ||
++     !fg_scanout_write(FG_SCAN_DSI+0x15c, 0) ||
++     !fg_scanout_write(FG_SCAN_DSI+0x1ec, 1)) return -1;
++ __asm__ volatile("dsb sy" ::: "memory");
++ delay(1);
++ if (!fg_scanout_write(FG_SCAN_DSI+0x1ec, 0) ||
++     !fg_scanout_write(FG_SCAN_DSI+0x03c, dma) ||
++     !fg_scanout_write(FG_SCAN_DSI+0x04c, length) ||
++     !fg_scanout_write(FG_SCAN_DSI+0x084, trigger) ||
++     !fg_scanout_write(FG_SCAN_DSI+0x110, masks)) return -1;
++ __asm__ volatile("dsb sy" ::: "memory");
++ return triggered ? result : 0;
++}
++/* Under FG_GUARD. 1: nothing waiting, or sent; 0: deferred (the level keeps waiting); -1: scanout stopped. via: 0 START, 1 timer. */
++static int fg_bl_flush(unsigned via)
++{
++ unsigned want = __atomic_load_n(&fg_bl_want, __ATOMIC_ACQUIRE);
++ if (!(want & FG_BL_PENDING)) return 1;
++ if (fg_bl_halted) {
++  (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++  return 1;
++ }
++ if (!fg_scanout_requested || !fg_scanout_panel120_requested || fg_scanout_failed || !fuxi_gpu_scanout_owned()) {
++  fg_bl_defer[FG_BL_D_OWNER]++;
++  if (!fg_scanout_requested || !fg_scanout_panel120_requested) {
++   if (!(fg_bl_said & 1)) { fg_bl_said |= 1; printf("FUXI BACKLIGHT DSI: not sent: needs fuxigpuscanout=1 fuxipanel120=1\n"); }
++  }
++  return 0;
++ }
++ if (!fg_scanout_panel120_attempted) { fg_bl_defer[FG_BL_D_PANEL120]++; return 0; }
++ if (fg_scanout_ar_on() || fg_scanout_ar_state == 4 || fg_scanout_mid_dirty) {
++  fg_bl_defer[FG_BL_D_AR]++;
++  if (!(fg_bl_said & 2)) { fg_bl_said |= 2; printf("FUXI BACKLIGHT DSI: deferred: autorefresh or mid-period START owns the trigger\n"); }
++  return 0;
++ }
++ unsigned ar, start, line;
++ if (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar) || !fg_scanout_read(FG_SCAN_CTL+0x1c, &start) ||
++     !fg_scanout_read(FG_SCAN_INTF+0x2b0, &line)) return fg_scanout_stop("backlight transfer status");
++ if ((ar & 0x80000000u) || (start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)) { fg_bl_defer[FG_BL_D_XFER]++; return 0; }
++ unsigned status, ctrl, dma, trigger, irq, tpg, length;
++ int idle = fg_bl_poll(0x008, 0x1f, 0, 0, FG_BL_IDLE_US, &status);
++ if (idle < 0 || !fg_scanout_read(FG_SCAN_DSI+0x004, &ctrl) || !fg_scanout_read(FG_SCAN_DSI+0x03c, &dma) ||
++     !fg_scanout_read(FG_SCAN_DSI+0x084, &trigger) || !fg_scanout_read(FG_SCAN_DSI+0x110, &irq) ||
++     !fg_scanout_read(FG_SCAN_DSI+0x15c, &tpg) || !fg_scanout_read(FG_SCAN_DSI+0x04c, &length))
++  return fg_scanout_stop("backlight setup MMIO");
++ /* The inherited command engine, an idle TPG and no pending error, as fg_panel120_switch requires. */
++ if (!idle || (ctrl & 7) != 5 || tpg || (irq & (1u << 24))) {
++  if (fg_bl_defer[FG_BL_D_DSI]++ < 4)
++   printf("FUXI BACKLIGHT DSI: deferred status=%#x ctrl=%#x tpg=%#x irq=%#x\n", status, ctrl, tpg, irq);
++  return 0;
++ }
++ uint64_t t0 = rsr("cntpct_el0");
++ unsigned level = want & FG_BL_MAX;
++ int r = fg_bl_send(level, trigger, dma, irq, length);
++ uint64_t ticks = rsr("cntpct_el0") - t0;
++ if (r < 0) {
++  printf("FUXI BACKLIGHT DSI: MMIO failure level=%u; panel state uncertain\n", level);
++  return fg_scanout_stop("backlight command MMIO");
++ }
++ if (!r) { fg_bl_defer[FG_BL_D_DSI]++; return 0; }
++ if (r == 2) {
++  unsigned after = 0;
++  fg_bl_halted = 1;
++  (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++  int quiet = fg_bl_poll(0x008, 0x1f, 0, 0, FG_SCAN_DSI_TIMEOUT_US, &after);
++  printf("FUXI BACKLIGHT DSI: level=%u no clean completion (status=%#x); registers restored, brightness halted for this boot\n",
++      level, after);
++  if (quiet != 1) return fg_scanout_stop("backlight command incomplete");
++  return 1;
++ }
++ /* Sent: clear the request unless a newer level arrived meanwhile (it stays pending for the next window). */
++ (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++ if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
++ if (++fg_bl_sent <= 8 || !(fg_bl_sent & 63)) {
++  uint64_t hz = rsr("cntfrq_el0");
++  unsigned *d = fg_bl_defer;
++  printf("FUXI BACKLIGHT DSI: level=%u sent=%u via=%s us=%llu max_us=%llu deferred owner/panel120/ar/xfer/dsi/gave_up=%u/%u/%u/%u/%u/%u\n",
++      level, fg_bl_sent, via ? "timer" : "start", (unsigned long long)(ticks*1000000/hz),
++      (unsigned long long)(fg_bl_ticks_max*1000000/hz), d[0], d[1], d[2], d[3], d[4], d[5]);
++ }
++ return 1;
++}
++static void fg_bl_run(thread_call_param_t a, thread_call_param_t b)
++{
++ (void)a; (void)b;
++ unsigned again = 0;
++ {
++  FG_GUARD;
++  if (fg_bl_flush(1) == 0) {
++   if (++fg_bl_tries < FG_BL_TRIES) again = 1;
++   else fg_bl_defer[FG_BL_D_GAVE_UP]++;
++  }
++ }
++ if (again) {
++  uint64_t d;
++  nanoseconds_to_absolutetime(FG_BL_RETRY_US*1000ull, &d);
++  (void)thread_call_enter_delayed(&fg_bl_call, mach_absolute_time() + d);
++ }
++}
++/* Any thread, no locks held: store the newest level and try to send it soon. */
++void fuxi_gpu_scanout_backlight(unsigned level);
++void fuxi_gpu_scanout_backlight(unsigned level)
++{
++ unsigned expect = 0;
++ if (level > FG_BL_MAX) level = FG_BL_MAX;
++ __atomic_store_n(&fg_bl_want, FG_BL_PENDING | level, __ATOMIC_RELEASE);
++ __atomic_store_n(&fg_bl_tries, 0u, __ATOMIC_RELAXED);
++ if (__atomic_compare_exchange_n(&fg_bl_call_setup, &expect, 1u, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++  thread_call_setup_with_options(&fg_bl_call, fg_bl_run, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
++  __atomic_store_n(&fg_bl_call_setup, 2u, __ATOMIC_RELEASE);
++ }
++ if (__atomic_load_n(&fg_bl_call_setup, __ATOMIC_ACQUIRE) == 2u) (void)thread_call_enter(&fg_bl_call);
++}
+ /* 1 writable, 0 wait, -1 held after error. Normal gates do not spin or sleep;
+  * the one-time panel120 switch uses bounded polling before granting writes.
+  * First
+@@ -2055,6 +2243,7 @@ static int fg_scanout_publish(void)
+      !fg_scanout_read(FG_SCAN_CTL+0x1c, &start) || (start & 1)))
+   return fg_scanout_stop("publish transfer status");
+  if (fg_abi_mid && !arm_on && !fg_scanout_mid_allow()) return 2; /* outside the tear-safe part of the period: the caller retries */
++ if (!arm_on && fg_bl_flush(0) < 0) return -1; /* fuxibacklight=4: a waiting brightness level goes out before this START */
+  fg_scanout_charge_to(fg_scanout_last_why); /* the last wait ran until this poll */
+  __asm__ volatile("dsb sy" ::: "memory");
+  if (!ov) fg_scanout_writable = 0;
+diff --git a/xnu/fuxi-backlight/FuxiBacklight.cpp b/xnu/fuxi-backlight/FuxiBacklight.cpp
+index c21104f..792aaaa 100644
+--- a/xnu/fuxi-backlight/FuxiBacklight.cpp
++++ b/xnu/fuxi-backlight/FuxiBacklight.cpp
+@@ -23,6 +23,10 @@
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
+ #include "fuxi_backlight_logic.h"
++#include "fuxi_dsi_backlight_logic.h"
++
++/* fuxibacklight=4: the AppleARMBacklight service in FuxiDsiBacklight.cpp (the display owner sends the levels). */
++void fuxi_dsi_backlight_publish(IOService *provider);
+ 
+ enum { BL_READ, BL_SET, BL_PROPERTIES, BL_OPEN, BL_METHOD, BL_BRIGHTNESS, BL_POWER, BL_COUNT };
+ static volatile SInt32 bl_events[BL_COUNT];
+@@ -302,6 +306,7 @@ void fuxi_backlight_publish(IOService *provider)
+ {
+ 	int enable = 0;
+ 	bool present = PE_parse_boot_argn("fuxibacklight", &enable, sizeof(enable));
++	if (fdbl_enabled(present, enable)) { fuxi_dsi_backlight_publish(provider); return; }
+ 	if (!fbl_enabled(present, enable)) return;
+ 	FuxiBacklight *service = new FuxiBacklight;
+ 	if (!service) { IOLog("FUXI BACKLIGHT: allocation failed\n"); return; }
+diff --git a/xnu/fuxi-backlight/FuxiDsiBacklight.cpp b/xnu/fuxi-backlight/FuxiDsiBacklight.cpp
+new file mode 100644
+index 0000000..3cd1b9c
+--- /dev/null
++++ b/xnu/fuxi-backlight/FuxiDsiBacklight.cpp
+@@ -0,0 +1,224 @@
++/*
++ * FUXI (fuxibacklight=4): panel brightness for iOS 16's CoreBrightness.
++ * CoreBrightness takes a backlight for the built-in display only when the service has backlight-control = true and conforms to
++ * AppleARMBacklight (-[CBDisplayContaineriOS findBacklight]); FuxiBacklight (modes 1-3) does not conform, so it never received a
++ * level. This kernel has no Apple AppleARMBacklight class (no AppleARMPlatform kext), so the service is that class itself, as
++ * AppleCLCD is. It publishes the panel's normal DBV range 0..2047 in IODisplayParameters brightness, accepts {brightness,
++ * FadePeriod (16.16 s)} through setProperties (flat, {value = n}, or wrapped in IODisplayParameters), fades on its own work loop in
++ * 16 ms steps and hands each level to the display owner (fuxi_gpu_scanout_backlight), which sends DCS 0x51 between transfers.
++ * setProperties never waits for the work loop: the newest request replaces one not yet taken. No MMIO in this file.
++ */
++#if defined(FUXI)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <libkern/OSAtomic.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++#include "fuxi_dsi_backlight_logic.h"
++
++extern "C" void fuxi_gpu_scanout_backlight(unsigned level);
++
++static volatile SInt32 dbl_events;
++
++/* Bounded description of a request: top-level keys with numbers or types, one nested level. */
++static void dbl_describe(uint32_t event, const char *prefix, OSDictionary *dict, unsigned depth)
++{
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++	if (!it) return;
++	unsigned shown = 0;
++	OSString *key;
++	while (shown < 16 && (key = OSDynamicCast(OSString, it->getNextObject()))) {
++		OSObject *value = dict->getObject(key);
++		OSNumber *number = OSDynamicCast(OSNumber, value);
++		OSDictionary *child = OSDynamicCast(OSDictionary, value);
++		shown++;
++		if (number)
++			IOLog("FUXI BACKLIGHT DSI: setProperties #%u %s%.64s number=%llu bits=%u\n", event, prefix,
++			    key->getCStringNoCopy(), number->unsigned64BitValue(), number->numberOfBits());
++		else
++			IOLog("FUXI BACKLIGHT DSI: setProperties #%u %s%.64s type=%s\n", event, prefix, key->getCStringNoCopy(),
++			    value ? value->getMetaClass()->getClassName() : "missing");
++		if (child && depth == 0) dbl_describe(event, "  ", child, 1);
++	}
++	it->release();
++}
++
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++	IOLock *fLock;
++	IOWorkLoop *fLoop;
++	IOTimerEventSource *fFade, *fRequest;
++	bool fFadeAdded, fRequestAdded, fFirst;
++	volatile uint64_t fPending;   /* fdbl_request(), taken by the work loop */
++	uint32_t fLevel, fFrom, fTo;  /* work loop only */
++	uint64_t fStart, fPeriod;     /* absolute time */
++	bool publishBrightness(uint32_t value);
++	void setLevel(uint32_t level);
++	void fadeStep(void);
++	static void requestFired(OSObject *owner, IOTimerEventSource *sender);
++	static void fadeFired(OSObject *owner, IOTimerEventSource *sender);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++bool AppleARMBacklight::publishBrightness(uint32_t value)
++{
++	OSDictionary *params = OSDictionary::withCapacity(1);
++	OSDictionary *brightness = OSDictionary::withCapacity(3);
++	OSNumber *minimum = OSNumber::withNumber(0ULL, 32);
++	OSNumber *maximum = OSNumber::withNumber(FDBL_MAX, 32);
++	OSNumber *current = OSNumber::withNumber(value, 32);
++	bool ok = params && brightness && minimum && maximum && current;
++	if (ok) ok = brightness->setObject("min", minimum) &&
++	    brightness->setObject("max", maximum) && brightness->setObject("value", current) &&
++	    params->setObject("brightness", brightness) && setProperty("IODisplayParameters", params);
++	OSSafeReleaseNULL(current);
++	OSSafeReleaseNULL(maximum);
++	OSSafeReleaseNULL(minimum);
++	OSSafeReleaseNULL(brightness);
++	OSSafeReleaseNULL(params);
++	return ok;
++}
++
++/* Work loop. */
++void AppleARMBacklight::setLevel(uint32_t level)
++{
++	if (level == fLevel) return;
++	fLevel = level;
++	fuxi_gpu_scanout_backlight(fdbl_level(level));
++}
++
++/* Work loop. */
++void AppleARMBacklight::fadeStep(void)
++{
++	uint64_t now = mach_absolute_time();
++	uint32_t next = fdbl_fade_at(fFrom, fTo, now - fStart, fPeriod);
++	setLevel(next);
++	if (next != fTo) fFade->setTimeoutMS(FDBL_STEP_MS);
++}
++
++void AppleARMBacklight::fadeFired(OSObject *owner, IOTimerEventSource *)
++{
++	AppleARMBacklight *self = OSDynamicCast(AppleARMBacklight, owner);
++	if (self) self->fadeStep();
++}
++
++void AppleARMBacklight::requestFired(OSObject *owner, IOTimerEventSource *)
++{
++	AppleARMBacklight *self = OSDynamicCast(AppleARMBacklight, owner);
++	if (!self) return;
++	uint64_t request = __atomic_exchange_n(&self->fPending, 0ull, __ATOMIC_ACQ_REL);
++	if (!(request & FDBL_PENDING)) return;
++	uint32_t goal = fdbl_request_goal(request), ms = fdbl_request_ms(request);
++	self->fFade->cancelTimeout();
++	/* The boot loader's level is unknown: the first request is applied at once instead of fading from a guess. */
++	if (self->fFirst) { self->fFirst = false; ms = 0; self->fLevel = ~0u; }
++	self->fFrom = self->fLevel == ~0u ? goal : self->fLevel;
++	self->fTo = goal;
++	self->fStart = mach_absolute_time();
++	nanoseconds_to_absolutetime((uint64_t)ms * 1000000ull, &self->fPeriod);
++	self->fadeStep();
++}
++
++bool AppleARMBacklight::start(IOService *provider)
++{
++	int enable = 0;
++	bool present = PE_parse_boot_argn("fuxibacklight", &enable, sizeof(enable));
++	if (!fdbl_enabled(present, enable)) return false;
++	if (!IOService::start(provider)) return false;
++	fLock = IOLockAlloc();
++	fLoop = IOWorkLoop::workLoop();
++	fFade = IOTimerEventSource::timerEventSource(this, &AppleARMBacklight::fadeFired);
++	fRequest = IOTimerEventSource::timerEventSource(this, &AppleARMBacklight::requestFired);
++	if (!fLock || !fLoop || !fFade || !fRequest) return false;
++	fFadeAdded = fLoop->addEventSource(fFade) == kIOReturnSuccess;
++	fRequestAdded = fLoop->addEventSource(fRequest) == kIOReturnSuccess;
++	if (!fFadeAdded || !fRequestAdded) return false;
++	fLevel = fFrom = fTo = FDBL_INITIAL;
++	fFirst = true;
++	if (!setProperty("backlight-control", kOSBooleanTrue) || !publishBrightness(FDBL_INITIAL)) return false;
++	registerService();
++	IOLog("FUXI BACKLIGHT DSI: published AppleARMBacklight min=0 max=%u value=%u; levels go to the display owner (DCS 0x51)\n",
++	    FDBL_MAX, FDBL_INITIAL);
++	return true;
++}
++
++void AppleARMBacklight::free(void)
++{
++	if (fLoop) {
++		if (fFade) { fFade->cancelTimeout(); if (fFadeAdded) fLoop->removeEventSource(fFade); }
++		if (fRequest) { fRequest->cancelTimeout(); if (fRequestAdded) fLoop->removeEventSource(fRequest); }
++	}
++	OSSafeReleaseNULL(fFade);
++	OSSafeReleaseNULL(fRequest);
++	OSSafeReleaseNULL(fLoop);
++	if (fLock) { IOLockFree(fLock); fLock = NULL; }
++	IOService::free();
++}
++
++IOReturn AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (!dict) return kIOReturnBadArgument;
++	if (!fRequest || !fLock) return kIOReturnNotReady;
++	uint32_t event = (uint32_t)OSIncrementAtomic(&dbl_events) + 1;
++	bool log = fdbl_log_this(event);
++	if (log) {
++		char name[33] = {};
++		proc_selfname(name, sizeof(name));
++		IOLog("FUXI BACKLIGHT DSI: setProperties #%u process=%.32s keys=%u\n", event, name, dict->getCount());
++		dbl_describe(event, "", dict, 0);
++	}
++	OSDictionary *params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
++	OSDictionary *source = params ? params : dict;
++	OSObject *value = source->getObject("brightness");
++	OSDictionary *range = OSDynamicCast(OSDictionary, value);
++	if (range) value = range->getObject("value");
++	OSNumber *brightness = OSDynamicCast(OSNumber, value);
++	OSNumber *fade = OSDynamicCast(OSNumber, source->getObject("FadePeriod"));
++	if (!fade && params) fade = OSDynamicCast(OSNumber, dict->getObject("FadePeriod"));
++	/* Other keys are accepted (and logged above): a refusal could stop CoreBrightness's whole update. */
++	if (!brightness) return kIOReturnSuccess;
++	uint32_t goal = fdbl_goal(brightness->unsigned64BitValue(), brightness->numberOfBits());
++	uint32_t ms = fdbl_fade_ms(fade ? fade->unsigned64BitValue() : 0);
++	__atomic_store_n(&fPending, fdbl_request(goal, ms), __ATOMIC_RELEASE);
++	fRequest->setTimeoutUS(1);
++	IOLockLock(fLock);
++	/* Replace the immutable registry dictionary; never mutate a reader's snapshot. */
++	bool ok = publishBrightness(goal);
++	IOLockUnlock(fLock);
++	if (log)
++		IOLog("FUXI BACKLIGHT DSI: brightness #%u goal=%u sent=%u fade_ms=%u published=%u\n", event, goal, fdbl_level(goal), ms, ok);
++	return kIOReturnSuccess;
++}
++
++/* Called from fuxi_backlight_publish (FuxiBacklight.cpp) under AppleCLCD before its registerService(). */
++void fuxi_dsi_backlight_publish(IOService *provider);
++void fuxi_dsi_backlight_publish(IOService *provider)
++{
++	AppleARMBacklight *service = new AppleARMBacklight;
++	if (!service) { IOLog("FUXI BACKLIGHT DSI: allocation failed\n"); return; }
++	if (!service->init()) {
++		IOLog("FUXI BACKLIGHT DSI: init failed\n");
++	} else if (!service->attach(provider)) {
++		IOLog("FUXI BACKLIGHT DSI: attach failed\n");
++	} else if (!service->start(provider)) {
++		IOLog("FUXI BACKLIGHT DSI: start failed\n");
++		service->detach(provider);
++	}
++	service->release(); /* registry attachment owns the successful service */
++}
++#endif /* FUXI */
+diff --git a/xnu/fuxi-backlight/fuxi_dsi_backlight_logic.h b/xnu/fuxi-backlight/fuxi_dsi_backlight_logic.h
+new file mode 100644
+index 0000000..b73c081
+--- /dev/null
++++ b/xnu/fuxi-backlight/fuxi_dsi_backlight_logic.h
+@@ -0,0 +1,57 @@
++/* fuxibacklight=4 policy: brightness request decoding, fade and the panel's DBV limits. No hardware access. */
++#ifndef FUXI_DSI_BACKLIGHT_LOGIC_H
++#define FUXI_DSI_BACKLIGHT_LOGIC_H
++#include <stdint.h>
++#define FDBL_MAX 2047u          /* panel normal maximum DBV (mi,mdss-dsi-fac-bl-max-level 0x7ff); HBM 0xfff is not offered */
++#define FDBL_MIN_SENT 8u        /* below this the panel goes fully dark */
++#define FDBL_INITIAL 1023u      /* the boot loader's level is not read back */
++#define FDBL_FADE_MAX_MS 5000u
++#define FDBL_STEP_MS 16u
++#define FDBL_PENDING (1ull << 63)
++static inline int fdbl_enabled(int present, int value)
++{
++	return present && value == 4;
++}
++/* An OSNumber of `bits` bits (a CFNumber from user space): a set sign bit is a negative request, 0. */
++static inline uint32_t fdbl_goal(uint64_t raw, unsigned bits)
++{
++	if (bits >= 1 && bits <= 64 && ((raw >> (bits - 1)) & 1u)) return 0;
++	return raw > FDBL_MAX ? FDBL_MAX : (uint32_t)raw;
++}
++/* FadePeriod is 16.16 fixed-point seconds. */
++static inline uint32_t fdbl_fade_ms(uint64_t fixed)
++{
++	if (fixed > (((uint64_t)FDBL_FADE_MAX_MS << 16) / 1000u) + 1u) return FDBL_FADE_MAX_MS;
++	uint64_t ms = (fixed * 1000u) >> 16;
++	return ms > FDBL_FADE_MAX_MS ? FDBL_FADE_MAX_MS : (uint32_t)ms;
++}
++/* The level actually sent: the panel's range, never fully dark. */
++static inline uint32_t fdbl_level(uint32_t goal)
++{
++	return goal > FDBL_MAX ? FDBL_MAX : goal < FDBL_MIN_SENT ? FDBL_MIN_SENT : goal;
++}
++/* setProperties -> work loop handoff in one 64-bit word: pending bit, goal, fade milliseconds. */
++static inline uint64_t fdbl_request(uint32_t goal, uint32_t ms)
++{
++	return FDBL_PENDING | ((uint64_t)(goal & 0xffffu) << 32) | ms;
++}
++static inline uint32_t fdbl_request_goal(uint64_t request)
++{
++	return (uint32_t)(request >> 32) & 0xffffu;
++}
++static inline uint32_t fdbl_request_ms(uint64_t request)
++{
++	return (uint32_t)request;
++}
++/* Linear fade from `from` to `to`; elapsed and period in the same time unit. */
++static inline uint32_t fdbl_fade_at(uint32_t from, uint32_t to, uint64_t elapsed, uint64_t period)
++{
++	if (!period || elapsed >= period) return to;
++	if (to >= from) return from + (uint32_t)((uint64_t)(to - from) * elapsed / period);
++	return from - (uint32_t)((uint64_t)(from - to) * elapsed / period);
++}
++static inline int fdbl_log_this(uint32_t event)
++{
++	return event && (event <= 64 || (event & 255u) == 0);
++}
++#endif
+diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
+index 64b3e28..0ca2838 100644
+--- a/xnu/patches/0098-fuxi-native-adreno-abi.patch
++++ b/xnu/patches/0098-fuxi-native-adreno-abi.patch
+@@ -1628,7 +1628,7 @@
+ +#endif
+ --- a/bsd/dev/fuxi_gpu_scanout.inc
+ +++ b/bsd/dev/fuxi_gpu_scanout.inc
+-@@ -0,0 +1,2386 @@
++@@ -0,0 +1,2575 @@
+ +/* SPDX-License-Identifier: MIT
+ + * Copyright (c) 2026 NativeMetal contributors
+ + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
+@@ -3425,6 +3425,194 @@
+ + printf("FUXI SCANOUT: panel120 aborted; panel state uncertain, reboot required\n");
+ + return fg_scanout_stop("panel120 switch incomplete");
+ +}
+++/* fuxibacklight=4: panel brightness. One DCS set_display_brightness (0x51, 11-bit level, high byte first; 0x7ff is the panel's
+++ * normal maximum, mi,mdss-dsi-fac-bl-max-level) through the command-DMA FIFO sequence of fg_panel120_switch, with a single long
+++ * packet. Only the display owner sends it, under FG_GUARD, between transfers: autorefresh off, CTL START clear, the write line idle
+++ * and the DSI controller idle. Every START is written under FG_GUARD (fg_scanout_publish), so no transfer can begin while the
+++ * command is on the link. A waiting level goes out right before the next START (animated screens) or from a short thread call
+++ * (static screens); a newer level replaces one not sent yet. The AppleARMBacklight service (FuxiDsiBacklight.cpp) only stores the
+++ * level here and never touches the hardware. Needs fuxigpuscanout=1 (ownership) and fuxipanel120=1 (only then is the DSI0 window
+++ * mapped). After an uncertain command (error raised, or no completion) the registers are restored as after a good one and no
+++ * further level is sent this boot; if the controller is then not idle, scanout stops (panel held) as after a failed panel120. */
+++#define FG_BL_PENDING 0x80000000u
+++#define FG_BL_MAX 2047u
+++#define FG_BL_IDLE_US 50u      /* MDP engine finishing the last lines after the write line went idle */
+++#define FG_BL_DONE_US 2000u    /* a 3-byte HS long write completes in microseconds */
+++#define FG_BL_RETRY_US 4000u   /* static screen: retry while a transfer still runs */
+++#define FG_BL_TRIES 12u        /* ~48 ms, longer than one 60 Hz transfer; later the next START sends it */
+++enum { FG_BL_D_OWNER, FG_BL_D_PANEL120, FG_BL_D_AR, FG_BL_D_XFER, FG_BL_D_DSI, FG_BL_D_GAVE_UP, FG_BL_D_N };
+++static unsigned fg_bl_want, fg_bl_tries, fg_bl_halted, fg_bl_call_setup, fg_bl_sent, fg_bl_said, fg_bl_defer[FG_BL_D_N];
+++static uint64_t fg_bl_ticks_max;
+++static thread_call_data_t fg_bl_call;
+++/* The two FIFO words of one DCS long write: header (flags 0xc0 = long packet + last of the batch, data type 0x39, 3 bytes), then
+++ * the payload bytes 0x51, level high byte, level low byte and one pad byte 0xff (the FIFO takes word pairs). */
+++static void fg_bl_words(unsigned level, uint32_t words[2])
+++{
+++ words[0] = 3u | (0x39u << 16) | (0xc0u << 24);
+++ words[1] = 0x51u | (((level >> 8) & 0xffu) << 8) | ((level & 0xffu) << 16) | (0xffu << 24);
+++}
+++/* Bounded poll of a DSI register: 1 (status & mask) == want, 0 timeout, -1 MMIO failure. any=1: done when (status & mask) != 0. */
+++static int fg_bl_poll(unsigned offset, unsigned mask, unsigned want, unsigned any, unsigned limit_us, unsigned *status)
+++{
+++ uint64_t deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")*limit_us/1000000;
+++ for (unsigned n = 0; n <= limit_us; n++) {
+++  if (!fg_scanout_read(FG_SCAN_DSI+offset, status)) return -1;
+++  if (any ? (*status & mask) != 0 : (*status & mask) == want) return 1;
+++  if (rsr("cntpct_el0") >= deadline) break;
+++  delay(1);
+++ }
+++ return 0;
+++}
+++/* 1 sent, 0 not sent (a stale DMA-done that would not clear; registers restored), 2 uncertain (triggered without a clean
+++ * completion; registers restored), -1 MMIO failure. trigger/dma/irq/length are the values read before. */
+++static int fg_bl_send(unsigned level, unsigned trigger, unsigned dma, unsigned irq, unsigned length)
+++{
+++ uint32_t words[2];
+++ unsigned masks = irq & 0xaaaaaaaau, status = 0, triggered = 0;
+++ int result = 0;
+++ fg_bl_words(level, words);
+++ /* Software DMA trigger 4, MDP/TE trigger fields kept; DMA_TRG_MUX bit16 and BLOCK_DMA_WITHIN_FRAME bit12 cleared while idle. */
+++ if (!fg_scanout_write(FG_SCAN_DSI+0x084, (trigger & ~0x1100fu) | 4) ||
+++     !fg_scanout_write(FG_SCAN_DSI+0x110, (masks & ~2u) | 1u)) return -1;
+++ int cleared = fg_bl_poll(0x110, 1, 0, 0, FG_BL_IDLE_US, &status); /* the stale DMA-done must read clear before the trigger */
+++ if (cleared < 0) return -1;
+++ if (cleared) {
+++  if (!fg_scanout_write(FG_SCAN_DSI+0x1ec, 1)) return -1;
+++  __asm__ volatile("dsb sy" ::: "memory");
+++  delay(1);
+++  if (!fg_scanout_write(FG_SCAN_DSI+0x1ec, 0) ||
+++      !fg_scanout_write(FG_SCAN_DSI+0x15c, 0x00030006) ||
+++      !fg_scanout_write(FG_SCAN_DSI+0x17c, words[0]) ||
+++      !fg_scanout_write(FG_SCAN_DSI+0x17c, words[1]) ||
+++      /* Embedded register FIFO, unicast HS: broadcast/master/LP all clear. */
+++      !fg_scanout_write(FG_SCAN_DSI+0x03c, (dma & ~0xc4000000u) | 0x10000000u) ||
+++      !fg_scanout_write(FG_SCAN_DSI+0x04c, 8)) return -1;
+++  __asm__ volatile("dsb sy" ::: "memory");
+++  if (!fg_scanout_write(FG_SCAN_DSI+0x090, 1)) return -1;
+++  triggered = 1;
+++  int done = fg_bl_poll(0x110, 1u | (1u << 24), 0, 1, FG_BL_DONE_US, &status);
+++  if (done < 0) return -1;
+++  result = done && !(status & (1u << 24)) ? 1 : 2;
+++  if (result == 1) {
+++   int idle = fg_bl_poll(0x008, 0x1f, 0, 0, FG_BL_DONE_US, &status);
+++   if (idle < 0) return -1;
+++   if (!idle) result = 2;
+++  }
+++ }
+++ /* Same restore as a completed panel120 switch: done status cleared, TPG off, FIFO reset, ABL's command settings back. */
+++ if (!fg_scanout_write(FG_SCAN_DSI+0x110, (masks & ~2u) | 1u) ||
+++     !fg_scanout_write(FG_SCAN_DSI+0x15c, 0) ||
+++     !fg_scanout_write(FG_SCAN_DSI+0x1ec, 1)) return -1;
+++ __asm__ volatile("dsb sy" ::: "memory");
+++ delay(1);
+++ if (!fg_scanout_write(FG_SCAN_DSI+0x1ec, 0) ||
+++     !fg_scanout_write(FG_SCAN_DSI+0x03c, dma) ||
+++     !fg_scanout_write(FG_SCAN_DSI+0x04c, length) ||
+++     !fg_scanout_write(FG_SCAN_DSI+0x084, trigger) ||
+++     !fg_scanout_write(FG_SCAN_DSI+0x110, masks)) return -1;
+++ __asm__ volatile("dsb sy" ::: "memory");
+++ return triggered ? result : 0;
+++}
+++/* Under FG_GUARD. 1: nothing waiting, or sent; 0: deferred (the level keeps waiting); -1: scanout stopped. via: 0 START, 1 timer. */
+++static int fg_bl_flush(unsigned via)
+++{
+++ unsigned want = __atomic_load_n(&fg_bl_want, __ATOMIC_ACQUIRE);
+++ if (!(want & FG_BL_PENDING)) return 1;
+++ if (fg_bl_halted) {
+++  (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+++  return 1;
+++ }
+++ if (!fg_scanout_requested || !fg_scanout_panel120_requested || fg_scanout_failed || !fuxi_gpu_scanout_owned()) {
+++  fg_bl_defer[FG_BL_D_OWNER]++;
+++  if (!fg_scanout_requested || !fg_scanout_panel120_requested) {
+++   if (!(fg_bl_said & 1)) { fg_bl_said |= 1; printf("FUXI BACKLIGHT DSI: not sent: needs fuxigpuscanout=1 fuxipanel120=1\n"); }
+++  }
+++  return 0;
+++ }
+++ if (!fg_scanout_panel120_attempted) { fg_bl_defer[FG_BL_D_PANEL120]++; return 0; }
+++ if (fg_scanout_ar_on() || fg_scanout_ar_state == 4 || fg_scanout_mid_dirty) {
+++  fg_bl_defer[FG_BL_D_AR]++;
+++  if (!(fg_bl_said & 2)) { fg_bl_said |= 2; printf("FUXI BACKLIGHT DSI: deferred: autorefresh or mid-period START owns the trigger\n"); }
+++  return 0;
+++ }
+++ unsigned ar, start, line;
+++ if (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar) || !fg_scanout_read(FG_SCAN_CTL+0x1c, &start) ||
+++     !fg_scanout_read(FG_SCAN_INTF+0x2b0, &line)) return fg_scanout_stop("backlight transfer status");
+++ if ((ar & 0x80000000u) || (start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)) { fg_bl_defer[FG_BL_D_XFER]++; return 0; }
+++ unsigned status, ctrl, dma, trigger, irq, tpg, length;
+++ int idle = fg_bl_poll(0x008, 0x1f, 0, 0, FG_BL_IDLE_US, &status);
+++ if (idle < 0 || !fg_scanout_read(FG_SCAN_DSI+0x004, &ctrl) || !fg_scanout_read(FG_SCAN_DSI+0x03c, &dma) ||
+++     !fg_scanout_read(FG_SCAN_DSI+0x084, &trigger) || !fg_scanout_read(FG_SCAN_DSI+0x110, &irq) ||
+++     !fg_scanout_read(FG_SCAN_DSI+0x15c, &tpg) || !fg_scanout_read(FG_SCAN_DSI+0x04c, &length))
+++  return fg_scanout_stop("backlight setup MMIO");
+++ /* The inherited command engine, an idle TPG and no pending error, as fg_panel120_switch requires. */
+++ if (!idle || (ctrl & 7) != 5 || tpg || (irq & (1u << 24))) {
+++  if (fg_bl_defer[FG_BL_D_DSI]++ < 4)
+++   printf("FUXI BACKLIGHT DSI: deferred status=%#x ctrl=%#x tpg=%#x irq=%#x\n", status, ctrl, tpg, irq);
+++  return 0;
+++ }
+++ uint64_t t0 = rsr("cntpct_el0");
+++ unsigned level = want & FG_BL_MAX;
+++ int r = fg_bl_send(level, trigger, dma, irq, length);
+++ uint64_t ticks = rsr("cntpct_el0") - t0;
+++ if (r < 0) {
+++  printf("FUXI BACKLIGHT DSI: MMIO failure level=%u; panel state uncertain\n", level);
+++  return fg_scanout_stop("backlight command MMIO");
+++ }
+++ if (!r) { fg_bl_defer[FG_BL_D_DSI]++; return 0; }
+++ if (r == 2) {
+++  unsigned after = 0;
+++  fg_bl_halted = 1;
+++  (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+++  int quiet = fg_bl_poll(0x008, 0x1f, 0, 0, FG_SCAN_DSI_TIMEOUT_US, &after);
+++  printf("FUXI BACKLIGHT DSI: level=%u no clean completion (status=%#x); registers restored, brightness halted for this boot\n",
+++      level, after);
+++  if (quiet != 1) return fg_scanout_stop("backlight command incomplete");
+++  return 1;
+++ }
+++ /* Sent: clear the request unless a newer level arrived meanwhile (it stays pending for the next window). */
+++ (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+++ if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
+++ if (++fg_bl_sent <= 8 || !(fg_bl_sent & 63)) {
+++  uint64_t hz = rsr("cntfrq_el0");
+++  unsigned *d = fg_bl_defer;
+++  printf("FUXI BACKLIGHT DSI: level=%u sent=%u via=%s us=%llu max_us=%llu deferred owner/panel120/ar/xfer/dsi/gave_up=%u/%u/%u/%u/%u/%u\n",
+++      level, fg_bl_sent, via ? "timer" : "start", (unsigned long long)(ticks*1000000/hz),
+++      (unsigned long long)(fg_bl_ticks_max*1000000/hz), d[0], d[1], d[2], d[3], d[4], d[5]);
+++ }
+++ return 1;
+++}
+++static void fg_bl_run(thread_call_param_t a, thread_call_param_t b)
+++{
+++ (void)a; (void)b;
+++ unsigned again = 0;
+++ {
+++  FG_GUARD;
+++  if (fg_bl_flush(1) == 0) {
+++   if (++fg_bl_tries < FG_BL_TRIES) again = 1;
+++   else fg_bl_defer[FG_BL_D_GAVE_UP]++;
+++  }
+++ }
+++ if (again) {
+++  uint64_t d;
+++  nanoseconds_to_absolutetime(FG_BL_RETRY_US*1000ull, &d);
+++  (void)thread_call_enter_delayed(&fg_bl_call, mach_absolute_time() + d);
+++ }
+++}
+++/* Any thread, no locks held: store the newest level and try to send it soon. */
+++void fuxi_gpu_scanout_backlight(unsigned level);
+++void fuxi_gpu_scanout_backlight(unsigned level)
+++{
+++ unsigned expect = 0;
+++ if (level > FG_BL_MAX) level = FG_BL_MAX;
+++ __atomic_store_n(&fg_bl_want, FG_BL_PENDING | level, __ATOMIC_RELEASE);
+++ __atomic_store_n(&fg_bl_tries, 0u, __ATOMIC_RELAXED);
+++ if (__atomic_compare_exchange_n(&fg_bl_call_setup, &expect, 1u, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+++  thread_call_setup_with_options(&fg_bl_call, fg_bl_run, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+++  __atomic_store_n(&fg_bl_call_setup, 2u, __ATOMIC_RELEASE);
+++ }
+++ if (__atomic_load_n(&fg_bl_call_setup, __ATOMIC_ACQUIRE) == 2u) (void)thread_call_enter(&fg_bl_call);
+++}
+ +/* 1 writable, 0 wait, -1 held after error. Normal gates do not spin or sleep;
+ + * the one-time panel120 switch uses bounded polling before granting writes.
+ + * First
+@@ -3686,6 +3874,7 @@
+ +     !fg_scanout_read(FG_SCAN_CTL+0x1c, &start) || (start & 1)))
+ +  return fg_scanout_stop("publish transfer status");
+ + if (fg_abi_mid && !arm_on && !fg_scanout_mid_allow()) return 2; /* outside the tear-safe part of the period: the caller retries */
+++ if (!arm_on && fg_bl_flush(0) < 0) return -1; /* fuxibacklight=4: a waiting brightness level goes out before this START */
+ + fg_scanout_charge_to(fg_scanout_last_why); /* the last wait ran until this poll */
+ + __asm__ volatile("dsb sy" ::: "memory");
+ + if (!ov) fg_scanout_writable = 0;
+diff --git a/xnu/patches/0109-fuxi-backlight.patch b/xnu/patches/0109-fuxi-backlight.patch
+index 87c156b..da5cf7d 100644
+--- a/xnu/patches/0109-fuxi-backlight.patch
++++ b/xnu/patches/0109-fuxi-backlight.patch
+@@ -1,16 +1,17 @@
+ --- a/iokit/conf/files.arm64
+ +++ b/iokit/conf/files.arm64
+-@@ -15,6 +15,7 @@
++@@ -15,6 +15,8 @@
+  iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+  iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+  iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ +iokit/Kernel/arm/FuxiBacklight.cpp                                optional iokitcpp
+++iokit/Kernel/arm/FuxiDsiBacklight.cpp                             optional iokitcpp
+  iokit/Kernel/arm/FuxiAdrenoUserClient.cpp                         optional iokitcpp
+  iokit/Kernel/arm/FuxiWLAN.cpp                                    optional iokitcpp
+  iokit/Kernel/arm/FuxiNetworkStack.cpp                            optional iokitcpp
+ --- /dev/null
+ +++ b/iokit/Kernel/arm/FuxiBacklight.cpp
+-@@ -0,0 +1,356 @@
++@@ -0,0 +1,361 @@
+ +/*
+ + * FUXI backlight-control observer and opt-in logical power notifications.
+ + * Published by AppleCLCD before its first registerService(), only on opt-in.
+@@ -36,6 +37,10 @@
+ +#include <kern/clock.h>
+ +#include <mach/mach_time.h>
+ +#include "fuxi_backlight_logic.h"
+++#include "fuxi_dsi_backlight_logic.h"
+++
+++/* fuxibacklight=4: the AppleARMBacklight service in FuxiDsiBacklight.cpp (the display owner sends the levels). */
+++void fuxi_dsi_backlight_publish(IOService *provider);
+ +
+ +enum { BL_READ, BL_SET, BL_PROPERTIES, BL_OPEN, BL_METHOD, BL_BRIGHTNESS, BL_POWER, BL_COUNT };
+ +static volatile SInt32 bl_events[BL_COUNT];
+@@ -315,6 +320,7 @@
+ +{
+ +	int enable = 0;
+ +	bool present = PE_parse_boot_argn("fuxibacklight", &enable, sizeof(enable));
+++	if (fdbl_enabled(present, enable)) { fuxi_dsi_backlight_publish(provider); return; }
+ +	if (!fbl_enabled(present, enable)) return;
+ +	FuxiBacklight *service = new FuxiBacklight;
+ +	if (!service) { IOLog("FUXI BACKLIGHT: allocation failed\n"); return; }
+@@ -406,3 +412,290 @@
+ +	return value <= FUXI_BACKLIGHT_MAX;
+ +}
+ +#endif
++--- /dev/null
+++++ b/iokit/Kernel/arm/FuxiDsiBacklight.cpp
++@@ -0,0 +1,224 @@
+++/*
+++ * FUXI (fuxibacklight=4): panel brightness for iOS 16's CoreBrightness.
+++ * CoreBrightness takes a backlight for the built-in display only when the service has backlight-control = true and conforms to
+++ * AppleARMBacklight (-[CBDisplayContaineriOS findBacklight]); FuxiBacklight (modes 1-3) does not conform, so it never received a
+++ * level. This kernel has no Apple AppleARMBacklight class (no AppleARMPlatform kext), so the service is that class itself, as
+++ * AppleCLCD is. It publishes the panel's normal DBV range 0..2047 in IODisplayParameters brightness, accepts {brightness,
+++ * FadePeriod (16.16 s)} through setProperties (flat, {value = n}, or wrapped in IODisplayParameters), fades on its own work loop in
+++ * 16 ms steps and hands each level to the display owner (fuxi_gpu_scanout_backlight), which sends DCS 0x51 between transfers.
+++ * setProperties never waits for the work loop: the newest request replaces one not yet taken. No MMIO in this file.
+++ */
+++#if defined(FUXI)
+++#include <IOKit/IOService.h>
+++#include <IOKit/IOLib.h>
+++#include <IOKit/IOLocks.h>
+++#include <IOKit/IOWorkLoop.h>
+++#include <IOKit/IOTimerEventSource.h>
+++#include <libkern/OSAtomic.h>
+++#include <libkern/c++/OSBoolean.h>
+++#include <libkern/c++/OSCollectionIterator.h>
+++#include <libkern/c++/OSData.h>
+++#include <libkern/c++/OSDictionary.h>
+++#include <libkern/c++/OSNumber.h>
+++#include <libkern/c++/OSString.h>
+++#include <pexpert/pexpert.h>
+++#include <sys/proc.h>
+++#include <kern/clock.h>
+++#include "fuxi_dsi_backlight_logic.h"
+++
+++extern "C" void fuxi_gpu_scanout_backlight(unsigned level);
+++
+++static volatile SInt32 dbl_events;
+++
+++/* Bounded description of a request: top-level keys with numbers or types, one nested level. */
+++static void dbl_describe(uint32_t event, const char *prefix, OSDictionary *dict, unsigned depth)
+++{
+++	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
+++	if (!it) return;
+++	unsigned shown = 0;
+++	OSString *key;
+++	while (shown < 16 && (key = OSDynamicCast(OSString, it->getNextObject()))) {
+++		OSObject *value = dict->getObject(key);
+++		OSNumber *number = OSDynamicCast(OSNumber, value);
+++		OSDictionary *child = OSDynamicCast(OSDictionary, value);
+++		shown++;
+++		if (number)
+++			IOLog("FUXI BACKLIGHT DSI: setProperties #%u %s%.64s number=%llu bits=%u\n", event, prefix,
+++			    key->getCStringNoCopy(), number->unsigned64BitValue(), number->numberOfBits());
+++		else
+++			IOLog("FUXI BACKLIGHT DSI: setProperties #%u %s%.64s type=%s\n", event, prefix, key->getCStringNoCopy(),
+++			    value ? value->getMetaClass()->getClassName() : "missing");
+++		if (child && depth == 0) dbl_describe(event, "  ", child, 1);
+++	}
+++	it->release();
+++}
+++
+++class AppleARMBacklight : public IOService {
+++	OSDeclareDefaultStructors(AppleARMBacklight);
+++	IOLock *fLock;
+++	IOWorkLoop *fLoop;
+++	IOTimerEventSource *fFade, *fRequest;
+++	bool fFadeAdded, fRequestAdded, fFirst;
+++	volatile uint64_t fPending;   /* fdbl_request(), taken by the work loop */
+++	uint32_t fLevel, fFrom, fTo;  /* work loop only */
+++	uint64_t fStart, fPeriod;     /* absolute time */
+++	bool publishBrightness(uint32_t value);
+++	void setLevel(uint32_t level);
+++	void fadeStep(void);
+++	static void requestFired(OSObject *owner, IOTimerEventSource *sender);
+++	static void fadeFired(OSObject *owner, IOTimerEventSource *sender);
+++public:
+++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+++	void free(void) APPLE_KEXT_OVERRIDE;
+++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+++};
+++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+++
+++bool AppleARMBacklight::publishBrightness(uint32_t value)
+++{
+++	OSDictionary *params = OSDictionary::withCapacity(1);
+++	OSDictionary *brightness = OSDictionary::withCapacity(3);
+++	OSNumber *minimum = OSNumber::withNumber(0ULL, 32);
+++	OSNumber *maximum = OSNumber::withNumber(FDBL_MAX, 32);
+++	OSNumber *current = OSNumber::withNumber(value, 32);
+++	bool ok = params && brightness && minimum && maximum && current;
+++	if (ok) ok = brightness->setObject("min", minimum) &&
+++	    brightness->setObject("max", maximum) && brightness->setObject("value", current) &&
+++	    params->setObject("brightness", brightness) && setProperty("IODisplayParameters", params);
+++	OSSafeReleaseNULL(current);
+++	OSSafeReleaseNULL(maximum);
+++	OSSafeReleaseNULL(minimum);
+++	OSSafeReleaseNULL(brightness);
+++	OSSafeReleaseNULL(params);
+++	return ok;
+++}
+++
+++/* Work loop. */
+++void AppleARMBacklight::setLevel(uint32_t level)
+++{
+++	if (level == fLevel) return;
+++	fLevel = level;
+++	fuxi_gpu_scanout_backlight(fdbl_level(level));
+++}
+++
+++/* Work loop. */
+++void AppleARMBacklight::fadeStep(void)
+++{
+++	uint64_t now = mach_absolute_time();
+++	uint32_t next = fdbl_fade_at(fFrom, fTo, now - fStart, fPeriod);
+++	setLevel(next);
+++	if (next != fTo) fFade->setTimeoutMS(FDBL_STEP_MS);
+++}
+++
+++void AppleARMBacklight::fadeFired(OSObject *owner, IOTimerEventSource *)
+++{
+++	AppleARMBacklight *self = OSDynamicCast(AppleARMBacklight, owner);
+++	if (self) self->fadeStep();
+++}
+++
+++void AppleARMBacklight::requestFired(OSObject *owner, IOTimerEventSource *)
+++{
+++	AppleARMBacklight *self = OSDynamicCast(AppleARMBacklight, owner);
+++	if (!self) return;
+++	uint64_t request = __atomic_exchange_n(&self->fPending, 0ull, __ATOMIC_ACQ_REL);
+++	if (!(request & FDBL_PENDING)) return;
+++	uint32_t goal = fdbl_request_goal(request), ms = fdbl_request_ms(request);
+++	self->fFade->cancelTimeout();
+++	/* The boot loader's level is unknown: the first request is applied at once instead of fading from a guess. */
+++	if (self->fFirst) { self->fFirst = false; ms = 0; self->fLevel = ~0u; }
+++	self->fFrom = self->fLevel == ~0u ? goal : self->fLevel;
+++	self->fTo = goal;
+++	self->fStart = mach_absolute_time();
+++	nanoseconds_to_absolutetime((uint64_t)ms * 1000000ull, &self->fPeriod);
+++	self->fadeStep();
+++}
+++
+++bool AppleARMBacklight::start(IOService *provider)
+++{
+++	int enable = 0;
+++	bool present = PE_parse_boot_argn("fuxibacklight", &enable, sizeof(enable));
+++	if (!fdbl_enabled(present, enable)) return false;
+++	if (!IOService::start(provider)) return false;
+++	fLock = IOLockAlloc();
+++	fLoop = IOWorkLoop::workLoop();
+++	fFade = IOTimerEventSource::timerEventSource(this, &AppleARMBacklight::fadeFired);
+++	fRequest = IOTimerEventSource::timerEventSource(this, &AppleARMBacklight::requestFired);
+++	if (!fLock || !fLoop || !fFade || !fRequest) return false;
+++	fFadeAdded = fLoop->addEventSource(fFade) == kIOReturnSuccess;
+++	fRequestAdded = fLoop->addEventSource(fRequest) == kIOReturnSuccess;
+++	if (!fFadeAdded || !fRequestAdded) return false;
+++	fLevel = fFrom = fTo = FDBL_INITIAL;
+++	fFirst = true;
+++	if (!setProperty("backlight-control", kOSBooleanTrue) || !publishBrightness(FDBL_INITIAL)) return false;
+++	registerService();
+++	IOLog("FUXI BACKLIGHT DSI: published AppleARMBacklight min=0 max=%u value=%u; levels go to the display owner (DCS 0x51)\n",
+++	    FDBL_MAX, FDBL_INITIAL);
+++	return true;
+++}
+++
+++void AppleARMBacklight::free(void)
+++{
+++	if (fLoop) {
+++		if (fFade) { fFade->cancelTimeout(); if (fFadeAdded) fLoop->removeEventSource(fFade); }
+++		if (fRequest) { fRequest->cancelTimeout(); if (fRequestAdded) fLoop->removeEventSource(fRequest); }
+++	}
+++	OSSafeReleaseNULL(fFade);
+++	OSSafeReleaseNULL(fRequest);
+++	OSSafeReleaseNULL(fLoop);
+++	if (fLock) { IOLockFree(fLock); fLock = NULL; }
+++	IOService::free();
+++}
+++
+++IOReturn AppleARMBacklight::setProperties(OSObject *properties)
+++{
+++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+++	if (!dict) return kIOReturnBadArgument;
+++	if (!fRequest || !fLock) return kIOReturnNotReady;
+++	uint32_t event = (uint32_t)OSIncrementAtomic(&dbl_events) + 1;
+++	bool log = fdbl_log_this(event);
+++	if (log) {
+++		char name[33] = {};
+++		proc_selfname(name, sizeof(name));
+++		IOLog("FUXI BACKLIGHT DSI: setProperties #%u process=%.32s keys=%u\n", event, name, dict->getCount());
+++		dbl_describe(event, "", dict, 0);
+++	}
+++	OSDictionary *params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
+++	OSDictionary *source = params ? params : dict;
+++	OSObject *value = source->getObject("brightness");
+++	OSDictionary *range = OSDynamicCast(OSDictionary, value);
+++	if (range) value = range->getObject("value");
+++	OSNumber *brightness = OSDynamicCast(OSNumber, value);
+++	OSNumber *fade = OSDynamicCast(OSNumber, source->getObject("FadePeriod"));
+++	if (!fade && params) fade = OSDynamicCast(OSNumber, dict->getObject("FadePeriod"));
+++	/* Other keys are accepted (and logged above): a refusal could stop CoreBrightness's whole update. */
+++	if (!brightness) return kIOReturnSuccess;
+++	uint32_t goal = fdbl_goal(brightness->unsigned64BitValue(), brightness->numberOfBits());
+++	uint32_t ms = fdbl_fade_ms(fade ? fade->unsigned64BitValue() : 0);
+++	__atomic_store_n(&fPending, fdbl_request(goal, ms), __ATOMIC_RELEASE);
+++	fRequest->setTimeoutUS(1);
+++	IOLockLock(fLock);
+++	/* Replace the immutable registry dictionary; never mutate a reader's snapshot. */
+++	bool ok = publishBrightness(goal);
+++	IOLockUnlock(fLock);
+++	if (log)
+++		IOLog("FUXI BACKLIGHT DSI: brightness #%u goal=%u sent=%u fade_ms=%u published=%u\n", event, goal, fdbl_level(goal), ms, ok);
+++	return kIOReturnSuccess;
+++}
+++
+++/* Called from fuxi_backlight_publish (FuxiBacklight.cpp) under AppleCLCD before its registerService(). */
+++void fuxi_dsi_backlight_publish(IOService *provider);
+++void fuxi_dsi_backlight_publish(IOService *provider)
+++{
+++	AppleARMBacklight *service = new AppleARMBacklight;
+++	if (!service) { IOLog("FUXI BACKLIGHT DSI: allocation failed\n"); return; }
+++	if (!service->init()) {
+++		IOLog("FUXI BACKLIGHT DSI: init failed\n");
+++	} else if (!service->attach(provider)) {
+++		IOLog("FUXI BACKLIGHT DSI: attach failed\n");
+++	} else if (!service->start(provider)) {
+++		IOLog("FUXI BACKLIGHT DSI: start failed\n");
+++		service->detach(provider);
+++	}
+++	service->release(); /* registry attachment owns the successful service */
+++}
+++#endif /* FUXI */
++--- /dev/null
+++++ b/iokit/Kernel/arm/fuxi_dsi_backlight_logic.h
++@@ -0,0 +1,57 @@
+++/* fuxibacklight=4 policy: brightness request decoding, fade and the panel's DBV limits. No hardware access. */
+++#ifndef FUXI_DSI_BACKLIGHT_LOGIC_H
+++#define FUXI_DSI_BACKLIGHT_LOGIC_H
+++#include <stdint.h>
+++#define FDBL_MAX 2047u          /* panel normal maximum DBV (mi,mdss-dsi-fac-bl-max-level 0x7ff); HBM 0xfff is not offered */
+++#define FDBL_MIN_SENT 8u        /* below this the panel goes fully dark */
+++#define FDBL_INITIAL 1023u      /* the boot loader's level is not read back */
+++#define FDBL_FADE_MAX_MS 5000u
+++#define FDBL_STEP_MS 16u
+++#define FDBL_PENDING (1ull << 63)
+++static inline int fdbl_enabled(int present, int value)
+++{
+++	return present && value == 4;
+++}
+++/* An OSNumber of `bits` bits (a CFNumber from user space): a set sign bit is a negative request, 0. */
+++static inline uint32_t fdbl_goal(uint64_t raw, unsigned bits)
+++{
+++	if (bits >= 1 && bits <= 64 && ((raw >> (bits - 1)) & 1u)) return 0;
+++	return raw > FDBL_MAX ? FDBL_MAX : (uint32_t)raw;
+++}
+++/* FadePeriod is 16.16 fixed-point seconds. */
+++static inline uint32_t fdbl_fade_ms(uint64_t fixed)
+++{
+++	if (fixed > (((uint64_t)FDBL_FADE_MAX_MS << 16) / 1000u) + 1u) return FDBL_FADE_MAX_MS;
+++	uint64_t ms = (fixed * 1000u) >> 16;
+++	return ms > FDBL_FADE_MAX_MS ? FDBL_FADE_MAX_MS : (uint32_t)ms;
+++}
+++/* The level actually sent: the panel's range, never fully dark. */
+++static inline uint32_t fdbl_level(uint32_t goal)
+++{
+++	return goal > FDBL_MAX ? FDBL_MAX : goal < FDBL_MIN_SENT ? FDBL_MIN_SENT : goal;
+++}
+++/* setProperties -> work loop handoff in one 64-bit word: pending bit, goal, fade milliseconds. */
+++static inline uint64_t fdbl_request(uint32_t goal, uint32_t ms)
+++{
+++	return FDBL_PENDING | ((uint64_t)(goal & 0xffffu) << 32) | ms;
+++}
+++static inline uint32_t fdbl_request_goal(uint64_t request)
+++{
+++	return (uint32_t)(request >> 32) & 0xffffu;
+++}
+++static inline uint32_t fdbl_request_ms(uint64_t request)
+++{
+++	return (uint32_t)request;
+++}
+++/* Linear fade from `from` to `to`; elapsed and period in the same time unit. */
+++static inline uint32_t fdbl_fade_at(uint32_t from, uint32_t to, uint64_t elapsed, uint64_t period)
+++{
+++	if (!period || elapsed >= period) return to;
+++	if (to >= from) return from + (uint32_t)((uint64_t)(to - from) * elapsed / period);
+++	return from - (uint32_t)((uint64_t)(from - to) * elapsed / period);
+++}
+++static inline int fdbl_log_this(uint32_t event)
+++{
+++	return event && (event <= 64 || (event & 255u) == 0);
+++}
+++#endif
