@@ -44,6 +44,8 @@ jobs:
           git -C source apply ../harness/patches/native-smoke-class.patch
           git -C source apply --check ../harness/patches/native-ca-smoke-class.patch
           git -C source apply ../harness/patches/native-ca-smoke-class.patch
+          git -C source apply --check ../harness/patches/fuxi-tudebug-bootarg.patch
+          git -C source apply ../harness/patches/fuxi-tudebug-bootarg.patch
           cp harness/patches/nativemetal-fuxi-0004-optional-answers.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0005-completion-handlers.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0006-uchar3-constant.patch source/tools/patches/
