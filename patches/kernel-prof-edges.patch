@@ -1,8 +1,8 @@
 diff --git a/xnu/fuxi-prof/sweet_prof_sample.c b/xnu/fuxi-prof/sweet_prof_sample.c
-index b17a628..2cb6ecb 100644
+index b17a628..7fdab1a 100644
 --- a/xnu/fuxi-prof/sweet_prof_sample.c
 +++ b/xnu/fuxi-prof/sweet_prof_sample.c
-@@ -92,6 +92,22 @@ static void sp_pc_print(void) {
+@@ -92,9 +92,25 @@ static void sp_pc_print(void) {
  #define SP_INC_FRAMES 24u
  static struct sp_pc sp_incs[SP_INC_BUCKETS];
  static unsigned sp_inc_dropped,sp_inc_samples,sp_inc_by[3]; /* samples by class: 0 live (on a core), 1 waiting, 2 runnable off-core */
@@ -14,7 +14,7 @@ index b17a628..2cb6ecb 100644
 +static struct sp_edge sp_edges[SP_EDGE_BUCKETS];
 +static unsigned sp_edge_dropped;
 +static void sp_edge_add(uint64_t a,uint64_t b) {
-+ uint64_t h=(a>>6)*0x9e3779b97f4a7c15ULL^(b>>6);
++ uint64_t h=(a>>2)*0x9e3779b97f4a7c15ULL^(b>>2);
 + for(unsigned i=0;i<64;i++){
 +  struct sp_edge *e=&sp_edges[(h+i)%SP_EDGE_BUCKETS];
 +  if(!e->n){e->a=a;e->b=b;e->n=1;return;}
@@ -24,8 +24,31 @@ index b17a628..2cb6ecb 100644
 +}
  static unsigned long long sp_inc_frames;
  static void sp_inc_add(uint64_t tid,uint64_t pc) {
-  uint64_t h=(pc>>6)^(tid*0x9e3779b97f4a7c15ULL);
-@@ -123,6 +139,12 @@ static void sp_inc_sample(vm_map_t map,uint64_t tid,unsigned cls,uint64_t pc,uin
+- uint64_t h=(pc>>6)^(tid*0x9e3779b97f4a7c15ULL);
++ uint64_t h=(pc>>2)*0x9e3779b97f4a7c15ULL^tid;
+  for(unsigned i=0;i<64;i++){
+   struct sp_pc *e=&sp_incs[(h+i)%SP_INC_BUCKETS];
+   if(!e->n){e->tid=tid;e->pc=pc;e->n=1;return;}
+@@ -108,13 +124,15 @@ static void sp_inc_sample(vm_map_t map,uint64_t tid,unsigned cls,uint64_t pc,uin
+  tid|=(uint64_t)cls<<60;
+  uint64_t seen[SP_INC_FRAMES+2];unsigned k=0;
+  const uint64_t mask=((uint64_t)1<<47)-1;
+- seen[k++]=(pc&mask)&~(uint64_t)63;
+- if(lr)seen[k++]=(lr&mask)&~(uint64_t)63;
++ /* a live pc is anywhere in a function: bucket it; return addresses (lr, frames) and a blocked thread's trap pc are exact call
++  * sites, kept exact so they symbolize to the caller (a 64-byte bucket can start in the previous function). */
++ seen[k++]=cls==0 ? (pc&mask)&~(uint64_t)63 : pc&mask;
++ if(lr)seen[k++]=lr&mask;
+  uint64_t base=fp;
+  for(unsigned n=0;n<SP_INC_FRAMES && fp && !(fp&7) && fp>=base && fp-base<1024*1024;n++) {
+   uint64_t frame[2];
+   if(vm_map_read_user(map,fp,frame,sizeof(frame))!=KERN_SUCCESS)break;
+-  if(frame[1])seen[k++]=(frame[1]&mask)&~(uint64_t)63;
++  if(frame[1])seen[k++]=frame[1]&mask;
+   sp_inc_frames++;
+   if(frame[0]<=fp)break;fp=frame[0];
+  }
+@@ -123,6 +141,12 @@ static void sp_inc_sample(vm_map_t map,uint64_t tid,unsigned cls,uint64_t pc,uin
    for(unsigned j=0;j<i;j++)if(seen[j]==seen[i]){dup=1;break;}
    if(!dup)sp_inc_add(tid,seen[i]);
   }
@@ -38,7 +61,7 @@ index b17a628..2cb6ecb 100644
   sp_inc_samples++;if(cls<3)sp_inc_by[cls]++;
  }
  static void sp_inc_print(void) {
-@@ -134,6 +156,14 @@ static void sp_inc_print(void) {
+@@ -134,6 +158,14 @@ static void sp_inc_print(void) {
    sp_incs[best].n=0;
   }
   printf("PROFINC done samples=%u live=%u wait=%u ready=%u dropped=%u frames=%llu\n",sp_inc_samples,sp_inc_by[0],sp_inc_by[1],sp_inc_by[2],sp_inc_dropped,sp_inc_frames);
@@ -53,7 +76,7 @@ index b17a628..2cb6ecb 100644
  }
  #endif
  void sweet_prof_task(task_t task,int pid);
-@@ -212,7 +242,7 @@ void sweet_prof_task(task_t task,int pid) {
+@@ -212,7 +244,7 @@ void sweet_prof_task(task_t task,int pid) {
  #ifndef SP_NO_LIVE
   nanoseconds_to_absolutetime(200*NSEC_PER_USEC,&sp_live_wait);
   memset(sp_pcs,0,sizeof(sp_pcs));sp_pc_dropped=0;
@@ -63,7 +86,7 @@ index b17a628..2cb6ecb 100644
   uint64_t start=mach_absolute_time(),end=start+duration;deadline=start;
   while(mach_absolute_time()<end) {
 diff --git a/xnu/patches/0111-fuxi-user-profiler.patch b/xnu/patches/0111-fuxi-user-profiler.patch
-index 9235427..6b86b17 100644
+index 9235427..8349337 100644
 --- a/xnu/patches/0111-fuxi-user-profiler.patch
 +++ b/xnu/patches/0111-fuxi-user-profiler.patch
 @@ -90,7 +90,7 @@
@@ -71,11 +94,11 @@ index 9235427..6b86b17 100644
  --- /dev/null
  +++ b/osfmk/kern/sweet_prof_sample.c
 -@@ -0,0 +1,233 @@
-+@@ -0,0 +1,263 @@
++@@ -0,0 +1,265 @@
  +/* Saved user stacks are approximate; no target suspension or logging per sweep. */
  +#include <pexpert/arm64/board_config.h>
  +#if defined(FUXI)
-@@ -185,6 +185,22 @@
+@@ -185,9 +185,25 @@
  +#define SP_INC_FRAMES 24u
  +static struct sp_pc sp_incs[SP_INC_BUCKETS];
  +static unsigned sp_inc_dropped,sp_inc_samples,sp_inc_by[3]; /* samples by class: 0 live (on a core), 1 waiting, 2 runnable off-core */
@@ -87,7 +110,7 @@ index 9235427..6b86b17 100644
 ++static struct sp_edge sp_edges[SP_EDGE_BUCKETS];
 ++static unsigned sp_edge_dropped;
 ++static void sp_edge_add(uint64_t a,uint64_t b) {
-++ uint64_t h=(a>>6)*0x9e3779b97f4a7c15ULL^(b>>6);
+++ uint64_t h=(a>>2)*0x9e3779b97f4a7c15ULL^(b>>2);
 ++ for(unsigned i=0;i<64;i++){
 ++  struct sp_edge *e=&sp_edges[(h+i)%SP_EDGE_BUCKETS];
 ++  if(!e->n){e->a=a;e->b=b;e->n=1;return;}
@@ -97,8 +120,31 @@ index 9235427..6b86b17 100644
 ++}
  +static unsigned long long sp_inc_frames;
  +static void sp_inc_add(uint64_t tid,uint64_t pc) {
- + uint64_t h=(pc>>6)^(tid*0x9e3779b97f4a7c15ULL);
-@@ -216,6 +232,12 @@
+-+ uint64_t h=(pc>>6)^(tid*0x9e3779b97f4a7c15ULL);
+++ uint64_t h=(pc>>2)*0x9e3779b97f4a7c15ULL^tid;
+ + for(unsigned i=0;i<64;i++){
+ +  struct sp_pc *e=&sp_incs[(h+i)%SP_INC_BUCKETS];
+ +  if(!e->n){e->tid=tid;e->pc=pc;e->n=1;return;}
+@@ -201,13 +217,15 @@
+ + tid|=(uint64_t)cls<<60;
+ + uint64_t seen[SP_INC_FRAMES+2];unsigned k=0;
+ + const uint64_t mask=((uint64_t)1<<47)-1;
+-+ seen[k++]=(pc&mask)&~(uint64_t)63;
+-+ if(lr)seen[k++]=(lr&mask)&~(uint64_t)63;
+++ /* a live pc is anywhere in a function: bucket it; return addresses (lr, frames) and a blocked thread's trap pc are exact call
+++  * sites, kept exact so they symbolize to the caller (a 64-byte bucket can start in the previous function). */
+++ seen[k++]=cls==0 ? (pc&mask)&~(uint64_t)63 : pc&mask;
+++ if(lr)seen[k++]=lr&mask;
+ + uint64_t base=fp;
+ + for(unsigned n=0;n<SP_INC_FRAMES && fp && !(fp&7) && fp>=base && fp-base<1024*1024;n++) {
+ +  uint64_t frame[2];
+ +  if(vm_map_read_user(map,fp,frame,sizeof(frame))!=KERN_SUCCESS)break;
+-+  if(frame[1])seen[k++]=(frame[1]&mask)&~(uint64_t)63;
+++  if(frame[1])seen[k++]=frame[1]&mask;
+ +  sp_inc_frames++;
+ +  if(frame[0]<=fp)break;fp=frame[0];
+ + }
+@@ -216,6 +234,12 @@
  +  for(unsigned j=0;j<i;j++)if(seen[j]==seen[i]){dup=1;break;}
  +  if(!dup)sp_inc_add(tid,seen[i]);
  + }
@@ -111,7 +157,7 @@ index 9235427..6b86b17 100644
  + sp_inc_samples++;if(cls<3)sp_inc_by[cls]++;
  +}
  +static void sp_inc_print(void) {
-@@ -227,6 +249,14 @@
+@@ -227,6 +251,14 @@
  +  sp_incs[best].n=0;
  + }
  + printf("PROFINC done samples=%u live=%u wait=%u ready=%u dropped=%u frames=%llu\n",sp_inc_samples,sp_inc_by[0],sp_inc_by[1],sp_inc_by[2],sp_inc_dropped,sp_inc_frames);
@@ -126,7 +172,7 @@ index 9235427..6b86b17 100644
  +}
  +#endif
  +void sweet_prof_task(task_t task,int pid);
-@@ -305,7 +335,7 @@
+@@ -305,7 +337,7 @@
  +#ifndef SP_NO_LIVE
  + nanoseconds_to_absolutetime(200*NSEC_PER_USEC,&sp_live_wait);
  + memset(sp_pcs,0,sizeof(sp_pcs));sp_pc_dropped=0;
