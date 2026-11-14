@@ -1,0 +1,454 @@
+diff --git a/crates/metal2vulkan-runtime/src/fuxi_census.rs b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+index 9de3c57..da88442 100644
+--- a/crates/metal2vulkan-runtime/src/fuxi_census.rs
++++ b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+@@ -8,9 +8,11 @@
+ //! the plan's instantiation, the rest of `draw_resident` (heap sets, passes, Vulkan recording),
+ //! the bookkeeping after it, and the time between two draws (the caller's work). The rest of
+ //! `draw_resident` is split again at nine marks (heap sets, instance, tables, shadows, fixed state,
+-//! notices, pipeline lookup, bind, uses) and the recording after them. Every 10 s a thread that
+-//! drew writes `FUXI HYB` lines to stderr, one write per line. Diagnostics only: nothing here
+-//! changes what is drawn.
++//! notices, pipeline lookup, bind, uses) and the recording after them. The entry, the settle and
++//! the recording are split again (`pre`, `settle` and `rec` lines), and the settle counts how its
++//! bind shape came (kept, found among the state's lately settled ones, or made). Every 10 s a
++//! thread that drew writes `FUXI HYB` lines to stderr, one write per line. Diagnostics only:
++//! nothing here changes what is drawn.
+ 
+ use std::cell::{Cell, RefCell};
+ use std::collections::HashMap;
+@@ -63,11 +65,27 @@ pub(crate) enum Event {
+     Bounds = 3,
+     Capture = 4,
+     Skipped = 5,
++    /// Not a step: the settle's refresh may have changed the bind shape.
++    Reshaped = 6,
++    /// Not a step: the shape was one the drawing state settled lately.
++    ShapeFound = 7,
++    /// Not a step: the shape was made again.
++    ShapeMade = 8,
+ }
+-const EVENTS: usize = 6;
++const EVENTS: usize = 9;
+ const EVENT_NAMES: [&str; EVENTS] = [
+-    "reformat", "restart", "rewrite", "bounds", "capture", "skipped",
++    "reformat",
++    "restart",
++    "rewrite",
++    "bounds",
++    "capture",
++    "skipped",
++    "reshaped",
++    "shapefound",
++    "shapemade",
+ ];
++/// The events that are runtime steps (a draw with one is not eligible); the rest are counts.
++const STEP_EVENTS: u16 = (1 << 6) - 1;
+ 
+ /// Structural traits of a drawing pipeline (bits of `end`'s `traits`).
+ pub(crate) const TESSELLATION: u32 = 1 << 0;
+@@ -89,8 +107,22 @@ pub(crate) const MULTISAMPLE: u32 = 1 << 14;
+ pub(crate) const NO_PIPELINE: u32 = 1 << 15;
+ const TRAITS: usize = 16;
+ const TRAIT_NAMES: [&str; TRAITS] = [
+-    "tess", "mesh", "fetch", "storage", "imageblock", "shadowstencil", "amp", "sampleshading",
+-    "shadertests", "tilemem", "functables", "vpindex", "vtxwrites", "discard", "msaa", "nopipe",
++    "tess",
++    "mesh",
++    "fetch",
++    "storage",
++    "imageblock",
++    "shadowstencil",
++    "amp",
++    "sampleshading",
++    "shadertests",
++    "tilemem",
++    "functables",
++    "vpindex",
++    "vtxwrites",
++    "discard",
++    "msaa",
++    "nopipe",
+ ];
+ 
+ /// The structural traits of the drawing pipeline `state` (the bits above).
+@@ -174,16 +206,51 @@ pub(crate) enum Mark {
+     Bind = 11,
+     /// After the ordering checks, reach notes, heap set and sampler listing.
+     Uses = 12,
++    /// The entry, split: after the extended-range shadows' start and the reroute.
++    PreShadows = 13,
++    /// After the draw's settings.
++    PreSettings = 14,
++    /// After the argument samplers, function tables, capture check and pass-start tables.
++    PreTables = 15,
++    /// The settle, split: after the bind state's refresh from the encoder's tables.
++    Refreshed = 16,
++    /// After the state's other fields and the reshape.
++    Fields = 17,
++    /// After the bind shape (kept, found or made).
++    Shaped = 18,
++    /// After the drawing state's settle of the shape.
++    Looked = 19,
++    /// The recording, split: after the record and pending checks and the again/capture flags.
++    Prepared = 20,
++    /// After the instance's install, the steps before the draw and the storage barrier.
++    SetUp = 21,
++    /// After the Vulkan recording itself.
++    Recording = 22,
++    /// After the draw kept for a reroute and for capture.
++    Kept = 23,
++    /// After the notices, the bound announcement and the execution record.
++    Noted = 24,
++    /// After the retains.
++    Retained = 25,
+ }
+-const MARKS: usize = 13;
++const MARKS: usize = 26;
+ /// The rest's pieces, from `Instantiated` through each split mark to `Recorded`.
+ const REST_MARKS: [usize; 9] = [4, 5, 6, 7, 8, 9, 10, 11, 12];
+ const RESTS: usize = REST_MARKS.len() + 1;
+ const REST_NAMES: [&str; RESTS] = [
+     "heap", "instance", "tables", "shadows", "fixed", "notices", "pipe", "bind", "uses", "rec",
+ ];
++/// The entry's pieces, from the draw's start through each mark to `Settle`.
++const PRE_MARKS: [usize; 3] = [13, 14, 15];
++const PRE_NAMES: [&str; 4] = ["ext", "settings", "tables", "colors"];
++/// The settle's pieces, from `Settle` through each mark to `Settled`.
++const SETTLE_MARKS: [usize; 4] = [16, 17, 18, 19];
++const SETTLE_NAMES: [&str; 5] = ["refresh", "fields", "shape", "lookup", "fit"];
++/// The recording's pieces, from `Uses` through each mark to `Recorded`.
++const REC_MARKS: [usize; 6] = [20, 21, 22, 23, 24, 25];
++const REC_NAMES: [&str; 7] = ["prep", "setup", "record", "keep", "notes", "retain", "tail"];
+ 
+-#[derive(Clone, Copy, Default)]
++#[derive(Clone, Copy)]
+ struct Current {
+     marks: [u64; MARKS],
+     events: u16,
+@@ -191,6 +258,48 @@ struct Current {
+     variant: usize,
+ }
+ 
++/// One split of a phase: its pieces' nanoseconds over the draws that reached every mark.
++#[derive(Clone, Copy)]
++struct Split<const N: usize> {
++    ns: [u64; N],
++    draws: u64,
++}
++
++impl<const N: usize> Default for Split<N> {
++    fn default() -> Self {
++        Split {
++            ns: [0; N],
++            draws: 0,
++        }
++    }
++}
++
++impl<const N: usize> Split<N> {
++    /// Add `cur`'s pieces from mark time `from` through `marks` to `to`, where all are set.
++    fn add<const M: usize>(&mut self, cur: &Current, from: u64, marks: [usize; M], to: u64) {
++        debug_assert_eq!(M + 1, N);
++        if from == 0 || to == 0 || marks.iter().any(|&m| cur.marks[m] == 0) {
++            return;
++        }
++        let mut at = from;
++        for (piece, &m) in self.ns.iter_mut().zip(&marks) {
++            *piece += cur.marks[m].saturating_sub(at);
++            at = at.max(cur.marks[m]);
++        }
++        self.ns[N - 1] += to.saturating_sub(at);
++        self.draws += 1;
++    }
++
++    /// The report line `{head} {name} n=.. piece=..`.
++    fn line(&self, head: &str, name: &str, names: [&str; N]) -> String {
++        let mut text = format!("{head} {name} n={}", self.draws);
++        for (piece, ns) in names.iter().zip(self.ns) {
++            text.push_str(&format!(" {piece}={:.1}", us(ns, self.draws)));
++        }
++        text
++    }
++}
++
+ #[derive(Default)]
+ struct Stats {
+     id: u32,
+@@ -207,6 +316,9 @@ struct Stats {
+     /// The rest's pieces (`REST_NAMES`), over the `rest_draws` draws that reached every mark.
+     rest_ns: [u64; RESTS],
+     rest_draws: u64,
++    pre: Split<4>,
++    settle: Split<5>,
++    rec: Split<7>,
+     between_ns: u64,
+     between: u64,
+     same_pipeline: u64,
+@@ -220,8 +332,13 @@ struct Stats {
+     variants: HashMap<usize, u64>,
+ }
+ 
++// The current draw's marks, events, bind calls and variant, each in a cell of its own: a mark
++// writes one word, not a copy of the whole draw.
+ thread_local! {
+-    static CURRENT: Cell<Current> = const { Cell::new(Current { marks: [0; MARKS], events: 0, sets: 0, variant: 0 }) };
++    static MARKS_NOW: [Cell<u64>; MARKS] = const { [const { Cell::new(0) }; MARKS] };
++    static EVENTS_NOW: Cell<u16> = const { Cell::new(0) };
++    static SETS_NOW: Cell<u16> = const { Cell::new(0) };
++    static VARIANT_NOW: Cell<usize> = const { Cell::new(0) };
+     static STATS: RefCell<Option<Box<Stats>>> = const { RefCell::new(None) };
+ }
+ 
+@@ -304,11 +421,7 @@ fn now() -> u64 {
+ #[inline]
+ pub(crate) fn set(kind: Set) {
+     if on() {
+-        CURRENT.with(|c| {
+-            let mut cur = c.get();
+-            cur.sets |= 1 << kind as u16;
+-            c.set(cur);
+-        });
++        SETS_NOW.with(|c| c.set(c.get() | 1 << kind as u16));
+     }
+ }
+ 
+@@ -316,11 +429,7 @@ pub(crate) fn set(kind: Set) {
+ #[inline]
+ pub(crate) fn event(event: Event) {
+     if on() {
+-        CURRENT.with(|c| {
+-            let mut cur = c.get();
+-            cur.events |= 1 << event as u16;
+-            c.set(cur);
+-        });
++        EVENTS_NOW.with(|c| c.set(c.get() | 1 << event as u16));
+     }
+ }
+ 
+@@ -329,11 +438,7 @@ pub(crate) fn event(event: Event) {
+ pub(crate) fn mark(mark: Mark) {
+     if on() {
+         let t = now();
+-        CURRENT.with(|c| {
+-            let mut cur = c.get();
+-            cur.marks[mark as usize] = t;
+-            c.set(cur);
+-        });
++        MARKS_NOW.with(|m| m[mark as usize].set(t));
+     }
+ }
+ 
+@@ -341,11 +446,7 @@ pub(crate) fn mark(mark: Mark) {
+ #[inline]
+ pub(crate) fn variant(address: usize) {
+     if on() {
+-        CURRENT.with(|c| {
+-            let mut cur = c.get();
+-            cur.variant = address;
+-            c.set(cur);
+-        });
++        VARIANT_NOW.with(|c| c.set(address));
+     }
+ }
+ 
+@@ -356,26 +457,21 @@ pub(crate) fn begin() -> Option<u64> {
+         return None;
+     }
+     let t = now();
+-    CURRENT.with(|c| {
+-        let mut cur = c.get();
+-        cur.marks = [0; MARKS];
+-        cur.events = 0;
+-        cur.variant = 0;
+-        c.set(cur);
+-    });
++    MARKS_NOW.with(|m| m.iter().for_each(|c| c.set(0)));
++    EVENTS_NOW.with(|c| c.set(0));
++    VARIANT_NOW.with(|c| c.set(0));
+     Some(t)
+ }
+ 
+ /// The draw that began at `start` ends, drawn by the pipeline at `pipeline` with `traits`.
+ pub(crate) fn end(start: u64, pipeline: usize, traits: u32) {
+     let t = now();
+-    let cur = CURRENT.with(|c| {
+-        let cur = c.get();
+-        let mut next = cur;
+-        next.sets = 0;
+-        c.set(next);
+-        cur
+-    });
++    let cur = Current {
++        marks: MARKS_NOW.with(|m| std::array::from_fn(|i| m[i].get())),
++        events: EVENTS_NOW.with(Cell::get),
++        sets: SETS_NOW.with(|c| c.replace(0)),
++        variant: VARIANT_NOW.with(Cell::get),
++    };
+     STATS.with(|s| {
+         let mut slot = s.borrow_mut();
+         let stats = slot.get_or_insert_with(|| {
+@@ -430,6 +526,10 @@ fn record(stats: &mut Stats, cur: &Current, start: u64, t: u64, pipeline: usize,
+             stats.rest_ns[RESTS - 1] += recorded.saturating_sub(at);
+             stats.rest_draws += 1;
+         }
++        stats.pre.add(cur, start, PRE_MARKS, settle);
++        stats.settle.add(cur, settle, SETTLE_MARKS, settled);
++        let uses = cur.marks[Mark::Uses as usize];
++        stats.rec.add(cur, uses, REC_MARKS, recorded);
+     } else {
+         stats.phase_ns[0] += total;
+     }
+@@ -462,7 +562,7 @@ fn record(stats: &mut Stats, cur: &Current, start: u64, t: u64, pipeline: usize,
+         *count += u64::from((cur.sets >> bit) & 1);
+     }
+     *stats.masks.entry(cur.sets).or_default() += 1;
+-    if traits == 0 && cur.events == 0 {
++    if traits == 0 && cur.events & STEP_EVENTS == 0 {
+         stats.eligible += 1;
+         stats.eligible_ns += total;
+     }
+@@ -515,6 +615,12 @@ fn report(stats: &Stats, t: u64) {
+     }
+     rest.push('\n');
+     line(&rest);
++    line(&format!("{}\n", stats.pre.line(&head, "pre", PRE_NAMES)));
++    line(&format!(
++        "{}\n",
++        stats.settle.line(&head, "settle", SETTLE_NAMES)
++    ));
++    line(&format!("{}\n", stats.rec.line(&head, "rec", REC_NAMES)));
+     let mut traits = format!("{head} traits");
+     for (name, count) in TRAIT_NAMES.iter().zip(stats.traits) {
+         if count != 0 {
+diff --git a/crates/metal2vulkan-runtime/src/live_bind.rs b/crates/metal2vulkan-runtime/src/live_bind.rs
+index 8696754..fae0a7a 100644
+--- a/crates/metal2vulkan-runtime/src/live_bind.rs
++++ b/crates/metal2vulkan-runtime/src/live_bind.rs
+@@ -53,6 +53,11 @@ impl Reshape {
+         }
+     }
+ 
++    /// Whether a change may have changed the shape (the FUXI census counts it).
++    pub(super) fn changed(self) -> bool {
++        self.0
++    }
++
+     /// A slot of a kept stage table unbound.
+     pub(super) fn unbound(&mut self) {
+         self.0 = true;
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 415ea57..3ad2255 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -5879,6 +5879,7 @@ impl RenderCommandEncoder {
+                 .collect();
+             self.reroute(&own, &pipeline)?;
+         }
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::PreShadows);
+         // What the draw settles from the encoder's state, as an execution's precompile at commit
+         // settles it (`draw_settings`).
+         // An indexed strip the encoder's call restarts at another index than Vulkan's is drawn
+@@ -5890,6 +5891,7 @@ impl RenderCommandEncoder {
+         }
+         let assembly = restarted.map_or(assembly, |r| r.assembly());
+         let settings = self.draw_settings(call, &pipeline, assembly, true)?;
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::PreSettings);
+         let (topology, primitive_restart) = (settings.topology, settings.primitive_restart);
+         let unsized_points = settings.unsized_points;
+         let (native, compensation) = (settings.native, settings.compensation);
+@@ -5925,6 +5927,7 @@ impl RenderCommandEncoder {
+                 &pipeline.base().interface,
+             )?,
+         };
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::PreTables);
+         if capture.is_none() {
+             self.degrade_kept_colors(&pipeline, &settings.routing);
+         }
+@@ -7094,6 +7097,7 @@ impl RenderCommandEncoder {
+             && self.state.reach_state().is_some();
+         // A draw that rasterizes nothing reaches no tile: it changes nothing the capture finds.
+         let rasterizes = !graphics.rasterizer_discard;
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Prepared);
+         // Recording starts here: nothing below can be refused.
+         self.driver_restarts |= tessellated;
+         if let Some(made) = made {
+@@ -7190,6 +7194,7 @@ impl RenderCommandEncoder {
+                 self.current.pieces.push(Piece::Pending(self.pending.len()));
+                 (making, state, draws, query)
+             });
++            crate::fuxi_census::mark(crate::fuxi_census::Mark::SetUp);
+             let made_now = match &draw_pipeline {
+                 DrawPipeline::Made(made) => Some(made.raw),
+                 DrawPipeline::Making(_) => None,
+@@ -7248,6 +7253,7 @@ impl RenderCommandEncoder {
+                 }
+             }
+             device.shared().counts.draw_states_recorded(states_recorded);
++            crate::fuxi_census::mark(crate::fuxi_census::Mark::Recording);
+             if let Some((making, state, draws, query)) = split {
+                 // The record's times: the pipeline's, then those of the other `VkPipeline`s the
+                 // draw records, made at the draw, set once the making made it. Every copy of the
+@@ -7297,6 +7303,7 @@ impl RenderCommandEncoder {
+             if rasterizes {
+                 self.keep_capture(capturable, (call, assembly, draw), index);
+             }
++            crate::fuxi_census::mark(crate::fuxi_census::Mark::Kept);
+             if pushes.len() > 1 {
+                 let count = pushes.len();
+                 device.degrade(Degradation::AmplificationDraws, || {
+@@ -7354,6 +7361,7 @@ impl RenderCommandEncoder {
+                 execution.with_index_padding(padding)
+             });
+         }
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Noted);
+         let made = match draw_pipeline {
+             DrawPipeline::Made(made) => Some(made),
+             DrawPipeline::Making(_) => None,
+@@ -7394,6 +7402,7 @@ impl RenderCommandEncoder {
+         if heap.is_some() && !function_tables.is_empty() {
+             self.core.retain(function_tables);
+         }
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Retained);
+         if capture.is_some() {
+             self.capture_uses(uses);
+         } else {
+@@ -7685,6 +7694,7 @@ impl RenderCommandEncoder {
+                 (argument_samplers, function_tables),
+                 (interface, &sampler_maps),
+             );
++            crate::fuxi_census::mark(crate::fuxi_census::Mark::Refreshed);
+             let state = &mut live.state;
+             reshape.field(
+                 &mut state.vertex_amplification,
+@@ -7720,9 +7730,21 @@ impl RenderCommandEncoder {
+             reshape.field(&mut state.imageblock_size, imageblock_size);
+             reshape.field(&mut state.render_area, render_area);
+             reshape.field(&mut state.tile_threadgroup, tile_threadgroup);
++            if reshape.changed() {
++                crate::fuxi_census::event(crate::fuxi_census::Event::Reshaped);
++            }
+             live.reshaped(reshape);
++            crate::fuxi_census::mark(crate::fuxi_census::Mark::Fields);
+             let counts = &self.core.device().shared().counts;
+-            let shape = live.shape(counts, |state| pipeline.kept_shape(state));
++            let shape = live.shape(counts, |state| {
++                let found = pipeline.kept_shape(state);
++                crate::fuxi_census::event(match found {
++                    Some(_) => crate::fuxi_census::Event::ShapeFound,
++                    None => crate::fuxi_census::Event::ShapeMade,
++                });
++                found
++            });
++            crate::fuxi_census::mark(crate::fuxi_census::Mark::Shaped);
+             // Through what the pipeline state settled lately (`GraphicsState::settle_shape`).
+             let settled = match pipeline.settle_shape(&shape, self.forms) {
+                 // A variant whose shadows the storage form or the bind layer refuses (a mesh
+@@ -7754,6 +7776,7 @@ impl RenderCommandEncoder {
+                 }
+                 settled => settled?,
+             };
++            crate::fuxi_census::mark(crate::fuxi_census::Mark::Looked);
+             let set = settled.variant.pipeline().layout.sets.get(1);
+             if heap_sets::fit_samplers(set, argument_samplers, unlisted) {
+                 return Ok(settled);
