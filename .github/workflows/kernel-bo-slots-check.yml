@@ -19,6 +19,7 @@ on:
       - patches/kernel-prof-edges.patch
       - patches/kernel-taps-presets.patch
       - patches/kernel-input-fixes.patch
+      - patches/kernel-taps-page2.patch
       - tests/test-perf-governor.py
       - tests/test-ib-profile.py
       - tests/test-surface-plane-result.py
@@ -81,6 +82,8 @@ jobs:
           git -C source apply ../harness/patches/kernel-taps-presets.patch
           git -C source apply --check ../harness/patches/kernel-input-fixes.patch
           git -C source apply ../harness/patches/kernel-input-fixes.patch
+          git -C source apply --check ../harness/patches/kernel-taps-page2.patch
+          git -C source apply ../harness/patches/kernel-taps-page2.patch
           (cd source && python3 tools/test-fuxi-prof.py)
       - name: Build and audit kernel
         shell: bash
