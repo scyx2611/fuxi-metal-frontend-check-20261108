@@ -122,7 +122,7 @@ static int fg_scanout_read(unsigned pa, unsigned *value)
 	unsigned off = pa - FG_SCAN_DSI;
 	if (off == 0x110) { *value = (dsi[0x110/4] & 0xaaaaaaaau) | (done_bit || sticky_done) | (err_bit << 24); return 1; }
 	if (off == 0x008) {
-		unsigned busy = (dma_running || wedged) ? 2u : 0u;
+		unsigned busy = dma_running ? 2u : 0u; /* wedged: a triggered DMA that the FIFO reset does not stop */
 		if (mdp_busy_reads) { mdp_busy_reads--; busy |= 4u; }
 		*value = busy; return 1;
 	}
