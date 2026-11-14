@@ -3,6 +3,8 @@ name: Rebuild Turnip for the hybrid lane
 # inputs it came from (ios-fuxi f44bf569, Mesa 85fda3b, UniXNU fb6aad6a, Xcode 16.2) and compare
 # the dylib with the one on the phone. Later hybrid-lane Turnip patches (patches/mesa-hyb-*.patch)
 # are appended to the same recipe.
+# Run 43602667374 rebuilt 04ae43c0... (same size, __text 456 bytes shorter than the deployed
+# build); a second run tells whether the recipe itself is deterministic.
 on:
   push:
     branches:
