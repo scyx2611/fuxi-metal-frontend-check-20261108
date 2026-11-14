@@ -69,6 +69,7 @@ jobs:
           cp harness/patches/metal2vulkan-fuxi-0008-shadow-log.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0009-linear-align.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0010-draw-census.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0011-census-rest.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |

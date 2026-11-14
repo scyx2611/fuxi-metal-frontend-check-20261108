@@ -1,0 +1,276 @@
+diff --git a/crates/metal2vulkan-runtime/src/fuxi_census.rs b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+index 3cc56c0..9de3c57 100644
+--- a/crates/metal2vulkan-runtime/src/fuxi_census.rs
++++ b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+@@ -6,9 +6,11 @@
+ //! steps the draw took (a reformat, an index rewrite, ...), which bind calls came since the last
+ //! draw, and where the draw's time went: entry to the bind settle, the settle (its lock included),
+ //! the plan's instantiation, the rest of `draw_resident` (heap sets, passes, Vulkan recording),
+-//! the bookkeeping after it, and the time between two draws (the caller's work). Every 10 s a
+-//! thread that drew writes `FUXI HYB` lines to stderr. Diagnostics only: nothing here changes
+-//! what is drawn.
++//! the bookkeeping after it, and the time between two draws (the caller's work). The rest of
++//! `draw_resident` is split again at nine marks (heap sets, instance, tables, shadows, fixed state,
++//! notices, pipeline lookup, bind, uses) and the recording after them. Every 10 s a thread that
++//! drew writes `FUXI HYB` lines to stderr, one write per line. Diagnostics only: nothing here
++//! changes what is drawn.
+ 
+ use std::cell::{Cell, RefCell};
+ use std::collections::HashMap;
+@@ -154,8 +156,32 @@ pub(crate) enum Mark {
+     Instantiated = 2,
+     /// After `draw_resident` returned.
+     Recorded = 3,
++    /// The rest of `draw_resident`, split: after the heap sets, texture table and skip check.
++    Heap = 4,
++    /// After the instance choice and the pass's shadow, stand-in and imageblock storage.
++    Instance = 5,
++    /// After the binding tables, the command's uses and the detached-buffer check.
++    Tables = 6,
++    /// After the shadowed textures' uses and the vertex buffers.
++    Shadows = 7,
++    /// After the fixed state, depth bias, viewports and draw states.
++    Fixed = 8,
++    /// After the graphics key and the bound-format and bound-value notices.
++    Notices = 9,
++    /// After the `VkPipeline` lookup (or its making's start).
++    Pipeline = 10,
++    /// After the descriptor bind, push writes and set 0's writes.
++    Bind = 11,
++    /// After the ordering checks, reach notes, heap set and sampler listing.
++    Uses = 12,
+ }
+-const MARKS: usize = 4;
++const MARKS: usize = 13;
++/// The rest's pieces, from `Instantiated` through each split mark to `Recorded`.
++const REST_MARKS: [usize; 9] = [4, 5, 6, 7, 8, 9, 10, 11, 12];
++const RESTS: usize = REST_MARKS.len() + 1;
++const REST_NAMES: [&str; RESTS] = [
++    "heap", "instance", "tables", "shadows", "fixed", "notices", "pipe", "bind", "uses", "rec",
++];
+ 
+ #[derive(Clone, Copy, Default)]
+ struct Current {
+@@ -178,6 +204,9 @@ struct Stats {
+     total_ns: u64,
+     /// entry..settle, settle, instantiate, rest of draw_resident, after it.
+     phase_ns: [u64; 5],
++    /// The rest's pieces (`REST_NAMES`), over the `rest_draws` draws that reached every mark.
++    rest_ns: [u64; RESTS],
++    rest_draws: u64,
+     between_ns: u64,
+     between: u64,
+     same_pipeline: u64,
+@@ -377,7 +406,12 @@ fn record(stats: &mut Stats, cur: &Current, start: u64, t: u64, pipeline: usize,
+     let total = t.saturating_sub(start);
+     stats.draws += 1;
+     stats.total_ns += total;
+-    let [settle, settled, instantiated, recorded] = cur.marks;
++    let [settle, settled, instantiated, recorded] = [
++        cur.marks[Mark::Settle as usize],
++        cur.marks[Mark::Settled as usize],
++        cur.marks[Mark::Instantiated as usize],
++        cur.marks[Mark::Recorded as usize],
++    ];
+     // A draw that left early (an empty one) has no marks: all its time is "entry".
+     if settle != 0 && settled != 0 && instantiated != 0 && recorded != 0 {
+         stats.phase_ns[0] += settle.saturating_sub(start);
+@@ -385,6 +419,17 @@ fn record(stats: &mut Stats, cur: &Current, start: u64, t: u64, pipeline: usize,
+         stats.phase_ns[2] += instantiated.saturating_sub(settled);
+         stats.phase_ns[3] += recorded.saturating_sub(instantiated);
+         stats.phase_ns[4] += t.saturating_sub(recorded);
++        // The rest's pieces, only for a draw that reached every split mark (a skipped draw or
++        // one that records nothing leaves some out).
++        if REST_MARKS.iter().all(|&m| cur.marks[m] != 0) {
++            let mut at = instantiated;
++            for (piece, &m) in stats.rest_ns.iter_mut().zip(&REST_MARKS) {
++                *piece += cur.marks[m].saturating_sub(at);
++                at = at.max(cur.marks[m]);
++            }
++            stats.rest_ns[RESTS - 1] += recorded.saturating_sub(at);
++            stats.rest_draws += 1;
++        }
+     } else {
+         stats.phase_ns[0] += total;
+     }
+@@ -435,14 +480,19 @@ fn us(ns: u64, n: u64) -> f64 {
+     }
+ }
+ 
++/// One report line, written on its own: the boot log's capture prefixes only the first line of a
++/// write and splits what follows in it at about 256 bytes, so every line here stays well under.
++fn line(text: &str) {
++    let _ = std::io::stderr().write_all(text.as_bytes());
++}
++
+ fn report(stats: &Stats, t: u64) {
+     if stats.draws == 0 {
+         return;
+     }
+     let n = stats.draws;
+     let head = format!("FUXI HYB T{} pid={}", stats.id, std::process::id());
+-    let mut out = String::new();
+-    out.push_str(&format!(
++    line(&format!(
+         "{head} win_s={:.1} draws={n} elig={} elig_us={:.1} us/draw tot={:.1} pre={:.1} settle={:.1} inst={:.1} rest={:.1} post={:.1} between={:.1} same_pipe={} same_var={} pipes={} vars={}\n",
+         t.saturating_sub(stats.window) as f64 / 1e9,
+         stats.eligible,
+@@ -459,41 +509,59 @@ fn report(stats: &Stats, t: u64) {
+         stats.pipelines.len(),
+         stats.variants.len(),
+     ));
+-    out.push_str(&format!("{head} traits"));
++    let mut rest = format!("{head} rest n={}", stats.rest_draws);
++    for (name, ns) in REST_NAMES.iter().zip(stats.rest_ns) {
++        rest.push_str(&format!(" {name}={:.1}", us(ns, stats.rest_draws)));
++    }
++    rest.push('\n');
++    line(&rest);
++    let mut traits = format!("{head} traits");
+     for (name, count) in TRAIT_NAMES.iter().zip(stats.traits) {
+         if count != 0 {
+-            out.push_str(&format!(" {name}={count}"));
++            traits.push_str(&format!(" {name}={count}"));
+         }
+     }
+-    out.push_str(" events");
++    traits.push_str(" events");
+     for (name, count) in EVENT_NAMES.iter().zip(stats.events) {
+         if count != 0 {
+-            out.push_str(&format!(" {name}={count}"));
++            traits.push_str(&format!(" {name}={count}"));
+         }
+     }
+-    out.push('\n');
+-    out.push_str(&format!("{head} sets"));
++    traits.push('\n');
++    line(&traits);
++    let mut sets = format!("{head} sets");
+     for (name, count) in SET_NAMES.iter().zip(stats.sets) {
+-        out.push_str(&format!(" {name}={count}"));
++        sets.push_str(&format!(" {name}={count}"));
+     }
++    sets.push('\n');
++    line(&sets);
+     let mut masks: Vec<_> = stats.masks.iter().map(|(&m, &c)| (c, m)).collect();
+     masks.sort_unstable_by(|a, b| b.cmp(a));
+-    out.push_str(" masks");
++    let mut mask_line = format!("{head} masks");
+     for (count, mask) in masks.into_iter().take(TOP) {
+-        out.push_str(&format!(" {mask:04x}:{count}"));
+-    }
+-    out.push('\n');
+-    let mut pipes: Vec<_> = stats.pipelines.iter().map(|(&p, &v)| (v.0, p, v.1, v.2)).collect();
++        mask_line.push_str(&format!(" {mask:04x}:{count}"));
++    }
++    mask_line.push('\n');
++    line(&mask_line);
++    let mut pipes: Vec<_> = stats
++        .pipelines
++        .iter()
++        .map(|(&p, &v)| (v.0, p, v.1, v.2))
++        .collect();
+     pipes.sort_unstable_by(|a, b| b.cmp(a));
+-    out.push_str(&format!("{head} top"));
+-    for (draws, pipeline, traits, ns) in pipes.into_iter().take(TOP) {
+-        // The address's low bits name the pipeline within this report; it is not a stable ID.
+-        out.push_str(&format!(
+-            " {:06x}:{draws}:{traits:x}:{:.1}",
+-            pipeline & 0xff_ffff,
+-            us(ns, draws)
+-        ));
+-    }
+-    out.push('\n');
+-    let _ = std::io::stderr().write_all(out.as_bytes());
++    pipes.truncate(TOP);
++    // Two lines of six, each well under the capture's split.
++    for half in pipes.chunks(TOP / 2) {
++        let mut top = format!("{head} top");
++        for &(draws, pipeline, traits, ns) in half {
++            // The address's low bits name the pipeline within this report; it is not a stable ID.
++            top.push_str(&format!(
++                " {:06x}:{draws}:{traits:x}:{:.1}",
++                pipeline & 0xff_ffff,
++                us(ns, draws)
++            ));
++        }
++        top.push('\n');
++        line(&top);
++    }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 6fcd26a..415ea57 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -6084,6 +6084,7 @@ impl RenderCommandEncoder {
+             self.skipped_draw();
+             return Ok(());
+         }
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Heap);
+         let rewrite = match (restarted, &buffers.index) {
+             (None, _) => None,
+             (Some(_), None) => return Err(internal("a restarted strip without indices")),
+@@ -6376,6 +6377,7 @@ impl RenderCommandEncoder {
+             Some(_) => made_imageblock.as_ref().or(self.imageblock.as_ref()),
+             None => None,
+         };
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Instance);
+         // The pass's tile memory, made at its first draw or dispatch that reads it.
+         let tile_buffer = plan
+             .descriptors
+@@ -6510,6 +6512,7 @@ impl RenderCommandEncoder {
+             self.skipped_draw();
+             return Ok(());
+         }
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Tables);
+         // The shadowed textures the draw uses, copied around its instance (`render/shadows.rs`).
+         let textures = self
+             .vertex
+@@ -6558,6 +6561,7 @@ impl RenderCommandEncoder {
+             };
+             vertex_buffers.push((bind.binding, raw, start + offset, stride.unwrap_or(0)));
+         }
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Shadows);
+         let profile = device.compile_device().profile();
+         let selects = graphics.writes_viewport_index;
+         let mut fixed = self.draw_fixed(
+@@ -6660,6 +6664,7 @@ impl RenderCommandEncoder {
+                 }
+             }
+         }
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Fixed);
+         let instance = match &next {
+             Next::Current => &self.current,
+             Next::New { instance, .. } => &**instance,
+@@ -6713,6 +6718,7 @@ impl RenderCommandEncoder {
+         let bound_each = device
+             .binds_each(variant.objects().kinds())
+             .then(|| variant.objects().tested_formats(&formats));
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Notices);
+         // The draw's `VkPipeline`: made, or being made on the device's pool while the draw goes
+         // on, where its recording can wait for it (`render/pending.rs`): not in an execution's
+         // replay, whose host step records now, nor for a draw that records nothing, nor in a pass
+@@ -6747,6 +6753,7 @@ impl RenderCommandEncoder {
+         if let DrawPipeline::Made(made) = &draw_pipeline {
+             variant.first_use(made, specialization, &formats);
+         }
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Pipeline);
+         let bound = {
+             let mut state = self.core.command_buffer().state();
+             let memo = Some(&mut self.bind_memo);
+@@ -6778,6 +6785,7 @@ impl RenderCommandEncoder {
+         // and sampler written is live (the command buffer retains them below, and a refusal
+         // leaves the set unused in its pool).
+         unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Bind);
+         // The Vulkan draws: the binder's, the index bounds pass's two, or the index rewrite
+         // pass's one.
+         let sized = device.shared().sized_index_bind;
+@@ -6993,6 +7001,7 @@ impl RenderCommandEncoder {
+             }
+             _ => None,
+         };
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Uses);
+         let records = self.core.records_executions();
+         let mut created = match &draw_pipeline {
+             DrawPipeline::Made(made) if records => vec![made.created_in],
