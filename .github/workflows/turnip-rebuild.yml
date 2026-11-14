@@ -1,0 +1,93 @@
+name: Rebuild Turnip for the hybrid lane
+# Gate for the hybrid lane's Turnip work: rebuild the deployed Turnip ICD from the exact public
+# inputs it came from (ios-fuxi f44bf569, Mesa 85fda3b, UniXNU fb6aad6a, Xcode 16.2) and compare
+# the dylib with the one on the phone. Later hybrid-lane Turnip patches (patches/mesa-hyb-*.patch)
+# are appended to the same recipe.
+on:
+  push:
+    branches:
+      - codex/hybrid-lane
+    paths:
+      - .github/workflows/turnip-rebuild.yml
+      - patches/mesa-hyb-*.patch
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  turnip:
+    runs-on: macos-15
+    timeout-minutes: 150
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
+      SOURCE_COMMIT: f44bf5693da18ac11abfa510c5ad711fc316254b
+      DEPLOYED_SHA256: 7467020727fcf6d7f98a047bbeaeef4ffe384775890ead544ffff0a18e637c51
+    steps:
+      - name: Check out public test harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Fetch exact public source
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app
+          test -d "$DEVELOPER_DIR"
+          git init source
+          git -C source remote add origin https://github.com/zgl97/ios-fuxi.git
+          git -C source fetch --no-tags --depth=1 origin "$SOURCE_COMMIT"
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          grep -E '^(MESA_SHA|UNIXNU_SHA|BISON_VERSION)=' source/tools/ci/pins.env
+          grep -n "mesa-fuxi-" source/tools/build-fuxi-turnip.py
+      - name: Add hybrid lane Turnip patches (none for the reproduction gate)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          extra=(harness/patches/mesa-hyb-*.patch)
+          echo "hybrid lane patches: ${#extra[@]}"
+          if (( ${#extra[@]} )); then
+            cp "${extra[@]}" source/tools/patches/
+            python3 - "${extra[@]}" <<'PY'
+          import sys
+          from pathlib import Path
+          p = Path('source/tools/build-fuxi-turnip.py')
+          t = p.read_text()
+          anchor = "                ROOT/'tools/patches/mesa-fuxi-bo-cache.patch']"
+          assert t.count(anchor) == 1
+          names = [Path(a).name for a in sys.argv[1:]]
+          extra = ''.join(f",\n                ROOT/'tools/patches/{n}'" for n in sorted(names))
+          p.write_text(t.replace(anchor, anchor[:-1] + extra + ']'))
+          PY
+            grep -n "mesa-hyb-" source/tools/build-fuxi-turnip.py
+          fi
+      - name: Build Turnip
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          xcodebuild -version
+          bash tools/ci/build.sh mesa
+      - name: Compare with the deployed dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source/tools/out/ci/mesa
+          got=$(shasum -a 256 libvulkan_freedreno.dylib | cut -d' ' -f1)
+          echo "rebuilt  $got"
+          echo "deployed $DEPLOYED_SHA256"
+          if [[ $got == "$DEPLOYED_SHA256" ]]; then
+            echo "TURNIP REBUILD: IDENTICAL" | tee rebuild-compare.txt
+          else
+            echo "TURNIP REBUILD: DIFFERS" | tee rebuild-compare.txt
+          fi
+          ls -l libvulkan_freedreno.dylib
+      - name: Upload Turnip outputs and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuxi-turnip-hybrid
+          path: source/tools/out/ci/mesa/
+          if-no-files-found: warn
+          retention-days: 7

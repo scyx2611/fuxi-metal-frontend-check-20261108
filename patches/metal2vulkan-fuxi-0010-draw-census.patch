@@ -1,0 +1,903 @@
+diff --git a/crates/metal2vulkan-runtime/src/fuxi_census.rs b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+new file mode 100644
+index 0000000..3cc56c0
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+@@ -0,0 +1,499 @@
++//! FUXI: a draw census for the hybrid lane plan, on with `fuxihyb=1` (or any value from 1) on the
++//! boot line, read once per process. Off, each hook is one relaxed atomic load.
++//!
++//! Per thread it counts every render draw the encoder records: the drawing pipeline's structural
++//! traits that keep a draw off a lean lane (framebuffer fetch, tessellation, ...), the runtime
++//! steps the draw took (a reformat, an index rewrite, ...), which bind calls came since the last
++//! draw, and where the draw's time went: entry to the bind settle, the settle (its lock included),
++//! the plan's instantiation, the rest of `draw_resident` (heap sets, passes, Vulkan recording),
++//! the bookkeeping after it, and the time between two draws (the caller's work). Every 10 s a
++//! thread that drew writes `FUXI HYB` lines to stderr. Diagnostics only: nothing here changes
++//! what is drawn.
++
++use std::cell::{Cell, RefCell};
++use std::collections::HashMap;
++use std::io::Write as _;
++use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
++use std::sync::OnceLock;
++use std::time::Instant;
++
++const UNKNOWN: u8 = 0;
++const ON: u8 = 1;
++const OFF: u8 = 2;
++
++static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
++static NEXT_THREAD: AtomicU32 = AtomicU32::new(1);
++static BASE: OnceLock<Instant> = OnceLock::new();
++
++const WINDOW_NS: u64 = 10_000_000_000;
++const BETWEEN_CAP_NS: u64 = 500_000;
++const TOP: usize = 12;
++
++/// A bind call kind, one bit of a draw's mask of the calls since the draw before it.
++#[derive(Clone, Copy)]
++pub(crate) enum Set {
++    Pipeline = 0,
++    VertexBuffer = 1,
++    VertexBytes = 2,
++    VertexTexture = 3,
++    VertexSampler = 4,
++    FragmentBuffer = 5,
++    FragmentBytes = 6,
++    FragmentTexture = 7,
++    FragmentSampler = 8,
++    ViewScissor = 9,
++    DepthStencil = 10,
++    Raster = 11,
++    Other = 12,
++}
++const SETS: usize = 13;
++const SET_NAMES: [&str; SETS] = [
++    "pipe", "vbuf", "vbytes", "vtex", "vsamp", "fbuf", "fbytes", "ftex", "fsamp", "view", "ds",
++    "raster", "other",
++];
++
++/// A runtime step a draw took that a lean lane would not.
++#[derive(Clone, Copy)]
++pub(crate) enum Event {
++    Reformat = 0,
++    Restart = 1,
++    Rewrite = 2,
++    Bounds = 3,
++    Capture = 4,
++    Skipped = 5,
++}
++const EVENTS: usize = 6;
++const EVENT_NAMES: [&str; EVENTS] = [
++    "reformat", "restart", "rewrite", "bounds", "capture", "skipped",
++];
++
++/// Structural traits of a drawing pipeline (bits of `end`'s `traits`).
++pub(crate) const TESSELLATION: u32 = 1 << 0;
++pub(crate) const MESH: u32 = 1 << 1;
++pub(crate) const FETCH: u32 = 1 << 2;
++pub(crate) const STORAGE_ATTACHMENTS: u32 = 1 << 3;
++pub(crate) const IMAGEBLOCK: u32 = 1 << 4;
++pub(crate) const SHADOW_STENCIL: u32 = 1 << 5;
++pub(crate) const AMPLIFICATION: u32 = 1 << 6;
++pub(crate) const SAMPLE_SHADING: u32 = 1 << 7;
++pub(crate) const SHADER_TESTS: u32 = 1 << 8;
++pub(crate) const TILE_MEMORY: u32 = 1 << 9;
++pub(crate) const FUNCTION_TABLES: u32 = 1 << 10;
++pub(crate) const VIEWPORT_INDEX: u32 = 1 << 11;
++pub(crate) const VERTEX_WRITES: u32 = 1 << 12;
++pub(crate) const DISCARD: u32 = 1 << 13;
++pub(crate) const MULTISAMPLE: u32 = 1 << 14;
++/// No graphics pipeline (an error path); never counted as eligible.
++pub(crate) const NO_PIPELINE: u32 = 1 << 15;
++const TRAITS: usize = 16;
++const TRAIT_NAMES: [&str; TRAITS] = [
++    "tess", "mesh", "fetch", "storage", "imageblock", "shadowstencil", "amp", "sampleshading",
++    "shadertests", "tilemem", "functables", "vpindex", "vtxwrites", "discard", "msaa", "nopipe",
++];
++
++/// The structural traits of the drawing pipeline `state` (the bits above).
++pub(crate) fn traits(state: &crate::pipeline::GraphicsState) -> u32 {
++    let g = &state.base().graphics;
++    let mut t = 0;
++    if g.tessellation.is_some() {
++        t |= TESSELLATION;
++    }
++    if g.mesh_records.is_some() || state.descriptor().vertex().is_none() {
++        t |= MESH;
++    }
++    if !g.input_attachments.is_empty() {
++        t |= FETCH;
++    }
++    if !g.storage_attachments.is_empty() {
++        t |= STORAGE_ATTACHMENTS;
++    }
++    if g.fragment_imageblock.is_some() {
++        t |= IMAGEBLOCK;
++    }
++    if g.shadow_stencil.is_some() {
++        t |= SHADOW_STENCIL;
++    }
++    if g.max_vertex_amplification_count > 1 {
++        t |= AMPLIFICATION;
++    }
++    if g.sample_shading {
++        t |= SAMPLE_SHADING;
++    }
++    if g.shader_tests.is_some() {
++        t |= SHADER_TESTS;
++    }
++    if state.reads_tile_memory() {
++        t |= TILE_MEMORY;
++    }
++    if !state.function_tables().is_empty() {
++        t |= FUNCTION_TABLES;
++    }
++    if g.writes_viewport_index {
++        t |= VIEWPORT_INDEX;
++    }
++    if g.vertex_writes_memory {
++        t |= VERTEX_WRITES;
++    }
++    if g.rasterizer_discard {
++        t |= DISCARD;
++    }
++    if state.descriptor().raster_sample_count() > 1 {
++        t |= MULTISAMPLE;
++    }
++    t
++}
++
++/// Where a draw is (the marks between `begin` and `end`).
++#[derive(Clone, Copy)]
++pub(crate) enum Mark {
++    /// Before the bind settle (its lock).
++    Settle = 0,
++    /// After the bind settle.
++    Settled = 1,
++    /// After the plan's instantiation.
++    Instantiated = 2,
++    /// After `draw_resident` returned.
++    Recorded = 3,
++}
++const MARKS: usize = 4;
++
++#[derive(Clone, Copy, Default)]
++struct Current {
++    marks: [u64; MARKS],
++    events: u16,
++    sets: u16,
++    variant: usize,
++}
++
++#[derive(Default)]
++struct Stats {
++    id: u32,
++    window: u64,
++    last_end: u64,
++    last_pipeline: usize,
++    last_variant: usize,
++    draws: u64,
++    eligible: u64,
++    eligible_ns: u64,
++    total_ns: u64,
++    /// entry..settle, settle, instantiate, rest of draw_resident, after it.
++    phase_ns: [u64; 5],
++    between_ns: u64,
++    between: u64,
++    same_pipeline: u64,
++    same_variant: u64,
++    traits: [u64; TRAITS],
++    events: [u64; EVENTS],
++    sets: [u64; SETS],
++    masks: HashMap<u16, u64>,
++    /// Draws, traits and nanoseconds by pipeline.
++    pipelines: HashMap<usize, (u64, u32, u64)>,
++    variants: HashMap<usize, u64>,
++}
++
++thread_local! {
++    static CURRENT: Cell<Current> = const { Cell::new(Current { marks: [0; MARKS], events: 0, sets: 0, variant: 0 }) };
++    static STATS: RefCell<Option<Box<Stats>>> = const { RefCell::new(None) };
++}
++
++#[cfg(target_vendor = "apple")]
++fn boot_value() -> Option<u64> {
++    use std::ffi::{c_char, c_int, c_void};
++    unsafe extern "C" {
++        fn sysctlbyname(
++            name: *const c_char,
++            old: *mut c_void,
++            old_len: *mut usize,
++            new: *mut c_void,
++            new_len: usize,
++        ) -> c_int;
++    }
++    let mut args = [0u8; 2048];
++    let mut len = args.len();
++    // SAFETY: a fixed stack buffer and its length.
++    let read = unsafe {
++        sysctlbyname(
++            c"kern.bootargs".as_ptr(),
++            args.as_mut_ptr().cast(),
++            &mut len,
++            std::ptr::null_mut(),
++            0,
++        )
++    } == 0;
++    if !read {
++        return None;
++    }
++    args[..len.min(args.len())]
++        .split(|&b| b == b' ' || b == b'\t' || b == b'\n' || b == 0)
++        .find_map(|word| word.strip_prefix(b"fuxihyb="))
++        .and_then(|value| std::str::from_utf8(value).ok()?.parse().ok())
++}
++
++#[cfg(not(target_vendor = "apple"))]
++fn boot_value() -> Option<u64> {
++    None
++}
++
++#[cold]
++fn start() -> bool {
++    let on = boot_value().is_some_and(|v| v >= 1);
++    if STATE
++        .compare_exchange(
++            UNKNOWN,
++            if on { ON } else { OFF },
++            Ordering::AcqRel,
++            Ordering::Acquire,
++        )
++        .is_ok()
++        && on
++    {
++        let line = format!(
++            "FUXI HYB: census on pid={} (fuxihyb={})\n",
++            std::process::id(),
++            boot_value().unwrap_or(0)
++        );
++        let _ = std::io::stderr().write_all(line.as_bytes());
++    }
++    STATE.load(Ordering::Acquire) == ON
++}
++
++#[inline]
++fn on() -> bool {
++    match STATE.load(Ordering::Relaxed) {
++        ON => true,
++        OFF => false,
++        _ => start(),
++    }
++}
++
++fn now() -> u64 {
++    let base = BASE.get_or_init(Instant::now);
++    u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX)
++}
++
++/// A bind call of `kind`.
++#[inline]
++pub(crate) fn set(kind: Set) {
++    if on() {
++        CURRENT.with(|c| {
++            let mut cur = c.get();
++            cur.sets |= 1 << kind as u16;
++            c.set(cur);
++        });
++    }
++}
++
++/// The draw's runtime step `event`.
++#[inline]
++pub(crate) fn event(event: Event) {
++    if on() {
++        CURRENT.with(|c| {
++            let mut cur = c.get();
++            cur.events |= 1 << event as u16;
++            c.set(cur);
++        });
++    }
++}
++
++/// The draw reached `mark`.
++#[inline]
++pub(crate) fn mark(mark: Mark) {
++    if on() {
++        let t = now();
++        CURRENT.with(|c| {
++            let mut cur = c.get();
++            cur.marks[mark as usize] = t;
++            c.set(cur);
++        });
++    }
++}
++
++/// The variant the bind settle chose (its address).
++#[inline]
++pub(crate) fn variant(address: usize) {
++    if on() {
++        CURRENT.with(|c| {
++            let mut cur = c.get();
++            cur.variant = address;
++            c.set(cur);
++        });
++    }
++}
++
++/// A draw starts: its start time while the census is on.
++#[inline]
++pub(crate) fn begin() -> Option<u64> {
++    if !on() {
++        return None;
++    }
++    let t = now();
++    CURRENT.with(|c| {
++        let mut cur = c.get();
++        cur.marks = [0; MARKS];
++        cur.events = 0;
++        cur.variant = 0;
++        c.set(cur);
++    });
++    Some(t)
++}
++
++/// The draw that began at `start` ends, drawn by the pipeline at `pipeline` with `traits`.
++pub(crate) fn end(start: u64, pipeline: usize, traits: u32) {
++    let t = now();
++    let cur = CURRENT.with(|c| {
++        let cur = c.get();
++        let mut next = cur;
++        next.sets = 0;
++        c.set(next);
++        cur
++    });
++    STATS.with(|s| {
++        let mut slot = s.borrow_mut();
++        let stats = slot.get_or_insert_with(|| {
++            Box::new(Stats {
++                id: NEXT_THREAD.fetch_add(1, Ordering::Relaxed),
++                window: start,
++                ..Stats::default()
++            })
++        });
++        record(stats, &cur, start, t, pipeline, traits);
++        if t.saturating_sub(stats.window) >= WINDOW_NS {
++            report(stats, t);
++            let (id, last_pipeline, last_variant) =
++                (stats.id, stats.last_pipeline, stats.last_variant);
++            **stats = Stats {
++                id,
++                window: t,
++                last_end: t,
++                last_pipeline,
++                last_variant,
++                ..Stats::default()
++            };
++        }
++    });
++}
++
++fn record(stats: &mut Stats, cur: &Current, start: u64, t: u64, pipeline: usize, traits: u32) {
++    let total = t.saturating_sub(start);
++    stats.draws += 1;
++    stats.total_ns += total;
++    let [settle, settled, instantiated, recorded] = cur.marks;
++    // A draw that left early (an empty one) has no marks: all its time is "entry".
++    if settle != 0 && settled != 0 && instantiated != 0 && recorded != 0 {
++        stats.phase_ns[0] += settle.saturating_sub(start);
++        stats.phase_ns[1] += settled.saturating_sub(settle);
++        stats.phase_ns[2] += instantiated.saturating_sub(settled);
++        stats.phase_ns[3] += recorded.saturating_sub(instantiated);
++        stats.phase_ns[4] += t.saturating_sub(recorded);
++    } else {
++        stats.phase_ns[0] += total;
++    }
++    if stats.last_end != 0 {
++        let gap = start.saturating_sub(stats.last_end);
++        if gap < BETWEEN_CAP_NS {
++            stats.between_ns += gap;
++            stats.between += 1;
++        }
++    }
++    stats.last_end = t;
++    if pipeline == stats.last_pipeline {
++        stats.same_pipeline += 1;
++    }
++    stats.last_pipeline = pipeline;
++    if cur.variant != 0 && cur.variant == stats.last_variant {
++        stats.same_variant += 1;
++    }
++    if cur.variant != 0 {
++        stats.last_variant = cur.variant;
++        *stats.variants.entry(cur.variant).or_default() += 1;
++    }
++    for (bit, count) in stats.traits.iter_mut().enumerate() {
++        *count += u64::from((traits >> bit) & 1);
++    }
++    for (bit, count) in stats.events.iter_mut().enumerate() {
++        *count += u64::from((cur.events >> bit) & 1);
++    }
++    for (bit, count) in stats.sets.iter_mut().enumerate() {
++        *count += u64::from((cur.sets >> bit) & 1);
++    }
++    *stats.masks.entry(cur.sets).or_default() += 1;
++    if traits == 0 && cur.events == 0 {
++        stats.eligible += 1;
++        stats.eligible_ns += total;
++    }
++    let entry = stats.pipelines.entry(pipeline).or_insert((0, traits, 0));
++    entry.0 += 1;
++    entry.1 = traits;
++    entry.2 += total;
++}
++
++fn us(ns: u64, n: u64) -> f64 {
++    if n == 0 {
++        0.0
++    } else {
++        ns as f64 / n as f64 / 1000.0
++    }
++}
++
++fn report(stats: &Stats, t: u64) {
++    if stats.draws == 0 {
++        return;
++    }
++    let n = stats.draws;
++    let head = format!("FUXI HYB T{} pid={}", stats.id, std::process::id());
++    let mut out = String::new();
++    out.push_str(&format!(
++        "{head} win_s={:.1} draws={n} elig={} elig_us={:.1} us/draw tot={:.1} pre={:.1} settle={:.1} inst={:.1} rest={:.1} post={:.1} between={:.1} same_pipe={} same_var={} pipes={} vars={}\n",
++        t.saturating_sub(stats.window) as f64 / 1e9,
++        stats.eligible,
++        us(stats.eligible_ns, stats.eligible),
++        us(stats.total_ns, n),
++        us(stats.phase_ns[0], n),
++        us(stats.phase_ns[1], n),
++        us(stats.phase_ns[2], n),
++        us(stats.phase_ns[3], n),
++        us(stats.phase_ns[4], n),
++        us(stats.between_ns, stats.between),
++        stats.same_pipeline,
++        stats.same_variant,
++        stats.pipelines.len(),
++        stats.variants.len(),
++    ));
++    out.push_str(&format!("{head} traits"));
++    for (name, count) in TRAIT_NAMES.iter().zip(stats.traits) {
++        if count != 0 {
++            out.push_str(&format!(" {name}={count}"));
++        }
++    }
++    out.push_str(" events");
++    for (name, count) in EVENT_NAMES.iter().zip(stats.events) {
++        if count != 0 {
++            out.push_str(&format!(" {name}={count}"));
++        }
++    }
++    out.push('\n');
++    out.push_str(&format!("{head} sets"));
++    for (name, count) in SET_NAMES.iter().zip(stats.sets) {
++        out.push_str(&format!(" {name}={count}"));
++    }
++    let mut masks: Vec<_> = stats.masks.iter().map(|(&m, &c)| (c, m)).collect();
++    masks.sort_unstable_by(|a, b| b.cmp(a));
++    out.push_str(" masks");
++    for (count, mask) in masks.into_iter().take(TOP) {
++        out.push_str(&format!(" {mask:04x}:{count}"));
++    }
++    out.push('\n');
++    let mut pipes: Vec<_> = stats.pipelines.iter().map(|(&p, &v)| (v.0, p, v.1, v.2)).collect();
++    pipes.sort_unstable_by(|a, b| b.cmp(a));
++    out.push_str(&format!("{head} top"));
++    for (draws, pipeline, traits, ns) in pipes.into_iter().take(TOP) {
++        // The address's low bits name the pipeline within this report; it is not a stable ID.
++        out.push_str(&format!(
++            " {:06x}:{draws}:{traits:x}:{:.1}",
++            pipeline & 0xff_ffff,
++            us(ns, draws)
++        ));
++    }
++    out.push('\n');
++    let _ = std::io::stderr().write_all(out.as_bytes());
++}
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 4781491..a7305f9 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -97,6 +97,7 @@ mod fragment_imageblock;
+ mod framebuffer_fetch;
+ mod fresh_unwritten;
+ mod function_table;
++mod fuxi_census;
+ #[doc(hidden)]
+ pub mod generated_commands;
+ mod generated_execute;
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 5cd377c..6fcd26a 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -1556,6 +1556,7 @@ impl RenderCommandEncoder {
+     /// the state keeps unwritten and the device lacks `independentBlend`. A refused call keeps the
+     /// state set before.
+     pub fn set_render_pipeline_state(&mut self, state: &RenderPipelineState) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::Pipeline);
+         self.log(|_| RenderCall::PipelineState(state.clone()));
+         const CALL: &str = "set_render_pipeline_state";
+         self.core.check_device(CALL, state.device())?;
+@@ -1616,6 +1617,7 @@ impl RenderCommandEncoder {
+         offset: u64,
+         index: u32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::VertexBuffer);
+         self.log(|_| RenderCall::Buffer(Table::Vertex, buffer.cloned(), offset, index));
+         self.vertex
+             .set_buffer(&self.core, "set_vertex_buffer", buffer, offset, index)
+@@ -1630,6 +1632,7 @@ impl RenderCommandEncoder {
+         offsets: &[u64],
+         first: u32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::VertexBuffer);
+         self.log(|log| {
+             RenderCall::Buffers(
+                 Table::Vertex,
+@@ -1650,6 +1653,7 @@ impl RenderCommandEncoder {
+     /// the index is bound again, as plain Metal reads them (an M4; its debug layer asserts there is
+     /// no buffer). Refused: nothing bound at the index, an offset past the buffer's length.
+     pub fn set_vertex_buffer_offset(&mut self, offset: u64, index: u32) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::VertexBuffer);
+         self.log(|_| RenderCall::BufferOffset(Table::Vertex, offset, index));
+         self.vertex
+             .set_buffer_offset(&self.core, "set_vertex_buffer_offset", offset, index)
+@@ -1665,6 +1669,7 @@ impl RenderCommandEncoder {
+     /// `Bind(MissingDeviceAddress)`, at the draw. Refused: an index past the table, and more than
+     /// 4096 bytes, Metal's limit for inline bytes (`Invalid(InlineBytesLength)`).
+     pub fn set_vertex_bytes(&mut self, bytes: &[u8], index: u32) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::VertexBytes);
+         self.log(|log| RenderCall::Bytes(Table::Vertex, log.byte_span(bytes), index));
+         self.vertex
+             .set_bytes(&self.core, "set_vertex_bytes", bytes, None, index)
+@@ -1677,6 +1682,7 @@ impl RenderCommandEncoder {
+         texture: Option<&Texture>,
+         index: u32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::VertexTexture);
+         self.log(|_| RenderCall::Texture(Table::Vertex, texture.cloned(), index));
+         self.vertex
+             .set_textures(&self.core, "set_vertex_texture", &[texture], index)
+@@ -1689,6 +1695,7 @@ impl RenderCommandEncoder {
+         textures: &[Option<&Texture>],
+         first: u32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::VertexTexture);
+         self.log(|log| RenderCall::Textures(Table::Vertex, log.texture_span(textures), first));
+         self.vertex
+             .set_textures(&self.core, "set_vertex_textures", textures, first)
+@@ -1701,6 +1708,7 @@ impl RenderCommandEncoder {
+         sampler: Option<&SamplerState>,
+         index: u32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::VertexSampler);
+         self.log(|_| RenderCall::Sampler(Table::Vertex, sampler.cloned(), index));
+         self.vertex.set_samplers(
+             &self.core,
+@@ -1721,6 +1729,7 @@ impl RenderCommandEncoder {
+         clamps: Option<(&[f32], &[f32])>,
+         first: u32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::VertexSampler);
+         self.log(|_| RenderCall::Samplers(Table::Vertex, Samplers::of(samplers, clamps, first)));
+         self.vertex.set_samplers(
+             &self.core,
+@@ -1739,6 +1748,7 @@ impl RenderCommandEncoder {
+         offset: u64,
+         index: u32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentBuffer);
+         self.log(|_| RenderCall::Buffer(Table::Fragment, buffer.cloned(), offset, index));
+         self.fragment
+             .set_buffer(&self.core, "set_fragment_buffer", buffer, offset, index)
+@@ -1752,6 +1762,7 @@ impl RenderCommandEncoder {
+         offsets: &[u64],
+         first: u32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentBuffer);
+         self.log(|log| {
+             RenderCall::Buffers(
+                 Table::Fragment,
+@@ -1767,6 +1778,7 @@ impl RenderCommandEncoder {
+     /// `setFragmentBufferOffset:atIndex:`. Refused as
+     /// [`RenderCommandEncoder::set_vertex_buffer_offset`] is.
+     pub fn set_fragment_buffer_offset(&mut self, offset: u64, index: u32) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentBuffer);
+         self.log(|_| RenderCall::BufferOffset(Table::Fragment, offset, index));
+         self.fragment
+             .set_buffer_offset(&self.core, "set_fragment_buffer_offset", offset, index)
+@@ -1776,6 +1788,7 @@ impl RenderCommandEncoder {
+     /// [`set_vertex_bytes`](Self::set_vertex_bytes), in the fragment stage's table. Refused as
+     /// that is.
+     pub fn set_fragment_bytes(&mut self, bytes: &[u8], index: u32) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentBytes);
+         self.log(|log| RenderCall::Bytes(Table::Fragment, log.byte_span(bytes), index));
+         self.fragment
+             .set_bytes(&self.core, "set_fragment_bytes", bytes, None, index)
+@@ -1788,6 +1801,7 @@ impl RenderCommandEncoder {
+         texture: Option<&Texture>,
+         index: u32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentTexture);
+         self.log(|_| RenderCall::Texture(Table::Fragment, texture.cloned(), index));
+         self.fragment
+             .set_textures(&self.core, "set_fragment_texture", &[texture], index)
+@@ -1800,6 +1814,7 @@ impl RenderCommandEncoder {
+         textures: &[Option<&Texture>],
+         first: u32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentTexture);
+         self.log(|log| RenderCall::Textures(Table::Fragment, log.texture_span(textures), first));
+         self.fragment
+             .set_textures(&self.core, "set_fragment_textures", textures, first)
+@@ -1812,6 +1827,7 @@ impl RenderCommandEncoder {
+         sampler: Option<&SamplerState>,
+         index: u32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentSampler);
+         self.log(|_| RenderCall::Sampler(Table::Fragment, sampler.cloned(), index));
+         self.fragment.set_samplers(
+             &self.core,
+@@ -1831,6 +1847,7 @@ impl RenderCommandEncoder {
+         clamps: Option<(&[f32], &[f32])>,
+         first: u32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentSampler);
+         self.log(|_| RenderCall::Samplers(Table::Fragment, Samplers::of(samplers, clamps, first)));
+         self.fragment.set_samplers(
+             &self.core,
+@@ -2069,6 +2086,7 @@ impl RenderCommandEncoder {
+     /// that draws the compensated depths inexactly (`render_state.rs`). A refused call keeps the
+     /// viewports set before.
+     pub fn set_viewport(&mut self, viewport: Viewport) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::ViewScissor);
+         self.log(|_| RenderCall::Viewport(Box::new(viewport)));
+         let refused = render_state::depth_ranges_refused(self.core.device());
+         self.state
+@@ -2078,6 +2096,7 @@ impl RenderCommandEncoder {
+     /// `setViewports:count:`. Refused as [`RenderCommandEncoder::set_viewport`] is, and for a
+     /// count outside 1 to 16 (measured).
+     pub fn set_viewports(&mut self, viewports: &[Viewport]) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::ViewScissor);
+         self.log(|_| RenderCall::Viewports(viewports.into()));
+         let refused = render_state::depth_ranges_refused(self.core.device());
+         self.state
+@@ -2087,6 +2106,7 @@ impl RenderCommandEncoder {
+     /// `setScissorRect:`. A rectangle past the render area is clipped to it, as plain Metal clips
+     /// it where its validation stops the call (RT6 probe 4).
+     pub fn set_scissor_rect(&mut self, rect: ScissorRect) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::ViewScissor);
+         self.log(|_| RenderCall::ScissorRect(rect));
+         self.state.set_scissors("set_scissor_rect", &[rect])
+     }
+@@ -2100,18 +2120,21 @@ impl RenderCommandEncoder {
+     /// nothing, as plain Metal draws them where its validation stops a count other than 1 and the
+     /// viewport count (probes).
+     pub fn set_scissor_rects(&mut self, rects: &[ScissorRect]) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::ViewScissor);
+         self.log(|_| RenderCall::ScissorRects(rects.into()));
+         self.state.set_scissors("set_scissor_rects", rects)
+     }
+ 
+     /// `setCullMode:`.
+     pub fn set_cull_mode(&mut self, mode: CullMode) {
++        crate::fuxi_census::set(crate::fuxi_census::Set::Raster);
+         self.log(|_| RenderCall::CullMode(mode));
+         self.state.set_cull_mode(mode);
+     }
+ 
+     /// `setFrontFacingWinding:`.
+     pub fn set_front_facing_winding(&mut self, winding: Winding) {
++        crate::fuxi_census::set(crate::fuxi_census::Set::Raster);
+         self.log(|_| RenderCall::FrontFacingWinding(winding));
+         self.state.set_winding(winding);
+     }
+@@ -2126,6 +2149,7 @@ impl RenderCommandEncoder {
+         &mut self,
+         state: impl Into<Option<&'a DepthStencilState>>,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::DepthStencil);
+         let state = state.into();
+         self.log(|_| RenderCall::DepthStencilState(state.cloned()));
+         if let Some(state) = state {
+@@ -2139,12 +2163,14 @@ impl RenderCommandEncoder {
+     /// `setStencilReferenceValue:`: both faces' reference, saturated at 255 as Metal's is
+     /// (measured).
+     pub fn set_stencil_reference_value(&mut self, value: u32) {
++        crate::fuxi_census::set(crate::fuxi_census::Set::DepthStencil);
+         self.log(|_| RenderCall::StencilReferenceValue(value));
+         self.state.set_stencil_references(value, value);
+     }
+ 
+     /// `setStencilFrontReferenceValue:backReferenceValue:`, saturated at 255 as Metal's are.
+     pub fn set_stencil_reference_values(&mut self, front: u32, back: u32) {
++        crate::fuxi_census::set(crate::fuxi_census::Set::DepthStencil);
+         self.log(|_| RenderCall::StencilReferenceValues(front, back));
+         self.state.set_stencil_references(front, back);
+     }
+@@ -2164,12 +2190,14 @@ impl RenderCommandEncoder {
+         slope_scale: f32,
+         clamp: f32,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::Raster);
+         self.log(|_| RenderCall::DepthBias(depth_bias, slope_scale, clamp));
+         self.state.set_depth_bias(depth_bias, slope_scale, clamp)
+     }
+ 
+     /// `setDepthClipMode:`. `Clamp` needs `depthClamp` (`Unsupported`).
+     pub fn set_depth_clip_mode(&mut self, mode: DepthClipMode) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::Raster);
+         self.log(|_| RenderCall::DepthClipMode(mode));
+         let profile = self.core.device().compile_device().profile();
+         self.state.set_clip_mode(mode, profile)
+@@ -2177,6 +2205,7 @@ impl RenderCommandEncoder {
+ 
+     /// `setTriangleFillMode:`. `Lines` needs `fillModeNonSolid` (`Unsupported`).
+     pub fn set_triangle_fill_mode(&mut self, mode: TriangleFillMode) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::Raster);
+         self.log(|_| RenderCall::TriangleFillMode(mode));
+         let profile = self.core.device().compile_device().profile();
+         self.state.set_fill_mode(mode, profile)
+@@ -2184,6 +2213,7 @@ impl RenderCommandEncoder {
+ 
+     /// `setBlendColorRed:green:blue:alpha:`.
+     pub fn set_blend_color(&mut self, red: f32, green: f32, blue: f32, alpha: f32) {
++        crate::fuxi_census::set(crate::fuxi_census::Set::Raster);
+         self.log(|_| RenderCall::BlendColor([red, green, blue, alpha]));
+         self.state.set_blend_color([red, green, blue, alpha]);
+     }
+@@ -2203,6 +2233,7 @@ impl RenderCommandEncoder {
+         offset: u64,
+         instance_stride: u64,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::Other);
+         self.log(|_| {
+             RenderCall::TessellationFactorBuffer(buffer.cloned(), offset, instance_stride)
+         });
+@@ -2227,6 +2258,7 @@ impl RenderCommandEncoder {
+     /// M4): each culls or draws as its `half` does under a pipeline that enables the scale, and a
+     /// pipeline that does not draws as before.
+     pub fn set_tessellation_factor_scale(&mut self, scale: f32) {
++        crate::fuxi_census::set(crate::fuxi_census::Set::Other);
+         self.log(|_| RenderCall::TessellationFactorScale(scale));
+         self.factors.scale = Some(scale);
+     }
+@@ -2242,6 +2274,7 @@ impl RenderCommandEncoder {
+         count: u64,
+         view_mappings: Option<&[VertexAmplificationViewMapping]>,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::Other);
+         self.log(|_| RenderCall::VertexAmplificationCount(count, view_mappings.map(Into::into)));
+         self.amplification = Amplification::new(count, view_mappings)
+             .map_err(|problem| draw_problem("set_vertex_amplification_count", problem))?;
+@@ -2941,6 +2974,7 @@ impl RenderCommandEncoder {
+         mode: VisibilityResultMode,
+         offset: u64,
+     ) -> Result<(), Error> {
++        crate::fuxi_census::set(crate::fuxi_census::Set::Other);
+         self.log(|_| RenderCall::VisibilityResultMode(mode, offset));
+         let offset = visibility::result_offset(offset);
+         let device = self.core.device().clone();
+@@ -5661,6 +5695,7 @@ impl RenderCommandEncoder {
+         buffers: DrawBuffers<'_>,
+         empty: bool,
+     ) -> Result<(), Error> {
++        let census = crate::fuxi_census::begin();
+         self.sync_heaps();
+         // And whether it rasterizes, without which its primitives reach no tile (EV RRS3-reach4c,
+         // `no_raster_t11`). And whether it chooses its viewport.
+@@ -5674,6 +5709,7 @@ impl RenderCommandEncoder {
+                 _ => (RenderStages::empty(), true, true),
+             };
+         self.draw_resident(call, assembly, draw, buffers, empty)?;
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Recorded);
+         // Every draw, one of nothing too (EV XRR2-x6j); an execution's commands announce at the
+         // execution (`executions.rs`).
+         if !self.replaying {
+@@ -5718,6 +5754,16 @@ impl RenderCommandEncoder {
+                 }
+             }
+         }
++        if let Some(start) = census {
++            let (pipeline, traits) = match self.pipeline.as_ref().map(RenderPipelineState::kind) {
++                Some(RenderStateKind::Graphics(state)) => (
++                    std::ptr::from_ref(state.base()) as usize,
++                    crate::fuxi_census::traits(state),
++                ),
++                _ => (0, crate::fuxi_census::NO_PIPELINE),
++            };
++            crate::fuxi_census::end(start, pipeline, traits);
++        }
+         Ok(())
+     }
+ 
+@@ -5839,6 +5885,9 @@ impl RenderCommandEncoder {
+         // as the list the index rewrite pass writes, of its class's list topology
+         // (`render/restart.rs`).
+         let restarted = self.restarted(assembly, &draw);
++        if restarted.is_some() {
++            crate::fuxi_census::event(crate::fuxi_census::Event::Restart);
++        }
+         let assembly = restarted.map_or(assembly, |r| r.assembly());
+         let settings = self.draw_settings(call, &pipeline, assembly, true)?;
+         let (topology, primitive_restart) = (settings.topology, settings.primitive_restart);
+@@ -5865,6 +5914,9 @@ impl RenderCommandEncoder {
+         // A capture draw (`render/capture.rs`) runs before the pass: it reads the bytes as they
+         // were then, in place, and announces nothing its first recording did not.
+         let capture = self.capture_addresses();
++        if capture.is_some() {
++            crate::fuxi_census::event(crate::fuxi_census::Event::Capture);
++        }
+         let pass_start = match capture {
+             Some(_) => PassStartTables::default(),
+             None => self.pass_start.tables(
+@@ -5880,11 +5932,15 @@ impl RenderCommandEncoder {
+         // its own (`next_instance`). Refused (`NotImplemented(IndirectRenderCommands)`) for an
+         // execution's command, whose runs' framebuffers are the pass's.
+         let reformats = self.reformats(&pipeline, &settings.routing)?;
++        if !reformats.is_empty() {
++            crate::fuxi_census::event(crate::fuxi_census::Event::Reformat);
++        }
+         if self.replaying && !reformats.is_empty() {
+             return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+         }
+         // The encoder's kept bind state, brought to the draw's (`live_bind.rs`), held for the
+         // draw: no draw of the encoder runs inside another past here.
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Settle);
+         let live = Arc::clone(&self.live);
+         let mut live = lock(&live);
+         let settled = self.settle_draw(
+@@ -5895,6 +5951,8 @@ impl RenderCommandEncoder {
+             &function_tables,
+         )?;
+         let (variant, plan) = (Arc::clone(&settled.variant), Arc::clone(&settled.plan));
++        crate::fuxi_census::variant(Arc::as_ptr(&variant).cast::<()>() as usize);
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Settled);
+         self.give_up_extended_shadows(&pipeline, &live.state);
+         // A capture draw runs its variant's capture form, where its objects are made: else it
+         // records nothing, and the capture neither.
+@@ -5976,6 +6034,7 @@ impl RenderCommandEncoder {
+         let mut commands = self.draw_commands.take().unwrap_or_else(DrawCommands::empty);
+         plan.instantiate_draw_into(&live.state, &draw, &mut commands)
+             .map_err(Error::Bind)?;
++        crate::fuxi_census::mark(crate::fuxi_census::Mark::Instantiated);
+         self.reaches_unnamed |= !commands.root_tables.is_empty() || reads_handles(&plan);
+         // A mesh draw the binder launches no threadgroup of (as plain Metal draws nothing).
+         let empty = empty
+@@ -6018,6 +6077,7 @@ impl RenderCommandEncoder {
+                 .flatten()
+                 .map(|buffer| buffer.identity().key),
+         ) {
++            crate::fuxi_census::event(crate::fuxi_census::Event::Skipped);
+             if self.capture_missed() {
+                 return Ok(());
+             }
+@@ -6068,6 +6128,9 @@ impl RenderCommandEncoder {
+                 )?)
+             }
+         };
++        if rewrite.is_some() {
++            crate::fuxi_census::event(crate::fuxi_census::Event::Rewrite);
++        }
+         let pass = match (commands.indirect_needs_arguments, &buffers) {
+             _ if rewrite.is_some() => None,
+             (
+@@ -6125,6 +6188,9 @@ impl RenderCommandEncoder {
+                 )?)
+             }
+         };
++        if bounds.is_some() {
++            crate::fuxi_census::event(crate::fuxi_census::Event::Bounds);
++        }
+         // The dynamic states the pipeline holds, which the draw records and its secondary's record
+         // keeps (`render/bound.rs`): a pipeline that discards rasterization has no fragment
+         // shader or fragment output state, so those states are none of its own (`fragment_state`).
