@@ -1,0 +1,109 @@
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+index 1194f78..075fd5b 100644
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -881,8 +881,15 @@ impl EncoderCore {
+         let counts = &self.device().shared().counts;
+         counts.shadow_copies_planned(copies.len(), texels);
+         self.shadow_copies(&copies);
++        let render = matches!(kind, EncoderKind::Render);
++        if render {
++            crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 14);
++        }
+         // SAFETY: as in `barrier`.
+         unsafe { self.device().shared().vk().end_command_buffer(self.raw) }.map_err(vulkan)?;
++        if render {
++            crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 15);
++        }
+         let EncoderCore {
+             mut open,
+             raw,
+diff --git a/crates/metal2vulkan-runtime/src/fuxi_census.rs b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+index 39ac61a..32c7c0e 100644
+--- a/crates/metal2vulkan-runtime/src/fuxi_census.rs
++++ b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+@@ -21,8 +21,8 @@
+ //! and command buffer commits, and counts the encoders that log their calls for a rebind. The
+ //! `open` and `end` lines split an encoder's opening and end at their phase marks.
+ //!
+-//! [`lane`] is the hybrid lane's switch (`fuxihyb=2`), read once per process: off, every cut it
+-//! guards takes the path it took before. `fuxihyb=3` sets it by census window, for an A/B in one
++//! [`lane`] is the hybrid lane's switch (`fuxihyb=2`, or `fuxihyb=4` for the lane without the
++//! census), read once per process: off, every cut it guards takes the path it took before. `fuxihyb=3` sets it by census window, for an A/B in one
+ //! boot: the process's first drawing thread picks the next window's way at random as each of its
+ //! windows ends (not by turns, which a periodic load aliases), and its window line says which way
+ //! the window ran (`lane=0|1`; the cuts are exact either way, so a change between two draws
+@@ -430,7 +430,8 @@ fn boot_value() -> Option<u64> {
+ 
+ #[cold]
+ fn start() -> bool {
+-    let on = boot_value().is_some_and(|v| v >= 1);
++    // `fuxihyb=4` runs the lane without the census (its own cost stays off).
++    let on = boot_value().is_some_and(|v| (1..=3).contains(&v));
+     if STATE
+         .compare_exchange(
+             UNKNOWN,
+@@ -472,6 +473,7 @@ fn lane_start() -> bool {
+     let state = match boot_value() {
+         Some(3) => ALTERNATE,
+         Some(v) if v >= 2 => ON,
++        // (4 and up: ON without the census, `start`.)
+         _ => OFF,
+     };
+     let _ = LANE.compare_exchange(UNKNOWN, state, Ordering::AcqRel, Ordering::Acquire);
+@@ -540,7 +542,7 @@ pub(crate) enum Around {
+ }
+ const AROUND: usize = 4;
+ /// The most phase marks of an encoder's opening or end.
+-const PHASES: usize = 10;
++const PHASES: usize = 16;
+ 
+ /// The phase group of `what`: an opening's 0, an end's 1.
+ fn phase_group(what: u8) -> Option<usize> {
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 6219df8..0b6ea24 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -1355,8 +1355,10 @@ impl CommandBuffer {
+         // The pass's loads read a new texture's unwritten texels (`fresh_unwritten.rs`).
+         FreshUnwritten::begin_pass(device, &layout)?;
+         render_pass::degrade_depth_clear(device, &layout);
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::Open, 4);
+         let extended = ExtendedShadows::of(descriptor, &layout, rate_map.is_some());
+         let rerecord = reroute::keeps_whole(device) || extended.keeps_draws();
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::Open, 5);
+         Ok(RenderCommandEncoder {
+             core,
+             earlier: Vec::new(),
+@@ -3074,6 +3076,7 @@ impl RenderCommandEncoder {
+     pub fn end_encoding(self) -> Result<(), Error> {
+         let _timed = crate::fuxi_census::timed(crate::fuxi_census::Around::End);
+         let (core, residency, log) = self.end_pass()?;
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 13);
+         core.end_with_replay(
+             EncoderKind::Render,
+             Some(residency),
+@@ -4196,6 +4199,7 @@ impl RenderCommandEncoder {
+         }
+         // Metal drops the pass's stores into a sparse texture's unmapped tiles: each sparse
+         // texture it wrote is scrubbed after it (`sparse/emulated.rs`).
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 10);
+         let written = layout
+             .colors
+             .iter()
+@@ -4219,6 +4223,7 @@ impl RenderCommandEncoder {
+         // unwritten pattern (`fresh_unwritten.rs`).
+         FreshUnwritten::resolved(&device, &resolved, layout.extent)?;
+         // The pass's one instance, where nothing recorded restarts a driver's Metal pass.
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 11);
+         let whole = (shapes.len() == 1 && unbroken).then(|| WholePass {
+             shape: &shapes[0],
+             drew,
+@@ -4283,6 +4288,7 @@ impl RenderCommandEncoder {
+         // What the pass's commands use, held until the command buffer completes as one object,
+         // which lets go of them in this order: the command buffer lets go of what it holds from
+         // the last retained back.
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 12);
+         core.retain((
+             imageblock.as_ref().map(PassImageblock::held),
+             depth_stand_in.as_ref().map(DepthStandIn::held),
