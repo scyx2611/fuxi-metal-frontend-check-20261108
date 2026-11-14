@@ -1,0 +1,151 @@
+diff --git a/xnu/fuxi-prof/sweet_prof_sample.c b/xnu/fuxi-prof/sweet_prof_sample.c
+index 3926714..b17a628 100644
+--- a/xnu/fuxi-prof/sweet_prof_sample.c
++++ b/xnu/fuxi-prof/sweet_prof_sample.c
+@@ -87,11 +87,11 @@ static void sp_pc_print(void) {
+  * counts once for each distinct 64-byte bucket among its pc, its lr and up to SP_INC_FRAMES return addresses of its frame chain,
+  * so a function's count is the time spent in it and below it. Printed as "PROFINC t<tid> 0x<bucket> <count>" (top SP_INC_TOP)
+  * and "PROFINC done samples= dropped= frames=". lr names a leaf's caller (a leaf such as memmove saves no frame). */
+-#define SP_INC_BUCKETS 8192u
+-#define SP_INC_TOP 360u
++#define SP_INC_BUCKETS 16384u
++#define SP_INC_TOP 380u
+ #define SP_INC_FRAMES 24u
+ static struct sp_pc sp_incs[SP_INC_BUCKETS];
+-static unsigned sp_inc_dropped,sp_inc_samples;
++static unsigned sp_inc_dropped,sp_inc_samples,sp_inc_by[3]; /* samples by class: 0 live (on a core), 1 waiting, 2 runnable off-core */
+ static unsigned long long sp_inc_frames;
+ static void sp_inc_add(uint64_t tid,uint64_t pc) {
+  uint64_t h=(pc>>6)^(tid*0x9e3779b97f4a7c15ULL);
+@@ -102,7 +102,10 @@ static void sp_inc_add(uint64_t tid,uint64_t pc) {
+  }
+  sp_inc_dropped++;
+ }
+-static void sp_inc_sample(vm_map_t map,uint64_t tid,uint64_t pc,uint64_t lr,uint64_t fp) {
++/* cls 0 live, 1 wait, 2 ready: off-core samples use the saved user state, exact for a thread blocked in a trap; the class is kept in
++ * bits 60-61 of the key's tid so one bucket table holds both. */
++static void sp_inc_sample(vm_map_t map,uint64_t tid,unsigned cls,uint64_t pc,uint64_t lr,uint64_t fp) {
++ tid|=(uint64_t)cls<<60;
+  uint64_t seen[SP_INC_FRAMES+2];unsigned k=0;
+  const uint64_t mask=((uint64_t)1<<47)-1;
+  seen[k++]=(pc&mask)&~(uint64_t)63;
+@@ -120,17 +123,17 @@ static void sp_inc_sample(vm_map_t map,uint64_t tid,uint64_t pc,uint64_t lr,uint
+   for(unsigned j=0;j<i;j++)if(seen[j]==seen[i]){dup=1;break;}
+   if(!dup)sp_inc_add(tid,seen[i]);
+  }
+- sp_inc_samples++;
++ sp_inc_samples++;if(cls<3)sp_inc_by[cls]++;
+ }
+ static void sp_inc_print(void) {
+  for(unsigned k=0;k<SP_INC_TOP;k++){
+   unsigned best=SP_INC_BUCKETS;
+   for(unsigned i=0;i<SP_INC_BUCKETS;i++)if(sp_incs[i].n && (best==SP_INC_BUCKETS || sp_incs[i].n>sp_incs[best].n))best=i;
+   if(best==SP_INC_BUCKETS)break;
+-  printf("PROFINC t%llu 0x%llx %u\n",(unsigned long long)sp_incs[best].tid,(unsigned long long)sp_incs[best].pc,sp_incs[best].n);
++  printf("PROFINC t%llu %c 0x%llx %u\n",(unsigned long long)(sp_incs[best].tid&(((uint64_t)1<<60)-1)),"LWR?"[(sp_incs[best].tid>>60)&3],(unsigned long long)sp_incs[best].pc,sp_incs[best].n);
+   sp_incs[best].n=0;
+  }
+- printf("PROFINC done samples=%u dropped=%u frames=%llu\n",sp_inc_samples,sp_inc_dropped,sp_inc_frames);
++ printf("PROFINC done samples=%u live=%u wait=%u ready=%u dropped=%u frames=%llu\n",sp_inc_samples,sp_inc_by[0],sp_inc_by[1],sp_inc_by[2],sp_inc_dropped,sp_inc_frames);
+ }
+ #endif
+ void sweet_prof_task(task_t task,int pid);
+@@ -173,7 +176,8 @@ static void sp_sweep(task_t task,struct sp_table *p) {
+   if(t==SP_THREADS)continue;
+   if(!p->threads[t].name[0] && get_bsdthread_info(thread))thread_get_thread_name(thread,p->threads[t].name);
+ #ifndef SP_NO_LIVE
+-  if(live && (is_main || !strncmp(p->threads[t].name,"com.apple.coreanimation.display",31)))sp_inc_sample(map,s.tid,s.pc,s.lr,live_fp);
++  if((is_main || !strncmp(p->threads[t].name,"com.apple.coreanimation.display",31)) && (live || s.state==1 || s.state==2))
++   sp_inc_sample(map,s.tid,live ? 0 : s.state,s.pc,s.lr,live ? live_fp : get_saved_state_fp(ss));
+ #endif
+   sp_add(p,t,&s);
+  }
+@@ -208,7 +212,7 @@ void sweet_prof_task(task_t task,int pid) {
+ #ifndef SP_NO_LIVE
+  nanoseconds_to_absolutetime(200*NSEC_PER_USEC,&sp_live_wait);
+  memset(sp_pcs,0,sizeof(sp_pcs));sp_pc_dropped=0;
+- memset(sp_incs,0,sizeof(sp_incs));sp_inc_dropped=sp_inc_samples=0;sp_inc_frames=0;
++ memset(sp_incs,0,sizeof(sp_incs));sp_inc_dropped=sp_inc_samples=0;sp_inc_frames=0;memset(sp_inc_by,0,sizeof(sp_inc_by));
+ #endif
+  uint64_t start=mach_absolute_time(),end=start+duration;deadline=start;
+  while(mach_absolute_time()<end) {
+diff --git a/xnu/patches/0111-fuxi-user-profiler.patch b/xnu/patches/0111-fuxi-user-profiler.patch
+index 5cd3f28..9235427 100644
+--- a/xnu/patches/0111-fuxi-user-profiler.patch
++++ b/xnu/patches/0111-fuxi-user-profiler.patch
+@@ -90,7 +90,7 @@
+ +#endif
+ --- /dev/null
+ +++ b/osfmk/kern/sweet_prof_sample.c
+-@@ -0,0 +1,229 @@
++@@ -0,0 +1,233 @@
+ +/* Saved user stacks are approximate; no target suspension or logging per sweep. */
+ +#include <pexpert/arm64/board_config.h>
+ +#if defined(FUXI)
+@@ -180,11 +180,11 @@
+ + * counts once for each distinct 64-byte bucket among its pc, its lr and up to SP_INC_FRAMES return addresses of its frame chain,
+ + * so a function's count is the time spent in it and below it. Printed as "PROFINC t<tid> 0x<bucket> <count>" (top SP_INC_TOP)
+ + * and "PROFINC done samples= dropped= frames=". lr names a leaf's caller (a leaf such as memmove saves no frame). */
+-+#define SP_INC_BUCKETS 8192u
+-+#define SP_INC_TOP 360u
+++#define SP_INC_BUCKETS 16384u
+++#define SP_INC_TOP 380u
+ +#define SP_INC_FRAMES 24u
+ +static struct sp_pc sp_incs[SP_INC_BUCKETS];
+-+static unsigned sp_inc_dropped,sp_inc_samples;
+++static unsigned sp_inc_dropped,sp_inc_samples,sp_inc_by[3]; /* samples by class: 0 live (on a core), 1 waiting, 2 runnable off-core */
+ +static unsigned long long sp_inc_frames;
+ +static void sp_inc_add(uint64_t tid,uint64_t pc) {
+ + uint64_t h=(pc>>6)^(tid*0x9e3779b97f4a7c15ULL);
+@@ -195,7 +195,10 @@
+ + }
+ + sp_inc_dropped++;
+ +}
+-+static void sp_inc_sample(vm_map_t map,uint64_t tid,uint64_t pc,uint64_t lr,uint64_t fp) {
+++/* cls 0 live, 1 wait, 2 ready: off-core samples use the saved user state, exact for a thread blocked in a trap; the class is kept in
+++ * bits 60-61 of the key's tid so one bucket table holds both. */
+++static void sp_inc_sample(vm_map_t map,uint64_t tid,unsigned cls,uint64_t pc,uint64_t lr,uint64_t fp) {
+++ tid|=(uint64_t)cls<<60;
+ + uint64_t seen[SP_INC_FRAMES+2];unsigned k=0;
+ + const uint64_t mask=((uint64_t)1<<47)-1;
+ + seen[k++]=(pc&mask)&~(uint64_t)63;
+@@ -213,17 +216,17 @@
+ +  for(unsigned j=0;j<i;j++)if(seen[j]==seen[i]){dup=1;break;}
+ +  if(!dup)sp_inc_add(tid,seen[i]);
+ + }
+-+ sp_inc_samples++;
+++ sp_inc_samples++;if(cls<3)sp_inc_by[cls]++;
+ +}
+ +static void sp_inc_print(void) {
+ + for(unsigned k=0;k<SP_INC_TOP;k++){
+ +  unsigned best=SP_INC_BUCKETS;
+ +  for(unsigned i=0;i<SP_INC_BUCKETS;i++)if(sp_incs[i].n && (best==SP_INC_BUCKETS || sp_incs[i].n>sp_incs[best].n))best=i;
+ +  if(best==SP_INC_BUCKETS)break;
+-+  printf("PROFINC t%llu 0x%llx %u\n",(unsigned long long)sp_incs[best].tid,(unsigned long long)sp_incs[best].pc,sp_incs[best].n);
+++  printf("PROFINC t%llu %c 0x%llx %u\n",(unsigned long long)(sp_incs[best].tid&(((uint64_t)1<<60)-1)),"LWR?"[(sp_incs[best].tid>>60)&3],(unsigned long long)sp_incs[best].pc,sp_incs[best].n);
+ +  sp_incs[best].n=0;
+ + }
+-+ printf("PROFINC done samples=%u dropped=%u frames=%llu\n",sp_inc_samples,sp_inc_dropped,sp_inc_frames);
+++ printf("PROFINC done samples=%u live=%u wait=%u ready=%u dropped=%u frames=%llu\n",sp_inc_samples,sp_inc_by[0],sp_inc_by[1],sp_inc_by[2],sp_inc_dropped,sp_inc_frames);
+ +}
+ +#endif
+ +void sweet_prof_task(task_t task,int pid);
+@@ -266,7 +269,8 @@
+ +  if(t==SP_THREADS)continue;
+ +  if(!p->threads[t].name[0] && get_bsdthread_info(thread))thread_get_thread_name(thread,p->threads[t].name);
+ +#ifndef SP_NO_LIVE
+-+  if(live && (is_main || !strncmp(p->threads[t].name,"com.apple.coreanimation.display",31)))sp_inc_sample(map,s.tid,s.pc,s.lr,live_fp);
+++  if((is_main || !strncmp(p->threads[t].name,"com.apple.coreanimation.display",31)) && (live || s.state==1 || s.state==2))
+++   sp_inc_sample(map,s.tid,live ? 0 : s.state,s.pc,s.lr,live ? live_fp : get_saved_state_fp(ss));
+ +#endif
+ +  sp_add(p,t,&s);
+ + }
+@@ -301,7 +305,7 @@
+ +#ifndef SP_NO_LIVE
+ + nanoseconds_to_absolutetime(200*NSEC_PER_USEC,&sp_live_wait);
+ + memset(sp_pcs,0,sizeof(sp_pcs));sp_pc_dropped=0;
+-+ memset(sp_incs,0,sizeof(sp_incs));sp_inc_dropped=sp_inc_samples=0;sp_inc_frames=0;
+++ memset(sp_incs,0,sizeof(sp_incs));sp_inc_dropped=sp_inc_samples=0;sp_inc_frames=0;memset(sp_inc_by,0,sizeof(sp_inc_by));
+ +#endif
+ + uint64_t start=mach_absolute_time(),end=start+duration;deadline=start;
+ + while(mach_absolute_time()<end) {
