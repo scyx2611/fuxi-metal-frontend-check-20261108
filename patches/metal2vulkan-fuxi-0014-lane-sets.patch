@@ -1,0 +1,280 @@
+diff --git a/crates/metal2vulkan-runtime/src/descriptor_arena.rs b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
+index f54f31d..8e53709 100644
+--- a/crates/metal2vulkan-runtime/src/descriptor_arena.rs
++++ b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
+@@ -162,11 +162,48 @@ pub(crate) struct DescriptorArena {
+     book: Book,
+     pools: Vec<DescriptorPool>,
+     device: Option<Device>,
++    /// FUXI (`fuxihyb=2`): the latest written sets of the command buffer's draws, each with its
++    /// layout and its writes flattened ([`reused`](Self::reused)), newest last, at most
++    /// [`KEPT_SETS`].
++    written: Vec<(vk::DescriptorSetLayout, Vec<u64>, vk::DescriptorSet)>,
+ }
+ 
++/// FUXI: the most written sets an arena keeps for a draw to take again.
++const KEPT_SETS: usize = 32;
++
+ impl DescriptorArena {
+     /// One set of `layout`, whose needs are `needs` (not empty), from the newest pool with room
+     /// for it, or a pool opened for it: a spare of the device's with room, else a new one.
++    /// FUXI (`fuxihyb=2`): a set of `layout` this command buffer already holds whose writes were
++    /// exactly `writes` (flattened by the caller), none written since: a draw that would write
++    /// the same into a new set binds that one instead. Every object its writes name is held by the
++    /// command buffer since the draw that wrote it, so the set reads the same until it completes.
++    pub(crate) fn reused(
++        &self,
++        layout: vk::DescriptorSetLayout,
++        writes: &[u64],
++    ) -> Option<vk::DescriptorSet> {
++        self.written
++            .iter()
++            .rev()
++            .find(|(of, kept, _)| *of == layout && kept[..] == *writes)
++            .map(|&(_, _, set)| set)
++    }
++
++    /// FUXI (`fuxihyb=2`): note that `set`, of `layout`, holds `writes` (flattened), for
++    /// [`reused`](Self::reused).
++    pub(crate) fn wrote(
++        &mut self,
++        layout: vk::DescriptorSetLayout,
++        writes: Vec<u64>,
++        set: vk::DescriptorSet,
++    ) {
++        if self.written.len() == KEPT_SETS {
++            self.written.remove(0);
++        }
++        self.written.push((layout, writes, set));
++    }
++
+     pub(crate) fn allocate(
+         &mut self,
+         device: &Device,
+@@ -220,6 +257,7 @@ impl DescriptorArena {
+     /// their sets any more.
+     pub(crate) fn give_back(&mut self) {
+         self.book.rooms.clear();
++        self.written.clear();
+         let Some(device) = &self.device else {
+             return;
+         };
+@@ -233,6 +271,7 @@ impl DescriptorArena {
+     /// was never submitted).
+     pub(crate) fn release(&mut self) {
+         self.book.rooms.clear();
++        self.written.clear();
+         let Some(device) = &self.device else {
+             return;
+         };
+diff --git a/crates/metal2vulkan-runtime/src/fuxi_census.rs b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+index 551d4bf..e6f2210 100644
+--- a/crates/metal2vulkan-runtime/src/fuxi_census.rs
++++ b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+@@ -16,8 +16,11 @@
+ //! pipeline layout. Every 10 s a thread that drew writes `FUXI HYB` lines to stderr, one write
+ //! per line. Diagnostics only: nothing here changes what is drawn.
+ //!
+-//! [`lane`] is the hybrid lane's switch (`fuxihyb=2` or more), read once per process: off, every
+-//! cut it guards takes the path it took before.
++//! [`lane`] is the hybrid lane's switch (`fuxihyb=2`), read once per process: off, every cut it
++//! guards takes the path it took before. `fuxihyb=3` alternates it by census window, for an A/B
++//! in one boot: the process's first drawing thread turns it over as each of its windows ends, and
++//! its window line says which way the window ran (`lane=0|1`; the cuts are exact either way, so
++//! a turn between two draws changes nothing they draw).
+ 
+ use std::cell::{Cell, RefCell};
+ use std::collections::HashMap;
+@@ -32,6 +35,9 @@ const OFF: u8 = 2;
+ 
+ static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
+ static LANE: AtomicU8 = AtomicU8::new(UNKNOWN);
++/// `LANE`'s third state: alternating by window (`fuxihyb=3`), now as `LANE_NOW` says.
++const ALTERNATE: u8 = 3;
++static LANE_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+ static NEXT_THREAD: AtomicU32 = AtomicU32::new(1);
+ static BASE: OnceLock<Instant> = OnceLock::new();
+ 
+@@ -79,8 +85,10 @@ pub(crate) enum Event {
+     ShapeMade = 8,
+     /// Not a step: the lane kept the encoder's argument sampler listing (`fuxihyb=2`).
+     SamplersKept = 9,
++    /// Not a step: the lane bound a set-0 set the command buffer wrote alike before.
++    SetReused = 10,
+ }
+-const EVENTS: usize = 10;
++const EVENTS: usize = 11;
+ const EVENT_NAMES: [&str; EVENTS] = [
+     "reformat",
+     "restart",
+@@ -92,6 +100,7 @@ const EVENT_NAMES: [&str; EVENTS] = [
+     "shapefound",
+     "shapemade",
+     "samplerskept",
++    "setreused",
+ ];
+ /// The events that are runtime steps (a draw with one is not eligible); the rest are counts.
+ const STEP_EVENTS: u16 = (1 << 6) - 1;
+@@ -444,22 +453,23 @@ pub(crate) fn active() -> bool {
+ 
+ #[cold]
+ fn lane_start() -> bool {
+-    let on = boot_value().is_some_and(|v| v >= 2);
+-    let _ = LANE.compare_exchange(
+-        UNKNOWN,
+-        if on { ON } else { OFF },
+-        Ordering::AcqRel,
+-        Ordering::Acquire,
+-    );
+-    LANE.load(Ordering::Acquire) == ON
++    let state = match boot_value() {
++        Some(3) => ALTERNATE,
++        Some(v) if v >= 2 => ON,
++        _ => OFF,
++    };
++    let _ = LANE.compare_exchange(UNKNOWN, state, Ordering::AcqRel, Ordering::Acquire);
++    lane()
+ }
+ 
+-/// Whether the hybrid lane's cuts are on (`fuxihyb=2` or more), read once per process.
++/// Whether the hybrid lane's cuts are on (`fuxihyb=2`; by window under `fuxihyb=3`), the boot
++/// value read once per process.
+ #[inline]
+ pub(crate) fn lane() -> bool {
+     match LANE.load(Ordering::Relaxed) {
+         ON => true,
+         OFF => false,
++        ALTERNATE => LANE_NOW.load(Ordering::Relaxed),
+         _ => lane_start(),
+     }
+ }
+@@ -566,6 +576,10 @@ pub(crate) fn end(start: u64, pipeline: usize, traits: u32) {
+         record(stats, &cur, start, t, pipeline, traits);
+         if t.saturating_sub(stats.window) >= WINDOW_NS {
+             report(stats, t);
++            // Under `fuxihyb=3` the first drawing thread turns the lane over for the next window.
++            if stats.id == 1 && LANE.load(Ordering::Relaxed) == ALTERNATE {
++                LANE_NOW.fetch_xor(true, Ordering::Relaxed);
++            }
+             let (id, last_pipeline, last_variant) =
+                 (stats.id, stats.last_pipeline, stats.last_variant);
+             **stats = Stats {
+@@ -684,7 +698,7 @@ fn report(stats: &Stats, t: u64) {
+     let n = stats.draws;
+     let head = format!("FUXI HYB T{} pid={}", stats.id, std::process::id());
+     line(&format!(
+-        "{head} win_s={:.1} draws={n} elig={} elig_us={:.1} us/draw tot={:.1} pre={:.1} settle={:.1} inst={:.1} rest={:.1} post={:.1} between={:.1} same_pipe={} same_var={} pipes={} vars={}\n",
++        "{head} win_s={:.1} draws={n} elig={} elig_us={:.1} us/draw tot={:.1} pre={:.1} settle={:.1} inst={:.1} rest={:.1} post={:.1} between={:.1} same_pipe={} same_var={} pipes={} vars={} lane={}\n",
+         t.saturating_sub(stats.window) as f64 / 1e9,
+         stats.eligible,
+         us(stats.eligible_ns, stats.eligible),
+@@ -699,6 +713,7 @@ fn report(stats: &Stats, t: u64) {
+         stats.same_variant,
+         stats.pipelines.len(),
+         stats.variants.len(),
++        u8::from(lane()),
+     ));
+     let mut rest = format!("{head} rest n={}", stats.rest_draws);
+     for (name, ns) in REST_NAMES.iter().zip(stats.rest_ns) {
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/objects.rs b/crates/metal2vulkan-runtime/src/pipeline/objects.rs
+index dad330c..03f1be0 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/objects.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/objects.rs
+@@ -740,6 +740,14 @@ impl VariantObjects {
+         self.set_layouts.len()
+     }
+ 
++    /// FUXI: the layout of set 0, where a command takes one ([`set_zero`](Self::set_zero)).
++    pub(crate) fn set_zero_layout(&self) -> Option<vk::DescriptorSetLayout> {
++        match (self.set_layouts.first(), self.set_needs.first()) {
++            (Some(&layout), Some(needs)) if !needs.is_empty() => Some(layout),
++            _ => None,
++        }
++    }
++
+     /// A command's set 0, from its command buffer's pools `arena`; none when the layout has no
+     /// set, or set 0 no descriptor (a pipeline that uses no set needs none bound).
+     pub(crate) fn set_zero(
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 118c327..de88f0f 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -546,6 +546,30 @@ struct DrawBuffers<'a> {
+     control_point_indices: Option<(&'a Buffer, u64)>,
+ }
+ 
++/// FUXI (`fuxihyb=2`): a draw's set-0 writes flattened, field by field and handle by handle, the
++/// key a written set is taken again by (`DescriptorArena::reused`): equal words, equal writes.
++fn set_zero_words(writes: &[binding::Write]) -> Vec<u64> {
++    use ash::vk::Handle as _;
++    let mut words = Vec::with_capacity(writes.len() * 5);
++    for write in writes {
++        words.push(u64::from(write.set) << 32 | u64::from(write.binding));
++        words.push(u64::from(write.element) << 32 | write.ty.as_raw() as u32 as u64);
++        match write.info {
++            binding::Info::Buffer(info) => {
++                words.extend([1, info.buffer.as_raw(), info.offset, info.range]);
++            }
++            binding::Info::Image(info) => words.extend([
++                2,
++                info.sampler.as_raw(),
++                info.image_view.as_raw(),
++                info.image_layout.as_raw() as u32 as u64,
++            ]),
++            binding::Info::Texel(view) => words.extend([3, view.as_raw()]),
++        }
++    }
++    words
++}
++
+ /// FUXI census: a hash (FNV-1a) of a draw's set-0 writes, what its descriptor set holds, so the
+ /// census can count draws whose writes equal the last ones of their pipeline layout.
+ fn set_zero_hash(writes: &[binding::Write]) -> u64 {
+@@ -6844,11 +6868,42 @@ impl RenderCommandEncoder {
+         // Set 0 per draw; set 1 the device's (written below, once nothing refuses).
+         let mut writes = bound.writes;
+         let heap_writes: Vec<_> = writes.extract_if(.., |write| write.set > 0).collect();
+-        let set = objects.set_zero(&mut self.core.command_buffer().state().descriptors)?;
+-        // SAFETY: the set was just allocated and no command uses it yet; every buffer, view
+-        // and sampler written is live (the command buffer retains them below, and a refusal
+-        // leaves the set unused in its pool).
+-        unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
++        // FUXI (`fuxihyb=2`): a set this command buffer wrote alike already, where every write
++        // is a plain set-0 descriptor (none holds an object of its own).
++        let flat = match (crate::fuxi_census::lane(), objects.set_zero_layout()) {
++            (true, Some(layout)) if writes.iter().all(|w| w.set == 0 && w.held.is_none()) => {
++                Some((layout, set_zero_words(&writes)))
++            }
++            _ => None,
++        };
++        let again = flat.as_ref().and_then(|(layout, words)| {
++            self.core
++                .command_buffer()
++                .state()
++                .descriptors
++                .reused(*layout, words)
++        });
++        let set = match again {
++            Some(set) => {
++                crate::fuxi_census::event(crate::fuxi_census::Event::SetReused);
++                Some(set)
++            }
++            None => {
++                let set = objects.set_zero(&mut self.core.command_buffer().state().descriptors)?;
++                // SAFETY: the set was just allocated and no command uses it yet; every buffer,
++                // view and sampler written is live (the command buffer retains them below, and a
++                // refusal leaves the set unused in its pool).
++                unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
++                if let (Some((layout, words)), Some(set)) = (flat, set) {
++                    self.core
++                        .command_buffer()
++                        .state()
++                        .descriptors
++                        .wrote(layout, words, set);
++                }
++                set
++            }
++        };
+         if crate::fuxi_census::active() {
+             use ash::vk::Handle as _;
+             crate::fuxi_census::set_zero(objects.layout().as_raw(), set_zero_hash(&writes));
