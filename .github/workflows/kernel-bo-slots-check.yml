@@ -16,6 +16,7 @@ on:
       - patches/kernel-prof-inclusive.patch
       - patches/kernel-swipe-pacing.patch
       - patches/kernel-prof-inclusive-wait.patch
+      - patches/kernel-prof-edges.patch
       - tests/test-perf-governor.py
       - tests/test-ib-profile.py
       - tests/test-surface-plane-result.py
@@ -72,6 +73,8 @@ jobs:
           git -C source apply ../harness/patches/kernel-swipe-pacing.patch
           git -C source apply --check ../harness/patches/kernel-prof-inclusive-wait.patch
           git -C source apply ../harness/patches/kernel-prof-inclusive-wait.patch
+          git -C source apply --check ../harness/patches/kernel-prof-edges.patch
+          git -C source apply ../harness/patches/kernel-prof-edges.patch
           (cd source && python3 tools/test-fuxi-prof.py)
       - name: Build and audit kernel
         shell: bash
