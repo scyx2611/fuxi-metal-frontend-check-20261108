@@ -1,0 +1,246 @@
+diff --git a/bridge/FuxiThreadCache.rs b/bridge/FuxiThreadCache.rs
+new file mode 100644
+index 0000000..44d8aa4
+--- /dev/null
++++ b/bridge/FuxiThreadCache.rs
+@@ -0,0 +1,225 @@
++// SPDX-License-Identifier: MIT
++//! Fuxi patch 0015: a per-thread cache in front of the system allocator for the bridge's small Rust allocations.
++//!
++//! The display thread of the render server makes thousands of small Rust allocations per frame (the runtime's per-draw
++//! vectors, maps and reference counts); each went through libmalloc's tiny allocator and its lock. With `fuxitcache=1`
++//! on the boot line (read once per process) a thread keeps freed blocks of up to 512 bytes in 16-byte size classes and
++//! hands them back without a lock. Without the argument every call goes to the system allocator exactly as before.
++//!
++//! Cached blocks are ordinary `malloc` blocks of their class size, so memory that crosses the C ABI stays valid for
++//! `malloc`/`free` in either direction. A thread keeps at most `CAP` blocks per class; its cache is returned to `free`
++//! when the thread exits (pthread key destructor). Larger or over-aligned requests always use the system allocator.
++
++use std::alloc::{GlobalAlloc, Layout, System};
++use std::ffi::{c_char, c_int, c_void};
++use std::ptr;
++use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
++
++const QUANTUM: usize = 16;
++const CLASSES: usize = 32;
++const MAX_SIZE: usize = QUANTUM * CLASSES;
++const CAP: u32 = 64;
++
++const UNKNOWN: u8 = 0;
++const STARTING: u8 = 1;
++const ON: u8 = 2;
++const OFF: u8 = 3;
++
++static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
++static KEY: AtomicUsize = AtomicUsize::new(0);
++
++#[repr(C)]
++struct Cache {
++    heads: [*mut c_void; CLASSES],
++    counts: [u32; CLASSES],
++}
++
++unsafe extern "C" {
++    fn malloc(size: usize) -> *mut c_void;
++    fn calloc(count: usize, size: usize) -> *mut c_void;
++    fn free(ptr: *mut c_void);
++    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
++    fn pthread_key_create(key: *mut usize, destructor: Option<unsafe extern "C" fn(*mut c_void)>) -> c_int;
++    fn pthread_getspecific(key: usize) -> *mut c_void;
++    fn pthread_setspecific(key: usize, value: *const c_void) -> c_int;
++    fn sysctlbyname(name: *const c_char, old: *mut c_void, old_len: *mut usize, new: *mut c_void, new_len: usize)
++    -> c_int;
++}
++
++/// Whether `token` is one whitespace-separated word of `args`.
++fn has_token(args: &[u8], token: &[u8]) -> bool {
++    args.split(|&b| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' || b == 0).any(|word| word == token)
++}
++
++#[cold]
++fn start() -> bool {
++    if STATE.compare_exchange(UNKNOWN, STARTING, Ordering::AcqRel, Ordering::Acquire).is_err() {
++        // Another thread is deciding; until it has, this call uses the system allocator.
++        return STATE.load(Ordering::Acquire) == ON;
++    }
++    let mut args = [0u8; 2048];
++    let mut len = args.len();
++    // SAFETY: a fixed stack buffer and its length; sysctlbyname does not allocate through Rust.
++    let read =
++        unsafe { sysctlbyname(c"kern.bootargs".as_ptr(), args.as_mut_ptr().cast(), &mut len, ptr::null_mut(), 0) } == 0;
++    let mut key = 0usize;
++    let on = read
++        && has_token(&args[..len.min(args.len())], b"fuxitcache=1")
++        // SAFETY: plain pthread call; the destructor only frees blocks this module cached.
++        && unsafe { pthread_key_create(&mut key, Some(release)) } == 0;
++    if on {
++        KEY.store(key, Ordering::Release);
++        let line = b"FUXI TCACHE: on (16..512 bytes, 64 blocks per class per thread)\n";
++        // SAFETY: a static message to stderr; write does not allocate.
++        unsafe { write(2, line.as_ptr().cast(), line.len()) };
++    }
++    STATE.store(if on { ON } else { OFF }, Ordering::Release);
++    on
++}
++
++#[inline]
++fn enabled() -> bool {
++    match STATE.load(Ordering::Acquire) {
++        ON => true,
++        UNKNOWN => start(),
++        _ => false,
++    }
++}
++
++#[inline]
++fn class_of(layout: &Layout) -> Option<usize> {
++    let size = layout.size();
++    (size <= MAX_SIZE && layout.align() <= QUANTUM).then(|| (size.max(1) - 1) / QUANTUM)
++}
++
++/// This thread's cache, made on first use (allocation side only). Null when it cannot be made.
++#[inline]
++unsafe fn cache() -> *mut Cache {
++    let key = KEY.load(Ordering::Relaxed);
++    // SAFETY: KEY was created before STATE became ON.
++    let mut cache = unsafe { pthread_getspecific(key) }.cast::<Cache>();
++    if cache.is_null() {
++        // SAFETY: zeroed storage is an empty cache (null heads, zero counts).
++        cache = unsafe { calloc(1, size_of::<Cache>()) }.cast();
++        // SAFETY: storing our own pointer under our own key.
++        if !cache.is_null() && unsafe { pthread_setspecific(key, cache.cast()) } != 0 {
++            unsafe { free(cache.cast()) };
++            cache = ptr::null_mut();
++        }
++    }
++    cache
++}
++
++/// Thread exit: every cached block and the cache itself go back to `free`.
++unsafe extern "C" fn release(value: *mut c_void) {
++    let cache = value.cast::<Cache>();
++    if cache.is_null() {
++        return;
++    }
++    for class in 0..CLASSES {
++        // SAFETY: the list holds blocks this module pushed, each linked through its first word.
++        let mut block = unsafe { (*cache).heads[class] };
++        while !block.is_null() {
++            let next = unsafe { *block.cast::<*mut c_void>() };
++            unsafe { free(block) };
++            block = next;
++        }
++    }
++    unsafe { free(cache.cast()) };
++}
++
++pub struct ThreadCache;
++
++unsafe impl GlobalAlloc for ThreadCache {
++    #[inline]
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        if let Some(class) = class_of(&layout) {
++            if enabled() {
++                // SAFETY: STATE is ON, so KEY is valid.
++                let cache = unsafe { cache() };
++                if !cache.is_null() {
++                    // SAFETY: only this thread touches its own cache.
++                    let cache = unsafe { &mut *cache };
++                    let block = cache.heads[class];
++                    if !block.is_null() {
++                        cache.heads[class] = unsafe { *block.cast::<*mut c_void>() };
++                        cache.counts[class] -= 1;
++                        return block.cast();
++                    }
++                }
++                // SAFETY: a class-sized malloc block (malloc aligns to 16).
++                return unsafe { malloc((class + 1) * QUANTUM) }.cast();
++            }
++        }
++        // SAFETY: forwarded unchanged.
++        unsafe { System.alloc(layout) }
++    }
++
++    #[inline]
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        if let Some(class) = class_of(&layout) {
++            if enabled() {
++                // SAFETY: as in alloc; the block is at least layout.size() bytes.
++                let block = unsafe { self.alloc(layout) };
++                if !block.is_null() {
++                    unsafe { ptr::write_bytes(block, 0, (class + 1) * QUANTUM) };
++                }
++                return block;
++            }
++        }
++        // SAFETY: forwarded unchanged.
++        unsafe { System.alloc_zeroed(layout) }
++    }
++
++    #[inline]
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        if let Some(class) = class_of(&layout) {
++            if STATE.load(Ordering::Relaxed) == ON {
++                // The deallocation side never makes a cache (thread exit may free after `release`).
++                // SAFETY: STATE is ON, so KEY is valid.
++                let cache = unsafe { pthread_getspecific(KEY.load(Ordering::Relaxed)) }.cast::<Cache>();
++                if !cache.is_null() {
++                    // SAFETY: only this thread touches its own cache; the block is at least 16 bytes.
++                    let cache = unsafe { &mut *cache };
++                    if cache.counts[class] < CAP {
++                        unsafe { *ptr.cast::<*mut c_void>() = cache.heads[class] };
++                        cache.heads[class] = ptr.cast();
++                        cache.counts[class] += 1;
++                        return;
++                    }
++                }
++                // Every block of these sizes is a malloc block, whichever path made it.
++                unsafe { free(ptr.cast()) };
++                return;
++            }
++        }
++        // SAFETY: forwarded unchanged.
++        unsafe { System.dealloc(ptr, layout) }
++    }
++
++    #[inline]
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        // SAFETY: the caller guarantees new_size and layout.align() form a valid layout.
++        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
++        match (class_of(&layout), class_of(&new_layout)) {
++            // Same class: the block already holds the new size (a system block of these sizes is at least its
++            // 16-byte-rounded size, which is the class size).
++            (Some(old), Some(new)) if old == new => ptr,
++            (None, None) => unsafe { System.realloc(ptr, layout, new_size) },
++            _ => {
++                // SAFETY: a fresh block, the overlap copied, the old block released with its own layout.
++                let block = unsafe { self.alloc(new_layout) };
++                if !block.is_null() {
++                    unsafe {
++                        ptr::copy_nonoverlapping(ptr, block, layout.size().min(new_size));
++                        self.dealloc(ptr, layout);
++                    }
++                }
++                block
++            }
++        }
++    }
++}
++
++#[global_allocator]
++static ALLOCATOR: ThreadCache = ThreadCache;
+diff --git a/bridge/NativeMetalBridge.rs b/bridge/NativeMetalBridge.rs
+index b01151a..b09e1d2 100644
+--- a/bridge/NativeMetalBridge.rs
++++ b/bridge/NativeMetalBridge.rs
+@@ -11,6 +11,10 @@
+ #[path = "NativeMetalObjects.rs"]
+ pub mod objects;
+ 
++// Fuxi patch 0015: per-thread cache for small Rust allocations, opt-in with fuxitcache=1 (FuxiThreadCache.rs).
++#[path = "FuxiThreadCache.rs"]
++mod fuxi_thread_cache;
++
+ use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
+ use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
+ use metal2vulkan_runtime::{
