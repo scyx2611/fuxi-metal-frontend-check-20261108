@@ -1,0 +1,107 @@
+diff --git a/xnu/fuxi-h1/fuxi_keys.c b/xnu/fuxi-h1/fuxi_keys.c
+index 461db49..1b2fdc6 100644
+--- a/xnu/fuxi-h1/fuxi_keys.c
++++ b/xnu/fuxi-h1/fuxi_keys.c
+@@ -621,10 +621,10 @@ fk_taps(void *arg, wait_result_t wr)
+ 		}
+ 		if (op == 't' && n >= 2) {
+ 			printf("FUXI TAPS: tap %ld,%ld\n", v[0], v[1]);
+-			fuxi_perf_input();
+-			sweet_hid_touch(0, 1, (int)v[0], (int)v[1]);
+-			fk_script_sleep(80);
+-			sweet_hid_touch(0, 0, (int)v[0], (int)v[1]);
++			fk_swipe((int)v[0], (int)v[1], (int)v[0], (int)v[1], 96); /* held in place, reporting every 8 ms */
++			/* a real finger reports every ~8.4 ms while down; a lone down, 80 ms of silence and an up */
++			/* opened no app in the tours or in fuxitapcmd=@1 (no exec Preferences) */
++			;
+ 			fk_script_sleep(1200);
+ 			printf("FUXI TOUR: shot %u step\n", ++shots);
+ 		} else if (op == 's' && n >= 4) {
+@@ -672,10 +672,10 @@ static unsigned fk_tour_hold = 45, fk_tour_general = 2100, fk_tour_about = 400;
+ static void
+ fk_tap(int x, int y)
+ {
+-	fuxi_perf_input();
+-	sweet_hid_touch(0, 1, x, y);
+-	fk_script_sleep(80);
+-	sweet_hid_touch(0, 0, x, y);
++	fk_swipe(x, y, x, y, 96); /* held in place, reporting every 8 ms like a finger (see fk_taps 't') */
++	;
++	;
++	;
+ }
+ 
+ static void
+diff --git a/xnu/fuxi-h1/fuxi_touch.c b/xnu/fuxi-h1/fuxi_touch.c
+index 15fa38d..448b856 100644
+--- a/xnu/fuxi-h1/fuxi_touch.c
++++ b/xnu/fuxi-h1/fuxi_touch.c
+@@ -612,7 +612,7 @@ ft_thread(void *arg, wait_result_t result)
+ 	static const uint8_t id_cmd[] = {0xfb, 0x20, 0x00, 0x00, 0x00}, fifo[] = {0x87};
+ 	static const uint8_t sense[] = {0xa0, 0x00, 0x01};
+ 	uint8_t ev[8] = {0}, chip[2] = {0};
+-	unsigned delay_s = 30, errors = 0;
++	unsigned delay_s = 10, errors = 0; /* sensing ~41 s on the launchd clock, before the lock screen takes input (was 30) */
+ 	unsigned poll_us = 4000, idle_us = 8000, offsup = 1;
+ 	bool irq_seen = false, was_off = false;
+ 	(void)arg;
+diff --git a/xnu/patches/0091-fuxi-touch-fts-spi.patch b/xnu/patches/0091-fuxi-touch-fts-spi.patch
+index 47d67de..d28b85f 100644
+--- a/xnu/patches/0091-fuxi-touch-fts-spi.patch
++++ b/xnu/patches/0091-fuxi-touch-fts-spi.patch
+@@ -502,7 +502,7 @@
+ +	static const uint8_t id_cmd[] = {0xfb, 0x20, 0x00, 0x00, 0x00}, fifo[] = {0x87};
+ +	static const uint8_t sense[] = {0xa0, 0x00, 0x01};
+ +	uint8_t ev[8] = {0}, chip[2] = {0};
+-+	unsigned delay_s = 30, errors = 0;
+++	unsigned delay_s = 10, errors = 0; /* sensing ~41 s on the launchd clock, before the lock screen takes input (was 30) */
+ +	unsigned ticks = 0;
+ +	bool irq_seen = false;
+ +	(void)arg;
+diff --git a/xnu/patches/0093-fuxi-touch-display-polish.patch b/xnu/patches/0093-fuxi-touch-display-polish.patch
+index 6bd7d87..2fe230c 100644
+--- a/xnu/patches/0093-fuxi-touch-display-polish.patch
++++ b/xnu/patches/0093-fuxi-touch-display-polish.patch
+@@ -202,7 +202,7 @@
+ @@ -490,12 +558,18 @@
+  	static const uint8_t sense[] = {0xa0, 0x00, 0x01};
+  	uint8_t ev[8] = {0}, chip[2] = {0};
+- 	unsigned delay_s = 30, errors = 0;
++ 	unsigned delay_s = 10, errors = 0; /* sensing ~41 s on the launchd clock, before the lock screen takes input (was 30) */
+ -	unsigned ticks = 0;
+ -	bool irq_seen = false;
+ +	unsigned poll_us = 4000, idle_us = 8000, offsup = 1;
+diff --git a/xnu/patches/0103-fuxi-kernel-h1.patch b/xnu/patches/0103-fuxi-kernel-h1.patch
+index 6d14002..3ac013a 100644
+--- a/xnu/patches/0103-fuxi-kernel-h1.patch
++++ b/xnu/patches/0103-fuxi-kernel-h1.patch
+@@ -585,10 +585,10 @@
+ +		}
+ +		if (op == 't' && n >= 2) {
+ +			printf("FUXI TAPS: tap %ld,%ld\n", v[0], v[1]);
+-+			fuxi_perf_input();
+-+			sweet_hid_touch(0, 1, (int)v[0], (int)v[1]);
+-+			fk_script_sleep(80);
+-+			sweet_hid_touch(0, 0, (int)v[0], (int)v[1]);
+++			fk_swipe((int)v[0], (int)v[1], (int)v[0], (int)v[1], 96); /* held in place, reporting every 8 ms */
+++			/* a real finger reports every ~8.4 ms while down; a lone down, 80 ms of silence and an up */
+++			/* opened no app in the tours or in fuxitapcmd=@1 (no exec Preferences) */
+++			;
+ +			fk_script_sleep(1200);
+ +			printf("FUXI TOUR: shot %u step\n", ++shots);
+ +		} else if (op == 's' && n >= 4) {
+@@ -636,10 +636,10 @@
+ +static void
+ +fk_tap(int x, int y)
+ +{
+-+	fuxi_perf_input();
+-+	sweet_hid_touch(0, 1, x, y);
+-+	fk_script_sleep(80);
+-+	sweet_hid_touch(0, 0, x, y);
+++	fk_swipe(x, y, x, y, 96); /* held in place, reporting every 8 ms like a finger (see fk_taps 't') */
+++	;
+++	;
+++	;
+ +}
+ +
+ +static void

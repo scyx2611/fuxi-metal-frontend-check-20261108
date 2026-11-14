@@ -18,6 +18,7 @@ on:
       - patches/kernel-prof-inclusive-wait.patch
       - patches/kernel-prof-edges.patch
       - patches/kernel-taps-presets.patch
+      - patches/kernel-input-fixes.patch
       - tests/test-perf-governor.py
       - tests/test-ib-profile.py
       - tests/test-surface-plane-result.py
@@ -78,6 +79,8 @@ jobs:
           git -C source apply ../harness/patches/kernel-prof-edges.patch
           git -C source apply --check ../harness/patches/kernel-taps-presets.patch
           git -C source apply ../harness/patches/kernel-taps-presets.patch
+          git -C source apply --check ../harness/patches/kernel-input-fixes.patch
+          git -C source apply ../harness/patches/kernel-input-fixes.patch
           (cd source && python3 tools/test-fuxi-prof.py)
       - name: Build and audit kernel
         shell: bash
