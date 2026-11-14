@@ -1,0 +1,271 @@
+diff --git a/xnu/fuxi-adreno/fuxi_gpu_abi_backend.inc b/xnu/fuxi-adreno/fuxi_gpu_abi_backend.inc
+index 387e453..2ed8d99 100644
+--- a/xnu/fuxi-adreno/fuxi_gpu_abi_backend.inc
++++ b/xnu/fuxi-adreno/fuxi_gpu_abi_backend.inc
+@@ -365,17 +365,47 @@ enum { FG_IBP_K_EMPTY, FG_IBP_K_FULL, FG_IBP_K_PART, FG_IBP_K_BLIT, FG_IBP_K_CS,
+ struct fg_ibp_ib {
+  uint32_t dw, ib2, ib2dw, draws, blits, blit_kpx, cs, wfi, waits, sds, rps, rp_kpx, rt_w, rt_h, rt_info, rt_pitch, d2_info, s2_info, s2_size,
+      tl2, br2, ev, ev_ccu, ev_cache, wfm, bc, clr_kpx, cp_kpx[4], big_kpx, big_s2, big_s2size, big_d2, big_bc,
+-     flags; /* cp_kpx: linear->linear, linear->tiled, tiled->linear, tiled->tiled; flags: 1 not in a mapping, 2 out of budget, 4 read fault, 8 unknown packet type, 16 IB chain, 32 IB3 */
++     flags, /* cp_kpx: linear->linear, linear->tiled, tiled->linear, tiled->tiled; flags: 1 not in a mapping, 2 out of budget, 4 read fault, 8 unknown packet type, 16 IB chain, 32 IB3, 64 IB2 dedup table full */
++     udraws; /* draws counted once per IB2 address (GMEM calls a render pass's draw IB2 once per bin: draws is per execution) */
+ };
+ static struct fg_ibp_ib fg_ibp_ibs[NativeAdrenoAbiMaxBuffers];
+ static unsigned fg_ibp_on, fg_ibp_count, fg_ibp_active, fg_ibp_scanned;
+ static uint32_t fg_ibp_seq, fg_ibp_jobs, fg_ibp_samples, fg_ibp_bad, fg_ibp_stamp[NativeAdrenoAbiMaxBuffers+1u], fg_ibp_d[NativeAdrenoAbiMaxBuffers];
+ static uint64_t fg_ibp_kind_t[FG_IBP_KINDS], fg_ibp_kind_n[FG_IBP_KINDS], fg_ibp_span_t;
+ static uint32_t fg_ibp_words[FG_ABI_JOB_WORDS+FG_IBP_STAMP_WORDS*(NativeAdrenoAbiMaxBuffers+1u)];
++/* Draw census for per-draw CPU cost: IB2 addresses already scanned in the sampled job (unique draws), its submitter, and the jobs
++ * per submitting pid between the per-16-samples lines (every job while the profile is on; pid lookup only, no scan). */
++#define FG_IBP_SEEN 128u
++#define FG_IBP_PIDS 6u
++extern int proc_selfpid(void);
++extern void proc_selfname(char *buf, int size);
++static uint64_t fg_ibp_seen[FG_IBP_SEEN], fg_ibp_t0;
++static unsigned fg_ibp_nseen;
++static int fg_ibp_pid, fg_ibp_rate_pid[FG_IBP_PIDS];
++static uint32_t fg_ibp_rate_n[FG_IBP_PIDS], fg_ibp_rate_other;
++static char fg_ibp_name[24];
+ static void fg_ibp_reset(void)
+ {
+  fg_ibp_count=fg_ibp_active=fg_ibp_scanned=0; fg_ibp_seq=fg_ibp_jobs=fg_ibp_samples=fg_ibp_bad=0; fg_ibp_span_t=0;
+  memset(fg_ibp_kind_t,0,sizeof(fg_ibp_kind_t)); memset(fg_ibp_kind_n,0,sizeof(fg_ibp_kind_n));
++ memset(fg_ibp_rate_pid,0,sizeof(fg_ibp_rate_pid)); memset(fg_ibp_rate_n,0,sizeof(fg_ibp_rate_n)); fg_ibp_rate_other=0; fg_ibp_t0=mach_absolute_time();
++}
++/* First visit of this IB2 in the sampled job: its draws count as unique. A full table counts every visit (flag 64). */
++static int fg_ibp_first(struct fg_ibp_ib *r, uint64_t iova)
++{
++ for (unsigned i=0;i<fg_ibp_nseen;i++) if (fg_ibp_seen[i]==iova) return 0;
++ if (fg_ibp_nseen<FG_IBP_SEEN) fg_ibp_seen[fg_ibp_nseen++]=iova; else r->flags|=64;
++ return 1;
++}
++/* Every rung job while the profile is on: count it under its submitter's pid (the client's thread submits). */
++static void fg_ibp_rate(void)
++{
++ const int pid=proc_selfpid();
++ for (unsigned i=0;i<FG_IBP_PIDS;i++) {
++  if (fg_ibp_rate_n[i] && fg_ibp_rate_pid[i]==pid) { fg_ibp_rate_n[i]++; return; }
++  if (!fg_ibp_rate_n[i]) { fg_ibp_rate_pid[i]=pid; fg_ibp_rate_n[i]=1; return; }
++ }
++ fg_ibp_rate_other++;
+ }
+ /* This submit is sampled (decided before the ring room check; counted only once the job is rung). */
+ static int fg_ibp_want(void)
+@@ -391,7 +421,7 @@ static int fg_ibp_rd(const typeof(fg_abi_maps[0]) *m, uint64_t iova, uint32_t *w
+  *w=(uint32_t)v;
+  return 1;
+ }
+-static void fg_ibp_scan(struct fg_ibp_ib *r, uint64_t iova, uint32_t dwords, unsigned depth, unsigned *budget)
++static void fg_ibp_scan(struct fg_ibp_ib *r, uint64_t iova, uint32_t dwords, unsigned depth, unsigned *budget, int uniq)
+ {
+  const typeof(fg_abi_maps[0]) *m=fg_abi_map_at(iova);
+  if (!m) { r->flags|=1; return; }
+@@ -425,7 +455,7 @@ static void fg_ibp_scan(struct fg_ibp_ib *r, uint64_t iova, uint32_t dwords, uns
+   } else if (h>>28==7u) {
+    const uint32_t op=(h>>16)&0x7fu, cnt=h&0x3fffu;
+    switch (op) {
+-    case 0x38: case 0x28: case 0x29: case 0x2a: case 0x24: r->draws++; break;
++    case 0x38: case 0x28: case 0x29: case 0x2a: case 0x24: r->draws++; if (uniq) r->udraws++; break;
+     case 0x2c: {
+      const uint32_t x0=r->tl2&0x3fffu, y0=(r->tl2>>16)&0x3fffu, x1=r->br2&0x3fffu, y1=(r->br2>>16)&0x3fffu;
+      const uint32_t kpx=x1>=x0 && y1>=y0 ? (x1-x0+1)*(y1-y0+1)/1024 : 0;
+@@ -457,7 +487,7 @@ static void fg_ibp_scan(struct fg_ibp_ib *r, uint64_t iova, uint32_t dwords, uns
+       if (!fg_ibp_rd(m,iova+4ull*(i+1),&lo) || !fg_ibp_rd(m,iova+4ull*(i+2),&hi) || !fg_ibp_rd(m,iova+4ull*(i+3),&sz)) { r->flags|=4; return; }
+       *budget-=3; sz&=0xfffffu;
+       r->ib2++; r->ib2dw+=sz;
+-      if (!depth) fg_ibp_scan(r,(uint64_t)hi<<32|lo,sz,1,budget); else r->flags|=32;
++      if (!depth) { const uint64_t a2=(uint64_t)hi<<32|lo; const int u2=uniq && fg_ibp_first(r,a2); fg_ibp_scan(r,a2,sz,1,budget,u2); } else r->flags|=32;
+      }
+      break;
+    }
+@@ -468,11 +498,13 @@ static void fg_ibp_scan(struct fg_ibp_ib *r, uint64_t iova, uint32_t dwords, uns
+ static void fg_ibp_decode(const uint64_t *iovas, const uint64_t *sizes, unsigned count)
+ {
+  unsigned left=FG_IBP_BUDGET;
++ fg_ibp_nseen=0;
++ fg_ibp_pid=proc_selfpid(); proc_selfname(fg_ibp_name,(int)sizeof(fg_ibp_name));
+  for (unsigned k=0;k<count;k++) {
+   struct fg_ibp_ib *r=&fg_ibp_ibs[k];
+   unsigned b=left<FG_IBP_IB_BUDGET ? left : FG_IBP_IB_BUDGET, b0=b;
+   memset(r,0,sizeof(*r)); r->dw=(uint32_t)(sizes[k]/4);
+-  fg_ibp_scan(r,iovas[k],r->dw,0,&b);
++  fg_ibp_scan(r,iovas[k],r->dw,0,&b,1);
+   left-=b0-b;
+  }
+  fg_ibp_scanned=FG_IBP_BUDGET-left;
+@@ -514,6 +546,12 @@ static void fg_ibp_retire(uint32_t from, uint32_t to)
+  if (!fg_ibp_active || fg_ibp_seq-from-1u>=to-from) return;
+  fg_ibp_active=0;
+  const unsigned n=fg_ibp_count;
++ { /* draw census of the whole job (independent of the stamps) */
++  uint32_t dr=0, udr=0, rps=0, bl=0, cs=0, ib2=0, fl=0;
++  for (unsigned i=0;i<n;i++) { const struct fg_ibp_ib *r=&fg_ibp_ibs[i]; dr+=r->draws; udr+=r->udraws; rps+=r->rps; bl+=r->blits; cs+=r->cs; ib2+=r->ib2; fl|=r->flags; }
++  printf("FUXI IBPROF: job %u totals pid %d %s ibs %u dr %u udr %u ib2 %u seen %u rp %u bl %u cs %u fl %x\n",
++      fg_ibp_seq,fg_ibp_pid,fg_ibp_name,n,dr,udr,ib2,fg_ibp_nseen,rps,bl,cs,fl);
++ }
+  unsigned bad=0;
+  for (unsigned i=0;i<=n;i++) { fg_ibp_stamp[i]=g3_read(G3_FENCE_PA+FG_IBP_OFF+16u*i); if (fg_access_failed || !fg_ibp_stamp[i]) bad++; }
+  for (unsigned i=0;i<n && !bad;i++) { fg_ibp_d[i]=fg_ibp_stamp[i+1]-fg_ibp_stamp[i]; if ((int32_t)fg_ibp_d[i]<0) bad++; }
+@@ -543,6 +581,13 @@ static void fg_ibp_retire(uint32_t from, uint32_t to)
+       FG_IBP_US(fg_ibp_kind_t[2]/16),(unsigned long long)((unsigned long long)(fg_ibp_kind_n[2]/16)),FG_IBP_US(fg_ibp_kind_t[3]/16),(unsigned long long)((unsigned long long)(fg_ibp_kind_n[3]/16)),FG_IBP_US(fg_ibp_kind_t[4]/16),(unsigned long long)((unsigned long long)(fg_ibp_kind_n[4]/16)),
+       FG_IBP_US(fg_ibp_kind_t[5]/16),(unsigned long long)((unsigned long long)(fg_ibp_kind_n[5]/16)),fg_ibp_bad);
+   fg_ibp_span_t=0; fg_ibp_bad=0; memset(fg_ibp_kind_t,0,sizeof(fg_ibp_kind_t)); memset(fg_ibp_kind_n,0,sizeof(fg_ibp_kind_n));
++  /* jobs per submitting pid since the last such line, and the wall time they took */
++  uint64_t now=mach_absolute_time(), ns=0;
++  absolutetime_to_nanoseconds(now-fg_ibp_t0,&ns);
++  printf("FUXI IBPROF: rate %llu ms jobs pid=n %d=%u %d=%u %d=%u %d=%u %d=%u %d=%u other %u\n",(unsigned long long)(ns/1000000),
++      fg_ibp_rate_pid[0],fg_ibp_rate_n[0],fg_ibp_rate_pid[1],fg_ibp_rate_n[1],fg_ibp_rate_pid[2],fg_ibp_rate_n[2],
++      fg_ibp_rate_pid[3],fg_ibp_rate_n[3],fg_ibp_rate_pid[4],fg_ibp_rate_n[4],fg_ibp_rate_pid[5],fg_ibp_rate_n[5],fg_ibp_rate_other);
++  memset(fg_ibp_rate_pid,0,sizeof(fg_ibp_rate_pid)); memset(fg_ibp_rate_n,0,sizeof(fg_ibp_rate_n)); fg_ibp_rate_other=0; fg_ibp_t0=now;
+  }
+ }
+ #undef FG_IBP_US
+@@ -1297,7 +1342,7 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
+  if (!fg_ring_doorbell() || fg_access_failed) return fg_abi_fault("client doorbell");
+  *fence=++fg_abi_seq;
+  if (ibp_on) { fg_ibp_active=1; fg_ibp_seq=fg_abi_seq; fg_ibp_count=count; }
+- if (fg_ibp_on) fg_ibp_jobs++;
++ if (fg_ibp_on) { fg_ibp_jobs++; fg_ibp_rate(); }
+  FG_SS(FG_SS_BELL);
+  if (queued) {
+   fg_abi_q_stats[0]++;
+diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
+index 843f375..64b3e28 100644
+--- a/xnu/patches/0098-fuxi-native-adreno-abi.patch
++++ b/xnu/patches/0098-fuxi-native-adreno-abi.patch
+@@ -4041,7 +4041,7 @@
+ +SOFTWARE.
+ --- a/bsd/dev/fuxi_gpu_abi_backend.inc
+ +++ b/bsd/dev/fuxi_gpu_abi_backend.inc
+-@@ -0,0 +1,1499 @@
++@@ -0,0 +1,1544 @@
+ +/* Built into fuxi_adreno.c, with access to its proven SMMU/ring helpers.
+ + * Single privileged diagnostic client, not a security boundary for PM4.
+ + * Its root has no scanout or surface-cache mappings. The kernel-only runtime
+@@ -4409,17 +4409,47 @@
+ +struct fg_ibp_ib {
+ + uint32_t dw, ib2, ib2dw, draws, blits, blit_kpx, cs, wfi, waits, sds, rps, rp_kpx, rt_w, rt_h, rt_info, rt_pitch, d2_info, s2_info, s2_size,
+ +     tl2, br2, ev, ev_ccu, ev_cache, wfm, bc, clr_kpx, cp_kpx[4], big_kpx, big_s2, big_s2size, big_d2, big_bc,
+-+     flags; /* cp_kpx: linear->linear, linear->tiled, tiled->linear, tiled->tiled; flags: 1 not in a mapping, 2 out of budget, 4 read fault, 8 unknown packet type, 16 IB chain, 32 IB3 */
+++     flags, /* cp_kpx: linear->linear, linear->tiled, tiled->linear, tiled->tiled; flags: 1 not in a mapping, 2 out of budget, 4 read fault, 8 unknown packet type, 16 IB chain, 32 IB3, 64 IB2 dedup table full */
+++     udraws; /* draws counted once per IB2 address (GMEM calls a render pass's draw IB2 once per bin: draws is per execution) */
+ +};
+ +static struct fg_ibp_ib fg_ibp_ibs[NativeAdrenoAbiMaxBuffers];
+ +static unsigned fg_ibp_on, fg_ibp_count, fg_ibp_active, fg_ibp_scanned;
+ +static uint32_t fg_ibp_seq, fg_ibp_jobs, fg_ibp_samples, fg_ibp_bad, fg_ibp_stamp[NativeAdrenoAbiMaxBuffers+1u], fg_ibp_d[NativeAdrenoAbiMaxBuffers];
+ +static uint64_t fg_ibp_kind_t[FG_IBP_KINDS], fg_ibp_kind_n[FG_IBP_KINDS], fg_ibp_span_t;
+ +static uint32_t fg_ibp_words[FG_ABI_JOB_WORDS+FG_IBP_STAMP_WORDS*(NativeAdrenoAbiMaxBuffers+1u)];
+++/* Draw census for per-draw CPU cost: IB2 addresses already scanned in the sampled job (unique draws), its submitter, and the jobs
+++ * per submitting pid between the per-16-samples lines (every job while the profile is on; pid lookup only, no scan). */
+++#define FG_IBP_SEEN 128u
+++#define FG_IBP_PIDS 6u
+++extern int proc_selfpid(void);
+++extern void proc_selfname(char *buf, int size);
+++static uint64_t fg_ibp_seen[FG_IBP_SEEN], fg_ibp_t0;
+++static unsigned fg_ibp_nseen;
+++static int fg_ibp_pid, fg_ibp_rate_pid[FG_IBP_PIDS];
+++static uint32_t fg_ibp_rate_n[FG_IBP_PIDS], fg_ibp_rate_other;
+++static char fg_ibp_name[24];
+ +static void fg_ibp_reset(void)
+ +{
+ + fg_ibp_count=fg_ibp_active=fg_ibp_scanned=0; fg_ibp_seq=fg_ibp_jobs=fg_ibp_samples=fg_ibp_bad=0; fg_ibp_span_t=0;
+ + memset(fg_ibp_kind_t,0,sizeof(fg_ibp_kind_t)); memset(fg_ibp_kind_n,0,sizeof(fg_ibp_kind_n));
+++ memset(fg_ibp_rate_pid,0,sizeof(fg_ibp_rate_pid)); memset(fg_ibp_rate_n,0,sizeof(fg_ibp_rate_n)); fg_ibp_rate_other=0; fg_ibp_t0=mach_absolute_time();
+++}
+++/* First visit of this IB2 in the sampled job: its draws count as unique. A full table counts every visit (flag 64). */
+++static int fg_ibp_first(struct fg_ibp_ib *r, uint64_t iova)
+++{
+++ for (unsigned i=0;i<fg_ibp_nseen;i++) if (fg_ibp_seen[i]==iova) return 0;
+++ if (fg_ibp_nseen<FG_IBP_SEEN) fg_ibp_seen[fg_ibp_nseen++]=iova; else r->flags|=64;
+++ return 1;
+++}
+++/* Every rung job while the profile is on: count it under its submitter's pid (the client's thread submits). */
+++static void fg_ibp_rate(void)
+++{
+++ const int pid=proc_selfpid();
+++ for (unsigned i=0;i<FG_IBP_PIDS;i++) {
+++  if (fg_ibp_rate_n[i] && fg_ibp_rate_pid[i]==pid) { fg_ibp_rate_n[i]++; return; }
+++  if (!fg_ibp_rate_n[i]) { fg_ibp_rate_pid[i]=pid; fg_ibp_rate_n[i]=1; return; }
+++ }
+++ fg_ibp_rate_other++;
+ +}
+ +/* This submit is sampled (decided before the ring room check; counted only once the job is rung). */
+ +static int fg_ibp_want(void)
+@@ -4435,7 +4465,7 @@
+ + *w=(uint32_t)v;
+ + return 1;
+ +}
+-+static void fg_ibp_scan(struct fg_ibp_ib *r, uint64_t iova, uint32_t dwords, unsigned depth, unsigned *budget)
+++static void fg_ibp_scan(struct fg_ibp_ib *r, uint64_t iova, uint32_t dwords, unsigned depth, unsigned *budget, int uniq)
+ +{
+ + const typeof(fg_abi_maps[0]) *m=fg_abi_map_at(iova);
+ + if (!m) { r->flags|=1; return; }
+@@ -4469,7 +4499,7 @@
+ +  } else if (h>>28==7u) {
+ +   const uint32_t op=(h>>16)&0x7fu, cnt=h&0x3fffu;
+ +   switch (op) {
+-+    case 0x38: case 0x28: case 0x29: case 0x2a: case 0x24: r->draws++; break;
+++    case 0x38: case 0x28: case 0x29: case 0x2a: case 0x24: r->draws++; if (uniq) r->udraws++; break;
+ +    case 0x2c: {
+ +     const uint32_t x0=r->tl2&0x3fffu, y0=(r->tl2>>16)&0x3fffu, x1=r->br2&0x3fffu, y1=(r->br2>>16)&0x3fffu;
+ +     const uint32_t kpx=x1>=x0 && y1>=y0 ? (x1-x0+1)*(y1-y0+1)/1024 : 0;
+@@ -4501,7 +4531,7 @@
+ +      if (!fg_ibp_rd(m,iova+4ull*(i+1),&lo) || !fg_ibp_rd(m,iova+4ull*(i+2),&hi) || !fg_ibp_rd(m,iova+4ull*(i+3),&sz)) { r->flags|=4; return; }
+ +      *budget-=3; sz&=0xfffffu;
+ +      r->ib2++; r->ib2dw+=sz;
+-+      if (!depth) fg_ibp_scan(r,(uint64_t)hi<<32|lo,sz,1,budget); else r->flags|=32;
+++      if (!depth) { const uint64_t a2=(uint64_t)hi<<32|lo; const int u2=uniq && fg_ibp_first(r,a2); fg_ibp_scan(r,a2,sz,1,budget,u2); } else r->flags|=32;
+ +     }
+ +     break;
+ +   }
+@@ -4512,11 +4542,13 @@
+ +static void fg_ibp_decode(const uint64_t *iovas, const uint64_t *sizes, unsigned count)
+ +{
+ + unsigned left=FG_IBP_BUDGET;
+++ fg_ibp_nseen=0;
+++ fg_ibp_pid=proc_selfpid(); proc_selfname(fg_ibp_name,(int)sizeof(fg_ibp_name));
+ + for (unsigned k=0;k<count;k++) {
+ +  struct fg_ibp_ib *r=&fg_ibp_ibs[k];
+ +  unsigned b=left<FG_IBP_IB_BUDGET ? left : FG_IBP_IB_BUDGET, b0=b;
+ +  memset(r,0,sizeof(*r)); r->dw=(uint32_t)(sizes[k]/4);
+-+  fg_ibp_scan(r,iovas[k],r->dw,0,&b);
+++  fg_ibp_scan(r,iovas[k],r->dw,0,&b,1);
+ +  left-=b0-b;
+ + }
+ + fg_ibp_scanned=FG_IBP_BUDGET-left;
+@@ -4558,6 +4590,12 @@
+ + if (!fg_ibp_active || fg_ibp_seq-from-1u>=to-from) return;
+ + fg_ibp_active=0;
+ + const unsigned n=fg_ibp_count;
+++ { /* draw census of the whole job (independent of the stamps) */
+++  uint32_t dr=0, udr=0, rps=0, bl=0, cs=0, ib2=0, fl=0;
+++  for (unsigned i=0;i<n;i++) { const struct fg_ibp_ib *r=&fg_ibp_ibs[i]; dr+=r->draws; udr+=r->udraws; rps+=r->rps; bl+=r->blits; cs+=r->cs; ib2+=r->ib2; fl|=r->flags; }
+++  printf("FUXI IBPROF: job %u totals pid %d %s ibs %u dr %u udr %u ib2 %u seen %u rp %u bl %u cs %u fl %x\n",
+++      fg_ibp_seq,fg_ibp_pid,fg_ibp_name,n,dr,udr,ib2,fg_ibp_nseen,rps,bl,cs,fl);
+++ }
+ + unsigned bad=0;
+ + for (unsigned i=0;i<=n;i++) { fg_ibp_stamp[i]=g3_read(G3_FENCE_PA+FG_IBP_OFF+16u*i); if (fg_access_failed || !fg_ibp_stamp[i]) bad++; }
+ + for (unsigned i=0;i<n && !bad;i++) { fg_ibp_d[i]=fg_ibp_stamp[i+1]-fg_ibp_stamp[i]; if ((int32_t)fg_ibp_d[i]<0) bad++; }
+@@ -4587,6 +4625,13 @@
+ +      FG_IBP_US(fg_ibp_kind_t[2]/16),(unsigned long long)((unsigned long long)(fg_ibp_kind_n[2]/16)),FG_IBP_US(fg_ibp_kind_t[3]/16),(unsigned long long)((unsigned long long)(fg_ibp_kind_n[3]/16)),FG_IBP_US(fg_ibp_kind_t[4]/16),(unsigned long long)((unsigned long long)(fg_ibp_kind_n[4]/16)),
+ +      FG_IBP_US(fg_ibp_kind_t[5]/16),(unsigned long long)((unsigned long long)(fg_ibp_kind_n[5]/16)),fg_ibp_bad);
+ +  fg_ibp_span_t=0; fg_ibp_bad=0; memset(fg_ibp_kind_t,0,sizeof(fg_ibp_kind_t)); memset(fg_ibp_kind_n,0,sizeof(fg_ibp_kind_n));
+++  /* jobs per submitting pid since the last such line, and the wall time they took */
+++  uint64_t now=mach_absolute_time(), ns=0;
+++  absolutetime_to_nanoseconds(now-fg_ibp_t0,&ns);
+++  printf("FUXI IBPROF: rate %llu ms jobs pid=n %d=%u %d=%u %d=%u %d=%u %d=%u %d=%u other %u\n",(unsigned long long)(ns/1000000),
+++      fg_ibp_rate_pid[0],fg_ibp_rate_n[0],fg_ibp_rate_pid[1],fg_ibp_rate_n[1],fg_ibp_rate_pid[2],fg_ibp_rate_n[2],
+++      fg_ibp_rate_pid[3],fg_ibp_rate_n[3],fg_ibp_rate_pid[4],fg_ibp_rate_n[4],fg_ibp_rate_pid[5],fg_ibp_rate_n[5],fg_ibp_rate_other);
+++  memset(fg_ibp_rate_pid,0,sizeof(fg_ibp_rate_pid)); memset(fg_ibp_rate_n,0,sizeof(fg_ibp_rate_n)); fg_ibp_rate_other=0; fg_ibp_t0=now;
+ + }
+ +}
+ +#undef FG_IBP_US
+@@ -5341,7 +5386,7 @@
+ + if (!fg_ring_doorbell() || fg_access_failed) return fg_abi_fault("client doorbell");
+ + *fence=++fg_abi_seq;
+ + if (ibp_on) { fg_ibp_active=1; fg_ibp_seq=fg_abi_seq; fg_ibp_count=count; }
+-+ if (fg_ibp_on) fg_ibp_jobs++;
+++ if (fg_ibp_on) { fg_ibp_jobs++; fg_ibp_rate(); }
+ + FG_SS(FG_SS_BELL);
+ + if (queued) {
+ +  fg_abi_q_stats[0]++;
