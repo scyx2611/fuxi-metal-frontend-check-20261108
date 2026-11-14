@@ -71,6 +71,7 @@ jobs:
           cp harness/patches/metal2vulkan-fuxi-0010-draw-census.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0011-census-rest.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0012-census-split.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0013-lane-samplers.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |

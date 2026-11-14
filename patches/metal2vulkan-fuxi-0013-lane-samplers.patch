@@ -1,0 +1,541 @@
+diff --git a/crates/metal2vulkan-runtime/src/fuxi_census.rs b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+index da88442..551d4bf 100644
+--- a/crates/metal2vulkan-runtime/src/fuxi_census.rs
++++ b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+@@ -10,9 +10,14 @@
+ //! `draw_resident` is split again at nine marks (heap sets, instance, tables, shadows, fixed state,
+ //! notices, pipeline lookup, bind, uses) and the recording after them. The entry, the settle and
+ //! the recording are split again (`pre`, `settle` and `rec` lines), and the settle counts how its
+-//! bind shape came (kept, found among the state's lately settled ones, or made). Every 10 s a
+-//! thread that drew writes `FUXI HYB` lines to stderr, one write per line. Diagnostics only:
+-//! nothing here changes what is drawn.
++//! bind shape came (kept, found among the state's lately settled ones, or made). A `lane` line
++//! counts what the lane's cuts look at: the argument samplers listed per draw, the Vulkan state
++//! commands recorded per draw, and how often a draw's set-0 writes equal the last ones of its
++//! pipeline layout. Every 10 s a thread that drew writes `FUXI HYB` lines to stderr, one write
++//! per line. Diagnostics only: nothing here changes what is drawn.
++//!
++//! [`lane`] is the hybrid lane's switch (`fuxihyb=2` or more), read once per process: off, every
++//! cut it guards takes the path it took before.
+ 
+ use std::cell::{Cell, RefCell};
+ use std::collections::HashMap;
+@@ -26,6 +31,7 @@ const ON: u8 = 1;
+ const OFF: u8 = 2;
+ 
+ static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
++static LANE: AtomicU8 = AtomicU8::new(UNKNOWN);
+ static NEXT_THREAD: AtomicU32 = AtomicU32::new(1);
+ static BASE: OnceLock<Instant> = OnceLock::new();
+ 
+@@ -71,8 +77,10 @@ pub(crate) enum Event {
+     ShapeFound = 7,
+     /// Not a step: the shape was made again.
+     ShapeMade = 8,
++    /// Not a step: the lane kept the encoder's argument sampler listing (`fuxihyb=2`).
++    SamplersKept = 9,
+ }
+-const EVENTS: usize = 9;
++const EVENTS: usize = 10;
+ const EVENT_NAMES: [&str; EVENTS] = [
+     "reformat",
+     "restart",
+@@ -83,6 +91,7 @@ const EVENT_NAMES: [&str; EVENTS] = [
+     "reshaped",
+     "shapefound",
+     "shapemade",
++    "samplerskept",
+ ];
+ /// The events that are runtime steps (a draw with one is not eligible); the rest are counts.
+ const STEP_EVENTS: u16 = (1 << 6) - 1;
+@@ -256,6 +265,11 @@ struct Current {
+     events: u16,
+     sets: u16,
+     variant: usize,
++    /// The argument samplers the draw listed, the Vulkan state commands it recorded, and its
++    /// set-0 writes: their pipeline layout and a hash of them (0, 0 where none were seen).
++    samplers: u32,
++    states: u32,
++    set_zero: (u64, u64),
+ }
+ 
+ /// One split of a phase: its pieces' nanoseconds over the draws that reached every mark.
+@@ -319,6 +333,12 @@ struct Stats {
+     pre: Split<4>,
+     settle: Split<5>,
+     rec: Split<7>,
++    samplers: u64,
++    states: u64,
++    set_zero_draws: u64,
++    set_zero_same: u64,
++    /// The last set-0 writes' hash by pipeline layout.
++    set_zero_last: HashMap<u64, u64>,
+     between_ns: u64,
+     between: u64,
+     same_pipeline: u64,
+@@ -339,6 +359,9 @@ thread_local! {
+     static EVENTS_NOW: Cell<u16> = const { Cell::new(0) };
+     static SETS_NOW: Cell<u16> = const { Cell::new(0) };
+     static VARIANT_NOW: Cell<usize> = const { Cell::new(0) };
++    static SAMPLERS_NOW: Cell<u32> = const { Cell::new(0) };
++    static STATES_NOW: Cell<u32> = const { Cell::new(0) };
++    static SET_ZERO_NOW: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+     static STATS: RefCell<Option<Box<Stats>>> = const { RefCell::new(None) };
+ }
+ 
+@@ -412,6 +435,59 @@ fn on() -> bool {
+     }
+ }
+ 
++/// Whether the census is on (`fuxihyb=1` or more): what a caller tests before it computes
++/// something only the census reads.
++#[inline]
++pub(crate) fn active() -> bool {
++    on()
++}
++
++#[cold]
++fn lane_start() -> bool {
++    let on = boot_value().is_some_and(|v| v >= 2);
++    let _ = LANE.compare_exchange(
++        UNKNOWN,
++        if on { ON } else { OFF },
++        Ordering::AcqRel,
++        Ordering::Acquire,
++    );
++    LANE.load(Ordering::Acquire) == ON
++}
++
++/// Whether the hybrid lane's cuts are on (`fuxihyb=2` or more), read once per process.
++#[inline]
++pub(crate) fn lane() -> bool {
++    match LANE.load(Ordering::Relaxed) {
++        ON => true,
++        OFF => false,
++        _ => lane_start(),
++    }
++}
++
++/// The draw listed `count` argument samplers.
++#[inline]
++pub(crate) fn samplers(count: usize) {
++    if on() {
++        SAMPLERS_NOW.with(|c| c.set(u32::try_from(count).unwrap_or(u32::MAX)));
++    }
++}
++
++/// The draw recorded `count` Vulkan state commands.
++#[inline]
++pub(crate) fn states(count: u64) {
++    if on() {
++        STATES_NOW.with(|c| c.set(u32::try_from(count).unwrap_or(u32::MAX)));
++    }
++}
++
++/// The draw's set-0 writes, of pipeline layout `layout`, hash to `hash`.
++#[inline]
++pub(crate) fn set_zero(layout: u64, hash: u64) {
++    if on() {
++        SET_ZERO_NOW.with(|c| c.set((layout, hash)));
++    }
++}
++
+ fn now() -> u64 {
+     let base = BASE.get_or_init(Instant::now);
+     u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX)
+@@ -460,6 +536,9 @@ pub(crate) fn begin() -> Option<u64> {
+     MARKS_NOW.with(|m| m.iter().for_each(|c| c.set(0)));
+     EVENTS_NOW.with(|c| c.set(0));
+     VARIANT_NOW.with(|c| c.set(0));
++    SAMPLERS_NOW.with(|c| c.set(0));
++    STATES_NOW.with(|c| c.set(0));
++    SET_ZERO_NOW.with(|c| c.set((0, 0)));
+     Some(t)
+ }
+ 
+@@ -471,6 +550,9 @@ pub(crate) fn end(start: u64, pipeline: usize, traits: u32) {
+         events: EVENTS_NOW.with(Cell::get),
+         sets: SETS_NOW.with(|c| c.replace(0)),
+         variant: VARIANT_NOW.with(Cell::get),
++        samplers: SAMPLERS_NOW.with(Cell::get),
++        states: STATES_NOW.with(Cell::get),
++        set_zero: SET_ZERO_NOW.with(Cell::get),
+     };
+     STATS.with(|s| {
+         let mut slot = s.borrow_mut();
+@@ -562,6 +644,15 @@ fn record(stats: &mut Stats, cur: &Current, start: u64, t: u64, pipeline: usize,
+         *count += u64::from((cur.sets >> bit) & 1);
+     }
+     *stats.masks.entry(cur.sets).or_default() += 1;
++    stats.samplers += u64::from(cur.samplers);
++    stats.states += u64::from(cur.states);
++    if cur.set_zero.0 != 0 {
++        stats.set_zero_draws += 1;
++        let last = stats.set_zero_last.insert(cur.set_zero.0, cur.set_zero.1);
++        if last == Some(cur.set_zero.1) {
++            stats.set_zero_same += 1;
++        }
++    }
+     if traits == 0 && cur.events & STEP_EVENTS == 0 {
+         stats.eligible += 1;
+         stats.eligible_ns += total;
+@@ -621,6 +712,14 @@ fn report(stats: &Stats, t: u64) {
+         stats.settle.line(&head, "settle", SETTLE_NAMES)
+     ));
+     line(&format!("{}\n", stats.rec.line(&head, "rec", REC_NAMES)));
++    line(&format!(
++        "{head} lane samplers={:.1} states={:.1} set0={} set0same={} layouts={}\n",
++        stats.samplers as f64 / n as f64,
++        stats.states as f64 / n as f64,
++        stats.set_zero_draws,
++        stats.set_zero_same,
++        stats.set_zero_last.len(),
++    ));
+     let mut traits = format!("{head} traits");
+     for (name, count) in TRAIT_NAMES.iter().zip(stats.traits) {
+         if count != 0 {
+diff --git a/crates/metal2vulkan-runtime/src/live_bind.rs b/crates/metal2vulkan-runtime/src/live_bind.rs
+index fae0a7a..89f6f0d 100644
+--- a/crates/metal2vulkan-runtime/src/live_bind.rs
++++ b/crates/metal2vulkan-runtime/src/live_bind.rs
+@@ -82,6 +82,12 @@ pub(super) struct LiveBind {
+     pub(super) state: BindState,
+     /// The state's shape, `None` where a change may have changed it.
+     shape: Option<Arc<BindShape>>,
++    /// FUXI (`fuxihyb=2`): the sampler slots' change count of the listing the state's argument
++    /// samplers were last brought to, where a draw brought them to an untouched listing of the
++    /// device's live sampler states (`RenderCommandEncoder::argument_samplers_at`); `None` after
++    /// any other bring. While a draw brings them to an untouched listing of the same count, they
++    /// already are that listing.
++    pub(super) argument_samplers_at: Option<u64>,
+ }
+ 
+ impl LiveBind {
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/render.rs b/crates/metal2vulkan-runtime/src/pipeline/render.rs
+index c687980..78c9fb3 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/render.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/render.rs
+@@ -1816,9 +1816,26 @@ impl GraphicsState {
+     ) -> Result<Settled, Error> {
+         {
+             let mut kept = lock(&self.0.settled);
+-            let found = kept
+-                .iter()
+-                .position(|(kept, last)| *kept == forms && last.shape == *shape);
++            // FUXI (`fuxihyb=2`): the very shape first (a kept or found one is the one settled), by
++            // its address, before any comparison of contents; no two entries hold equal shapes in
++            // the same forms, so the entry found is the one the comparison finds. One already the
++            // latest stays where it is.
++            let lane = crate::fuxi_census::lane();
++            let found = match lane {
++                true => kept
++                    .iter()
++                    .position(|(kept, last)| *kept == forms && Arc::ptr_eq(&last.shape, shape))
++                    .or_else(|| {
++                        kept.iter()
++                            .position(|(kept, last)| *kept == forms && last.shape == *shape)
++                    }),
++                false => kept
++                    .iter()
++                    .position(|(kept, last)| *kept == forms && last.shape == *shape),
++            };
++            if lane && found == Some(0) {
++                return Ok(kept[0].1.clone());
++            }
+             if let Some(entry) = found.and_then(|at| kept.remove(at)) {
+                 let last = entry.1.clone();
+                 kept.push_front(entry);
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 3ad2255..118c327 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -546,6 +546,40 @@ struct DrawBuffers<'a> {
+     control_point_indices: Option<(&'a Buffer, u64)>,
+ }
+ 
++/// FUXI census: a hash (FNV-1a) of a draw's set-0 writes, what its descriptor set holds, so the
++/// census can count draws whose writes equal the last ones of their pipeline layout.
++fn set_zero_hash(writes: &[binding::Write]) -> u64 {
++    use ash::vk::Handle as _;
++    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
++    let mut mix = |value: u64| {
++        hash ^= value;
++        hash = hash.wrapping_mul(0x0100_0000_01b3);
++    };
++    for write in writes {
++        mix(u64::from(write.set) << 32 | u64::from(write.binding));
++        mix(u64::from(write.element) << 32 | write.ty.as_raw() as u32 as u64);
++        match write.info {
++            binding::Info::Buffer(info) => {
++                mix(1);
++                mix(info.buffer.as_raw());
++                mix(info.offset);
++                mix(info.range);
++            }
++            binding::Info::Image(info) => {
++                mix(2);
++                mix(info.sampler.as_raw());
++                mix(info.image_view.as_raw());
++                mix(info.image_layout.as_raw() as u32 as u64);
++            }
++            binding::Info::Texel(view) => {
++                mix(3);
++                mix(view.as_raw());
++            }
++        }
++    }
++    hash
++}
++
+ /// An indexed draw's values but its index buffer and offset (`draw_indexed`).
+ #[derive(Clone, Copy)]
+ struct IndexedDraw {
+@@ -1127,7 +1161,13 @@ pub struct RenderCommandEncoder {
+     /// (`binding::command_uses_in`).
+     uses_room: Vec<Use<ResourceKey>>,
+     /// The list the last draw's argument samplers were in, emptied (`Device::argument_samplers_into`).
++    /// FUXI (`fuxihyb=2`): kept whole instead, while `argument_samplers_at` names its listing.
+     argument_samplers_room: Vec<SamplerState>,
++    /// FUXI (`fuxihyb=2`): the sampler slots' change count `argument_samplers_room` lists the live
++    /// sampler states at, untouched since (`Device::argument_samplers_into_at`): while the
++    /// device's count is still it, the room is the listing a draw takes again, every state in it
++    /// live (the room holds them) and no other. `None` where the room is not such a listing.
++    argument_samplers_at: Option<u64>,
+     /// The views and sampler descriptions its draws' binds made or found (`binding::BindMemo`).
+     bind_memo: binding::BindMemo,
+     /// What its last draw retained of its own ([`LastRetained`]).
+@@ -1400,6 +1440,7 @@ impl CommandBuffer {
+             draw_commands: None,
+             uses_room: Vec::new(),
+             argument_samplers_room: Vec::new(),
++            argument_samplers_at: None,
+             bind_memo: binding::BindMemo::default(),
+             last_retained: LastRetained::default(),
+         })
+@@ -4283,8 +4324,13 @@ impl RenderCommandEncoder {
+         pass_start: &PassStartTables,
+         (argument_samplers, function_tables): (&[SamplerState], &[VisibleFunctionTable]),
+         (interface, maps): (&PipelineInterface, &SamplerMaps),
++        listed_at: Option<u64>,
+     ) -> Reshape {
+         let mut reshape = Reshape::default();
++        // FUXI (`fuxihyb=2`): argument samplers last brought to an untouched listing of the same
++        // change count are that listing already (`LiveBind::argument_samplers_at`).
++        let known = listed_at.is_some() && live.argument_samplers_at == listed_at;
++        live.argument_samplers_at = listed_at;
+         let state = &mut live.state;
+         for (stage, table) in [
+             (Stage::Vertex, pass_start.or(Stage::Vertex, &self.vertex)),
+@@ -4297,7 +4343,7 @@ impl RenderCommandEncoder {
+         }
+         reshape.field(&mut state.used_resources, self.residency.used_resources());
+         // Listed again only where the device's sampler states changed since.
+-        if !heap_sets::lists(&state.argument_samplers, argument_samplers) {
++        if !known && !heap_sets::lists(&state.argument_samplers, argument_samplers) {
+             reshape.field(
+                 &mut state.argument_samplers,
+                 heap_sets::listed(argument_samplers),
+@@ -5903,9 +5949,22 @@ impl RenderCommandEncoder {
+         // The device's sampler states, less those at IDs no set-1 sampler array of the variant
+         // holds (`heap_sets::fit_samplers`).
+         let mut argument_samplers = std::mem::take(&mut self.argument_samplers_room);
+-        self.core
+-            .device()
+-            .argument_samplers_into(&mut argument_samplers);
++        // FUXI (`fuxihyb=2`): the encoder's last listing again where no sampler slot changed since.
++        let listed_at = {
++            let device = self.core.device();
++            match (crate::fuxi_census::lane(), self.argument_samplers_at.take()) {
++                (true, Some(at)) if at == device.argument_sampler_changes() => {
++                    crate::fuxi_census::event(crate::fuxi_census::Event::SamplersKept);
++                    Some(at)
++                }
++                (true, _) => Some(device.argument_samplers_into_at(&mut argument_samplers)),
++                (false, _) => {
++                    device.argument_samplers_into(&mut argument_samplers);
++                    None
++                }
++            }
++        };
++        let listed = argument_samplers.len();
+         let function_tables = pipeline.function_tables();
+         let mut unlisted = None;
+         let reads_tile_memory = pipeline.reads_tile_memory();
+@@ -5952,9 +6011,11 @@ impl RenderCommandEncoder {
+             &pass_start,
+             (&mut argument_samplers, &mut unlisted),
+             &function_tables,
++            listed_at,
+         )?;
+         let (variant, plan) = (Arc::clone(&settled.variant), Arc::clone(&settled.plan));
+         crate::fuxi_census::variant(Arc::as_ptr(&variant).cast::<()>() as usize);
++        crate::fuxi_census::samplers(argument_samplers.len());
+         crate::fuxi_census::mark(crate::fuxi_census::Mark::Settled);
+         self.give_up_extended_shadows(&pipeline, &live.state);
+         // A capture draw runs its variant's capture form, where its objects are made: else it
+@@ -6788,6 +6849,10 @@ impl RenderCommandEncoder {
+         // and sampler written is live (the command buffer retains them below, and a refusal
+         // leaves the set unused in its pool).
+         unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
++        if crate::fuxi_census::active() {
++            use ash::vk::Handle as _;
++            crate::fuxi_census::set_zero(objects.layout().as_raw(), set_zero_hash(&writes));
++        }
+         crate::fuxi_census::mark(crate::fuxi_census::Mark::Bind);
+         // The Vulkan draws: the binder's, the index bounds pass's two, or the index rewrite
+         // pass's one.
+@@ -7253,6 +7318,7 @@ impl RenderCommandEncoder {
+                 }
+             }
+             device.shared().counts.draw_states_recorded(states_recorded);
++            crate::fuxi_census::states(states_recorded);
+             crate::fuxi_census::mark(crate::fuxi_census::Mark::Recording);
+             if let Some((making, state, draws, query)) = split {
+                 // The record's times: the pipeline's, then those of the other `VkPipeline`s the
+@@ -7409,8 +7475,12 @@ impl RenderCommandEncoder {
+             self.uses_room = uses.into_room();
+         }
+         self.draw_commands = Some(commands);
+-        // The states go; the list stays for the next draw's.
+-        argument_samplers.clear();
++        // The states go; the list stays for the next draw's. FUXI (`fuxihyb=2`): a listing no
++        // settle left states out of stays whole, for the next draw to take again.
++        match listed_at {
++            Some(at) if argument_samplers.len() == listed => self.argument_samplers_at = Some(at),
++            _ => argument_samplers.clear(),
++        }
+         self.argument_samplers_room = argument_samplers;
+         Ok(())
+     }
+@@ -7674,7 +7744,9 @@ impl RenderCommandEncoder {
+         pass_start: &PassStartTables,
+         (argument_samplers, unlisted): (&mut Vec<SamplerState>, &mut Option<(u64, u64)>),
+         function_tables: &[VisibleFunctionTable],
++        listed_at: Option<u64>,
+     ) -> Result<Settled, Error> {
++        let mut listed_at = listed_at;
+         // Its runtime samplers' address modes as the textures they sample map them.
+         let sampler_maps = self.sampler_maps(pipeline, pass_start)?;
+         // The pass's extended-range colors' shadows, which a variant that writes or reads them
+@@ -7693,6 +7765,7 @@ impl RenderCommandEncoder {
+                 pass_start,
+                 (argument_samplers, function_tables),
+                 (interface, &sampler_maps),
++                listed_at.take(),
+             );
+             crate::fuxi_census::mark(crate::fuxi_census::Mark::Refreshed);
+             let state = &mut live.state;
+diff --git a/crates/metal2vulkan-runtime/src/render/executions.rs b/crates/metal2vulkan-runtime/src/render/executions.rs
+index 768c128..f4fe0db 100644
+--- a/crates/metal2vulkan-runtime/src/render/executions.rs
++++ b/crates/metal2vulkan-runtime/src/render/executions.rs
+@@ -1584,6 +1584,7 @@ impl RenderCommandEncoder {
+             &PassStartTables::default(),
+             (&mut argument_samplers, &mut None),
+             &function_tables,
++            None,
+         )?;
+         let Settled { variant, plan, .. } = settled;
+         self.core
+@@ -2097,6 +2098,7 @@ impl RenderExecution {
+             draw_commands: None,
+             uses_room: Vec::new(),
+             argument_samplers_room: Vec::new(),
++            argument_samplers_at: None,
+             bind_memo: crate::binding::BindMemo::default(),
+             last_retained: Default::default(),
+         }
+diff --git a/crates/metal2vulkan-runtime/src/resource_ids.rs b/crates/metal2vulkan-runtime/src/resource_ids.rs
+index d5881f3..c4a38e5 100644
+--- a/crates/metal2vulkan-runtime/src/resource_ids.rs
++++ b/crates/metal2vulkan-runtime/src/resource_ids.rs
+@@ -299,6 +299,8 @@ pub(super) struct ResourceIds {
+     /// How many holders hold a sampler ID now (the module docs' live count), shared with the
+     /// device, which reads it without this lock ([`ResourceIds::sampler_id_reads`]).
+     sampler_ids_live: Arc<AtomicU64>,
++    /// FUXI: changes of the sampler space's slots ([`SamplerIdReads::slot_changes`]).
++    sampler_slot_changes: Arc<AtomicU64>,
+ }
+ 
+ /// What a device reads of its sampler IDs without their lock: the live count and the sampler
+@@ -307,6 +309,10 @@ pub(super) struct ResourceIds {
+ pub(super) struct SamplerIdReads {
+     pub(super) live: Arc<AtomicU64>,
+     pub(super) pool_size: Arc<AtomicU64>,
++    /// FUXI: how many times a sampler slot was held or let go, changed under the lock by the
++    /// step that changes the slots: while it reads the same, the live sampler states a listing
++    /// found are still the live ones (`Device::argument_samplers_into_at`).
++    pub(super) slot_changes: Arc<AtomicU64>,
+ }
+ 
+ impl Default for ResourceIds {
+@@ -325,6 +331,7 @@ impl Default for ResourceIds {
+             libraries: BTreeMap::new(),
+             functions: BTreeMap::new(),
+             sampler_ids_live: Arc::default(),
++            sampler_slot_changes: Arc::default(),
+         }
+     }
+ }
+@@ -350,6 +357,7 @@ impl ResourceIds {
+         SamplerIdReads {
+             live: Arc::clone(&self.sampler_ids_live),
+             pool_size: Arc::clone(&self.samplers.pool_size),
++            slot_changes: Arc::clone(&self.sampler_slot_changes),
+         }
+     }
+ 
+@@ -826,6 +834,9 @@ impl IdHold {
+         if self.space == IdSpace::Pipeline {
+             all.released_pipelines.remove(&self.id);
+         }
++        if self.space == IdSpace::Sampler {
++            all.sampler_slot_changes.fetch_add(1, Ordering::AcqRel);
++        }
+         all.space(self.space).slots.insert(
+             self.id,
+             Slot {
+@@ -864,7 +875,11 @@ impl Drop for IdHold {
+             .get(&self.id)
+             .is_some_and(|slot| slot.serial == self.serial)
+         {
+-            let kind = match space.slots.remove(&self.id).map(|slot| slot.holder) {
++            let removed = space.slots.remove(&self.id).map(|slot| slot.holder);
++            if self.space == IdSpace::Sampler {
++                all.sampler_slot_changes.fetch_add(1, Ordering::AcqRel);
++            }
++            let kind = match removed {
+                 Some(Holder::Pipeline(_)) => Some(StateKind::Compute),
+                 Some(Holder::RenderPipeline(_)) => Some(StateKind::Render),
+                 _ => None,
+diff --git a/crates/metal2vulkan-runtime/src/sampler.rs b/crates/metal2vulkan-runtime/src/sampler.rs
+index 9116a99..4cdf3d1 100644
+--- a/crates/metal2vulkan-runtime/src/sampler.rs
++++ b/crates/metal2vulkan-runtime/src/sampler.rs
+@@ -477,6 +477,26 @@ impl Device {
+         let ids = lock(&self.shared().resource_ids);
+         out.extend(ids.live_samplers().map(SamplerState));
+     }
++
++    /// FUXI (`fuxihyb=2`): [`argument_samplers_into`](Self::argument_samplers_into), and the
++    /// sampler slots' change count the listing is of, read under the lock that changes it.
++    pub(super) fn argument_samplers_into_at(&self, out: &mut Vec<SamplerState>) -> u64 {
++        out.clear();
++        let ids = lock(&self.shared().resource_ids);
++        out.extend(ids.live_samplers().map(SamplerState));
++        self.argument_sampler_changes()
++    }
++
++    /// FUXI: the sampler slots' change count now, read without the lock: equal to a listing's
++    /// ([`argument_samplers_into_at`](Self::argument_samplers_into_at)), no sampler slot was
++    /// held or let go since, so every state the listing holds is still live and no other is
++    /// (the listing's own references keep its states from going).
++    pub(super) fn argument_sampler_changes(&self) -> u64 {
++        self.shared()
++            .sampler_ids
++            .slot_changes
++            .load(std::sync::atomic::Ordering::Acquire)
++    }
+ }
+ 
+ impl SamplerState {
