@@ -1,0 +1,375 @@
+diff --git a/crates/metal2vulkan-runtime/src/buffer_descriptor.rs b/crates/metal2vulkan-runtime/src/buffer_descriptor.rs
+index 5d07264..ea1b87f 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_descriptor.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_descriptor.rs
+@@ -539,8 +539,9 @@ impl Device {
+         if self.is_lost() {
+             return Err(Error::DeviceLost);
+         }
+-        // Its encoders logged nothing to encode again (`DeviceOptions::refuse_rebinds`).
+-        if self.shared().refuse_rebinds {
++        // Its encoders logged nothing to encode again (`DeviceOptions::refuse_rebinds`). FUXI: nor
++        // may they have in a hybrid lane boot (`fuxihyb=2` or `3`, `DeviceShared::logs_calls`).
++        if self.shared().refuse_rebinds || crate::fuxi_census::lane_configured() {
+             return Err(invalid(call, Problem::Rebind(RebindProblem::Refused)));
+         }
+         let key = buffer.identity().key;
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 4aa4a55..7f1db8e 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2724,7 +2724,8 @@ impl CommandBufferShared {
+             // buffer that completed gives back its descriptor pools too, one that failed releases
+             // them here.
+             if let Some(pool) = state.pool.take() {
+-                self.device.shared().spares.give_command_pool(pool);
++                let shared = self.device.shared();
++                shared.spares.give_command_pool_reset(shared, pool);
+             }
+             if state.status == CommandBufferStatus::Completed {
+                 state.descriptors.give_back();
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 81304a0..db82e5a 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -380,7 +380,9 @@ impl DeviceShared {
+     /// over host pages, unless it refuses every rebind, the only reader of a log
+     /// (`DeviceOptions::refuse_rebinds`).
+     pub(crate) fn logs_calls(&self) -> bool {
+-        !self.refuse_rebinds && self.rebinds.any()
++        // FUXI (`fuxihyb=2`): no log under the lane, whose boot refuses every rebind, the log's
++        // only reader (`buffer_descriptor.rs`).
++        !self.refuse_rebinds && self.rebinds.any() && !crate::fuxi_census::lane()
+     }
+ 
+     /// What `create` makes with the `VkPipelineCache` it is handed, its `vkCreate*Pipelines` call:
+diff --git a/crates/metal2vulkan-runtime/src/fuxi_census.rs b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+index 111a91d..39ac61a 100644
+--- a/crates/metal2vulkan-runtime/src/fuxi_census.rs
++++ b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+@@ -18,13 +18,15 @@
+ //!
+ //! The `calls` line times what runs around the draws on the same thread: the encoder's bind
+ //! calls (outermost only, each from its entry to its return), render encoders' opening and ending,
+-//! and command buffer commits, and counts the encoders that log their calls for a rebind.
++//! and command buffer commits, and counts the encoders that log their calls for a rebind. The
++//! `open` and `end` lines split an encoder's opening and end at their phase marks.
+ //!
+ //! [`lane`] is the hybrid lane's switch (`fuxihyb=2`), read once per process: off, every cut it
+-//! guards takes the path it took before. `fuxihyb=3` alternates it by census window, for an A/B
+-//! in one boot: the process's first drawing thread turns it over as each of its windows ends, and
+-//! its window line says which way the window ran (`lane=0|1`; the cuts are exact either way, so
+-//! a turn between two draws changes nothing they draw).
++//! guards takes the path it took before. `fuxihyb=3` sets it by census window, for an A/B in one
++//! boot: the process's first drawing thread picks the next window's way at random as each of its
++//! windows ends (not by turns, which a periodic load aliases), and its window line says which way
++//! the window ran (`lane=0|1`; the cuts are exact either way, so a change between two draws
++//! changes nothing they draw).
+ 
+ use std::cell::{Cell, RefCell};
+ use std::collections::HashMap;
+@@ -42,6 +44,8 @@ static LANE: AtomicU8 = AtomicU8::new(UNKNOWN);
+ /// `LANE`'s third state: alternating by window (`fuxihyb=3`), now as `LANE_NOW` says.
+ const ALTERNATE: u8 = 3;
+ static LANE_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
++/// The random state that picks a `fuxihyb=3` window's way (xorshift64*), seeded by the clock.
++static LANE_RANDOM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ static NEXT_THREAD: AtomicU32 = AtomicU32::new(1);
+ static BASE: OnceLock<Instant> = OnceLock::new();
+ 
+@@ -377,6 +381,11 @@ thread_local! {
+     static AROUND_NS: [Cell<u64>; AROUND] = const { [const { Cell::new(0) }; AROUND] };
+     static AROUND_N: [Cell<u64>; AROUND] = const { [const { Cell::new(0) }; AROUND] };
+     static SETTER_DEPTH: Cell<u32> = const { Cell::new(0) };
++    /// The phase marks of the encoder opening and ending now, and their pieces' nanoseconds and
++    /// counts so far (`open` and `end` lines).
++    static PHASE_MARKS: [[Cell<u64>; PHASES]; 2] = const { [const { [const { Cell::new(0) }; PHASES] }; 2] };
++    static PHASE_NS: [[Cell<u64>; PHASES + 1]; 2] = const { [const { [const { Cell::new(0) }; PHASES + 1] }; 2] };
++    static PHASE_N: [Cell<u64>; 2] = const { [const { Cell::new(0) }; 2] };
+     static LOGGING_ENCODERS: Cell<u64> = const { Cell::new(0) };
+     static STATS: RefCell<Option<Box<Stats>>> = const { RefCell::new(None) };
+ }
+@@ -469,6 +478,13 @@ fn lane_start() -> bool {
+     lane()
+ }
+ 
++/// Whether the boot asked for the hybrid lane at all (`fuxihyb=2` or `3`): what holds for the whole
++/// process, such as refusing rebinds once some encoder may have logged no calls.
++pub(crate) fn lane_configured() -> bool {
++    lane();
++    matches!(LANE.load(Ordering::Relaxed), ON | ALTERNATE)
++}
++
+ /// Whether the hybrid lane's cuts are on (`fuxihyb=2`; by window under `fuxihyb=3`), the boot
+ /// value read once per process.
+ #[inline]
+@@ -523,6 +539,28 @@ pub(crate) enum Around {
+     Commit = 3,
+ }
+ const AROUND: usize = 4;
++/// The most phase marks of an encoder's opening or end.
++const PHASES: usize = 10;
++
++/// The phase group of `what`: an opening's 0, an end's 1.
++fn phase_group(what: u8) -> Option<usize> {
++    match what {
++        w if w == Around::Open as u8 => Some(0),
++        w if w == Around::End as u8 => Some(1),
++        _ => None,
++    }
++}
++
++/// The encoder opening or ending now (`what`) reached phase mark `index`.
++#[inline]
++pub(crate) fn phase_mark(what: Around, index: usize) {
++    if on() {
++        if let Some(g) = phase_group(what as u8) {
++            let t = now();
++            PHASE_MARKS.with(|m| m[g][index].set(t));
++        }
++    }
++}
+ 
+ /// A timed call, which adds its time to its `Around` as it goes (census on only).
+ pub(crate) struct Timed {
+@@ -533,8 +571,27 @@ pub(crate) struct Timed {
+ impl Drop for Timed {
+     fn drop(&mut self) {
+         if self.start != 0 {
+-            let ns = now().saturating_sub(self.start);
++            let end = now();
++            let ns = end.saturating_sub(self.start);
+             let what = usize::from(self.what);
++            if let Some(g) = phase_group(self.what) {
++                // Each piece from the mark before it (or the start) to its mark; marks not
++                // reached add nothing, and the last piece runs to the end.
++                PHASE_MARKS.with(|m| {
++                    PHASE_NS.with(|acc| {
++                        let mut at = self.start;
++                        for (i, mark) in m[g].iter().enumerate() {
++                            let t = mark.replace(0);
++                            if t != 0 {
++                                acc[g][i].set(acc[g][i].get() + t.saturating_sub(at));
++                                at = at.max(t);
++                            }
++                        }
++                        acc[g][PHASES].set(acc[g][PHASES].get() + end.saturating_sub(at));
++                    })
++                });
++                PHASE_N.with(|n| n[g].set(n[g].get() + 1));
++            }
+             AROUND_NS.with(|c| c[what].set(c[what].get() + ns));
+             AROUND_N.with(|c| c[what].set(c[what].get() + 1));
+             if self.what == Around::Setter as u8 {
+@@ -645,9 +702,17 @@ pub(crate) fn end(start: u64, pipeline: usize, traits: u32) {
+         record(stats, &cur, start, t, pipeline, traits);
+         if t.saturating_sub(stats.window) >= WINDOW_NS {
+             report(stats, t);
+-            // Under `fuxihyb=3` the first drawing thread turns the lane over for the next window.
++            // Under `fuxihyb=3` the first drawing thread picks the next window's way at random.
+             if stats.id == 1 && LANE.load(Ordering::Relaxed) == ALTERNATE {
+-                LANE_NOW.fetch_xor(true, Ordering::Relaxed);
++                let mut x = LANE_RANDOM.load(Ordering::Relaxed);
++                if x == 0 {
++                    x = t | 1;
++                }
++                x ^= x >> 12;
++                x ^= x << 25;
++                x ^= x >> 27;
++                LANE_RANDOM.store(x, Ordering::Relaxed);
++                LANE_NOW.store(x.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 63 == 1, Ordering::Relaxed);
+             }
+             let (id, last_pipeline, last_variant) =
+                 (stats.id, stats.last_pipeline, stats.last_variant);
+@@ -811,6 +876,18 @@ fn report(stats: &Stats, t: u64) {
+         per(Around::Commit as usize),
+         LOGGING_ENCODERS.with(|c| c.replace(0)),
+     ));
++    for (g, name) in [(0, "open"), (1, "end")] {
++        let n = PHASE_N.with(|c| c[g].replace(0));
++        let pieces = PHASE_NS.with(|c| c[g].each_ref().map(|x| x.replace(0)));
++        let mut text = format!("{head} {name} n={n}");
++        for (i, ns) in pieces.iter().enumerate() {
++            if *ns != 0 {
++                text.push_str(&format!(" p{i}={:.1}", us(*ns, n)));
++            }
++        }
++        text.push('\n');
++        line(&text);
++    }
+     line(&format!(
+         "{head} lane samplers={:.1} states={:.1} set0={} set0same={} layouts={}\n",
+         stats.samplers as f64 / n as f64,
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 186c69a..6219df8 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -1322,6 +1322,7 @@ impl CommandBuffer {
+             crate::fuxi_census::logging_encoder();
+         }
+         rate_mapped_pass::check_descriptor(CALL, device, descriptor)?;
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::Open, 0);
+         let taken = render_pass::surface_stencil_loads(descriptor);
+         let descriptor = &*taken;
+         let layout = render_pass::layout(CALL, self, descriptor)?;
+@@ -1330,6 +1331,7 @@ impl CommandBuffer {
+             0 => 0,
+             _ => layout.layers,
+         };
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::Open, 1);
+         let rate_map = RateMappedPass::of(CALL, descriptor, &layout)?;
+         let shape = PassShape::of(&layout)?;
+         let compatible = render_target::shared_compatible_pass(device, &shape)?;
+@@ -1338,7 +1340,9 @@ impl CommandBuffer {
+                 return Err(invalid(CALL, problem));
+             }
+         }
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::Open, 2);
+         let draws = self.begin_draws(&compatible)?;
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::Open, 3);
+         let keeping = capture::Keeping::of(&layout);
+         // A refusal past here leaves the secondary command buffer unused, freed with the pool.
+         let mut core = match again {
+@@ -3142,6 +3146,7 @@ impl RenderCommandEncoder {
+             ..
+         } = self;
+         earlier.push(current);
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 0);
+         let mut instances = earlier;
+         // A color attachment's store action still `Unknown` stores nothing, as plain Metal's
+         // `DontCare` (RT6 probe 1's `store_unknown`, which its validation stops).
+@@ -3225,6 +3230,7 @@ impl RenderCommandEncoder {
+         // another format, a fetched texture's scratch), the attachments the device renders only
+         // so render through images their textures keep, but one a draw took a view of
+         // (`linear_attachment.rs`).
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 1);
+         let others: Vec<Vec<usize>> = instances
+             .iter()
+             .map(|instance| {
+@@ -3336,6 +3342,7 @@ impl RenderCommandEncoder {
+             |index| taken.contains(&index),
+             |index| may_read.contains(&index),
+         )?;
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 2);
+         let device = core.device().clone();
+         // The pass's clears write a new texture's unwritten texels where they reach it: through
+         // another image only where the pass stores the aspect, whose copy back writes it
+@@ -3416,6 +3423,7 @@ impl RenderCommandEncoder {
+         // pass's layers does not render: a layered pass that resolves then ends with an instance of
+         // no draws over every layer. Every instance resolves as the pass ends: into the targets set
+         // last (`render/late_resolve.rs`).
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 3);
+         let resolving = PassShape::of(&layout)?;
+         late_resolve::settle(
+             instances.iter_mut().map(|instance| &mut instance.shape),
+@@ -3472,6 +3480,7 @@ impl RenderCommandEncoder {
+         if resolve_after {
+             shapes.push(resolving.clone());
+         }
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 4);
+         let mut uses = render_target::attachment_uses(&layout)?;
+         if let Some(planes) = &planes {
+             uses.extend(planes.uses.iter().cloned());
+@@ -3726,6 +3735,7 @@ impl RenderCommandEncoder {
+                 depth_stencil: None,
+                 ..layout.clone()
+             });
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 5);
+         let mut objects = Vec::with_capacity(count);
+         for (index, instance) in instances.iter().enumerate() {
+             let at = Position {
+@@ -3739,6 +3749,7 @@ impl RenderCommandEncoder {
+             let framebuffer = render_target::framebuffer(&device, &pass, &viewed, instance.views)?;
+             objects.push((pass, framebuffer));
+         }
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 6);
+         // The layout of the instances that resolve: the scratch image as the depth/stencil
+         // attachment where its copy stands for it.
+         let resolving_layout = resolve_source
+@@ -3990,6 +4001,7 @@ impl RenderCommandEncoder {
+         // Each instance's draws and pieces, and the steps around the instances, which record
+         // alike whether the pass records now or later with its executions
+         // (`render/pass_steps.rs`).
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 7);
+         let dispatch_count = dispatches.len();
+         let mut drawn = Vec::with_capacity(count);
+         let mut instance_steps = Vec::with_capacity(count);
+@@ -4043,6 +4055,7 @@ impl RenderCommandEncoder {
+             clear_values,
+             render_area,
+         };
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 8);
+         // The passes of the runs an execution may split an instance into (`render/executions.rs`).
+         let mut run_objects = Vec::new();
+         // The steps of a pass recorded now, or the pass that records later.
+@@ -4156,6 +4169,7 @@ impl RenderCommandEncoder {
+             deferred = Some(Arc::clone(&pass));
+             core.defer(Deferred::RenderPass(pass))?;
+         }
++        crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 9);
+         if let Some(resolves) = exact_resolves {
+             resolves.record(&mut core);
+         }
+diff --git a/crates/metal2vulkan-runtime/src/spares.rs b/crates/metal2vulkan-runtime/src/spares.rs
+index 39ac4d8..231e5a0 100644
+--- a/crates/metal2vulkan-runtime/src/spares.rs
++++ b/crates/metal2vulkan-runtime/src/spares.rs
+@@ -62,6 +62,9 @@ pub(super) struct CommandPool {
+     family: u32,
+     made: [Vec<vk::CommandBuffer>; 2],
+     handed: [usize; 2],
++    /// FUXI (`fuxihyb=2`): reset as it was given back, nothing made from it since
++    /// ([`Spares::give_command_pool_reset`]).
++    reset: bool,
+ }
+ 
+ impl CommandPool {
+@@ -72,6 +75,7 @@ impl CommandPool {
+             family,
+             made: [Vec::new(), Vec::new()],
+             handed: [0, 0],
++            reset: false,
+         }
+     }
+ 
+@@ -127,6 +131,11 @@ impl Spares {
+         let Some(mut pool) = take_command_pool(&mut lock(&self.command_pools), family) else {
+             return Ok(None);
+         };
++        // FUXI (`fuxihyb=2`): reset already, as it was given back.
++        if pool.reset {
++            pool.reset = false;
++            return Ok(Some(pool));
++        }
+         // SAFETY: the pool is the caller's alone now, and nothing of it is pending: a command
+         // buffer that completed gave it back.
+         let reset = unsafe {
+@@ -149,6 +158,28 @@ impl Spares {
+         keep_command_pool(&mut lock(&self.command_pools), pool);
+     }
+ 
++    /// FUXI (`fuxihyb=2`): [`give_command_pool`](Self::give_command_pool), the pool reset first
++    /// here, on the thread that saw its command buffer's work end, so the thread that takes it
++    /// next (a render encoder's, for a secondary) does not reset it. A pool whose reset fails is
++    /// kept as before, and reset as it is taken. Not in a section (the process's exit), where it
++    /// is kept as before.
++    pub(super) fn give_command_pool_reset(&self, device: &DeviceShared, mut pool: CommandPool) {
++        if crate::fuxi_census::lane() && !exit_guard::in_section() {
++            // SAFETY: the pool is the caller's alone, and nothing of it is pending: its command
++            // buffer's work ended.
++            let reset = unsafe {
++                device
++                    .vk()
++                    .reset_command_pool(pool.raw, vk::CommandPoolResetFlags::empty())
++            };
++            if reset.is_ok() {
++                pool.reset_handed();
++                pool.reset = true;
++            }
++        }
++        self.give_command_pool(pool);
++    }
++
+     /// A spare descriptor pool of `device`, reset, with room for one set of `needs`, the newest
+     /// such; `None` when there is none, or this thread is in a section.
+     pub(super) fn descriptor_pool(
