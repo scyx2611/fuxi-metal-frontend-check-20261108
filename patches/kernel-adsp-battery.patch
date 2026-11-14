@@ -4470,6 +4470,19 @@ index d95faff..71cc092 100644
   		int error = 0;
   
   		lck_mtx_lock(&sweet_ufs_lock);
+diff --git a/xnu/patches/0111-fuxi-user-profiler.patch b/xnu/patches/0111-fuxi-user-profiler.patch
+index 8349337..7d08b57 100644
+--- a/xnu/patches/0111-fuxi-user-profiler.patch
++++ b/xnu/patches/0111-fuxi-user-profiler.patch
+@@ -18,7 +18,7 @@
+  extern void sweet_keys_init(void);
+  extern void sweet_touch_init(void);
+  extern void fuxi_touch_init(void);
+-@@ -941,6 +942,7 @@
++@@ -1034,6 +1035,7 @@
+  	 * Stack sampler only, and only on request. sweet_log_start() stays off: it
+  	 * would write the tail of ufsroot0, which here is the HFS image itself.
+  	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
 index 0000000..1dfb65a
