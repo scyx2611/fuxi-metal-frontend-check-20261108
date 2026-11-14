@@ -1,0 +1,650 @@
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 8b3a0c2..4aa4a55 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -1483,6 +1483,7 @@ impl CommandBuffer {
+     /// encoder Metal's GPU faults fails as Metal's does ([`CommandBufferError::PageFault`]): that
+     /// encoder runs nothing, and the others run and every signal fires.
+     pub fn commit(&self) -> Result<(), Error> {
++        let _timed = crate::fuxi_census::timed(crate::fuxi_census::Around::Commit);
+         self.commit_as("commit", None)
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/descriptor_arena.rs b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
+index 8e53709..f54f31d 100644
+--- a/crates/metal2vulkan-runtime/src/descriptor_arena.rs
++++ b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
+@@ -162,48 +162,11 @@ pub(crate) struct DescriptorArena {
+     book: Book,
+     pools: Vec<DescriptorPool>,
+     device: Option<Device>,
+-    /// FUXI (`fuxihyb=2`): the latest written sets of the command buffer's draws, each with its
+-    /// layout and its writes flattened ([`reused`](Self::reused)), newest last, at most
+-    /// [`KEPT_SETS`].
+-    written: Vec<(vk::DescriptorSetLayout, Vec<u64>, vk::DescriptorSet)>,
+ }
+ 
+-/// FUXI: the most written sets an arena keeps for a draw to take again.
+-const KEPT_SETS: usize = 32;
+-
+ impl DescriptorArena {
+     /// One set of `layout`, whose needs are `needs` (not empty), from the newest pool with room
+     /// for it, or a pool opened for it: a spare of the device's with room, else a new one.
+-    /// FUXI (`fuxihyb=2`): a set of `layout` this command buffer already holds whose writes were
+-    /// exactly `writes` (flattened by the caller), none written since: a draw that would write
+-    /// the same into a new set binds that one instead. Every object its writes name is held by the
+-    /// command buffer since the draw that wrote it, so the set reads the same until it completes.
+-    pub(crate) fn reused(
+-        &self,
+-        layout: vk::DescriptorSetLayout,
+-        writes: &[u64],
+-    ) -> Option<vk::DescriptorSet> {
+-        self.written
+-            .iter()
+-            .rev()
+-            .find(|(of, kept, _)| *of == layout && kept[..] == *writes)
+-            .map(|&(_, _, set)| set)
+-    }
+-
+-    /// FUXI (`fuxihyb=2`): note that `set`, of `layout`, holds `writes` (flattened), for
+-    /// [`reused`](Self::reused).
+-    pub(crate) fn wrote(
+-        &mut self,
+-        layout: vk::DescriptorSetLayout,
+-        writes: Vec<u64>,
+-        set: vk::DescriptorSet,
+-    ) {
+-        if self.written.len() == KEPT_SETS {
+-            self.written.remove(0);
+-        }
+-        self.written.push((layout, writes, set));
+-    }
+-
+     pub(crate) fn allocate(
+         &mut self,
+         device: &Device,
+@@ -257,7 +220,6 @@ impl DescriptorArena {
+     /// their sets any more.
+     pub(crate) fn give_back(&mut self) {
+         self.book.rooms.clear();
+-        self.written.clear();
+         let Some(device) = &self.device else {
+             return;
+         };
+@@ -271,7 +233,6 @@ impl DescriptorArena {
+     /// was never submitted).
+     pub(crate) fn release(&mut self) {
+         self.book.rooms.clear();
+-        self.written.clear();
+         let Some(device) = &self.device else {
+             return;
+         };
+diff --git a/crates/metal2vulkan-runtime/src/fuxi_census.rs b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+index e6f2210..111a91d 100644
+--- a/crates/metal2vulkan-runtime/src/fuxi_census.rs
++++ b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+@@ -16,6 +16,10 @@
+ //! pipeline layout. Every 10 s a thread that drew writes `FUXI HYB` lines to stderr, one write
+ //! per line. Diagnostics only: nothing here changes what is drawn.
+ //!
++//! The `calls` line times what runs around the draws on the same thread: the encoder's bind
++//! calls (outermost only, each from its entry to its return), render encoders' opening and ending,
++//! and command buffer commits, and counts the encoders that log their calls for a rebind.
++//!
+ //! [`lane`] is the hybrid lane's switch (`fuxihyb=2`), read once per process: off, every cut it
+ //! guards takes the path it took before. `fuxihyb=3` alternates it by census window, for an A/B
+ //! in one boot: the process's first drawing thread turns it over as each of its windows ends, and
+@@ -85,10 +89,8 @@ pub(crate) enum Event {
+     ShapeMade = 8,
+     /// Not a step: the lane kept the encoder's argument sampler listing (`fuxihyb=2`).
+     SamplersKept = 9,
+-    /// Not a step: the lane bound a set-0 set the command buffer wrote alike before.
+-    SetReused = 10,
+ }
+-const EVENTS: usize = 11;
++const EVENTS: usize = 10;
+ const EVENT_NAMES: [&str; EVENTS] = [
+     "reformat",
+     "restart",
+@@ -100,7 +102,6 @@ const EVENT_NAMES: [&str; EVENTS] = [
+     "shapefound",
+     "shapemade",
+     "samplerskept",
+-    "setreused",
+ ];
+ /// The events that are runtime steps (a draw with one is not eligible); the rest are counts.
+ const STEP_EVENTS: u16 = (1 << 6) - 1;
+@@ -371,6 +372,12 @@ thread_local! {
+     static SAMPLERS_NOW: Cell<u32> = const { Cell::new(0) };
+     static STATES_NOW: Cell<u32> = const { Cell::new(0) };
+     static SET_ZERO_NOW: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
++    /// The calls around the draws (`Timed`): nanoseconds and counts by `Around`, the bind
++    /// calls' nesting depth, and the encoders opened that log their calls.
++    static AROUND_NS: [Cell<u64>; AROUND] = const { [const { Cell::new(0) }; AROUND] };
++    static AROUND_N: [Cell<u64>; AROUND] = const { [const { Cell::new(0) }; AROUND] };
++    static SETTER_DEPTH: Cell<u32> = const { Cell::new(0) };
++    static LOGGING_ENCODERS: Cell<u64> = const { Cell::new(0) };
+     static STATS: RefCell<Option<Box<Stats>>> = const { RefCell::new(None) };
+ }
+ 
+@@ -503,6 +510,68 @@ fn now() -> u64 {
+     u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX)
+ }
+ 
++/// What runs around the draws, timed (`calls` line).
++#[derive(Clone, Copy)]
++pub(crate) enum Around {
++    /// A bind call (outermost).
++    Setter = 0,
++    /// A render encoder's opening.
++    Open = 1,
++    /// A render encoder's end.
++    End = 2,
++    /// A command buffer's commit.
++    Commit = 3,
++}
++const AROUND: usize = 4;
++
++/// A timed call, which adds its time to its `Around` as it goes (census on only).
++pub(crate) struct Timed {
++    start: u64,
++    what: u8,
++}
++
++impl Drop for Timed {
++    fn drop(&mut self) {
++        if self.start != 0 {
++            let ns = now().saturating_sub(self.start);
++            let what = usize::from(self.what);
++            AROUND_NS.with(|c| c[what].set(c[what].get() + ns));
++            AROUND_N.with(|c| c[what].set(c[what].get() + 1));
++            if self.what == Around::Setter as u8 {
++                SETTER_DEPTH.with(|d| d.set(0));
++            }
++        }
++    }
++}
++
++/// Time a call of `what` until the returned value goes.
++#[inline]
++pub(crate) fn timed(what: Around) -> Timed {
++    Timed {
++        start: if on() { now() } else { 0 },
++        what: what as u8,
++    }
++}
++
++/// A bind call of `kind`, timed from here to its return where it is the outermost one.
++#[inline]
++pub(crate) fn setter(kind: Set) -> Timed {
++    set(kind);
++    let outermost = on() && SETTER_DEPTH.with(|d| d.replace(1)) == 0;
++    Timed {
++        start: if outermost { now() } else { 0 },
++        what: Around::Setter as u8,
++    }
++}
++
++/// A render encoder opened that logs its calls (for a rebind).
++#[inline]
++pub(crate) fn logging_encoder() {
++    if on() {
++        LOGGING_ENCODERS.with(|c| c.set(c.get() + 1));
++    }
++}
++
+ /// A bind call of `kind`.
+ #[inline]
+ pub(crate) fn set(kind: Set) {
+@@ -727,6 +796,21 @@ fn report(stats: &Stats, t: u64) {
+         stats.settle.line(&head, "settle", SETTLE_NAMES)
+     ));
+     line(&format!("{}\n", stats.rec.line(&head, "rec", REC_NAMES)));
++    let ns = AROUND_NS.with(|c| c.each_ref().map(|x| x.replace(0)));
++    let calls = AROUND_N.with(|c| c.each_ref().map(|x| x.replace(0)));
++    let per = |i: usize| us(ns[i], calls[i]);
++    line(&format!(
++        "{head} calls setters={:.2} per_draw={:.2} setter_us={:.2} encoders={} open={:.1} end={:.1} commits={} commit={:.1} logging={}\n",
++        ns[Around::Setter as usize] as f64 / n as f64 / 1000.0,
++        calls[Around::Setter as usize] as f64 / n as f64,
++        per(Around::Setter as usize),
++        calls[Around::Open as usize],
++        per(Around::Open as usize),
++        per(Around::End as usize),
++        calls[Around::Commit as usize],
++        per(Around::Commit as usize),
++        LOGGING_ENCODERS.with(|c| c.replace(0)),
++    ));
+     line(&format!(
+         "{head} lane samplers={:.1} states={:.1} set0={} set0same={} layouts={}\n",
+         stats.samplers as f64 / n as f64,
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/objects.rs b/crates/metal2vulkan-runtime/src/pipeline/objects.rs
+index 03f1be0..dad330c 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/objects.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/objects.rs
+@@ -740,14 +740,6 @@ impl VariantObjects {
+         self.set_layouts.len()
+     }
+ 
+-    /// FUXI: the layout of set 0, where a command takes one ([`set_zero`](Self::set_zero)).
+-    pub(crate) fn set_zero_layout(&self) -> Option<vk::DescriptorSetLayout> {
+-        match (self.set_layouts.first(), self.set_needs.first()) {
+-            (Some(&layout), Some(needs)) if !needs.is_empty() => Some(layout),
+-            _ => None,
+-        }
+-    }
+-
+     /// A command's set 0, from its command buffer's pools `arena`; none when the layout has no
+     /// set, or set 0 no descriptor (a pipeline that uses no set needs none bound).
+     pub(crate) fn set_zero(
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index de88f0f..186c69a 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -546,30 +546,6 @@ struct DrawBuffers<'a> {
+     control_point_indices: Option<(&'a Buffer, u64)>,
+ }
+ 
+-/// FUXI (`fuxihyb=2`): a draw's set-0 writes flattened, field by field and handle by handle, the
+-/// key a written set is taken again by (`DescriptorArena::reused`): equal words, equal writes.
+-fn set_zero_words(writes: &[binding::Write]) -> Vec<u64> {
+-    use ash::vk::Handle as _;
+-    let mut words = Vec::with_capacity(writes.len() * 5);
+-    for write in writes {
+-        words.push(u64::from(write.set) << 32 | u64::from(write.binding));
+-        words.push(u64::from(write.element) << 32 | write.ty.as_raw() as u32 as u64);
+-        match write.info {
+-            binding::Info::Buffer(info) => {
+-                words.extend([1, info.buffer.as_raw(), info.offset, info.range]);
+-            }
+-            binding::Info::Image(info) => words.extend([
+-                2,
+-                info.sampler.as_raw(),
+-                info.image_view.as_raw(),
+-                info.image_layout.as_raw() as u32 as u64,
+-            ]),
+-            binding::Info::Texel(view) => words.extend([3, view.as_raw()]),
+-        }
+-    }
+-    words
+-}
+-
+ /// FUXI census: a hash (FNV-1a) of a draw's set-0 writes, what its descriptor set holds, so the
+ /// census can count draws whose writes equal the last ones of their pipeline layout.
+ fn set_zero_hash(writes: &[binding::Write]) -> u64 {
+@@ -1320,6 +1296,7 @@ impl CommandBuffer {
+         &self,
+         descriptor: &RenderPassDescriptor,
+     ) -> Result<RenderCommandEncoder, Error> {
++        let _timed = crate::fuxi_census::timed(crate::fuxi_census::Around::Open);
+         self.open_render(descriptor, None)
+     }
+ 
+@@ -1341,6 +1318,9 @@ impl CommandBuffer {
+                 .then(|| RenderLog::new(descriptor)),
+             Some(_) => None,
+         };
++        if log.is_some() {
++            crate::fuxi_census::logging_encoder();
++        }
+         rate_mapped_pass::check_descriptor(CALL, device, descriptor)?;
+         let taken = render_pass::surface_stencil_loads(descriptor);
+         let descriptor = &*taken;
+@@ -1621,7 +1601,7 @@ impl RenderCommandEncoder {
+     /// the state keeps unwritten and the device lacks `independentBlend`. A refused call keeps the
+     /// state set before.
+     pub fn set_render_pipeline_state(&mut self, state: &RenderPipelineState) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::Pipeline);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::Pipeline);
+         self.log(|_| RenderCall::PipelineState(state.clone()));
+         const CALL: &str = "set_render_pipeline_state";
+         self.core.check_device(CALL, state.device())?;
+@@ -1682,7 +1662,7 @@ impl RenderCommandEncoder {
+         offset: u64,
+         index: u32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::VertexBuffer);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::VertexBuffer);
+         self.log(|_| RenderCall::Buffer(Table::Vertex, buffer.cloned(), offset, index));
+         self.vertex
+             .set_buffer(&self.core, "set_vertex_buffer", buffer, offset, index)
+@@ -1697,7 +1677,7 @@ impl RenderCommandEncoder {
+         offsets: &[u64],
+         first: u32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::VertexBuffer);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::VertexBuffer);
+         self.log(|log| {
+             RenderCall::Buffers(
+                 Table::Vertex,
+@@ -1718,7 +1698,7 @@ impl RenderCommandEncoder {
+     /// the index is bound again, as plain Metal reads them (an M4; its debug layer asserts there is
+     /// no buffer). Refused: nothing bound at the index, an offset past the buffer's length.
+     pub fn set_vertex_buffer_offset(&mut self, offset: u64, index: u32) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::VertexBuffer);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::VertexBuffer);
+         self.log(|_| RenderCall::BufferOffset(Table::Vertex, offset, index));
+         self.vertex
+             .set_buffer_offset(&self.core, "set_vertex_buffer_offset", offset, index)
+@@ -1734,7 +1714,7 @@ impl RenderCommandEncoder {
+     /// `Bind(MissingDeviceAddress)`, at the draw. Refused: an index past the table, and more than
+     /// 4096 bytes, Metal's limit for inline bytes (`Invalid(InlineBytesLength)`).
+     pub fn set_vertex_bytes(&mut self, bytes: &[u8], index: u32) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::VertexBytes);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::VertexBytes);
+         self.log(|log| RenderCall::Bytes(Table::Vertex, log.byte_span(bytes), index));
+         self.vertex
+             .set_bytes(&self.core, "set_vertex_bytes", bytes, None, index)
+@@ -1747,7 +1727,7 @@ impl RenderCommandEncoder {
+         texture: Option<&Texture>,
+         index: u32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::VertexTexture);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::VertexTexture);
+         self.log(|_| RenderCall::Texture(Table::Vertex, texture.cloned(), index));
+         self.vertex
+             .set_textures(&self.core, "set_vertex_texture", &[texture], index)
+@@ -1760,7 +1740,7 @@ impl RenderCommandEncoder {
+         textures: &[Option<&Texture>],
+         first: u32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::VertexTexture);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::VertexTexture);
+         self.log(|log| RenderCall::Textures(Table::Vertex, log.texture_span(textures), first));
+         self.vertex
+             .set_textures(&self.core, "set_vertex_textures", textures, first)
+@@ -1773,7 +1753,7 @@ impl RenderCommandEncoder {
+         sampler: Option<&SamplerState>,
+         index: u32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::VertexSampler);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::VertexSampler);
+         self.log(|_| RenderCall::Sampler(Table::Vertex, sampler.cloned(), index));
+         self.vertex.set_samplers(
+             &self.core,
+@@ -1794,7 +1774,7 @@ impl RenderCommandEncoder {
+         clamps: Option<(&[f32], &[f32])>,
+         first: u32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::VertexSampler);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::VertexSampler);
+         self.log(|_| RenderCall::Samplers(Table::Vertex, Samplers::of(samplers, clamps, first)));
+         self.vertex.set_samplers(
+             &self.core,
+@@ -1813,7 +1793,7 @@ impl RenderCommandEncoder {
+         offset: u64,
+         index: u32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentBuffer);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::FragmentBuffer);
+         self.log(|_| RenderCall::Buffer(Table::Fragment, buffer.cloned(), offset, index));
+         self.fragment
+             .set_buffer(&self.core, "set_fragment_buffer", buffer, offset, index)
+@@ -1827,7 +1807,7 @@ impl RenderCommandEncoder {
+         offsets: &[u64],
+         first: u32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentBuffer);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::FragmentBuffer);
+         self.log(|log| {
+             RenderCall::Buffers(
+                 Table::Fragment,
+@@ -1843,7 +1823,7 @@ impl RenderCommandEncoder {
+     /// `setFragmentBufferOffset:atIndex:`. Refused as
+     /// [`RenderCommandEncoder::set_vertex_buffer_offset`] is.
+     pub fn set_fragment_buffer_offset(&mut self, offset: u64, index: u32) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentBuffer);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::FragmentBuffer);
+         self.log(|_| RenderCall::BufferOffset(Table::Fragment, offset, index));
+         self.fragment
+             .set_buffer_offset(&self.core, "set_fragment_buffer_offset", offset, index)
+@@ -1853,7 +1833,7 @@ impl RenderCommandEncoder {
+     /// [`set_vertex_bytes`](Self::set_vertex_bytes), in the fragment stage's table. Refused as
+     /// that is.
+     pub fn set_fragment_bytes(&mut self, bytes: &[u8], index: u32) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentBytes);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::FragmentBytes);
+         self.log(|log| RenderCall::Bytes(Table::Fragment, log.byte_span(bytes), index));
+         self.fragment
+             .set_bytes(&self.core, "set_fragment_bytes", bytes, None, index)
+@@ -1866,7 +1846,7 @@ impl RenderCommandEncoder {
+         texture: Option<&Texture>,
+         index: u32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentTexture);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::FragmentTexture);
+         self.log(|_| RenderCall::Texture(Table::Fragment, texture.cloned(), index));
+         self.fragment
+             .set_textures(&self.core, "set_fragment_texture", &[texture], index)
+@@ -1879,7 +1859,7 @@ impl RenderCommandEncoder {
+         textures: &[Option<&Texture>],
+         first: u32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentTexture);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::FragmentTexture);
+         self.log(|log| RenderCall::Textures(Table::Fragment, log.texture_span(textures), first));
+         self.fragment
+             .set_textures(&self.core, "set_fragment_textures", textures, first)
+@@ -1892,7 +1872,7 @@ impl RenderCommandEncoder {
+         sampler: Option<&SamplerState>,
+         index: u32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentSampler);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::FragmentSampler);
+         self.log(|_| RenderCall::Sampler(Table::Fragment, sampler.cloned(), index));
+         self.fragment.set_samplers(
+             &self.core,
+@@ -1912,7 +1892,7 @@ impl RenderCommandEncoder {
+         clamps: Option<(&[f32], &[f32])>,
+         first: u32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::FragmentSampler);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::FragmentSampler);
+         self.log(|_| RenderCall::Samplers(Table::Fragment, Samplers::of(samplers, clamps, first)));
+         self.fragment.set_samplers(
+             &self.core,
+@@ -2151,7 +2131,7 @@ impl RenderCommandEncoder {
+     /// that draws the compensated depths inexactly (`render_state.rs`). A refused call keeps the
+     /// viewports set before.
+     pub fn set_viewport(&mut self, viewport: Viewport) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::ViewScissor);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::ViewScissor);
+         self.log(|_| RenderCall::Viewport(Box::new(viewport)));
+         let refused = render_state::depth_ranges_refused(self.core.device());
+         self.state
+@@ -2161,7 +2141,7 @@ impl RenderCommandEncoder {
+     /// `setViewports:count:`. Refused as [`RenderCommandEncoder::set_viewport`] is, and for a
+     /// count outside 1 to 16 (measured).
+     pub fn set_viewports(&mut self, viewports: &[Viewport]) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::ViewScissor);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::ViewScissor);
+         self.log(|_| RenderCall::Viewports(viewports.into()));
+         let refused = render_state::depth_ranges_refused(self.core.device());
+         self.state
+@@ -2171,7 +2151,7 @@ impl RenderCommandEncoder {
+     /// `setScissorRect:`. A rectangle past the render area is clipped to it, as plain Metal clips
+     /// it where its validation stops the call (RT6 probe 4).
+     pub fn set_scissor_rect(&mut self, rect: ScissorRect) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::ViewScissor);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::ViewScissor);
+         self.log(|_| RenderCall::ScissorRect(rect));
+         self.state.set_scissors("set_scissor_rect", &[rect])
+     }
+@@ -2185,21 +2165,21 @@ impl RenderCommandEncoder {
+     /// nothing, as plain Metal draws them where its validation stops a count other than 1 and the
+     /// viewport count (probes).
+     pub fn set_scissor_rects(&mut self, rects: &[ScissorRect]) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::ViewScissor);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::ViewScissor);
+         self.log(|_| RenderCall::ScissorRects(rects.into()));
+         self.state.set_scissors("set_scissor_rects", rects)
+     }
+ 
+     /// `setCullMode:`.
+     pub fn set_cull_mode(&mut self, mode: CullMode) {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::Raster);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::Raster);
+         self.log(|_| RenderCall::CullMode(mode));
+         self.state.set_cull_mode(mode);
+     }
+ 
+     /// `setFrontFacingWinding:`.
+     pub fn set_front_facing_winding(&mut self, winding: Winding) {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::Raster);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::Raster);
+         self.log(|_| RenderCall::FrontFacingWinding(winding));
+         self.state.set_winding(winding);
+     }
+@@ -2214,7 +2194,7 @@ impl RenderCommandEncoder {
+         &mut self,
+         state: impl Into<Option<&'a DepthStencilState>>,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::DepthStencil);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::DepthStencil);
+         let state = state.into();
+         self.log(|_| RenderCall::DepthStencilState(state.cloned()));
+         if let Some(state) = state {
+@@ -2228,14 +2208,14 @@ impl RenderCommandEncoder {
+     /// `setStencilReferenceValue:`: both faces' reference, saturated at 255 as Metal's is
+     /// (measured).
+     pub fn set_stencil_reference_value(&mut self, value: u32) {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::DepthStencil);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::DepthStencil);
+         self.log(|_| RenderCall::StencilReferenceValue(value));
+         self.state.set_stencil_references(value, value);
+     }
+ 
+     /// `setStencilFrontReferenceValue:backReferenceValue:`, saturated at 255 as Metal's are.
+     pub fn set_stencil_reference_values(&mut self, front: u32, back: u32) {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::DepthStencil);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::DepthStencil);
+         self.log(|_| RenderCall::StencilReferenceValues(front, back));
+         self.state.set_stencil_references(front, back);
+     }
+@@ -2255,14 +2235,14 @@ impl RenderCommandEncoder {
+         slope_scale: f32,
+         clamp: f32,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::Raster);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::Raster);
+         self.log(|_| RenderCall::DepthBias(depth_bias, slope_scale, clamp));
+         self.state.set_depth_bias(depth_bias, slope_scale, clamp)
+     }
+ 
+     /// `setDepthClipMode:`. `Clamp` needs `depthClamp` (`Unsupported`).
+     pub fn set_depth_clip_mode(&mut self, mode: DepthClipMode) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::Raster);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::Raster);
+         self.log(|_| RenderCall::DepthClipMode(mode));
+         let profile = self.core.device().compile_device().profile();
+         self.state.set_clip_mode(mode, profile)
+@@ -2270,7 +2250,7 @@ impl RenderCommandEncoder {
+ 
+     /// `setTriangleFillMode:`. `Lines` needs `fillModeNonSolid` (`Unsupported`).
+     pub fn set_triangle_fill_mode(&mut self, mode: TriangleFillMode) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::Raster);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::Raster);
+         self.log(|_| RenderCall::TriangleFillMode(mode));
+         let profile = self.core.device().compile_device().profile();
+         self.state.set_fill_mode(mode, profile)
+@@ -2278,7 +2258,7 @@ impl RenderCommandEncoder {
+ 
+     /// `setBlendColorRed:green:blue:alpha:`.
+     pub fn set_blend_color(&mut self, red: f32, green: f32, blue: f32, alpha: f32) {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::Raster);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::Raster);
+         self.log(|_| RenderCall::BlendColor([red, green, blue, alpha]));
+         self.state.set_blend_color([red, green, blue, alpha]);
+     }
+@@ -2298,7 +2278,7 @@ impl RenderCommandEncoder {
+         offset: u64,
+         instance_stride: u64,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::Other);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::Other);
+         self.log(|_| {
+             RenderCall::TessellationFactorBuffer(buffer.cloned(), offset, instance_stride)
+         });
+@@ -2323,7 +2303,7 @@ impl RenderCommandEncoder {
+     /// M4): each culls or draws as its `half` does under a pipeline that enables the scale, and a
+     /// pipeline that does not draws as before.
+     pub fn set_tessellation_factor_scale(&mut self, scale: f32) {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::Other);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::Other);
+         self.log(|_| RenderCall::TessellationFactorScale(scale));
+         self.factors.scale = Some(scale);
+     }
+@@ -2339,7 +2319,7 @@ impl RenderCommandEncoder {
+         count: u64,
+         view_mappings: Option<&[VertexAmplificationViewMapping]>,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::Other);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::Other);
+         self.log(|_| RenderCall::VertexAmplificationCount(count, view_mappings.map(Into::into)));
+         self.amplification = Amplification::new(count, view_mappings)
+             .map_err(|problem| draw_problem("set_vertex_amplification_count", problem))?;
+@@ -3039,7 +3019,7 @@ impl RenderCommandEncoder {
+         mode: VisibilityResultMode,
+         offset: u64,
+     ) -> Result<(), Error> {
+-        crate::fuxi_census::set(crate::fuxi_census::Set::Other);
++        let _timed = crate::fuxi_census::setter(crate::fuxi_census::Set::Other);
+         self.log(|_| RenderCall::VisibilityResultMode(mode, offset));
+         let offset = visibility::result_offset(offset);
+         let device = self.core.device().clone();
+@@ -3088,6 +3068,7 @@ impl RenderCommandEncoder {
+     /// is left untouched, as plain Metal leaves it. The encoder is consumed either way, so a
+     /// refusal leaves its command buffer abandoned, as Metal stops there.
+     pub fn end_encoding(self) -> Result<(), Error> {
++        let _timed = crate::fuxi_census::timed(crate::fuxi_census::Around::End);
+         let (core, residency, log) = self.end_pass()?;
+         core.end_with_replay(
+             EncoderKind::Render,
+@@ -6868,42 +6849,11 @@ impl RenderCommandEncoder {
+         // Set 0 per draw; set 1 the device's (written below, once nothing refuses).
+         let mut writes = bound.writes;
+         let heap_writes: Vec<_> = writes.extract_if(.., |write| write.set > 0).collect();
+-        // FUXI (`fuxihyb=2`): a set this command buffer wrote alike already, where every write
+-        // is a plain set-0 descriptor (none holds an object of its own).
+-        let flat = match (crate::fuxi_census::lane(), objects.set_zero_layout()) {
+-            (true, Some(layout)) if writes.iter().all(|w| w.set == 0 && w.held.is_none()) => {
+-                Some((layout, set_zero_words(&writes)))
+-            }
+-            _ => None,
+-        };
+-        let again = flat.as_ref().and_then(|(layout, words)| {
+-            self.core
+-                .command_buffer()
+-                .state()
+-                .descriptors
+-                .reused(*layout, words)
+-        });
+-        let set = match again {
+-            Some(set) => {
+-                crate::fuxi_census::event(crate::fuxi_census::Event::SetReused);
+-                Some(set)
+-            }
+-            None => {
+-                let set = objects.set_zero(&mut self.core.command_buffer().state().descriptors)?;
+-                // SAFETY: the set was just allocated and no command uses it yet; every buffer,
+-                // view and sampler written is live (the command buffer retains them below, and a
+-                // refusal leaves the set unused in its pool).
+-                unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
+-                if let (Some((layout, words)), Some(set)) = (flat, set) {
+-                    self.core
+-                        .command_buffer()
+-                        .state()
+-                        .descriptors
+-                        .wrote(layout, words, set);
+-                }
+-                set
+-            }
+-        };
++        let set = objects.set_zero(&mut self.core.command_buffer().state().descriptors)?;
++        // SAFETY: the set was just allocated and no command uses it yet; every buffer, view
++        // and sampler written is live (the command buffer retains them below, and a refusal
++        // leaves the set unused in its pool).
++        unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
+         if crate::fuxi_census::active() {
+             use ash::vk::Handle as _;
+             crate::fuxi_census::set_zero(objects.layout().as_raw(), set_zero_hash(&writes));
