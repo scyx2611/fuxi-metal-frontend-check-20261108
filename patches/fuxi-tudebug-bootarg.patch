@@ -1,8 +1,8 @@
 diff --git a/tools/fuxi-metal/ClientSetup.hpp b/tools/fuxi-metal/ClientSetup.hpp
-index 66ad4dc..2d7541c 100644
+index 66ad4dc..acdc7c1 100644
 --- a/tools/fuxi-metal/ClientSetup.hpp
 +++ b/tools/fuxi-metal/ClientSetup.hpp
-@@ -1,13 +1,47 @@
+@@ -1,14 +1,50 @@
  /* Fuxi startup policy; design observations credited in metal-m9m.md. */
  #pragma once
 +#include <cstdio>
@@ -42,15 +42,19 @@ index 66ad4dc..2d7541c 100644
   // Preserve an explicit diagnostic override, including an empty one.
   // fuxigpugmem=1 drops sysmem to test Turnip's tiled GMEM path; UniXNU saw
 - // GMEM hangs on A740 (metal-m9m.md), so it stays opt-in.
+- env("TU_DEBUG",systemTranslationPolicy().gmem?"nocb":"sysmem,nocb",0);
 + // GMEM hangs on A740 (metal-m9m.md), so it stays opt-in. fuxitudebug= replaces both defaults.
++ // GMEM keeps concurrent resolves off: on the Fuxi A740 with them on, bin stores overlapping the next bin left
++ // rows of recycled CoreAnimation surfaces unwritten (stale content in bands); off, the frames match sysmem.
 + if(const char *flags=tuDebugBootFlags()){
 +  env("TU_DEBUG",flags,0);
 +  static bool told;if(!told){told=true;fprintf(stderr,"FUXI MTL: TU_DEBUG default from boot fuxitudebug=%s\n",flags);}
 +  return;
 + }
-  env("TU_DEBUG",systemTranslationPolicy().gmem?"nocb":"sysmem,nocb",0);
++ env("TU_DEBUG",systemTranslationPolicy().gmem?"nocb,noconcurrentresolves":"sysmem,nocb",0);
  }
  inline void setupTurnip(){setupTurnip([](const char *key,const char *value,int overwrite){return setenv(key,value,overwrite);});}
+ template<class Environment,class Preference>
 diff --git a/tools/fuxi-metal/ClientSetupTests.cpp b/tools/fuxi-metal/ClientSetupTests.cpp
 index 84f7da2..1ee924e 100644
 --- a/tools/fuxi-metal/ClientSetupTests.cpp
