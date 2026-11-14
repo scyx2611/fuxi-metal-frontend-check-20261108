@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <objc/message.h>
@@ -101,8 +102,28 @@ int main(){@autoreleasepool{
  [racing commit];assert(!dispatch_semaphore_wait(entered,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC)));
  [racing addCompletedHandler:^(id<MTLCommandBuffer> cb){assert(cb==(id)racing);++racingCount;}];
  dispatch_semaphore_signal(release);[racing waitUntilCompleted];assert(racingCount==2);
+ // Swap-wait token parsing, gating and no-op command buffer verification (patch 0013)
+ assert(fuxiBootArgsHaveToken("fuxiswapwait=0","fuxiswapwait=0"));
+ assert(fuxiBootArgsHaveToken("a=1 fuxiswapwait=0 b=2","fuxiswapwait=0"));
+ assert(fuxiBootArgsHaveToken("x\tfuxiswapwait=0\n","fuxiswapwait=0"));
+ assert(!fuxiBootArgsHaveToken("fuxiswapwait=1","fuxiswapwait=0"));
+ assert(!fuxiBootArgsHaveToken("fuxiswapwait=01","fuxiswapwait=0"));
+ assert(!fuxiBootArgsHaveToken("xfuxiswapwait=0","fuxiswapwait=0"));
+ assert(!fuxiBootArgsHaveToken("fuxiswapwait=0x","fuxiswapwait=0"));
+ assert(!fuxiBootArgsHaveToken("","fuxiswapwait=0"));
+ assert(!fuxiBootArgsHaveToken(nullptr,"fuxiswapwait=0"));
+ setenv("FUXI_NATIVE_SWAP_WAIT","0",1);
+ assert(!fuxiSwapWaitEnabled());
+ setenv("FUXI_NATIVE_SWAP_WAIT","1",1);
+ assert(fuxiSwapWaitEnabled());
+ NBCommandBuffer *swap=[NBCommandBuffer new];
+ swap->encodedWork.storedSurface=true;
+ assert([swap commitAndWaitUntilSubmitted]);
+ [swap waitUntilCompleted];
+ assert(swap.fuxiNoop && gTimeSwapWait.count.load()==0 && gSwapWaitRefused.load()==0);
+ unsetenv("FUXI_NATIVE_SWAP_WAIT");
  size_t before=failures.size();
  @try {[[NBObject new] doesNotRecognizeSelector:sel_registerName("n1Unsupported")];assert(false);}
  @catch(NSException *e){assert(e && failures.size()>before);}
- puts("PASS: actual native refusal/surface/exception hooks, optional fallback, survey placeholders and no-op completion");
+ puts("PASS: actual native refusal/surface/exception hooks, optional fallback, survey placeholders and no-op completion, swap-wait gating");
 }}

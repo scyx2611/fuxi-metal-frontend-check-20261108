@@ -1,0 +1,92 @@
+diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+index 2872bb7..a0ee078 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+@@ -236,7 +236,7 @@ pub(super) enum TexelsHome {
+ 
+ /// The bytes of one texel of `pf`, the block of its direct Vulkan format (the bytes Metal's
+ /// format has, for every format the runtime holds exactly); `None` without one.
+-fn texel_bytes(pf: PixelFormat) -> Option<u64> {
++pub(super) fn texel_bytes(pf: PixelFormat) -> Option<u64> {
+     byte_format(pf)
+         .and_then(|format| format.block())
+         .map(|block| u64::from(block.size))
+diff --git a/crates/metal2vulkan-runtime/src/capabilities.rs b/crates/metal2vulkan-runtime/src/capabilities.rs
+index 16db3d0..4fd4b79 100644
+--- a/crates/metal2vulkan-runtime/src/capabilities.rs
++++ b/crates/metal2vulkan-runtime/src/capabilities.rs
+@@ -333,12 +333,18 @@ impl DeviceProperties {
+         &self,
+         format: PixelFormat,
+     ) -> Result<u64, Error> {
+-        linear_alignment(format, self.metal_level).map_err(|problem| {
++        let alignment = linear_alignment(format, self.metal_level).map_err(|problem| {
+             invalid(
+                 "minimum_linear_texture_alignment_for_pixel_format",
+                 Problem::BufferTexture(problem),
+             )
+-        })
++        })?;
++        // FUXI: the device's linear rows (`linear_plan::fuxi_linear_texels`), in the format's
++        // bytes, where it answers them.
++        let fuxi = super::linear_plan::fuxi_linear_texels()
++            .zip(super::buffer_texture::texel_bytes(format))
++            .map(|(texels, bytes)| texels * bytes);
++        Ok(fuxi.map_or(alignment, |fuxi| fuxi.max(alignment)))
+     }
+ }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/linear_plan.rs b/crates/metal2vulkan-runtime/src/linear_plan.rs
+index a0a2cbc..4a5e695 100644
+--- a/crates/metal2vulkan-runtime/src/linear_plan.rs
++++ b/crates/metal2vulkan-runtime/src/linear_plan.rs
+@@ -236,6 +236,25 @@ fn backed(pf: PixelFormat) -> Result<(), BufferTextureProblem> {
+     }
+ }
+ 
++/// FUXI: the texels a linear texture's rows are aligned to in the alignment the device answers
++/// (`minimumLinearTextureAlignmentForPixelFormat:`, `deviceLinearTextureAlignmentBytes`), where the
++/// device answers more than [`LINEAR_ALIGNMENT`]: on iOS 64 (Turnip lays a linear image's rows 64
++/// texels apart, and a host allocation's image takes no other pitch without DRM format modifiers,
++/// which the phone's Darwin KMD lacks), unless `FUXI_M2V_LINEAR_ALIGN` is 0; elsewhere none.
++/// CoreAnimation lays the bytes of the images it decodes out at the answer, so their rows then sit
++/// where the device's linear image does and the texture aliases them: at 16 every such image was a
++/// shadow, copied in before every encoder that sampled it (the kernel's per-IB profile measured
++/// about 7.7 million texels a frame, most of the GPU's frame). Metal permits a larger answer; the
++/// runtime still takes every texture at [`LINEAR_ALIGNMENT`].
++pub(super) fn fuxi_linear_texels() -> Option<u64> {
++    static TEXELS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
++    *TEXELS.get_or_init(|| match std::env::var_os("FUXI_M2V_LINEAR_ALIGN") {
++        Some(value) if value == "0" => None,
++        Some(_) => Some(64),
++        None => cfg!(target_os = "ios").then_some(64),
++    })
++}
++
+ /// `pf`'s alignment in a buffer ([`LINEAR_ALIGNMENT`]) on a device answering at `level`, or why
+ /// no buffer can back it: also a format the level describes none of
+ /// ([`MetalLevel::describes`]), whose alignment queries Metal asserts on (EVs XRR2-pla1-m4 and
+diff --git a/crates/metal2vulkan-runtime/src/private_properties.rs b/crates/metal2vulkan-runtime/src/private_properties.rs
+index 291a247..0bd6c18 100644
+--- a/crates/metal2vulkan-runtime/src/private_properties.rs
++++ b/crates/metal2vulkan-runtime/src/private_properties.rs
+@@ -616,10 +616,15 @@ impl Answers<'_> {
+         Some(match property {
+             C::GpuCoreCount => u64::from(self.properties.gpu_core_count?),
+             C::MaxVertexAmplificationCount | C::MaxComputeThreadgroupMemory => return None,
+-            C::DeviceLinearTextureAlignmentBytes
+-            | C::LinearTextureAlignmentBytes
+-            | C::IosurfaceTextureAlignmentBytes
+-            | C::IosurfaceReadOnlyTextureAlignmentBytes => LINEAR_ALIGNMENT,
++            // FUXI: the device's linear rows for a 4-byte texel, the widest CoreAnimation's images
++            // take (`linear_plan::fuxi_linear_texels`), where it answers them.
++            C::DeviceLinearTextureAlignmentBytes | C::LinearTextureAlignmentBytes => {
++                super::linear_plan::fuxi_linear_texels()
++                    .map_or(LINEAR_ALIGNMENT, |texels| (texels * 4).max(LINEAR_ALIGNMENT))
++            }
++            C::IosurfaceTextureAlignmentBytes | C::IosurfaceReadOnlyTextureAlignmentBytes => {
++                LINEAR_ALIGNMENT
++            }
+             C::MaxVertexBuffers
+             | C::MaxFragmentBuffers
+             | C::MaxComputeBuffers

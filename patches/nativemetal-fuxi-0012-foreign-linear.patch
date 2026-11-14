@@ -1,0 +1,65 @@
+diff --git a/FuxiTextureLayout.inc b/FuxiTextureLayout.inc
+index 3a7fd97..87d1be1 100644
+--- a/FuxiTextureLayout.inc
++++ b/FuxiTextureLayout.inc
+@@ -113,6 +113,31 @@ static FuxiLayoutSnapshot fuxiSnapshotLayout(void *memory,NSUInteger length,cons
+  }
+  out=std::move(copy);return FuxiLayoutSnapshot::Ready;
+ }
++// Cross-process source. A client without a Metal device (SpringBoard and the
++// poster extensions here) has no layout object: ImageIO serializes its ASTC
++// snapshot as row-major blocks behind a zero watermark (ATX payload at a
++// page-aligned file offset), maps the file and QuartzCore forwards that mapping
++// to the render server unchanged. No producer record can exist for it in this
++// process. Only the unambiguous shape is admitted: one level, one slice, a
++// page-aligned base and a length covering every block. The bytes are copied
++// with bounded self-memory reads, so a truncated or revoked mapping refuses.
++static bool fuxiForeignLinearEnabled() {
++ const char *value=std::getenv("FUXI_NATIVE_FOREIGN_LINEAR");
++ return !value || std::strcmp(value,"0")!=0;
++}
++static std::atomic<unsigned> gFuxiLayoutForeignImports;
++static bool fuxiSnapshotForeign(void *memory,NSUInteger length,const fuxi_layout::Layout &layout,std::vector<uint8_t> &out) {
++ const uintptr_t base=(uintptr_t)memory;
++ if(!fuxiForeignLinearEnabled() || layout.descriptor.levels!=1 || layout.descriptor.slices!=1 ||
++    !fuxiLayoutRange(base,layout.totalBytes) || base%16384 || length<layout.totalBytes)return false;
++ std::vector<uint8_t> copy(layout.totalBytes);
++ for(size_t offset=0;offset<copy.size();) {
++  const size_t count=std::min<size_t>(65536,copy.size()-offset);
++  if(!fuxiSafeRead(base+offset,copy.data()+offset,count))return false;
++  offset+=count;
++ }
++ out=std::move(copy);return true;
++}
+ typedef struct {uint64_t words[2];} FuxiLayoutWatermark;
+ @interface FuxiLinearTextureLayout : NSObject
+ + (instancetype)layoutWithDescriptor:(MTLTextureDescriptor *)descriptor;
+@@ -194,9 +219,12 @@ static id<MTLTexture> fuxiImportLinearTexture(id<MTLDevice> device,void *memory,
+  if(!fuxiBlockLayout(descriptor,layout) || descriptor.usage!=MTLTextureUsageShaderRead || fuxiBlocked())return nil;
+  std::vector<uint8_t> snapshot;
+  const FuxiLayoutSnapshot status=fuxiSnapshotLayout(memory,length,layout,descriptor.pixelFormat,snapshot);
+- if(status==FuxiLayoutSnapshot::Unknown)return nil;
++ // An unknown allocation is either an admissible cross-process snapshot or it
++ // falls through, untouched beyond the bounded read, to the diagnostic refusal.
++ const bool foreign=status==FuxiLayoutSnapshot::Unknown;
++ if(foreign && !fuxiSnapshotForeign(memory,length,layout,snapshot))return nil;
+  handled=true;
+- if(status!=FuxiLayoutSnapshot::Ready){NBLOG(@"native-metal: registered linear texture incomplete, mismatched, short or unreadable");return nil;}
++ if(!foreign && status!=FuxiLayoutSnapshot::Ready){NBLOG(@"native-metal: registered linear texture incomplete, mismatched, short or unreadable");return nil;}
+  MTLTextureDescriptor *shared=[descriptor copy];shared.storageMode=MTLStorageModeShared;
+  id<MTLTexture> texture=[device newTextureWithDescriptor:shared];if(!texture)return nil;
+  // Use the checked bridge calls directly so a void replaceRegion failure cannot
+@@ -211,7 +239,12 @@ static id<MTLTexture> fuxiImportLinearTexture(id<MTLDevice> device,void *memory,
+  }
+  if(deallocator)objc_setAssociatedObject(texture,&gFuxiLinearOwnerKey,
+    [[FuxiLinearMemoryOwner alloc] initWithBytes:memory length:length?length:layout.totalBytes release:deallocator],OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+- if(gFuxiLayoutImports.fetch_add(1)<8)
++ if(foreign) {
++  if(gFuxiLayoutForeignImports.fetch_add(1)<8)
++   NSLog(@"FUXI LINEAR: foreign snapshot imported format=%lu width=%zu height=%zu bytes=%zu length=%lu deallocator=%u",
++         (unsigned long)descriptor.pixelFormat,layout.descriptor.width,layout.descriptor.height,layout.totalBytes,
++         (unsigned long)length,(unsigned)(deallocator!=nil));
++ } else if(gFuxiLayoutImports.fetch_add(1)<8)
+   NSLog(@"FUXI LINEAR: imported format=%lu width=%zu height=%zu levels=%zu slices=%zu bytes=%zu",
+         (unsigned long)descriptor.pixelFormat,layout.descriptor.width,layout.descriptor.height,layout.descriptor.levels,layout.descriptor.slices,layout.totalBytes);
+  return texture;

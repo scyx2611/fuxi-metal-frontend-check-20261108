@@ -1,0 +1,31 @@
+diff --git a/crates/metal2vulkan-runtime/src/render/reroute.rs b/crates/metal2vulkan-runtime/src/render/reroute.rs
+index 7ea6871..7cf5fa6 100644
+--- a/crates/metal2vulkan-runtime/src/render/reroute.rs
++++ b/crates/metal2vulkan-runtime/src/render/reroute.rs
+@@ -130,15 +130,22 @@ impl RenderCommandEncoder {
+         (call, assembly, draw): (&'static str, Assembly, DrawCall),
+         index: Option<&DrawSource<'_>>,
+     ) {
+-        let index = match index {
+-            Some(source) => source.kept().map(Some),
+-            None => Some(None),
+-        };
+         let room = self
+             .current
+             .rerecord
+             .as_ref()
+             .is_some_and(|kept| kept.len() < MAX_DRAWS);
++        // FUXI: decide before taking the indices' kept source, whose clone of the index buffer
++        // (an atomic count shared with the threads that retire command buffers) a draw that
++        // keeps nothing only drops again: the same outcome, without the clone.
++        if !(again && room) {
++            self.current.rerecord = None;
++            return;
++        }
++        let index = match index {
++            Some(source) => source.kept().map(Some),
++            None => Some(None),
++        };
+         match (again && room, index) {
+             (true, Some(index)) => {
+                 let kept = Rerecord {

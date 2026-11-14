@@ -1,0 +1,15 @@
+diff --git a/tools/build-fuxi-nativemetal.py b/tools/build-fuxi-nativemetal.py
+index 99f97a7..b9c555b 100644
+--- a/tools/build-fuxi-nativemetal.py
++++ b/tools/build-fuxi-nativemetal.py
+@@ -114,7 +114,9 @@ def prepare(native, m2v, build):
+         'metal2vulkan = { path = '+json.dumps(str(m2v/'crates/metal2vulkan'))+', features = ["ash"] }',
+         'metal2vulkan-runtime = { path = '+json.dumps(str(m2v/'crates/metal2vulkan-runtime'))+' }',
+         'libc = "0.2"', 'sha2 = { version = "0.10", features = ["asm"] }',
+-        '[profile.release]', 'panic = "unwind"', 'debug = 1', '',
++        # Fuxi: one optimisation unit across the bridge, the runtime and the translator (cross-crate inlining on the
++        # per-draw path), as the render server's display thread spends most of its time in that code.
++        '[profile.release]', 'panic = "unwind"', 'debug = 1', 'lto = "fat"', 'codegen-units = 1', '',
+     ]))
+     return manifest
+ 

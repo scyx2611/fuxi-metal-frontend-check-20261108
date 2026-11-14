@@ -1,0 +1,24 @@
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -3491,6 +3491,20 @@ impl Device {
+         clear: bool,
+         key: ResourceKey,
+     ) -> Result<Option<Patterned>, Error> {
++        // FUXI: this port keeps no texture losslessly compressed, so a new texture reads zero
++        // (transparent black) instead of Metal's compressed pattern. On the phone CoreAnimation
++        // showed the pattern (opaque magenta) where it sampled a texture nothing had written.
++        // Default: zero on iOS, the pattern elsewhere; `FUXI_M2V_FRESH_PATTERN` 1 or 0 overrides.
++        static FUXI_FRESH_PATTERN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        let patterned = *FUXI_FRESH_PATTERN.get_or_init(|| {
++            match std::env::var_os("FUXI_M2V_FRESH_PATTERN") {
++                Some(value) => value != "0",
++                None => !cfg!(target_os = "ios"),
++            }
++        });
++        if !patterned {
++            return Ok(None);
++        }
+         let pf = layout.pixel_format;
+         let [width, height, _] = layout.extent.map(u64::from);
+         let one_row = matches!(

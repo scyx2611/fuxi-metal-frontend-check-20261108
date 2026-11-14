@@ -1,0 +1,32 @@
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs b/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
+index c5e5f46..90e6ecf 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
+@@ -816,7 +816,26 @@ impl VariantObjects {
+                 "a pipeline fetching in rasterization order outside a pass that does",
+             ));
+         }
+-        let blend_flags = match key.pass.fetch_inputs {
++        // FUXI: on the phone only a pipeline whose fragment function fetches orders its color
++        // attachment accesses. Turnip turns the flag into GRAS_SC_CNTL single_prim_mode
++        // FLUSH_PER_OVERLAP for every draw of the pipeline, in system memory too on A7XX (the GMEM
++        // prim-order state is reused there), so with it on every pipeline of every color pass each
++        // primitive that overlaps an earlier one waited for that one's pixels, and CoreAnimation's
++        // layers all overlap. The flush is the reading draw's: a fetching draw still waits for the
++        // overlapping fragments of every earlier draw, flagged or not. `FUXI_M2V_ORDER_ALL` 1
++        // restores the flag on every pipeline of a fetch pass.
++        static FUXI_ORDER_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        let order_all = *FUXI_ORDER_ALL.get_or_init(|| {
++            match std::env::var_os("FUXI_M2V_ORDER_ALL") {
++                Some(value) => value != "0",
++                None => !cfg!(target_os = "ios"),
++            }
++        });
++        let ordered = match order_all {
++            true => key.pass.fetch_inputs,
++            false => graphics.rasterization_order_attachment_access,
++        };
++        let blend_flags = match ordered {
+             true => {
+                 vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT
+             }
