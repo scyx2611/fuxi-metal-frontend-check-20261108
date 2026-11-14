@@ -1,11 +1,19 @@
 name: Build and test the NativeMetal alternative
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Standard macOS runner architecture
+        type: choice
+        default: macos-15
+        options:
+          - macos-15
+          - macos-15-intel
 permissions:
   contents: read
 jobs:
   native-metal:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 120
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
@@ -36,6 +44,8 @@ jobs:
           git -C source apply ../harness/patches/native-smoke-class.patch
           git -C source apply --check ../harness/patches/native-ca-smoke-class.patch
           git -C source apply ../harness/patches/native-ca-smoke-class.patch
+          git -C source apply --check ../harness/patches/fuxi-tudebug-bootarg.patch
+          git -C source apply ../harness/patches/fuxi-tudebug-bootarg.patch
           cp harness/patches/nativemetal-fuxi-0004-optional-answers.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0005-completion-handlers.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0006-uchar3-constant.patch source/tools/patches/
@@ -43,7 +53,18 @@ jobs:
           cp harness/patches/nativemetal-fuxi-0008-nocopy-callers.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0009-copy-span.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0010-nocopy-provenance.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0011-linear-layout.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0012-foreign-linear.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0013-swap-wait.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0014-lost-reason.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0001-copy-span.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0002-fresh-zero.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0004-surface-alias.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0005-family-cache.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0006-keep-draw.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0007-mesa-log-level.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0008-shadow-log.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0009-linear-align.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |

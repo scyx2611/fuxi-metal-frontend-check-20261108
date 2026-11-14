@@ -1,0 +1,571 @@
+diff --git a/FuxiBlockLayout.h b/FuxiBlockLayout.h
+new file mode 100644
+index 0000000..54b15c1
+--- /dev/null
++++ b/FuxiBlockLayout.h
+@@ -0,0 +1,308 @@
++#ifndef FUXI_BLOCK_LAYOUT_H
++#define FUXI_BLOCK_LAYOUT_H
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <limits>
++
++namespace fuxi_layout {
++
++constexpr size_t kMaxLevels = 15;
++constexpr size_t kMaxBytes = 256 * 1024 * 1024;
++constexpr size_t kMaxDimension = 16384;
++constexpr size_t kMaxSlices = 2048;
++
++struct Descriptor {
++    size_t width;
++    size_t height;
++    size_t levels;
++    size_t slices;
++    size_t blockWidth;
++    size_t blockHeight;
++    size_t blockBytes;
++};
++
++struct Level {
++    size_t width = 0;
++    size_t height = 0;
++    size_t blocksX = 0;
++    size_t blocksY = 0;
++    size_t rowBytes = 0;
++    size_t imageBytes = 0;
++    size_t offset = 0;
++    size_t firstBlock = 0;
++};
++
++struct Region {
++    size_t x;
++    size_t y;
++    size_t width;
++    size_t height;
++};
++
++struct CopyPlan {
++    size_t memoryOffset = 0;
++    size_t memoryRowBytes = 0;
++    size_t copiedRowBytes = 0;
++    size_t rows = 0;
++    size_t linearOffset = 0;
++    size_t linearSpan = 0;
++    size_t firstBlock = 0;
++    size_t blockStride = 0;
++    size_t blocksPerRow = 0;
++};
++
++namespace detail {
++
++inline bool safeAdd(size_t a, size_t b, size_t &out) {
++    if (std::numeric_limits<size_t>::max() - a < b) {
++        return false;
++    }
++    out = a + b;
++    return true;
++}
++
++inline bool safeMul(size_t a, size_t b, size_t &out) {
++    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
++        return false;
++    }
++    out = a * b;
++    return true;
++}
++
++inline size_t maxLevelsForDimension(size_t maxDim) {
++    size_t count = 1;
++    while ((maxDim >>= 1) > 0) {
++        ++count;
++    }
++    return std::min<size_t>(kMaxLevels, count);
++}
++
++} // namespace detail
++
++struct Layout {
++    Descriptor descriptor{};
++    std::array<Level, kMaxLevels> level{};
++    size_t chainBytes = 0;
++    size_t totalBytes = 0;
++    size_t chainBlocks = 0;
++    size_t totalBlocks = 0;
++
++    bool plan(size_t slice,
++              size_t mip,
++              Region region,
++              size_t linearOffset,
++              size_t linearBytesPerRow,
++              size_t linearBytesPerImage,
++              CopyPlan &out) const {
++        if (descriptor.levels == 0 || descriptor.levels > kMaxLevels || descriptor.slices == 0 ||
++            descriptor.blockWidth == 0 || descriptor.blockHeight == 0 ||
++            descriptor.blockBytes == 0 || totalBytes == 0) {
++            return false;
++        }
++
++        if (slice >= descriptor.slices || mip >= descriptor.levels) {
++            return false;
++        }
++
++        const Level &lvl = level[mip];
++
++        if (region.width == 0 || region.height == 0) {
++            return false;
++        }
++
++        size_t endX = 0;
++        if (!detail::safeAdd(region.x, region.width, endX) || endX > lvl.width) {
++            return false;
++        }
++
++        size_t endY = 0;
++        if (!detail::safeAdd(region.y, region.height, endY) || endY > lvl.height) {
++            return false;
++        }
++
++        if ((region.x % descriptor.blockWidth != 0) || (region.y % descriptor.blockHeight != 0)) {
++            return false;
++        }
++
++        const bool endXAtBlock = (region.width % descriptor.blockWidth == 0);
++        const bool endXAtEdge = (endX == lvl.width);
++        if (!endXAtBlock && !endXAtEdge) {
++            return false;
++        }
++
++        const bool endYAtBlock = (region.height % descriptor.blockHeight == 0);
++        const bool endYAtEdge = (endY == lvl.height);
++        if (!endYAtBlock && !endYAtEdge) {
++            return false;
++        }
++
++        const size_t blocksPerRow = (region.width + descriptor.blockWidth - 1) / descriptor.blockWidth;
++        const size_t rows = (region.height + descriptor.blockHeight - 1) / descriptor.blockHeight;
++
++        size_t copiedRowBytes = 0;
++        if (!detail::safeMul(blocksPerRow, descriptor.blockBytes, copiedRowBytes)) {
++            return false;
++        }
++
++        if (linearBytesPerRow < copiedRowBytes || (linearBytesPerRow % descriptor.blockBytes != 0)) {
++            return false;
++        }
++
++        size_t rowSpan = 0;
++        if (rows > 1) {
++            if (!detail::safeMul(linearBytesPerRow, rows - 1, rowSpan)) {
++                return false;
++            }
++        }
++
++        size_t accessedBytes = 0;
++        if (!detail::safeAdd(rowSpan, copiedRowBytes, accessedBytes)) {
++            return false;
++        }
++
++        if (linearBytesPerImage != 0 && linearBytesPerImage < accessedBytes) {
++            return false;
++        }
++
++        size_t linearSpan = 0;
++        if (!detail::safeAdd(linearOffset, accessedBytes, linearSpan)) {
++            return false;
++        }
++        if (linearSpan > kMaxBytes) {
++            return false;
++        }
++
++        const size_t blockX = region.x / descriptor.blockWidth;
++        const size_t blockY = region.y / descriptor.blockHeight;
++
++        size_t blockYTimesStride = 0;
++        if (!detail::safeMul(blockY, lvl.blocksX, blockYTimesStride)) {
++            return false;
++        }
++
++        size_t blockOffsetInLevel = 0;
++        if (!detail::safeAdd(blockYTimesStride, blockX, blockOffsetInLevel)) {
++            return false;
++        }
++
++        size_t sliceBlocks = 0;
++        if (!detail::safeMul(slice, chainBlocks, sliceBlocks)) {
++            return false;
++        }
++
++        size_t firstBlock = 0;
++        if (!detail::safeAdd(sliceBlocks, lvl.firstBlock, firstBlock) ||
++            !detail::safeAdd(firstBlock, blockOffsetInLevel, firstBlock)) {
++            return false;
++        }
++
++        size_t memoryOffset = 0;
++        if (!detail::safeMul(firstBlock, descriptor.blockBytes, memoryOffset)) {
++            return false;
++        }
++
++        size_t finalRows = 0, finalByte = 0;
++        if (!detail::safeMul(rows - 1, lvl.rowBytes, finalRows) ||
++            !detail::safeAdd(memoryOffset, finalRows, finalByte) ||
++            !detail::safeAdd(finalByte, copiedRowBytes, finalByte) || finalByte > totalBytes) {
++            return false;
++        }
++
++        CopyPlan temp{};
++        temp.memoryOffset = memoryOffset;
++        temp.memoryRowBytes = lvl.rowBytes;
++        temp.copiedRowBytes = copiedRowBytes;
++        temp.rows = rows;
++        temp.linearOffset = linearOffset;
++        temp.linearSpan = linearSpan;
++        temp.firstBlock = firstBlock;
++        temp.blockStride = lvl.blocksX;
++        temp.blocksPerRow = blocksPerRow;
++
++        out = temp;
++        return true;
++    }
++};
++
++inline bool make(Descriptor descriptor, Layout &out) {
++    if (descriptor.width < 1 || descriptor.width > kMaxDimension) {
++        return false;
++    }
++    if (descriptor.height < 1 || descriptor.height > kMaxDimension) {
++        return false;
++    }
++    if (descriptor.slices < 1 || descriptor.slices > kMaxSlices) {
++        return false;
++    }
++    if (descriptor.blockWidth < 1 || descriptor.blockWidth > 12) {
++        return false;
++    }
++    if (descriptor.blockHeight < 1 || descriptor.blockHeight > 12) {
++        return false;
++    }
++    if (descriptor.blockBytes != 8 && descriptor.blockBytes != 16) {
++        return false;
++    }
++
++    const size_t maxDim = std::max(descriptor.width, descriptor.height);
++    const size_t allowedLevels = detail::maxLevelsForDimension(maxDim);
++    if (descriptor.levels < 1 || descriptor.levels > allowedLevels) {
++        return false;
++    }
++
++    Layout temp{};
++    temp.descriptor = descriptor;
++
++    size_t currentOffset = 0;
++    for (size_t mip = 0; mip < descriptor.levels; ++mip) {
++        const size_t w = std::max<size_t>(1, descriptor.width >> mip);
++        const size_t h = std::max<size_t>(1, descriptor.height >> mip);
++
++        const size_t blocksX = (w + descriptor.blockWidth - 1) / descriptor.blockWidth;
++        const size_t blocksY = (h + descriptor.blockHeight - 1) / descriptor.blockHeight;
++
++        size_t rowBytes = 0;
++        if (!detail::safeMul(blocksX, descriptor.blockBytes, rowBytes)) {
++            return false;
++        }
++
++        size_t imageBytes = 0;
++        if (!detail::safeMul(rowBytes, blocksY, imageBytes)) {
++            return false;
++        }
++
++        temp.level[mip].width = w;
++        temp.level[mip].height = h;
++        temp.level[mip].blocksX = blocksX;
++        temp.level[mip].blocksY = blocksY;
++        temp.level[mip].rowBytes = rowBytes;
++        temp.level[mip].imageBytes = imageBytes;
++        temp.level[mip].offset = currentOffset;
++        temp.level[mip].firstBlock = currentOffset / descriptor.blockBytes;
++
++        if (!detail::safeAdd(currentOffset, imageBytes, currentOffset)) {
++            return false;
++        }
++    }
++
++    temp.chainBytes = currentOffset;
++    temp.chainBlocks = currentOffset / descriptor.blockBytes;
++
++    if (!detail::safeMul(temp.chainBytes, descriptor.slices, temp.totalBytes)) {
++        return false;
++    }
++    if (temp.totalBytes > kMaxBytes) {
++        return false;
++    }
++
++    temp.totalBlocks = temp.totalBytes / descriptor.blockBytes;
++
++    out = temp;
++    return true;
++}
++
++} // namespace fuxi_layout
++
++#endif // FUXI_BLOCK_LAYOUT_H
+diff --git a/FuxiTextureLayout.inc b/FuxiTextureLayout.inc
+new file mode 100644
+index 0000000..3a7fd97
+--- /dev/null
++++ b/FuxiTextureLayout.inc
+@@ -0,0 +1,218 @@
++// SPDX-License-Identifier: MIT
++// A paired block layout producer and read-only snapshot importer. The SPI
++// shape follows UniXNU/AdrenoMetal 4d789e9c (MIT); admission and bounds are local.
++#include "FuxiBlockLayout.h"
++#include <memory>
++#include <unordered_map>
++
++static bool fuxiLinearLayoutEnabled() {
++ const char *value=std::getenv("FUXI_NATIVE_LINEAR_LAYOUT");
++ return !value || std::strcmp(value,"0")!=0;
++}
++static bool fuxiSameLayout(const fuxi_layout::Layout &a,const fuxi_layout::Layout &b) {
++ const auto &x=a.descriptor;const auto &y=b.descriptor;
++ return x.width==y.width && x.height==y.height && x.levels==y.levels && x.slices==y.slices &&
++        x.blockWidth==y.blockWidth && x.blockHeight==y.blockHeight && x.blockBytes==y.blockBytes;
++}
++static bool fuxiBlockLayout(MTLTextureDescriptor *d,fuxi_layout::Layout &out) {
++ if(!d || !fuxiLinearLayoutEnabled() || d.depth!=1 || d.sampleCount!=1 ||
++    (d.pixelFormat!=MTLPixelFormatASTC_4x4_LDR && d.pixelFormat!=MTLPixelFormatASTC_4x4_sRGB))return false;
++ size_t slices=d.arrayLength;
++ switch(d.textureType) {
++  case MTLTextureType2D:if(slices!=1)return false;break;
++  case MTLTextureType2DArray:break;
++  case MTLTextureTypeCube:if(slices!=1 || d.width!=d.height)return false;slices=6;break;
++  case MTLTextureTypeCubeArray:if(d.width!=d.height || slices>fuxi_layout::kMaxSlices/6)return false;slices*=6;break;
++  default:return false;
++ }
++ return fuxi_layout::make({d.width,d.height,d.mipmapLevelCount,slices,4,4,16},out);
++}
++struct FuxiLayoutAllocation {
++ fuxi_layout::Layout layout;
++ MTLPixelFormat format;
++ std::vector<uint8_t> written;
++ size_t covered=0;
++ bool valid=true;
++};
++static std::mutex gFuxiLayoutLock;
++static std::unordered_map<uintptr_t,FuxiLayoutAllocation> gFuxiLayoutAllocations;
++static size_t gFuxiLayoutTrackedBytes=0;
++static constexpr size_t kFuxiLayoutAllocations=256,kFuxiLayoutTrackedBytes=512*1024*1024;
++static std::atomic<unsigned> gFuxiLayoutInitializations,gFuxiLayoutReady,gFuxiLayoutImports;
++static bool fuxiLayoutRange(uintptr_t base,size_t bytes) {return base && bytes && base<=UINTPTR_MAX-bytes;}
++static void fuxiForgetLayoutLocked(uintptr_t base) {
++ auto found=gFuxiLayoutAllocations.find(base);
++ if(found!=gFuxiLayoutAllocations.end()) {
++  gFuxiLayoutTrackedBytes-=found->second.layout.totalBytes;gFuxiLayoutAllocations.erase(found);
++ }
++}
++static void fuxiForgetLayout(void *memory) {
++ std::lock_guard<std::mutex> lock(gFuxiLayoutLock);fuxiForgetLayoutLocked((uintptr_t)memory);
++}
++static bool fuxiInitializeLayout(void *memory,const fuxi_layout::Layout &layout,MTLPixelFormat format) {
++ const uintptr_t base=(uintptr_t)memory;
++ if(!fuxiLayoutRange(base,layout.totalBytes) || base%16384)return false;
++ std::lock_guard<std::mutex> lock(gFuxiLayoutLock);
++ // Reinitialization starts a new generation, including its coverage.
++ fuxiForgetLayoutLocked(base);
++ if(gFuxiLayoutAllocations.size()>=kFuxiLayoutAllocations ||
++    layout.totalBytes>kFuxiLayoutTrackedBytes-gFuxiLayoutTrackedBytes)return false;
++ for(const auto &item:gFuxiLayoutAllocations) {
++  if(base<item.first+item.second.layout.totalBytes && item.first<base+layout.totalBytes)return false;
++ }
++ FuxiLayoutAllocation record{layout,format,std::vector<uint8_t>((layout.totalBlocks+7)/8),0,true};
++ gFuxiLayoutAllocations.emplace(base,std::move(record));gFuxiLayoutTrackedBytes+=layout.totalBytes;
++ if(gFuxiLayoutInitializations.fetch_add(1)<8)
++  NSLog(@"FUXI LINEAR: initialize format=%lu width=%zu height=%zu levels=%zu slices=%zu bytes=%zu",
++        (unsigned long)format,layout.descriptor.width,layout.descriptor.height,layout.descriptor.levels,layout.descriptor.slices,layout.totalBytes);
++ return true;
++}
++static bool fuxiMoveLayout(const fuxi_layout::Layout &layout,MTLPixelFormat format,MTLRegion region,
++                          NSUInteger slice,NSUInteger level,void *memory,void *linear,
++                          NSUInteger offset,NSUInteger row,NSUInteger image,bool toMemory) {
++ fuxi_layout::CopyPlan plan;
++ if(region.origin.z || region.size.depth!=1 || !memory || !linear ||
++    !layout.plan(slice,level,{region.origin.x,region.origin.y,region.size.width,region.size.height},offset,row,image,plan) ||
++    !fuxiLayoutRange((uintptr_t)memory,layout.totalBytes) || !fuxiLayoutRange((uintptr_t)linear,plan.linearSpan))return false;
++ // The two API ranges must be disjoint; memcpy never aliases itself here.
++ const uintptr_t base=(uintptr_t)memory,source=(uintptr_t)linear;
++ if(base<source+plan.linearSpan && source<base+layout.totalBytes)return false;
++ std::lock_guard<std::mutex> lock(gFuxiLayoutLock);
++ auto found=gFuxiLayoutAllocations.find(base);
++ if(found==gFuxiLayoutAllocations.end() || !found->second.valid || found->second.format!=format ||
++    !fuxiSameLayout(found->second.layout,layout))return false;
++ auto &record=found->second;
++ for(size_t y=0;y<plan.rows;++y) {
++  auto *packed=(uint8_t *)memory+plan.memoryOffset+y*plan.memoryRowBytes;
++  auto *line=(uint8_t *)linear+plan.linearOffset+y*row;
++  if(toMemory)std::memcpy(packed,line,plan.copiedRowBytes);else std::memcpy(line,packed,plan.copiedRowBytes);
++  if(toMemory)for(size_t x=0;x<plan.blocksPerRow;++x) {
++   const size_t block=plan.firstBlock+y*plan.blockStride+x;
++   uint8_t &byte=record.written[block/8];const uint8_t mask=(uint8_t)(1u<<(block%8));
++   if(!(byte&mask)){byte|=mask;++record.covered;}
++  }
++ }
++ if(toMemory && record.covered==layout.totalBlocks && gFuxiLayoutReady.fetch_add(1)<8)
++  NSLog(@"FUXI LINEAR: producer complete format=%lu bytes=%zu",(unsigned long)format,layout.totalBytes);
++ return true;
++}
++enum class FuxiLayoutSnapshot { Unknown, Invalid, Ready };
++static FuxiLayoutSnapshot fuxiSnapshotLayout(void *memory,NSUInteger length,const fuxi_layout::Layout &layout,
++                                            MTLPixelFormat format,std::vector<uint8_t> &out) {
++ std::lock_guard<std::mutex> lock(gFuxiLayoutLock);
++ auto found=gFuxiLayoutAllocations.find((uintptr_t)memory);
++ if(found==gFuxiLayoutAllocations.end())return FuxiLayoutSnapshot::Unknown;
++ const auto &record=found->second;
++ if(!record.valid || record.format!=format || !fuxiSameLayout(record.layout,layout) ||
++    record.covered!=layout.totalBlocks || (length && length<layout.totalBytes))return FuxiLayoutSnapshot::Invalid;
++ std::vector<uint8_t> copy(layout.totalBytes);
++ for(size_t offset=0;offset<copy.size();) {
++  const size_t count=std::min<size_t>(65536,copy.size()-offset);
++  if(!fuxiSafeRead((uintptr_t)memory+offset,copy.data()+offset,count))return FuxiLayoutSnapshot::Invalid;
++  offset+=count;
++ }
++ out=std::move(copy);return FuxiLayoutSnapshot::Ready;
++}
++typedef struct {uint64_t words[2];} FuxiLayoutWatermark;
++@interface FuxiLinearTextureLayout : NSObject
+++ (instancetype)layoutWithDescriptor:(MTLTextureDescriptor *)descriptor;
++- (const fuxi_layout::Layout &)blockLayout;
++- (NSUInteger)size;
++- (NSUInteger)alignment;
++- (MTLSize)copyGranularity;
++- (FuxiLayoutWatermark)watermark;
++- (void)initializeTextureMemory:(void *)memory;
++- (void)finalizeTextureMemory:(void *)memory;
++- (void)copyFromLinearBytes:(const void *)bytes linearOffset:(NSUInteger)offset linearBytesPerRow:(NSUInteger)row
++        linearBytesPerImage:(NSUInteger)image toTextureMemory:(void *)memory textureSlice:(NSUInteger)slice
++               textureLevel:(NSUInteger)level textureRegion:(MTLRegion)region;
++- (void)copyFromTextureMemory:(const void *)memory textureSlice:(NSUInteger)slice textureLevel:(NSUInteger)level textureRegion:(MTLRegion)region
++                 toLinearBytes:(void *)bytes linearOffset:(NSUInteger)offset linearBytesPerRow:(NSUInteger)row linearBytesPerImage:(NSUInteger)image;
++@end
++@implementation FuxiLinearTextureLayout {
++ fuxi_layout::Layout _layout;
++ MTLPixelFormat _format;
++}
+++ (instancetype)layoutWithDescriptor:(MTLTextureDescriptor *)descriptor {
++ fuxi_layout::Layout layout;if(!fuxiBlockLayout(descriptor,layout))return nil;
++ FuxiLinearTextureLayout *value=[self new];value->_layout=layout;value->_format=descriptor.pixelFormat;
++ return value;
++}
++- (const fuxi_layout::Layout &)blockLayout {return _layout;}
++- (NSUInteger)size {return _layout.totalBytes;}
++- (NSUInteger)alignment {return 16384;}
++- (MTLSize)copyGranularity {return MTLSizeMake(4,4,1);}
++- (FuxiLayoutWatermark)watermark {
++ // Different from both Apple and upstream DVM: unknown serialized allocations
++ // must be regenerated through this producer, not admitted by matching length.
++ static const uint8_t bytes[16]={'F','u','x','i',' ','A','S','T','C',' ','p','a','i','r',' ','1'};
++ FuxiLayoutWatermark value;std::memcpy(&value,bytes,sizeof value);return value;
++}
++- (void)initializeTextureMemory:(void *)memory {
++ try {if(!fuxiInitializeLayout(memory,_layout,_format))NBLOG(@"native-metal: linear layout initialization refused");}
++ catch(const std::exception &){NBLOG(@"native-metal: linear layout allocation refused");}
++}
++- (void)finalizeTextureMemory:(void *)memory {fuxiForgetLayout(memory);}
++- (void)copyFromLinearBytes:(const void *)bytes linearOffset:(NSUInteger)offset linearBytesPerRow:(NSUInteger)row
++        linearBytesPerImage:(NSUInteger)image toTextureMemory:(void *)memory textureSlice:(NSUInteger)slice
++               textureLevel:(NSUInteger)level textureRegion:(MTLRegion)region {
++ if(!fuxiMoveLayout(_layout,_format,region,slice,level,memory,const_cast<void *>(bytes),offset,row,image,true)) {
++  fuxiForgetLayout(memory);NBLOG(@"native-metal: linear producer copy refused");
++ }
++}
++- (void)copyFromTextureMemory:(const void *)memory textureSlice:(NSUInteger)slice textureLevel:(NSUInteger)level textureRegion:(MTLRegion)region
++                 toLinearBytes:(void *)bytes linearOffset:(NSUInteger)offset linearBytesPerRow:(NSUInteger)row linearBytesPerImage:(NSUInteger)image {
++ if(!fuxiMoveLayout(_layout,_format,region,slice,level,const_cast<void *>(memory),bytes,offset,row,image,false))
++  NBLOG(@"native-metal: linear layout readback refused");
++}
++@end
++@interface FuxiLinearMemoryOwner : NSObject
++- (instancetype)initWithBytes:(void *)bytes length:(NSUInteger)length release:(void (^)(void *,NSUInteger))release;
++@end
++@implementation FuxiLinearMemoryOwner {
++ void *_bytes;NSUInteger _length;void (^_release)(void *,NSUInteger);
++}
++- (instancetype)initWithBytes:(void *)bytes length:(NSUInteger)length release:(void (^)(void *,NSUInteger))release {
++ if((self=[super init])){_bytes=bytes;_length=length;_release=[release copy];}return self;
++}
++- (void)dealloc {fuxiForgetLayout(_bytes);if(_release)_release(_bytes,_length);}
++@end
++static char gFuxiLinearOwnerKey;
++#ifndef FUXI_LAYOUT_UPLOAD
++static bool fuxiUploadLinearTexture(id<MTLTexture> texture,const uint64_t region[6],NSUInteger level,NSUInteger slice,
++                                    const void *bytes,NSUInteger row,NSUInteger image,uint64_t length) {
++ if(![(id)texture isKindOfClass:[NBTexture class]] || ![(NBTexture *)texture handle])return false;
++ uint64_t required=0;NmbTexture *handle=[(NBTexture *)texture handle];
++ return nmb_texture_copy_span(handle,region,level,slice,row,image,true,&required) && required<=length &&
++        nmb_texture_replace(handle,region,level,slice,bytes,row,image,required);
++}
++#define FUXI_LAYOUT_UPLOAD fuxiUploadLinearTexture
++#endif
++static id<MTLTexture> fuxiImportLinearTexture(id<MTLDevice> device,void *memory,NSUInteger length,MTLTextureDescriptor *descriptor,
++                                             void (^deallocator)(void *,NSUInteger),bool &handled) {
++ handled=false;fuxi_layout::Layout layout;
++ if(!fuxiBlockLayout(descriptor,layout) || descriptor.usage!=MTLTextureUsageShaderRead || fuxiBlocked())return nil;
++ std::vector<uint8_t> snapshot;
++ const FuxiLayoutSnapshot status=fuxiSnapshotLayout(memory,length,layout,descriptor.pixelFormat,snapshot);
++ if(status==FuxiLayoutSnapshot::Unknown)return nil;
++ handled=true;
++ if(status!=FuxiLayoutSnapshot::Ready){NBLOG(@"native-metal: registered linear texture incomplete, mismatched, short or unreadable");return nil;}
++ MTLTextureDescriptor *shared=[descriptor copy];shared.storageMode=MTLStorageModeShared;
++ id<MTLTexture> texture=[device newTextureWithDescriptor:shared];if(!texture)return nil;
++ // Use the checked bridge calls directly so a void replaceRegion failure cannot
++ // turn into an apparently successful texture. Source bytes are owned until the
++ // bridge has copied each span; the GPU never borrows the caller's allocation.
++ for(size_t slice=0;slice<layout.descriptor.slices;++slice)for(size_t mip=0;mip<layout.descriptor.levels;++mip) {
++  const auto &level=layout.level[mip];const uint64_t region[6]={0,0,0,level.width,level.height,1};
++  if(!FUXI_LAYOUT_UPLOAD(texture,region,mip,slice,snapshot.data()+slice*layout.chainBytes+level.offset,
++                         level.rowBytes,level.imageBytes,level.imageBytes) || fuxiBlocked()) {
++   NBLOG(@"native-metal: linear texture upload refused: %@",lastError());return nil;
++  }
++ }
++ if(deallocator)objc_setAssociatedObject(texture,&gFuxiLinearOwnerKey,
++   [[FuxiLinearMemoryOwner alloc] initWithBytes:memory length:length?length:layout.totalBytes release:deallocator],OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++ if(gFuxiLayoutImports.fetch_add(1)<8)
++  NSLog(@"FUXI LINEAR: imported format=%lu width=%zu height=%zu levels=%zu slices=%zu bytes=%zu",
++        (unsigned long)descriptor.pixelFormat,layout.descriptor.width,layout.descriptor.height,layout.descriptor.levels,layout.descriptor.slices,layout.totalBytes);
++ return texture;
++}
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index c154e65..5bdcbd1 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1280,6 +1280,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+ 
+ @interface NBDeviceMethods : NSObject
+ @end
++#include "FuxiTextureLayout.inc"
++
+ @implementation NBDeviceMethods
+ - (id)_deviceWrapper { try { @try {return self;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (NSMethodSignature *)methodSignatureForSelector:(SEL)selector { try { @try {
+@@ -1364,6 +1366,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+ // Not made here: a texture over raw memory in Apple's layout, and Apple's texture layout object. Both are refused, with the reason, rather than
+ // answered with a guessed shape.
+ - (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator { try { @try {
++ bool handled=false;id<MTLTexture> imported=fuxiImportLinearTexture((id<MTLDevice>)self,bytes,length,d,deallocator,handled);
++ if(handled)return imported;
+  // Bounded metadata only: do not dereference or claim ownership of the caller's memory.
+  static std::atomic<unsigned> logged{0};
+  const unsigned logIndex=logged.fetch_add(1);
+@@ -1406,8 +1410,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  return nil;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBacked:(BOOL)backed { try { @try {
+- (void)d;(void)backed;
+- NBLOG(@"native-metal: newTextureLayoutWithDescriptor:isHeapOrBufferBacked: is not implemented (Apple's layout object is not known)");
++ if(!backed){id layout=[FuxiLinearTextureLayout layoutWithDescriptor:d];if(layout)return layout;}
++ NBLOG(@"native-metal: newTextureLayoutWithDescriptor:isHeapOrBufferBacked: unsupported descriptor or layout disabled");
+  return nil;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count { try { @try {(void)count;return [(id<MTLDevice>)self newCommandQueue];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }

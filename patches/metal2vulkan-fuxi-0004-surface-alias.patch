@@ -1,0 +1,41 @@
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index cdffce5..ef791ed 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -1386,6 +1386,17 @@ fn copy_error(call: &'static str, refusal: CopyRefusal) -> Error {
+     }
+ }
+ 
++/// FUXI: whether a surface plane's texture that renders or writes aliases its padded rows
++/// (`storage_over_buffer`): on iOS unless `FUXI_M2V_SURFACE_SHADOW` is 1; elsewhere only where it
++/// is 0.
++fn fuxi_surface_alias() -> bool {
++    static ALIAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ALIAS.get_or_init(|| match std::env::var_os("FUXI_M2V_SURFACE_SHADOW") {
++        Some(value) => value == "0",
++        None => cfg!(target_os = "ios"),
++    })
++}
++
+ impl Device {
+     /// `newTextureWithDescriptor:`: a texture of `descriptor`, its contents undefined.
+     ///
+@@ -1962,7 +1973,17 @@ impl Device {
+         // What an image over the texels may hold beside them: the bytes between padded rows too
+         // where the texture only reads, by the policy (`linear_plan::holding`); else why none may.
+         let policy = self.compile_device().policy().padded_reads;
+-        let holds = holding(&texels.layout, usage, policy);
++        let mut holds = holding(&texels.layout, usage, policy);
++        // FUXI: on the phone a surface's plane that renders or writes aliases its padded rows too.
++        // The bytes between its rows are the alignment the surface was made with (the kernel
++        // rounds a row the GPU reads to 256 bytes), which no client reads, so an image that holds
++        // them may write them; the shadow instead copied the whole plane in before and back after
++        // every pass that drew into it (three full-screen copies per CoreAnimation pass into the
++        // display surface, measured by the kernel's per-IB profile). `FUXI_M2V_SURFACE_SHADOW` 1
++        // keeps the shadow (the default elsewhere).
++        if holds.is_err() && call == "new_texture_with_iosurface_plane" && fuxi_surface_alias() {
++            holds = Ok(Holds::Padding);
++        }
+         // Over bytes detached from their pages (`detach.rs`) no image aliases them: the texture
+         // is their shadow, which presents a stand-in until they lie in pages again.
+         let detached = texels.buffer.detached();

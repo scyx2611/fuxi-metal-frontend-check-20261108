@@ -1,0 +1,74 @@
+diff --git a/tools/fuxi-metal/ClientSetup.hpp b/tools/fuxi-metal/ClientSetup.hpp
+index 66ad4dc..acdc7c1 100644
+--- a/tools/fuxi-metal/ClientSetup.hpp
++++ b/tools/fuxi-metal/ClientSetup.hpp
+@@ -1,14 +1,50 @@
+ /* Fuxi startup policy; design observations credited in metal-m9m.md. */
+ #pragma once
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include "TranslationPolicy.hpp"
+ namespace fuxi {
++// fuxitudebug=<flags> on the boot line: the TU_DEBUG default for every admitted process, flags separated by ',' (a Turnip
++// diagnostic, e.g. fuxitudebug=gmem,nocb,noconcurrentresolves), so trying one needs no root write. Exactly one token of
++// lower-case letters, digits, '_' and ','; a duplicate, an empty or another value is ignored and the usual default applies.
++inline bool tuDebugBootValue(const char *args,char *out,size_t capacity) {
++ static const char key[]="fuxitudebug=";const size_t length=sizeof(key)-1;
++ unsigned count=0;const char *value=nullptr;size_t n=0;
++ if(args)for(const char *p=args;*p;){
++  p+=strspn(p," \t\r\n");size_t m=strcspn(p," \t\r\n");
++  if(m>=length && !strncmp(p,key,length)){++count;value=p+length;n=m-length;}
++  p+=m;
++ }
++ if(count!=1 || !n || n>=capacity)return false;
++ for(size_t i=0;i<n;++i){char c=value[i];if(!((c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='_'||c==','))return false;}
++ memcpy(out,value,n);out[n]=0;return true;
++}
++inline const char *tuDebugBootFlags() {
++ static char flags[128];
++ static const bool present=[] {
++  char args[4096]={};
++#ifdef FUXI_MTL_HOST_TEST
++  const char *test=getenv("FUXI_MTL_TEST_BOOTARGS");if(test)snprintf(args,sizeof(args),"%s",test);
++#else
++  systemString("kern.bootargs",args,sizeof(args));
++#endif
++  return tuDebugBootValue(args,flags,sizeof(flags));
++ }();
++ return present?flags:nullptr;
++}
+ template<class Environment> void setupTurnip(Environment env) {
+  // Preserve an explicit diagnostic override, including an empty one.
+  // fuxigpugmem=1 drops sysmem to test Turnip's tiled GMEM path; UniXNU saw
+- // GMEM hangs on A740 (metal-m9m.md), so it stays opt-in.
+- env("TU_DEBUG",systemTranslationPolicy().gmem?"nocb":"sysmem,nocb",0);
++ // GMEM hangs on A740 (metal-m9m.md), so it stays opt-in. fuxitudebug= replaces both defaults.
++ // GMEM keeps concurrent resolves off: on the Fuxi A740 with them on, bin stores overlapping the next bin left
++ // rows of recycled CoreAnimation surfaces unwritten (stale content in bands); off, the frames match sysmem.
++ if(const char *flags=tuDebugBootFlags()){
++  env("TU_DEBUG",flags,0);
++  static bool told;if(!told){told=true;fprintf(stderr,"FUXI MTL: TU_DEBUG default from boot fuxitudebug=%s\n",flags);}
++  return;
++ }
++ env("TU_DEBUG",systemTranslationPolicy().gmem?"nocb,noconcurrentresolves":"sysmem,nocb",0);
+ }
+ inline void setupTurnip(){setupTurnip([](const char *key,const char *value,int overwrite){return setenv(key,value,overwrite);});}
+ template<class Environment,class Preference>
+diff --git a/tools/fuxi-metal/ClientSetupTests.cpp b/tools/fuxi-metal/ClientSetupTests.cpp
+index 84f7da2..1ee924e 100644
+--- a/tools/fuxi-metal/ClientSetupTests.cpp
++++ b/tools/fuxi-metal/ClientSetupTests.cpp
+@@ -19,5 +19,11 @@ int main(){
+  assert(values.at("TU_DEBUG")=="override" && values.at("CA_DISABLE_FRAMEBUFFER_COMPRESSION")=="1");
+  assert((preferences==std::vector<std::string>{"CAEnableFramebufferCompression","CAEnableDeepFramebuffer","CAEnableIOSurfaceCompression"}));
+  values["TU_DEBUG"]="";fuxi::setupTurnip(env);assert(values.at("TU_DEBUG").empty());
+- puts("PASS: admitted-only startup, sysmem/nocb default and override, render-server/client compression policy via hooks");
++ char flags[64];
++ assert(fuxi::tuDebugBootValue("a=1 fuxitudebug=gmem,nocb b=2",flags,sizeof(flags)) && !strcmp(flags,"gmem,nocb"));
++ assert(!fuxi::tuDebugBootValue("fuxitudebug=gmem fuxitudebug=nocb",flags,sizeof(flags)));
++ assert(!fuxi::tuDebugBootValue("fuxitudebug=",flags,sizeof(flags)) && !fuxi::tuDebugBootValue("fuxitudebug=Gmem",flags,sizeof(flags)));
++ assert(!fuxi::tuDebugBootValue("fuxitudebug=gmem;nocb",flags,sizeof(flags)) && !fuxi::tuDebugBootValue("xfuxitudebug=gmem",flags,sizeof(flags)));
++ assert(!fuxi::tuDebugBootValue("fuxitudebug=gmem,nocb",flags,6) && !fuxi::tuDebugBootValue(nullptr,flags,sizeof(flags)));
++ puts("PASS: admitted-only startup, sysmem/nocb default and override, render-server/client compression policy via hooks, fuxitudebug parsing");
+ }
