@@ -1,0 +1,59 @@
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 0b6ea24..db1ad2b 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -3146,8 +3146,43 @@ impl RenderCommandEncoder {
+             extended,
+             reload_at,
+             log,
++            state,
++            pipeline,
++            routed,
++            vertex,
++            fragment,
++            object,
++            mesh,
++            tile,
++            keeping,
++            drawn_before,
++            unordered,
++            unordered_dispatches,
++            pass_start,
++            live,
++            quiet_bound_values,
++            draw_commands,
++            uses_room,
++            argument_samplers_room,
++            bind_memo,
++            last_retained,
++            amplification,
++            factors,
++            rate_map,
++            extended_written,
++            zero_indices,
+             ..
+         } = self;
++        // FUXI (`fuxihyb=2`): what the encoder holds that its end does not read. Under the lane the
++        // command buffer retains it, so it goes on the thread that sees the command buffer's work
++        // end instead of on the encoding thread here; else it goes as the end returns, as before.
++        let leftovers = (
++            (state, pipeline, routed, vertex, fragment, object, mesh, tile),
++            (keeping, drawn_before, unordered, unordered_dispatches, pass_start, live),
++            (quiet_bound_values, draw_commands, uses_room, argument_samplers_room),
++            (bind_memo, last_retained, amplification, factors, rate_map),
++            (extended_written, zero_indices),
++        );
+         earlier.push(current);
+         crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 0);
+         let mut instances = earlier;
+@@ -4289,6 +4324,10 @@ impl RenderCommandEncoder {
+         // which lets go of them in this order: the command buffer lets go of what it holds from
+         // the last retained back.
+         crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 12);
++        match crate::fuxi_census::lane() {
++            true => core.retain(leftovers),
++            false => drop(leftovers),
++        }
+         core.retain((
+             imageblock.as_ref().map(PassImageblock::held),
+             depth_stand_in.as_ref().map(DepthStandIn::held),
