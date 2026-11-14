@@ -1,9 +1,9 @@
 diff --git a/docs-lanes/adsp.md b/docs-lanes/adsp.md
 new file mode 100644
-index 0000000..92ac167
+index 0000000..b11da62
 --- /dev/null
 +++ b/docs-lanes/adsp.md
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,95 @@
 +# Audio DSP and battery manager (`fuxiadsp`)
 +
 +Patch 0117 (`tools/sync-fuxi-adsp.py`, canonical sources `xnu/fuxi-adsp/`) starts the audio DSP (ADSP, LPASS) from XNU
@@ -77,9 +77,31 @@ index 0000000..92ac167
 +- `FUXI ADSP: failed at stage S error E (scm x0=.. x1=..)`: S is the step (3 firmware, 4 SMP2P, 5 doorbells, 6 AOSS,
 +  7 rails, 8 adsp_dtb, 9 load, 10 auth_and_reset, 11 ready, 12 GLINK)
 +- `FUXI ADSP: stage=... ipcc=... glink in=.. out=.. qrtr ...` every 30 s ten times, then every 10 min
++
++## Speaker amplifiers (`fuxiamp`, first step of sound)
++
++`fuxi_amp.c` (also in 0117, with UniXNU-sheng's `GeniI2c.c` unchanged) looks at the two CS35L41 amplifiers on QUP2 SE0
++I2C. It does not need the DSP. Boot argument `fuxiamp=N` or ADT `/chosen` u32 `fuxi,amp`; started from `fuxi_adsp_init`
++with its own switch.
++
++Board facts (live DT): `i2c@880000` (QUP2 SE0, SPI 373), `cs35l41@40` "B" reset GPIO 183 and `cs35l41@42` "T" reset GPIO
++182 (active low), SDA gpio0 / SCL gpio1 = function 2 `qup2_se0_l0/l1_mirb` (pinctrl-sm8550.c), 2 mA, pull-up. The
++node has `dmas`; whether the engine is FIFO-capable or GSI-only (as touch's QUP1 SE4 is) is what mode 1 reads.
++gcc-sm8550.c: votes 0x52010 bits 0-4 (wrap2 core, s_ahb, m_ahb, core_2x, s0), halts 0x233d4 / 0x233d0 / 0x233cc /
++0x23004 / 0x1e004, SE0 clock source 0x1e010 (DFS). sheng runs its amplifier bus 2 on this same engine and pins.
++
++| N | What happens |
++|---|---|
++| 1 | reads only: votes, GPLL0, the five QUP2 branches, the SE0 DFS state and its 19.2 MHz level, the four pins (ctl/io), the GIC enable of SPI 373; the engine (protocol, `GENI_IF_DISABLE` bit 0 = FIFO locked, clock config, SCL counters, FIFO depths, M_IRQ) only when all five branches read plainly on |
++| 2 | sheng's setupClocks / setupPins / setupBus (GPLL0 + QUP2 votes, I2C pins, engine at 400 kHz from the 19.2 MHz level when unconfigured, FIFO mode), SPI 373 masked first, then per amplifier: reset low 2 ms, high, 10 ms, read DEVID (0x35a40), REVID, IRQ1_STATUS3/4 (OTP boot), back into reset. Nothing is written to the amplifiers; pins and votes are restored |
++
++Log: `FUXI AMP: survey ...`, `FUXI AMP: pins ...`, `FUXI AMP: engine ...` (or `not read: QUP2 clocks off`), then for mode 2
++`FUXI AMP: amp B@0x40 answers devid=0x35a40 (CS35L41) ...` and `FUXI AMP: bring-up stopped at step 6 ...`. Step numbers:
++1 clocks did not run, 2 pins set, 3 engine is not I2C, 4 no 19.2 MHz level / engine programmed, 5 GIC mask or FIFO refused
++(GSI only), 6 both amplifiers read.
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..f97cbe3
+index 0000000..043a11f
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
 @@ -0,0 +1,142 @@
@@ -103,10 +125,10 @@ index 0000000..f97cbe3
 +ROOT = Path(__file__).resolve().parents[1]
 +SRC = ROOT / 'xnu/fuxi-adsp'
 +PATCH = ROOT / 'xnu/patches/0117-fuxi-adsp.patch'
-+SOURCES = ('fuxi_adsp.c', 'fuxi_adsp_fw.c', 'fuxi_adsp_battery.c', 'QcomSmem.c', 'QcomSmp2p.c', 'QcomGlink.c', 'QcomMdt.c',
-+           'QcomQmp.c', 'QcomRpmh.c', 'QcomQrtr.c', 'FatVolume.c', 'ShengBattmgr.c', 'ShengQrtr.c')
++SOURCES = ('fuxi_adsp.c', 'fuxi_adsp_fw.c', 'fuxi_adsp_battery.c', 'fuxi_amp.c', 'QcomSmem.c', 'QcomSmp2p.c', 'QcomGlink.c',
++           'QcomMdt.c', 'QcomQmp.c', 'QcomRpmh.c', 'QcomQrtr.c', 'FatVolume.c', 'ShengBattmgr.c', 'ShengQrtr.c', 'GeniI2c.c')
 +HEADERS = ('QcomSmem.h', 'QcomSmp2p.h', 'QcomGlink.h', 'QcomMdt.h', 'QcomQmp.h', 'QcomRpmh.h', 'QcomScm.h', 'QcomQrtr.h',
-+           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h', 'fuxi_adsp_battery.h')
++           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h', 'fuxi_adsp_battery.h', 'GeniI2c.h')
 +MODIFIED = {'iokit/Kernel/arm/SweetBattery.cpp': ('0062-sweet-touch-power-battery.patch', 'SweetBattery.cpp')}
 +# bsd/dev/LICENSE.UniXNU-sheng already comes with 0098 (the GPU fence interrupt is adapted from sheng too); --check
 +# verifies that the local copy is the same text.
@@ -510,6 +532,370 @@ index 0000000..4308316
 +/* path: names separated by '/', each matched in any case against the long name, else the 8.3 name ("image/adsp.b00"). */
 +int fat_open(FatVolume *v, const char *path, FatFile *file);
 +int fat_read(FatVolume *v, const FatFile *file, uint64_t offset, void *to, size_t length);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/xnu/fuxi-adsp/GeniI2c.c b/xnu/fuxi-adsp/GeniI2c.c
+new file mode 100644
+index 0000000..cad36d0
+--- /dev/null
++++ b/xnu/fuxi-adsp/GeniI2c.c
+@@ -0,0 +1,232 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "GeniI2c.h"
++
++static uint32_t rd(GeniI2c *g, uint32_t reg) {return g->io.read(g->io.ctx, reg);}
++static void wr(GeniI2c *g, uint32_t reg, uint32_t value) {g->io.write(g->io.ctx, reg, value);}
++
++/* A FIFO depth field (bits 21:16); a field that reads zero takes the smallest depth these engines have. */
++static uint32_t fifo_words(uint32_t param)
++{
++    const uint32_t words = (param >> 16) & 0x3fu;
++    return words ? words : 16u;
++}
++
++int geni_i2c_prepare(GeniI2c *g, const GeniIo *io, uint8_t address, uint32_t *config)
++{
++    for (unsigned i = 0; i < sizeof *g; ++i) ((uint8_t *)g)[i] = 0;
++    g->io = *io;
++    g->address = address;
++    const uint32_t proto = (rd(g, GENI_FW_REVISION) >> 8) & 0xffu, clock = rd(g, GENI_CLK_CFG);
++    if (config) *config = (proto << 24) | (clock & 0xffffffu);
++    if (proto != GENI_PROTO_I2C || (rd(g, GENI_IF_DISABLE) & 1u) || !(clock & 1u) || !rd(g, GENI_SCL_COUNTERS)) return -1;
++    wr(g, GENI_DMA_MODE, 0);
++    /* 8-bit words, 4 per FIFO word, least significant byte first on the wire. */
++    wr(g, GENI_TX_PACK0, 0x7f8fe); wr(g, GENI_TX_PACK1, 0xffefe);
++    wr(g, GENI_RX_PACK0, 0x7f8fe); wr(g, GENI_RX_PACK1, 0xffefe);
++    wr(g, GENI_BYTE_GRAN, 0);
++    wr(g, GENI_TX_WATERMARK, 0);
++    g->tx_fifo_words = fifo_words(rd(g, GENI_HW_PARAM_0));
++    g->rx_fifo_words = fifo_words(rd(g, GENI_HW_PARAM_1));
++    wr(g, GENI_M_IRQ_CLEAR, 0xffffffffu);
++    /* Exactly the bits this core handles: one the boot loader left enabled (RX watermark, RX last) would hold the level line up. */
++    wr(g, GENI_M_IRQ_EN, GENI_M_IRQ_WANTED);
++    wr(g, GENI_SE_IRQ_EN, rd(g, GENI_SE_IRQ_EN) | GENI_SE_M_IRQ_EN);
++    return 0;
++}
++
++/* Starts one write command of length bytes (at most 8); the data goes in when the engine asks for it (TX watermark). */
++static void write_command(GeniI2c *g, const uint8_t *bytes, uint32_t length, int hold)
++{
++    g->tx[0] = g->tx[1] = 0;
++    for (uint32_t i = 0; i < length; ++i) g->tx[i / 4] |= (uint32_t)bytes[i] << (8 * (i % 4));
++    g->tx_words = (uint8_t)((length + 3) / 4);
++    g->length = length;
++    g->hold = (uint8_t)hold;
++    wr(g, GENI_TX_LEN, length);
++    wr(g, GENI_M_CMD0, (GENI_OP_WRITE << 27) | ((uint32_t)g->address << 9) | (hold ? GENI_STOP_STRETCH : 0));
++    wr(g, GENI_TX_WATERMARK, 1);
++    g->phase = GeniTxWait;
++}
++
++int geni_i2c_start_write(GeniI2c *g, uint8_t reg, uint8_t value)
++{
++    if (g->phase != GeniIdle) return -1;
++    g->reading = 0; g->reg = reg; g->value = value; g->error = GeniOk;
++    const uint8_t bytes[2] = {reg, value};
++    write_command(g, bytes, 2, 0);
++    return 0;
++}
++
++int geni_i2c_start_read(GeniI2c *g, uint8_t reg)
++{
++    if (g->phase != GeniIdle) return -1;
++    g->reading = 1; g->rx_length = 1; g->reg = reg; g->error = GeniOk;
++    write_command(g, &reg, 1, 1);
++    return 0;
++}
++
++int geni_i2c_start_write_bytes(GeniI2c *g, const uint8_t *bytes, uint32_t length)
++{
++    if (g->phase != GeniIdle || !length || length > 8) return -1;
++    g->reading = 0; g->error = GeniOk;
++    write_command(g, bytes, length, 0);
++    return 0;
++}
++
++int geni_i2c_start_read_bytes(GeniI2c *g, const uint8_t *bytes, uint32_t length, uint32_t read_length)
++{
++    if (g->phase != GeniIdle || !length || length > 4 || !read_length || read_length > 4) return -1;
++    g->reading = 1; g->rx_length = (uint8_t)read_length; g->error = GeniOk;
++    write_command(g, bytes, length, 1);
++    return 0;
++}
++
++int geni_i2c_start_write_buffer(GeniI2c *g, const uint8_t *bytes, uint32_t length)
++{
++    if (g->phase != GeniIdle || !bytes || !length) return -1;
++    g->reading = 0; g->error = GeniOk;
++    g->tx_buffer = bytes; g->tx_done = 0;
++    g->tx_words = 0;
++    g->length = length;
++    g->hold = 0;
++    wr(g, GENI_TX_LEN, length);
++    wr(g, GENI_M_CMD0, (GENI_OP_WRITE << 27) | ((uint32_t)g->address << 9));
++    wr(g, GENI_TX_WATERMARK, 1);
++    g->phase = GeniTxWait;
++    return 0;
++}
++
++int geni_i2c_start_read_buffer(GeniI2c *g, const uint8_t *command, uint32_t command_length, uint8_t *buffer, uint32_t length)
++{
++    if (g->phase != GeniIdle || !command || !command_length || command_length > 8 || !buffer || !length) return -1;
++    g->reading = 1; g->error = GeniOk;
++    g->rx_buffer = buffer; g->rx_done = 0; g->rx_total = length;
++    write_command(g, command, command_length, 1);
++    return 0;
++}
++
++/* Fills the free TX FIFO words (a watermark event that finds the FIFO full writes nothing); the last word in ends the TX wait. */
++static void feed(GeniI2c *g)
++{
++    const uint32_t used = GENI_TX_FIFO_WORDS(rd(g, GENI_TX_FIFO_STATUS));
++    uint32_t room = used < g->tx_fifo_words ? g->tx_fifo_words - used : 0;
++    while (room && g->tx_done < g->length) {
++        uint32_t word = 0;
++        for (unsigned k = 0; k < 4 && g->tx_done < g->length; ++k) word |= (uint32_t)g->tx_buffer[g->tx_done++] << (8 * k);
++        wr(g, GENI_TX_FIFO, word);
++        --room;
++    }
++    if (g->tx_done == g->length) {
++        wr(g, GENI_TX_WATERMARK, 0);
++        g->phase = GeniWriteDone;
++    }
++}
++
++/* Empties the RX FIFO into the read buffer; words past the requested length are dropped. */
++static void drain(GeniI2c *g)
++{
++    for (uint32_t words = GENI_RX_FIFO_WORDS(rd(g, GENI_RX_FIFO_STATUS)); words; --words) {
++        const uint32_t word = rd(g, GENI_RX_FIFO);
++        for (unsigned k = 0; k < 4 && g->rx_buffer && g->rx_done < g->rx_total; ++k) g->rx_buffer[g->rx_done++] = (uint8_t)(word >> (8 * k));
++    }
++}
++
++static int finish(GeniI2c *g, int error, uint32_t status)
++{
++    g->phase = GeniIdle;
++    wr(g, GENI_TX_WATERMARK, 0);
++    if (g->rx_buffer) {
++        /* A failed or cancelled read can leave words behind; the next transfer must not take them. */
++        if (error) {uint8_t *keep = g->rx_buffer; g->rx_buffer = 0; drain(g); g->rx_buffer = keep;}
++        wr(g, GENI_M_IRQ_EN, GENI_M_IRQ_WANTED);
++    }
++    g->tx_buffer = 0; g->rx_buffer = 0;
++    if (!error) {g->done++; return GeniDone;}
++    g->error = (uint8_t)error;
++    g->error_status = status;
++    g->failed++;
++    return GeniFailed;
++}
++
++int geni_i2c_event(GeniI2c *g, uint32_t status)
++{
++    if (!status) return GeniPending;
++    switch (g->phase) {
++    case GeniIdle:
++        g->stray++;
++        return GeniPending;
++    case GeniCancelling:
++        if (status & GENI_M_CMD_CANCEL) return finish(g, GeniErrTimeout, g->error_status);
++        return GeniPending;
++    case GeniAborting:
++        if (status & GENI_M_CMD_ABORT) return finish(g, GeniErrTimeout, g->error_status);
++        return GeniPending;
++    default:
++        break;
++    }
++    /* A failed command also ends with CMD_DONE; the error bits decide. */
++    if (status & GENI_M_ERRORS) return finish(g, GeniErrBus, status);
++    if (g->phase == GeniTxWait) {
++        if ((status & GENI_M_TX_WATERMARK) && g->tx_buffer) feed(g);
++        else if (status & GENI_M_TX_WATERMARK) {
++            for (unsigned i = 0; i < g->tx_words; ++i) wr(g, GENI_TX_FIFO, g->tx[i]);
++            wr(g, GENI_TX_WATERMARK, 0);
++            g->phase = GeniWriteDone;
++        }
++        if (!(status & GENI_M_CMD_DONE)) return GeniPending;
++        if (g->phase == GeniTxWait) return finish(g, GeniErrState, status);  /* done before the data went in */
++    }
++    if (g->phase == GeniReadDone && g->rx_buffer) {
++        drain(g);
++        if (!(status & GENI_M_CMD_DONE)) return GeniPending;
++        drain(g);   /* the last words can land after the status was read */
++        return g->rx_done == g->rx_total ? finish(g, GeniOk, 0) : finish(g, GeniErrNoData, status);
++    }
++    if (!(status & GENI_M_CMD_DONE)) return GeniPending;
++    if (g->phase == GeniWriteDone) {
++        if (!g->reading) return finish(g, GeniOk, 0);
++        if (g->rx_buffer) {
++            const uint32_t mark = g->rx_fifo_words > 1 ? g->rx_fifo_words - 1 : 1;
++            wr(g, GENI_RX_WATERMARK, mark);
++            wr(g, GENI_RX_RFR_WATERMARK, g->rx_fifo_words);
++            wr(g, GENI_M_IRQ_EN, GENI_M_IRQ_WANTED | GENI_M_RX_WATERMARK | GENI_M_RX_LAST);
++            wr(g, GENI_RX_LEN, g->rx_total);
++        } else wr(g, GENI_RX_LEN, g->rx_length);
++        wr(g, GENI_M_CMD0, (GENI_OP_READ << 27) | ((uint32_t)g->address << 9));
++        g->phase = GeniReadDone;
++        return GeniPending;
++    }
++    /* GeniReadDone */
++    if (!(rd(g, GENI_RX_FIFO_STATUS) & 0x1ffffffu)) return finish(g, GeniErrNoData, status);
++    g->rx = rd(g, GENI_RX_FIFO);
++    g->data = (uint8_t)g->rx;
++    return finish(g, GeniOk, 0);
++}
++
++int geni_i2c_poll(GeniI2c *g)
++{
++    const uint32_t status = rd(g, GENI_M_IRQ_STATUS);
++    if (status) wr(g, GENI_M_IRQ_CLEAR, status);
++    return g->phase == GeniIdle ? GeniPending : geni_i2c_event(g, status);
++}
++
++int geni_i2c_timeout(GeniI2c *g)
++{
++    switch (g->phase) {
++    case GeniIdle:
++        return GeniPending;
++    case GeniCancelling:
++        wr(g, GENI_M_CMD_CTRL, GENI_CMD_CTRL_ABORT);
++        g->phase = GeniAborting;
++        return GeniPending;
++    case GeniAborting:
++        return finish(g, GeniErrTimeout, g->error_status);
++    default:
++        g->timeouts++;
++        g->error_status = rd(g, GENI_M_IRQ_STATUS);
++        wr(g, GENI_TX_WATERMARK, 0);
++        wr(g, GENI_M_CMD_CTRL, GENI_CMD_CTRL_CANCEL);
++        g->phase = GeniCancelling;
++        return GeniPending;
++    }
++}
+diff --git a/xnu/fuxi-adsp/GeniI2c.h b/xnu/fuxi-adsp/GeniI2c.h
+new file mode 100644
+index 0000000..118dc7c
+--- /dev/null
++++ b/xnu/fuxi-adsp/GeniI2c.h
+@@ -0,0 +1,120 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* One register transfer at a time on a Qualcomm GENI serial engine running the I2C firmware, as an event-driven state machine: the owner
++ * starts a transfer, then feeds the engine's M_IRQ status (from its interrupt handler or a timer poll) until the transfer is done or
++ * failed, and calls the timeout step when its deadline passes. Nothing here waits or spins: every call does a few register accesses and
++ * returns. A register write is one 2-byte write {register, value}; a register read is a 1-byte write {register} that holds the stop
++ * condition, then a 1-byte read. A transfer that stops answering is cancelled, then aborted, as the engine documents. Buffered transfers
++ * move any length through the FIFO: each TX watermark event fills the free FIFO words, each RX watermark or last event empties it. */
++#ifndef GENI_I2C_H
++#define GENI_I2C_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Serial engine registers (offsets in the engine's 16 KiB window). */
++#define GENI_FW_REVISION 0x68u
++#define GENI_IF_DISABLE 0x64u
++#define GENI_CLK_CFG 0x48u
++#define GENI_BYTE_GRAN 0x254u
++#define GENI_DMA_MODE 0x258u
++#define GENI_TX_PACK0 0x260u
++#define GENI_TX_PACK1 0x264u
++#define GENI_TX_LEN 0x26cu
++#define GENI_RX_LEN 0x270u
++#define GENI_SCL_COUNTERS 0x278u
++#define GENI_RX_PACK0 0x284u
++#define GENI_RX_PACK1 0x288u
++#define GENI_M_CMD0 0x600u
++#define GENI_M_CMD_CTRL 0x604u
++#define GENI_M_IRQ_STATUS 0x610u
++#define GENI_M_IRQ_EN 0x614u
++#define GENI_M_IRQ_CLEAR 0x618u
++#define GENI_TX_FIFO 0x700u
++#define GENI_RX_FIFO 0x780u
++#define GENI_TX_FIFO_STATUS 0x800u
++#define GENI_RX_FIFO_STATUS 0x804u
++#define GENI_TX_WATERMARK 0x80cu
++#define GENI_RX_WATERMARK 0x810u
++#define GENI_RX_RFR_WATERMARK 0x814u
++#define GENI_SE_IRQ_EN 0xe1cu
++#define GENI_HW_PARAM_0 0xe24u          /* bits 21:16 TX FIFO depth in words */
++#define GENI_HW_PARAM_1 0xe28u          /* bits 21:16 RX FIFO depth in words */
++#define GENI_TX_FIFO_WORDS(status) ((status) & 0x0fffffffu)
++#define GENI_RX_FIFO_WORDS(status) ((status) & 0x01ffffffu)
++
++/* M_IRQ bits. */
++#define GENI_M_CMD_DONE (1u << 0)
++#define GENI_M_CMD_OVERRUN (1u << 1)
++#define GENI_M_ILLEGAL_CMD (1u << 2)
++#define GENI_M_CMD_FAILURE (1u << 3)
++#define GENI_M_CMD_CANCEL (1u << 4)
++#define GENI_M_CMD_ABORT (1u << 5)
++#define GENI_M_GP_IRQ (0x3fu << 9)      /* I2C: NACK, bus error, arbitration lost and the like */
++#define GENI_M_RX_WATERMARK (1u << 26)
++#define GENI_M_RX_LAST (1u << 27)
++#define GENI_M_TX_WATERMARK (1u << 30)
++#define GENI_M_ERRORS (GENI_M_CMD_OVERRUN | GENI_M_ILLEGAL_CMD | GENI_M_CMD_FAILURE | GENI_M_GP_IRQ)
++/* What the engine is set to raise its line for. */
++#define GENI_M_IRQ_WANTED (GENI_M_CMD_DONE | GENI_M_ERRORS | GENI_M_CMD_CANCEL | GENI_M_CMD_ABORT | GENI_M_TX_WATERMARK)
++#define GENI_SE_M_IRQ_EN (1u << 2)
++#define GENI_CMD_CTRL_ABORT (1u << 1)
++#define GENI_CMD_CTRL_CANCEL (1u << 2)
++#define GENI_PROTO_I2C 3u
++#define GENI_OP_WRITE 1u
++#define GENI_OP_READ 2u
++#define GENI_STOP_STRETCH (1u << 2)
++
++typedef struct {
++    uint32_t (*read)(void *ctx, uint32_t reg);
++    void (*write)(void *ctx, uint32_t reg, uint32_t value);
++    void *ctx;
++} GeniIo;
++
++enum {GeniIdle, GeniTxWait, GeniWriteDone, GeniReadDone, GeniCancelling, GeniAborting};
++enum {GeniPending = 0, GeniDone = 1, GeniFailed = 2};
++/* Why the last transfer failed. */
++enum {GeniOk = 0, GeniErrBusy = 1, GeniErrBus = 2, GeniErrTimeout = 3, GeniErrNoData = 4, GeniErrState = 5};
++
++typedef struct {
++    GeniIo io;
++    uint8_t address, phase, reading, hold;
++    uint8_t reg, value, error, data;
++    uint8_t tx_words, rx_length;
++    uint32_t tx[2], length;
++    uint32_t rx;                     /* the bytes read, first byte in bits 7:0 */
++    uint32_t error_status;           /* the M_IRQ status of the last failure */
++    uint32_t done, failed, timeouts, stray;
++    /* Buffered transfers: the owner's buffers (its own until the transfer ends), the bytes moved so far, the FIFO depths in words. */
++    const uint8_t *tx_buffer;
++    uint8_t *rx_buffer;
++    uint32_t tx_done, rx_done, rx_total;
++    uint32_t tx_fifo_words, rx_fifo_words;
++} GeniI2c;
++
++/* Checks the engine runs the I2C firmware with its clock and timing set (the boot loader's), selects FIFO mode with 8-bit packing and
++ * enables the interrupts this core needs. Returns 0, or -1 when the engine is not usable. *config: proto << 24 | M_CLK_CFG bits 23:0. */
++int geni_i2c_prepare(GeniI2c *g, const GeniIo *io, uint8_t address, uint32_t *config);
++int geni_i2c_start_write(GeniI2c *g, uint8_t reg, uint8_t value);
++int geni_i2c_start_read(GeniI2c *g, uint8_t reg);
++/* Multi-byte forms for devices with wider registers: write 1..8 bytes; or write 1..4 bytes (holding the stop condition), then read 1..4
++ * bytes into g->rx. */
++int geni_i2c_start_write_bytes(GeniI2c *g, const uint8_t *bytes, uint32_t length);
++int geni_i2c_start_read_bytes(GeniI2c *g, const uint8_t *bytes, uint32_t length, uint32_t read_length);
++/* Buffered forms of any length: write length bytes from bytes; or write command_length (1..8) bytes holding the stop condition, then
++ * read length bytes into buffer. RX watermark and last interrupts are enabled for the read only. */
++int geni_i2c_start_write_buffer(GeniI2c *g, const uint8_t *bytes, uint32_t length);
++int geni_i2c_start_read_buffer(GeniI2c *g, const uint8_t *command, uint32_t command_length, uint8_t *buffer, uint32_t length);
++/* Feeds M_IRQ status bits (already cleared by whoever read them). Returns GeniPending, GeniDone (read value in g->data) or GeniFailed. */
++int geni_i2c_event(GeniI2c *g, uint32_t status);
++/* Reads and clears the status itself, then as geni_i2c_event (for a timer poll; the interrupt handler does the same in its context). */
++int geni_i2c_poll(GeniI2c *g);
++/* The owner's deadline for the current step passed: a pending transfer is cancelled, a cancel that is not acknowledged is aborted and an
++ * abort that is not acknowledged ends the transfer anyway. Returns as geni_i2c_event. */
++int geni_i2c_timeout(GeniI2c *g);
++static inline int geni_i2c_busy(const GeniI2c *g) {return g->phase != GeniIdle;}
 +
 +#ifdef __cplusplus
 +}
@@ -3419,10 +3805,10 @@ index 0000000..fb240db
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp.c b/xnu/fuxi-adsp/fuxi_adsp.c
 new file mode 100644
-index 0000000..5151929
+index 0000000..a4e4a96
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp.c
-@@ -0,0 +1,849 @@
+@@ -0,0 +1,851 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 + *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -3490,6 +3876,7 @@ index 0000000..5151929
 +extern void fuxi_adsp_fw_close(void *handle);
 +extern void sheng_qrtr_start(void);
 +extern void fuxi_adsp_battery_start(int publish);
++extern void fuxi_amp_init(void);
 +extern volatile int32_t native_qrtr_stats[16];
 +extern char native_qrtr_text[96];
 +void fuxi_adsp_init(void);
@@ -4255,6 +4642,7 @@ index 0000000..5151929
 +{
 +    const unsigned asked = fa_mode(), run = fuxi_adsp_mode();
 +    thread_t thread = NULL;
++    fuxi_amp_init(); /* the speaker amplifiers' own switch (fuxi_amp.c, fuxiamp / ADT fuxi,amp), independent of fuxiadsp */
 +    if (!run || gStarted) return;
 +    if (asked >= 2 && run < 2) {
 +        printf("FUXI ADSP: fuxiadsp=%u refused with fuxiwlan (both drive the apps RSC without a shared lock); surveying only\n", asked);
@@ -4700,6 +5088,335 @@ index 0000000..7755f92
 +    if (m) m->used = 0;
 +}
 +#endif /* FUXI */
+diff --git a/xnu/fuxi-adsp/fuxi_amp.c b/xnu/fuxi-adsp/fuxi_amp.c
+new file mode 100644
+index 0000000..9b12633
+--- /dev/null
++++ b/xnu/fuxi-adsp/fuxi_amp.c
+@@ -0,0 +1,323 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* FUXI speaker amplifiers: two Cirrus CS35L41 on QUP2 SE0 I2C (live DT i2c@880000: cs35l41@40 "B", reset GPIO 183; cs35l41@42
++ * "T", reset GPIO 182, both active low; pins gpio0 SDA / gpio1 SCL, function 2 = qup2_se0_l0/l1_mirb, 2 mA, pull-up; engine SPI
++ * 373, level). Boot argument fuxiamp, or ADT /chosen u32 "fuxi,amp" (the command line is full):
++ *   1  survey, reads only: the GCC votes 0x52008 / 0x52010 / 0x52018, the five QUP2 branches (core 0x233d4, s_ahb 0x233d0, m_ahb
++ *      0x233cc, core_2x 0x23004, s0 0x1e004; gcc-sm8550.c), the SE0 clock source 0x1e010 (DFS state, which level is 19.2 MHz) and
++ *      the four pins; only when all five branches run, also the engine: protocol, FIFO lock (GENI_IF_DISABLE bit 0 set means the
++ *      engine is GSI only, as touch's QUP1 SE4 is), clock configuration, SCL counters and FIFO depths.
++ *   2  brings the bus up as UniXNU-sheng AudioProbe.cpp setupClocks / setupPins / setupBus do for this same engine on sheng
++ *      (6880068): GPLL0 and the five QUP2 votes, the I2C pins, the engine at 400 kHz from the 19.2 MHz DFS level if the boot stages
++ *      left it unconfigured, FIFO mode (GeniI2c.c, sheng's, unchanged); SPI 373 is masked in the distributor first (no handler
++ *      here, every transfer is polled). Then each amplifier comes out of reset (low 2 ms, high, 10 ms for its OTP boot) and DEVID
++ *      0x0 (0x35a40 expected), REVID 0x4, IRQ1_STATUS3 0x10018 and IRQ1_STATUS4 0x1001c (OTP boot error / done) are read. Nothing
++ *      is written to the amplifiers. At the end both are held in reset again and the pins and votes go back to what they were.
++ * Facts: QUP2 SE0 window 0x880000 + 0x4000, GCC 0x100000, TLMM 0xf100000 (0x1000 per pin: ctl, io at +4), GICD 0x17100000.
++ * Windows are mapped with kernel_map VA and pmap entries (never ml_io_map), as fuxi_adsp.c does. */
++#include <pexpert/arm64/board_config.h>
++#if defined(FUXI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++#include "GeniI2c.h"
++
++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
++    unsigned, void *);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t thread_terminate(thread_t);
++extern void thread_deallocate(thread_t);
++extern void IOSleep(unsigned milliseconds);
++void fuxi_amp_init(void);
++
++#define FM_GCC 0x100000ull
++#define FM_TLMM 0xf100000ull
++#define FM_SE 0x880000ull
++#define FM_GICD 0x17100000ull
++#define FM_INTID_SE (32u + 373u)
++#define FM_VOTE1 0x52008u
++#define FM_VOTE2 0x52010u
++#define FM_VOTE2_BITS 0x1fu        /* wrap2 core 0, s_ahb 1, m_ahb 2, core_2x 3, s0 4 */
++#define FM_GPLL0_VOTE 0x52018u     /* bit 0 */
++#define FM_GPLL0_MODE 0x0u         /* bit 31 lock detect */
++#define FM_RCG 0x1e010u            /* gcc_qupv3_wrap2_s0_clk_src */
++#define FM_CLK_OFF (1u << 31)
++#define FM_SCL_COUNTERS (5u << 20 | 11u << 10 | 22u) /* 400 kHz from 19.2 MHz (i2c-qcom-geni.c): high 5, low 11, cycle 22 */
++#define FM_CLK_CFG (2u << 4 | 1u)                     /* divider 2, enable */
++#define FM_DEVID 0x35a40u
++
++static const uint32_t kHalts[5] = {0x233d4u, 0x233d0u, 0x233ccu, 0x23004u, 0x1e004u};
++static const unsigned kPins[4] = {0, 1, 183, 182};    /* SDA, SCL, reset B, reset T */
++static const uint8_t kAddr[2] = {0x40, 0x42};
++static const unsigned kReset[2] = {183, 182};
++static const char kName[2] = {'B', 'T'};
++
++/* ---- MMIO windows (16 KiB pages) ---- */
++struct fm_window { uint64_t pa; vm_size_t size; vm_offset_t va; };
++static struct fm_window gGcc0 = {FM_GCC, 0x4000, 0}, gGcc1c = {FM_GCC + 0x1c000, 0x4000, 0}, gGcc20 = {FM_GCC + 0x20000, 0x4000, 0},
++    gGcc50 = {FM_GCC + 0x50000, 0x4000, 0}, gSe = {FM_SE, 0x4000, 0}, gGicd = {FM_GICD, 0x4000, 0};
++static struct fm_window gPin[4];
++
++static kern_return_t fm_map(struct fm_window *w)
++{
++    vm_offset_t va = 0;
++    if (w->va) return KERN_SUCCESS;
++    if (!w->size || (w->pa & PAGE_MASK) || (w->size & PAGE_MASK)) return KERN_INVALID_ARGUMENT;
++    kern_return_t kr = kmem_alloc(kernel_map, &va, w->size, KMA_VAONLY | KMA_KOBJECT | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
++    if (kr != KERN_SUCCESS) return kr;
++    for (vm_size_t off = 0; off < w->size; off += PAGE_SIZE) {
++        kr = pmap_enter_options_addr(kernel_pmap, va + off, w->pa + off, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_NONE, VM_WIMG_IO, TRUE,
++            PMAP_OPTIONS_NOWAIT, NULL);
++        if (kr != KERN_SUCCESS) {
++            pmap_remove(kernel_pmap, va, va + w->size);
++            return kr; /* VA kept reserved, as in fuxi_adsp.c */
++        }
++    }
++    w->va = va;
++    return KERN_SUCCESS;
++}
++static uint32_t rd(const struct fm_window *w, uint64_t pa) { return *(volatile uint32_t *)(w->va + (pa - w->pa)); }
++static void wr(const struct fm_window *w, uint64_t pa, uint32_t value)
++{
++    *(volatile uint32_t *)(w->va + (pa - w->pa)) = value;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++/* A GCC register by its offset from the GCC base. */
++static const struct fm_window *gccWin(uint32_t off)
++{
++    const uint64_t pa = FM_GCC + off;
++    const struct fm_window *w[4] = {&gGcc0, &gGcc1c, &gGcc20, &gGcc50};
++    for (unsigned i = 0; i < 4; ++i) if (pa >= w[i]->pa && pa + 4 <= w[i]->pa + w[i]->size) return w[i];
++    return NULL;
++}
++static uint32_t gcc(uint32_t off) { return rd(gccWin(off), FM_GCC + off); }
++static void gccWr(uint32_t off, uint32_t value) { wr(gccWin(off), FM_GCC + off, value); }
++static uint64_t pinPa(unsigned gpio) { return FM_TLMM + (uint64_t)gpio * 0x1000u; }
++static uint32_t pinCtl(unsigned i) { return rd(&gPin[i], pinPa(kPins[i])); }
++static uint32_t pinIo(unsigned i) { return rd(&gPin[i], pinPa(kPins[i]) + 4); }
++static unsigned pinIndex(unsigned gpio) { for (unsigned i = 0; i < 4; ++i) if (kPins[i] == gpio) return i; return 0; }
++
++/* ---- clocks ---- */
++/* sheng's test: a branch is running unless it reports CLK_OFF without being under hardware control (bit 1). */
++static int branchesRun(uint32_t *mask)
++{
++    int ok = 1;
++    uint32_t off = 0;
++    for (unsigned i = 0; i < 5; ++i) {
++        const uint32_t v = gcc(kHalts[i]);
++        if ((v & FM_CLK_OFF) && !(v & 2u)) { ok = 0; off |= 1u << i; }
++    }
++    if (mask) *mask = off;
++    return ok;
++}
++/* The DFS level of the SE0 clock source that runs at 19.2 MHz (TCXO, no divider, no M/N), or -1. */
++static int level19m2(void)
++{
++    for (unsigned l = 0; l < 8; ++l) {
++        const uint32_t cfg = gcc(FM_RCG + 0x1c + 4 * l);
++        const unsigned src = (cfg >> 8) & 7, mode = (cfg >> 12) & 3, hid = cfg & 0x1f;
++        if (src == 0 && mode == 0 && hid <= 1) return (int)l; /* hid 0 or 1: divide by 1 */
++    }
++    return -1;
++}
++
++/* ---- the GIC: SPI 373 masked (polled engine, no handler in this kernel owns the line) ---- */
++static void gicMask(unsigned intid)
++{
++    wr(&gGicd, FM_GICD + 0x180 + (intid / 32) * 4, 1u << (intid % 32));
++    for (unsigned n = 0; (rd(&gGicd, FM_GICD) & 0x80000000u) && n < 100000; n++) delay(1); /* GICD_CTLR.RWP */
++}
++static int gicEnabled(unsigned intid) { return (rd(&gGicd, FM_GICD + 0x100 + (intid / 32) * 4) >> (intid % 32)) & 1; }
++
++/* ---- the engine ---- */
++static uint32_t ioRd(void *ctx, uint32_t reg) { (void)ctx; return rd(&gSe, FM_SE + reg); }
++static void ioWr(void *ctx, uint32_t reg, uint32_t value) { (void)ctx; wr(&gSe, FM_SE + reg, value); }
++static GeniI2c gBus;
++
++/* One register read on the bus (32-bit address, 32-bit data, both big-endian on the wire): 1 and *value, or 0. Polled in 20 us steps,
++ * 20 ms per stage of GeniI2c's cancel/abort ladder, as sheng's transfer(). */
++static int ampRead(uint8_t address, uint32_t reg, uint32_t *value)
++{
++    const uint8_t bytes[4] = {(uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg};
++    gBus.address = address;
++    if (geni_i2c_start_read_bytes(&gBus, bytes, 4, 4)) return 0;
++    for (int stages = 3; stages > 0;) {
++        for (unsigned i = 0; i < 1000; ++i) {
++            const int r = geni_i2c_poll(&gBus);
++            if (r == GeniDone) { *value = __builtin_bswap32(gBus.rx); return 1; }
++            if (r == GeniFailed) return 0;
++            delay(20);
++        }
++        if (geni_i2c_timeout(&gBus) != GeniPending) return 0;
++        --stages;
++    }
++    return 0;
++}
++
++/* The survey reads the engine only with every branch plainly on (CLK_OFF clear, hardware control or not): a read of an unclocked
++ * block stalls the bus. */
++static int branchesOn(void)
++{
++    for (unsigned i = 0; i < 5; ++i) if (gcc(kHalts[i]) & FM_CLK_OFF) return 0;
++    return 1;
++}
++
++static void survey(int *running)
++{
++    uint32_t off = 0;
++    const int run = branchesRun(&off) && branchesOn();
++    const int level = level19m2();
++    printf("FUXI AMP: survey vote 0x52008=%#x 0x52010=%#x gpll0=%#x/%#x branches core=%#x s_ahb=%#x m_ahb=%#x core2x=%#x s0=%#x "
++        "(off mask %#x) rcg cmd=%#x dfsr=%#x level19.2=%d gic_se_en=%d\n", gcc(FM_VOTE1), gcc(FM_VOTE2), gcc(FM_GPLL0_VOTE),
++        gcc(FM_GPLL0_MODE), gcc(kHalts[0]), gcc(kHalts[1]), gcc(kHalts[2]), gcc(kHalts[3]), gcc(kHalts[4]), off, gcc(FM_RCG),
++        gcc(FM_RCG + 0x14), level, gicEnabled(FM_INTID_SE));
++    printf("FUXI AMP: pins gpio0 %#x/%#x gpio1 %#x/%#x gpio183 %#x/%#x gpio182 %#x/%#x (ctl/io)\n", pinCtl(0), pinIo(0), pinCtl(1),
++        pinIo(1), pinCtl(2), pinIo(2), pinCtl(3), pinIo(3));
++    if (run) {
++        printf("FUXI AMP: engine fw=%#x proto=%u if_disable=%#x (%s) clk_cfg=%#x clk_sel=%#x scl=%#x hw0=%#x hw1=%#x m_irq=%#x/%#x\n",
++            ioRd(NULL, GENI_FW_REVISION), (ioRd(NULL, GENI_FW_REVISION) >> 8) & 0xff, ioRd(NULL, GENI_IF_DISABLE),
++            (ioRd(NULL, GENI_IF_DISABLE) & 1u) ? "FIFO locked: GSI only" : "FIFO usable", ioRd(NULL, GENI_CLK_CFG), ioRd(NULL, 0x7c),
++            ioRd(NULL, GENI_SCL_COUNTERS), ioRd(NULL, GENI_HW_PARAM_0), ioRd(NULL, GENI_HW_PARAM_1), ioRd(NULL, GENI_M_IRQ_STATUS),
++            ioRd(NULL, GENI_M_IRQ_EN));
++    } else {
++        printf("FUXI AMP: engine not read: QUP2 clocks off\n");
++    }
++    *running = run;
++}
++
++/* Mode 2. Saved state is put back on every exit path. */
++static void bringUp(int wasRunning)
++{
++    uint32_t savedCtl[4], savedIo[4];
++    for (unsigned i = 0; i < 4; ++i) { savedCtl[i] = pinCtl(i); savedIo[i] = pinIo(i); }
++    const uint32_t savedVote2 = gcc(FM_VOTE2), savedGpll0 = gcc(FM_GPLL0_VOTE);
++    int bus = 0, step = 0;
++    uint32_t config = 0;
++
++    /* clocks */
++    gccWr(FM_GPLL0_VOTE, savedGpll0 | 1u);
++    for (unsigned i = 0; i < 10000 && !(gcc(FM_GPLL0_MODE) & FM_CLK_OFF); ++i) delay(10); /* bit 31: lock detect */
++    gccWr(FM_VOTE2, savedVote2 | FM_VOTE2_BITS);
++    int run = 0;
++    for (unsigned i = 0; i < 2000 && !(run = branchesRun(NULL)); ++i) delay(10);
++    step = 1;
++    if (!run) goto out; /* never touch an engine without running clocks */
++
++    /* pins: I2C function 2, 2 mA, pull-up (DT active state) */
++    for (unsigned i = 0; i < 2; ++i) wr(&gPin[i], pinPa(kPins[i]), 2u << 2 | 0u << 6 | 3u);
++    step = 2;
++
++    /* the engine */
++    const uint32_t proto = (ioRd(NULL, GENI_FW_REVISION) >> 8) & 0xff;
++    if (proto != GENI_PROTO_I2C) goto out;
++    step = 3;
++    if (!(ioRd(NULL, GENI_CLK_CFG) & 1u) || !ioRd(NULL, GENI_SCL_COUNTERS)) {
++        const int level = level19m2();
++        if (level < 0) goto out;
++        ioWr(NULL, 0x28, ioRd(NULL, 0x28) | 0x7fu);   /* clock gating controls on */
++        ioWr(NULL, 0xe30, ioRd(NULL, 0xe30) | 0xfu);  /* DMA clock gating controls on */
++        ioWr(NULL, 0x24, 0x7fu);                      /* default output control */
++        ioWr(NULL, 0x20, 1u);                         /* force default */
++        ioWr(NULL, 0xe18, 0);                         /* no GSI events */
++        ioWr(NULL, 0x7c, (uint32_t)level);
++        ioWr(NULL, GENI_CLK_CFG, FM_CLK_CFG);
++        ioWr(NULL, GENI_SCL_COUNTERS, FM_SCL_COUNTERS);
++    }
++    step = 4;
++    gicMask(FM_INTID_SE);
++    if (gicEnabled(FM_INTID_SE)) goto out;
++    const GeniIo io = {ioRd, ioWr, NULL};
++    if (geni_i2c_prepare(&gBus, &io, kAddr[0], &config)) goto out; /* also refuses a GSI-only engine */
++    bus = 1;
++    step = 5;
++
++    /* the amplifiers, one at a time */
++    for (unsigned a = 0; a < 2; ++a) {
++        const unsigned p = pinIndex(kReset[a]);
++        wr(&gPin[p], pinPa(kReset[a]) + 4, 0);           /* output low */
++        wr(&gPin[p], pinPa(kReset[a]), 1u << 9);         /* GPIO, output enabled, 2 mA, no pull */
++        IOSleep(2);
++        wr(&gPin[p], pinPa(kReset[a]) + 4, 1u << 1);     /* release */
++        IOSleep(10);
++        uint32_t devid = 0, revid = 0, st3 = 0, st4 = 0;
++        const int ok = ampRead(kAddr[a], 0x0, &devid);
++        const int ok2 = ok && ampRead(kAddr[a], 0x4, &revid) && ampRead(kAddr[a], 0x10018, &st3) && ampRead(kAddr[a], 0x1001c, &st4);
++        printf("FUXI AMP: amp %c@%#x %s devid=%#x%s revid=%#x irq1_status3=%#x irq1_status4=%#x (geni error %u status %#x done %u "
++            "failed %u timeouts %u)\n", kName[a], kAddr[a], ok2 ? "answers" : ok ? "partly" : "no answer", devid,
++            devid == FM_DEVID ? " (CS35L41)" : "", revid, st3, st4, gBus.error, gBus.error_status, gBus.done, gBus.failed, gBus.timeouts);
++        wr(&gPin[p], pinPa(kReset[a]) + 4, 0);           /* back into reset */
++    }
++    step = 6;
++out:
++    /* Put back what the boot stages left: reset pins first (still low while their old configuration returns), then the I2C pins and
++     * the votes. A clock the boot stages had running stays running. */
++    for (unsigned i = 0; i < 4; ++i) {
++        wr(&gPin[i], pinPa(kPins[i]) + 4, savedIo[i] & ~1u);
++        wr(&gPin[i], pinPa(kPins[i]), savedCtl[i]);
++    }
++    if (!wasRunning) {
++        gccWr(FM_VOTE2, savedVote2);
++        gccWr(FM_GPLL0_VOTE, savedGpll0);
++    }
++    printf("FUXI AMP: bring-up stopped at step %d (6 = both read; bus %s, config %#x); pins%s restored\n", step,
++        bus ? "prepared" : "not prepared", config, wasRunning ? "" : " and votes");
++}
++
++/* Boot argument fuxiamp, else ADT /chosen u32 "fuxi,amp". */
++static unsigned fm_mode(void)
++{
++    unsigned mode = 0;
++    DTEntry chosen;
++    const void *prop;
++    unsigned bytes;
++    if (PE_parse_boot_argn("fuxiamp", &mode, sizeof(mode))) return mode;
++    if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++        SecureDTGetProperty(chosen, "fuxi,amp", &prop, &bytes) == kSuccess && bytes == sizeof(uint32_t))
++        memcpy(&mode, prop, sizeof(mode));
++    return mode;
++}
++
++static void ampThread(void *arg, wait_result_t result)
++{
++    (void)result;
++    const unsigned mode = (unsigned)(uintptr_t)arg;
++    int ok = fm_map(&gGcc0) == KERN_SUCCESS && fm_map(&gGcc1c) == KERN_SUCCESS && fm_map(&gGcc20) == KERN_SUCCESS &&
++        fm_map(&gGcc50) == KERN_SUCCESS && fm_map(&gSe) == KERN_SUCCESS && fm_map(&gGicd) == KERN_SUCCESS;
++    for (unsigned i = 0; ok && i < 4; ++i) {
++        gPin[i].pa = pinPa(kPins[i]) & ~(uint64_t)0x3fffu;
++        gPin[i].size = 0x4000;
++        for (unsigned j = 0; j < i; ++j) if (gPin[j].pa == gPin[i].pa) gPin[i].va = gPin[j].va; /* gpio0 and gpio1 share a page */
++        ok = fm_map(&gPin[i]) == KERN_SUCCESS;
++    }
++    if (!ok) {
++        printf("FUXI AMP: mapping failed\n");
++    } else {
++        int running = 0;
++        survey(&running);
++        if (mode >= 2) bringUp(running);
++    }
++    thread_terminate(current_thread());
++}
++
++/* Called from fuxi_adsp_init (sweet_ufs.c, after the UFS driver is ready). */
++void fuxi_amp_init(void)
++{
++    static int started;
++    thread_t thread = NULL;
++    const unsigned mode = fm_mode();
++    if (!mode || started) return;
++    started = 1;
++    if (kernel_thread_start(ampThread, (void *)(uintptr_t)(mode > 2 ? 2 : mode), &thread) != KERN_SUCCESS) {
++        printf("FUXI AMP: no thread\n");
++        return;
++    }
++    thread_deallocate(thread);
++    printf("FUXI AMP: started mode %u\n", mode > 2 ? 2 : mode);
++}
++#endif /* FUXI */
 diff --git a/xnu/fuxi-unixnu/sweet_ufs.c b/xnu/fuxi-unixnu/sweet_ufs.c
 index c8376e4..9c1dbe9 100644
 --- a/xnu/fuxi-unixnu/sweet_ufs.c
@@ -5054,19 +5771,20 @@ index 8349337..7d08b57 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..664c09f
+index 0000000..0212b6a
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,4120 @@
+@@ -0,0 +1,4808 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
-+@@ -121,6 +121,19 @@
++@@ -121,6 +121,21 @@
 + bsd/dev/sweet_rpmh.c			standard
 + bsd/dev/sweet_spmi.c			standard
 + bsd/dev/sweet_usb.c			standard
 ++bsd/dev/fuxi_adsp.c			standard
 ++bsd/dev/fuxi_adsp_fw.c			standard
 ++bsd/dev/fuxi_adsp_battery.c		standard
+++bsd/dev/fuxi_amp.c			standard
 ++bsd/dev/QcomSmem.c			standard
 ++bsd/dev/QcomSmp2p.c			standard
 ++bsd/dev/QcomGlink.c			standard
@@ -5077,12 +5795,13 @@ index 0000000..664c09f
 ++bsd/dev/FatVolume.c			standard
 ++bsd/dev/ShengBattmgr.c			standard
 ++bsd/dev/ShengQrtr.c			standard
+++bsd/dev/GeniI2c.c			standard
 + bsd/dev/mem.c				standard
 + bsd/dev/munge.c 			optional config_requires_u32_munging
 + bsd/dev/unix_startup.c			standard
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp.c
-+@@ -0,0 +1,849 @@
++@@ -0,0 +1,851 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 ++ *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -5150,6 +5869,7 @@ index 0000000..664c09f
 ++extern void fuxi_adsp_fw_close(void *handle);
 ++extern void sheng_qrtr_start(void);
 ++extern void fuxi_adsp_battery_start(int publish);
+++extern void fuxi_amp_init(void);
 ++extern volatile int32_t native_qrtr_stats[16];
 ++extern char native_qrtr_text[96];
 ++void fuxi_adsp_init(void);
@@ -5915,6 +6635,7 @@ index 0000000..664c09f
 ++{
 ++    const unsigned asked = fa_mode(), run = fuxi_adsp_mode();
 ++    thread_t thread = NULL;
+++    fuxi_amp_init(); /* the speaker amplifiers' own switch (fuxi_amp.c, fuxiamp / ADT fuxi,amp), independent of fuxiadsp */
 ++    if (!run || gStarted) return;
 ++    if (asked >= 2 && run < 2) {
 ++        printf("FUXI ADSP: fuxiadsp=%u refused with fuxiwlan (both drive the apps RSC without a shared lock); surveying only\n", asked);
@@ -6317,6 +7038,332 @@ index 0000000..664c09f
 ++    fb_channel = sheng_adsp_channel("PMIC_RTR_ADSP_APPS", 1024, 4, 0, &client, NULL);
 ++    printf("FUXI BATTERY: battery manager client %s%s\n", fb_channel ? "registered" : "NOT registered",
 ++        fb_publish ? ", readings go to SweetBattery" : "");
+++}
+++#endif /* FUXI */
++--- /dev/null
+++++ b/bsd/dev/fuxi_amp.c
++@@ -0,0 +1,323 @@
+++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
+++/* FUXI speaker amplifiers: two Cirrus CS35L41 on QUP2 SE0 I2C (live DT i2c@880000: cs35l41@40 "B", reset GPIO 183; cs35l41@42
+++ * "T", reset GPIO 182, both active low; pins gpio0 SDA / gpio1 SCL, function 2 = qup2_se0_l0/l1_mirb, 2 mA, pull-up; engine SPI
+++ * 373, level). Boot argument fuxiamp, or ADT /chosen u32 "fuxi,amp" (the command line is full):
+++ *   1  survey, reads only: the GCC votes 0x52008 / 0x52010 / 0x52018, the five QUP2 branches (core 0x233d4, s_ahb 0x233d0, m_ahb
+++ *      0x233cc, core_2x 0x23004, s0 0x1e004; gcc-sm8550.c), the SE0 clock source 0x1e010 (DFS state, which level is 19.2 MHz) and
+++ *      the four pins; only when all five branches run, also the engine: protocol, FIFO lock (GENI_IF_DISABLE bit 0 set means the
+++ *      engine is GSI only, as touch's QUP1 SE4 is), clock configuration, SCL counters and FIFO depths.
+++ *   2  brings the bus up as UniXNU-sheng AudioProbe.cpp setupClocks / setupPins / setupBus do for this same engine on sheng
+++ *      (6880068): GPLL0 and the five QUP2 votes, the I2C pins, the engine at 400 kHz from the 19.2 MHz DFS level if the boot stages
+++ *      left it unconfigured, FIFO mode (GeniI2c.c, sheng's, unchanged); SPI 373 is masked in the distributor first (no handler
+++ *      here, every transfer is polled). Then each amplifier comes out of reset (low 2 ms, high, 10 ms for its OTP boot) and DEVID
+++ *      0x0 (0x35a40 expected), REVID 0x4, IRQ1_STATUS3 0x10018 and IRQ1_STATUS4 0x1001c (OTP boot error / done) are read. Nothing
+++ *      is written to the amplifiers. At the end both are held in reset again and the pins and votes go back to what they were.
+++ * Facts: QUP2 SE0 window 0x880000 + 0x4000, GCC 0x100000, TLMM 0xf100000 (0x1000 per pin: ctl, io at +4), GICD 0x17100000.
+++ * Windows are mapped with kernel_map VA and pmap entries (never ml_io_map), as fuxi_adsp.c does. */
+++#include <pexpert/arm64/board_config.h>
+++#if defined(FUXI)
+++#include <sys/param.h>
+++#include <sys/systm.h>
+++#include <sys/errno.h>
+++#include <kern/clock.h>
+++#include <kern/thread.h>
+++#include <machine/machine_routines.h>
+++#include <pexpert/pexpert.h>
+++#include <pexpert/device_tree.h>
+++#include <vm/vm_kern.h>
+++#include <vm/pmap.h>
+++#include "GeniI2c.h"
+++
+++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
+++    unsigned, void *);
+++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+++extern kern_return_t thread_terminate(thread_t);
+++extern void thread_deallocate(thread_t);
+++extern void IOSleep(unsigned milliseconds);
+++void fuxi_amp_init(void);
+++
+++#define FM_GCC 0x100000ull
+++#define FM_TLMM 0xf100000ull
+++#define FM_SE 0x880000ull
+++#define FM_GICD 0x17100000ull
+++#define FM_INTID_SE (32u + 373u)
+++#define FM_VOTE1 0x52008u
+++#define FM_VOTE2 0x52010u
+++#define FM_VOTE2_BITS 0x1fu        /* wrap2 core 0, s_ahb 1, m_ahb 2, core_2x 3, s0 4 */
+++#define FM_GPLL0_VOTE 0x52018u     /* bit 0 */
+++#define FM_GPLL0_MODE 0x0u         /* bit 31 lock detect */
+++#define FM_RCG 0x1e010u            /* gcc_qupv3_wrap2_s0_clk_src */
+++#define FM_CLK_OFF (1u << 31)
+++#define FM_SCL_COUNTERS (5u << 20 | 11u << 10 | 22u) /* 400 kHz from 19.2 MHz (i2c-qcom-geni.c): high 5, low 11, cycle 22 */
+++#define FM_CLK_CFG (2u << 4 | 1u)                     /* divider 2, enable */
+++#define FM_DEVID 0x35a40u
+++
+++static const uint32_t kHalts[5] = {0x233d4u, 0x233d0u, 0x233ccu, 0x23004u, 0x1e004u};
+++static const unsigned kPins[4] = {0, 1, 183, 182};    /* SDA, SCL, reset B, reset T */
+++static const uint8_t kAddr[2] = {0x40, 0x42};
+++static const unsigned kReset[2] = {183, 182};
+++static const char kName[2] = {'B', 'T'};
+++
+++/* ---- MMIO windows (16 KiB pages) ---- */
+++struct fm_window { uint64_t pa; vm_size_t size; vm_offset_t va; };
+++static struct fm_window gGcc0 = {FM_GCC, 0x4000, 0}, gGcc1c = {FM_GCC + 0x1c000, 0x4000, 0}, gGcc20 = {FM_GCC + 0x20000, 0x4000, 0},
+++    gGcc50 = {FM_GCC + 0x50000, 0x4000, 0}, gSe = {FM_SE, 0x4000, 0}, gGicd = {FM_GICD, 0x4000, 0};
+++static struct fm_window gPin[4];
+++
+++static kern_return_t fm_map(struct fm_window *w)
+++{
+++    vm_offset_t va = 0;
+++    if (w->va) return KERN_SUCCESS;
+++    if (!w->size || (w->pa & PAGE_MASK) || (w->size & PAGE_MASK)) return KERN_INVALID_ARGUMENT;
+++    kern_return_t kr = kmem_alloc(kernel_map, &va, w->size, KMA_VAONLY | KMA_KOBJECT | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
+++    if (kr != KERN_SUCCESS) return kr;
+++    for (vm_size_t off = 0; off < w->size; off += PAGE_SIZE) {
+++        kr = pmap_enter_options_addr(kernel_pmap, va + off, w->pa + off, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_NONE, VM_WIMG_IO, TRUE,
+++            PMAP_OPTIONS_NOWAIT, NULL);
+++        if (kr != KERN_SUCCESS) {
+++            pmap_remove(kernel_pmap, va, va + w->size);
+++            return kr; /* VA kept reserved, as in fuxi_adsp.c */
+++        }
+++    }
+++    w->va = va;
+++    return KERN_SUCCESS;
+++}
+++static uint32_t rd(const struct fm_window *w, uint64_t pa) { return *(volatile uint32_t *)(w->va + (pa - w->pa)); }
+++static void wr(const struct fm_window *w, uint64_t pa, uint32_t value)
+++{
+++    *(volatile uint32_t *)(w->va + (pa - w->pa)) = value;
+++    __asm__ volatile("dsb sy" ::: "memory");
+++}
+++/* A GCC register by its offset from the GCC base. */
+++static const struct fm_window *gccWin(uint32_t off)
+++{
+++    const uint64_t pa = FM_GCC + off;
+++    const struct fm_window *w[4] = {&gGcc0, &gGcc1c, &gGcc20, &gGcc50};
+++    for (unsigned i = 0; i < 4; ++i) if (pa >= w[i]->pa && pa + 4 <= w[i]->pa + w[i]->size) return w[i];
+++    return NULL;
+++}
+++static uint32_t gcc(uint32_t off) { return rd(gccWin(off), FM_GCC + off); }
+++static void gccWr(uint32_t off, uint32_t value) { wr(gccWin(off), FM_GCC + off, value); }
+++static uint64_t pinPa(unsigned gpio) { return FM_TLMM + (uint64_t)gpio * 0x1000u; }
+++static uint32_t pinCtl(unsigned i) { return rd(&gPin[i], pinPa(kPins[i])); }
+++static uint32_t pinIo(unsigned i) { return rd(&gPin[i], pinPa(kPins[i]) + 4); }
+++static unsigned pinIndex(unsigned gpio) { for (unsigned i = 0; i < 4; ++i) if (kPins[i] == gpio) return i; return 0; }
+++
+++/* ---- clocks ---- */
+++/* sheng's test: a branch is running unless it reports CLK_OFF without being under hardware control (bit 1). */
+++static int branchesRun(uint32_t *mask)
+++{
+++    int ok = 1;
+++    uint32_t off = 0;
+++    for (unsigned i = 0; i < 5; ++i) {
+++        const uint32_t v = gcc(kHalts[i]);
+++        if ((v & FM_CLK_OFF) && !(v & 2u)) { ok = 0; off |= 1u << i; }
+++    }
+++    if (mask) *mask = off;
+++    return ok;
+++}
+++/* The DFS level of the SE0 clock source that runs at 19.2 MHz (TCXO, no divider, no M/N), or -1. */
+++static int level19m2(void)
+++{
+++    for (unsigned l = 0; l < 8; ++l) {
+++        const uint32_t cfg = gcc(FM_RCG + 0x1c + 4 * l);
+++        const unsigned src = (cfg >> 8) & 7, mode = (cfg >> 12) & 3, hid = cfg & 0x1f;
+++        if (src == 0 && mode == 0 && hid <= 1) return (int)l; /* hid 0 or 1: divide by 1 */
+++    }
+++    return -1;
+++}
+++
+++/* ---- the GIC: SPI 373 masked (polled engine, no handler in this kernel owns the line) ---- */
+++static void gicMask(unsigned intid)
+++{
+++    wr(&gGicd, FM_GICD + 0x180 + (intid / 32) * 4, 1u << (intid % 32));
+++    for (unsigned n = 0; (rd(&gGicd, FM_GICD) & 0x80000000u) && n < 100000; n++) delay(1); /* GICD_CTLR.RWP */
+++}
+++static int gicEnabled(unsigned intid) { return (rd(&gGicd, FM_GICD + 0x100 + (intid / 32) * 4) >> (intid % 32)) & 1; }
+++
+++/* ---- the engine ---- */
+++static uint32_t ioRd(void *ctx, uint32_t reg) { (void)ctx; return rd(&gSe, FM_SE + reg); }
+++static void ioWr(void *ctx, uint32_t reg, uint32_t value) { (void)ctx; wr(&gSe, FM_SE + reg, value); }
+++static GeniI2c gBus;
+++
+++/* One register read on the bus (32-bit address, 32-bit data, both big-endian on the wire): 1 and *value, or 0. Polled in 20 us steps,
+++ * 20 ms per stage of GeniI2c's cancel/abort ladder, as sheng's transfer(). */
+++static int ampRead(uint8_t address, uint32_t reg, uint32_t *value)
+++{
+++    const uint8_t bytes[4] = {(uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg};
+++    gBus.address = address;
+++    if (geni_i2c_start_read_bytes(&gBus, bytes, 4, 4)) return 0;
+++    for (int stages = 3; stages > 0;) {
+++        for (unsigned i = 0; i < 1000; ++i) {
+++            const int r = geni_i2c_poll(&gBus);
+++            if (r == GeniDone) { *value = __builtin_bswap32(gBus.rx); return 1; }
+++            if (r == GeniFailed) return 0;
+++            delay(20);
+++        }
+++        if (geni_i2c_timeout(&gBus) != GeniPending) return 0;
+++        --stages;
+++    }
+++    return 0;
+++}
+++
+++/* The survey reads the engine only with every branch plainly on (CLK_OFF clear, hardware control or not): a read of an unclocked
+++ * block stalls the bus. */
+++static int branchesOn(void)
+++{
+++    for (unsigned i = 0; i < 5; ++i) if (gcc(kHalts[i]) & FM_CLK_OFF) return 0;
+++    return 1;
+++}
+++
+++static void survey(int *running)
+++{
+++    uint32_t off = 0;
+++    const int run = branchesRun(&off) && branchesOn();
+++    const int level = level19m2();
+++    printf("FUXI AMP: survey vote 0x52008=%#x 0x52010=%#x gpll0=%#x/%#x branches core=%#x s_ahb=%#x m_ahb=%#x core2x=%#x s0=%#x "
+++        "(off mask %#x) rcg cmd=%#x dfsr=%#x level19.2=%d gic_se_en=%d\n", gcc(FM_VOTE1), gcc(FM_VOTE2), gcc(FM_GPLL0_VOTE),
+++        gcc(FM_GPLL0_MODE), gcc(kHalts[0]), gcc(kHalts[1]), gcc(kHalts[2]), gcc(kHalts[3]), gcc(kHalts[4]), off, gcc(FM_RCG),
+++        gcc(FM_RCG + 0x14), level, gicEnabled(FM_INTID_SE));
+++    printf("FUXI AMP: pins gpio0 %#x/%#x gpio1 %#x/%#x gpio183 %#x/%#x gpio182 %#x/%#x (ctl/io)\n", pinCtl(0), pinIo(0), pinCtl(1),
+++        pinIo(1), pinCtl(2), pinIo(2), pinCtl(3), pinIo(3));
+++    if (run) {
+++        printf("FUXI AMP: engine fw=%#x proto=%u if_disable=%#x (%s) clk_cfg=%#x clk_sel=%#x scl=%#x hw0=%#x hw1=%#x m_irq=%#x/%#x\n",
+++            ioRd(NULL, GENI_FW_REVISION), (ioRd(NULL, GENI_FW_REVISION) >> 8) & 0xff, ioRd(NULL, GENI_IF_DISABLE),
+++            (ioRd(NULL, GENI_IF_DISABLE) & 1u) ? "FIFO locked: GSI only" : "FIFO usable", ioRd(NULL, GENI_CLK_CFG), ioRd(NULL, 0x7c),
+++            ioRd(NULL, GENI_SCL_COUNTERS), ioRd(NULL, GENI_HW_PARAM_0), ioRd(NULL, GENI_HW_PARAM_1), ioRd(NULL, GENI_M_IRQ_STATUS),
+++            ioRd(NULL, GENI_M_IRQ_EN));
+++    } else {
+++        printf("FUXI AMP: engine not read: QUP2 clocks off\n");
+++    }
+++    *running = run;
+++}
+++
+++/* Mode 2. Saved state is put back on every exit path. */
+++static void bringUp(int wasRunning)
+++{
+++    uint32_t savedCtl[4], savedIo[4];
+++    for (unsigned i = 0; i < 4; ++i) { savedCtl[i] = pinCtl(i); savedIo[i] = pinIo(i); }
+++    const uint32_t savedVote2 = gcc(FM_VOTE2), savedGpll0 = gcc(FM_GPLL0_VOTE);
+++    int bus = 0, step = 0;
+++    uint32_t config = 0;
+++
+++    /* clocks */
+++    gccWr(FM_GPLL0_VOTE, savedGpll0 | 1u);
+++    for (unsigned i = 0; i < 10000 && !(gcc(FM_GPLL0_MODE) & FM_CLK_OFF); ++i) delay(10); /* bit 31: lock detect */
+++    gccWr(FM_VOTE2, savedVote2 | FM_VOTE2_BITS);
+++    int run = 0;
+++    for (unsigned i = 0; i < 2000 && !(run = branchesRun(NULL)); ++i) delay(10);
+++    step = 1;
+++    if (!run) goto out; /* never touch an engine without running clocks */
+++
+++    /* pins: I2C function 2, 2 mA, pull-up (DT active state) */
+++    for (unsigned i = 0; i < 2; ++i) wr(&gPin[i], pinPa(kPins[i]), 2u << 2 | 0u << 6 | 3u);
+++    step = 2;
+++
+++    /* the engine */
+++    const uint32_t proto = (ioRd(NULL, GENI_FW_REVISION) >> 8) & 0xff;
+++    if (proto != GENI_PROTO_I2C) goto out;
+++    step = 3;
+++    if (!(ioRd(NULL, GENI_CLK_CFG) & 1u) || !ioRd(NULL, GENI_SCL_COUNTERS)) {
+++        const int level = level19m2();
+++        if (level < 0) goto out;
+++        ioWr(NULL, 0x28, ioRd(NULL, 0x28) | 0x7fu);   /* clock gating controls on */
+++        ioWr(NULL, 0xe30, ioRd(NULL, 0xe30) | 0xfu);  /* DMA clock gating controls on */
+++        ioWr(NULL, 0x24, 0x7fu);                      /* default output control */
+++        ioWr(NULL, 0x20, 1u);                         /* force default */
+++        ioWr(NULL, 0xe18, 0);                         /* no GSI events */
+++        ioWr(NULL, 0x7c, (uint32_t)level);
+++        ioWr(NULL, GENI_CLK_CFG, FM_CLK_CFG);
+++        ioWr(NULL, GENI_SCL_COUNTERS, FM_SCL_COUNTERS);
+++    }
+++    step = 4;
+++    gicMask(FM_INTID_SE);
+++    if (gicEnabled(FM_INTID_SE)) goto out;
+++    const GeniIo io = {ioRd, ioWr, NULL};
+++    if (geni_i2c_prepare(&gBus, &io, kAddr[0], &config)) goto out; /* also refuses a GSI-only engine */
+++    bus = 1;
+++    step = 5;
+++
+++    /* the amplifiers, one at a time */
+++    for (unsigned a = 0; a < 2; ++a) {
+++        const unsigned p = pinIndex(kReset[a]);
+++        wr(&gPin[p], pinPa(kReset[a]) + 4, 0);           /* output low */
+++        wr(&gPin[p], pinPa(kReset[a]), 1u << 9);         /* GPIO, output enabled, 2 mA, no pull */
+++        IOSleep(2);
+++        wr(&gPin[p], pinPa(kReset[a]) + 4, 1u << 1);     /* release */
+++        IOSleep(10);
+++        uint32_t devid = 0, revid = 0, st3 = 0, st4 = 0;
+++        const int ok = ampRead(kAddr[a], 0x0, &devid);
+++        const int ok2 = ok && ampRead(kAddr[a], 0x4, &revid) && ampRead(kAddr[a], 0x10018, &st3) && ampRead(kAddr[a], 0x1001c, &st4);
+++        printf("FUXI AMP: amp %c@%#x %s devid=%#x%s revid=%#x irq1_status3=%#x irq1_status4=%#x (geni error %u status %#x done %u "
+++            "failed %u timeouts %u)\n", kName[a], kAddr[a], ok2 ? "answers" : ok ? "partly" : "no answer", devid,
+++            devid == FM_DEVID ? " (CS35L41)" : "", revid, st3, st4, gBus.error, gBus.error_status, gBus.done, gBus.failed, gBus.timeouts);
+++        wr(&gPin[p], pinPa(kReset[a]) + 4, 0);           /* back into reset */
+++    }
+++    step = 6;
+++out:
+++    /* Put back what the boot stages left: reset pins first (still low while their old configuration returns), then the I2C pins and
+++     * the votes. A clock the boot stages had running stays running. */
+++    for (unsigned i = 0; i < 4; ++i) {
+++        wr(&gPin[i], pinPa(kPins[i]) + 4, savedIo[i] & ~1u);
+++        wr(&gPin[i], pinPa(kPins[i]), savedCtl[i]);
+++    }
+++    if (!wasRunning) {
+++        gccWr(FM_VOTE2, savedVote2);
+++        gccWr(FM_GPLL0_VOTE, savedGpll0);
+++    }
+++    printf("FUXI AMP: bring-up stopped at step %d (6 = both read; bus %s, config %#x); pins%s restored\n", step,
+++        bus ? "prepared" : "not prepared", config, wasRunning ? "" : " and votes");
+++}
+++
+++/* Boot argument fuxiamp, else ADT /chosen u32 "fuxi,amp". */
+++static unsigned fm_mode(void)
+++{
+++    unsigned mode = 0;
+++    DTEntry chosen;
+++    const void *prop;
+++    unsigned bytes;
+++    if (PE_parse_boot_argn("fuxiamp", &mode, sizeof(mode))) return mode;
+++    if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+++        SecureDTGetProperty(chosen, "fuxi,amp", &prop, &bytes) == kSuccess && bytes == sizeof(uint32_t))
+++        memcpy(&mode, prop, sizeof(mode));
+++    return mode;
+++}
+++
+++static void ampThread(void *arg, wait_result_t result)
+++{
+++    (void)result;
+++    const unsigned mode = (unsigned)(uintptr_t)arg;
+++    int ok = fm_map(&gGcc0) == KERN_SUCCESS && fm_map(&gGcc1c) == KERN_SUCCESS && fm_map(&gGcc20) == KERN_SUCCESS &&
+++        fm_map(&gGcc50) == KERN_SUCCESS && fm_map(&gSe) == KERN_SUCCESS && fm_map(&gGicd) == KERN_SUCCESS;
+++    for (unsigned i = 0; ok && i < 4; ++i) {
+++        gPin[i].pa = pinPa(kPins[i]) & ~(uint64_t)0x3fffu;
+++        gPin[i].size = 0x4000;
+++        for (unsigned j = 0; j < i; ++j) if (gPin[j].pa == gPin[i].pa) gPin[i].va = gPin[j].va; /* gpio0 and gpio1 share a page */
+++        ok = fm_map(&gPin[i]) == KERN_SUCCESS;
+++    }
+++    if (!ok) {
+++        printf("FUXI AMP: mapping failed\n");
+++    } else {
+++        int running = 0;
+++        survey(&running);
+++        if (mode >= 2) bringUp(running);
+++    }
+++    thread_terminate(current_thread());
+++}
+++
+++/* Called from fuxi_adsp_init (sweet_ufs.c, after the UFS driver is ready). */
+++void fuxi_amp_init(void)
+++{
+++    static int started;
+++    thread_t thread = NULL;
+++    const unsigned mode = fm_mode();
+++    if (!mode || started) return;
+++    started = 1;
+++    if (kernel_thread_start(ampThread, (void *)(uintptr_t)(mode > 2 ? 2 : mode), &thread) != KERN_SUCCESS) {
+++        printf("FUXI AMP: no thread\n");
+++        return;
+++    }
+++    thread_deallocate(thread);
+++    printf("FUXI AMP: started mode %u\n", mode > 2 ? 2 : mode);
 ++}
 ++#endif /* FUXI */
 +--- /dev/null
@@ -8248,6 +9295,241 @@ index 0000000..664c09f
 ++    native_qrtr_stats[0] = gChannel ? 1 : -1;
 ++}
 +--- /dev/null
+++++ b/bsd/dev/GeniI2c.c
++@@ -0,0 +1,232 @@
+++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
+++#include "GeniI2c.h"
+++
+++static uint32_t rd(GeniI2c *g, uint32_t reg) {return g->io.read(g->io.ctx, reg);}
+++static void wr(GeniI2c *g, uint32_t reg, uint32_t value) {g->io.write(g->io.ctx, reg, value);}
+++
+++/* A FIFO depth field (bits 21:16); a field that reads zero takes the smallest depth these engines have. */
+++static uint32_t fifo_words(uint32_t param)
+++{
+++    const uint32_t words = (param >> 16) & 0x3fu;
+++    return words ? words : 16u;
+++}
+++
+++int geni_i2c_prepare(GeniI2c *g, const GeniIo *io, uint8_t address, uint32_t *config)
+++{
+++    for (unsigned i = 0; i < sizeof *g; ++i) ((uint8_t *)g)[i] = 0;
+++    g->io = *io;
+++    g->address = address;
+++    const uint32_t proto = (rd(g, GENI_FW_REVISION) >> 8) & 0xffu, clock = rd(g, GENI_CLK_CFG);
+++    if (config) *config = (proto << 24) | (clock & 0xffffffu);
+++    if (proto != GENI_PROTO_I2C || (rd(g, GENI_IF_DISABLE) & 1u) || !(clock & 1u) || !rd(g, GENI_SCL_COUNTERS)) return -1;
+++    wr(g, GENI_DMA_MODE, 0);
+++    /* 8-bit words, 4 per FIFO word, least significant byte first on the wire. */
+++    wr(g, GENI_TX_PACK0, 0x7f8fe); wr(g, GENI_TX_PACK1, 0xffefe);
+++    wr(g, GENI_RX_PACK0, 0x7f8fe); wr(g, GENI_RX_PACK1, 0xffefe);
+++    wr(g, GENI_BYTE_GRAN, 0);
+++    wr(g, GENI_TX_WATERMARK, 0);
+++    g->tx_fifo_words = fifo_words(rd(g, GENI_HW_PARAM_0));
+++    g->rx_fifo_words = fifo_words(rd(g, GENI_HW_PARAM_1));
+++    wr(g, GENI_M_IRQ_CLEAR, 0xffffffffu);
+++    /* Exactly the bits this core handles: one the boot loader left enabled (RX watermark, RX last) would hold the level line up. */
+++    wr(g, GENI_M_IRQ_EN, GENI_M_IRQ_WANTED);
+++    wr(g, GENI_SE_IRQ_EN, rd(g, GENI_SE_IRQ_EN) | GENI_SE_M_IRQ_EN);
+++    return 0;
+++}
+++
+++/* Starts one write command of length bytes (at most 8); the data goes in when the engine asks for it (TX watermark). */
+++static void write_command(GeniI2c *g, const uint8_t *bytes, uint32_t length, int hold)
+++{
+++    g->tx[0] = g->tx[1] = 0;
+++    for (uint32_t i = 0; i < length; ++i) g->tx[i / 4] |= (uint32_t)bytes[i] << (8 * (i % 4));
+++    g->tx_words = (uint8_t)((length + 3) / 4);
+++    g->length = length;
+++    g->hold = (uint8_t)hold;
+++    wr(g, GENI_TX_LEN, length);
+++    wr(g, GENI_M_CMD0, (GENI_OP_WRITE << 27) | ((uint32_t)g->address << 9) | (hold ? GENI_STOP_STRETCH : 0));
+++    wr(g, GENI_TX_WATERMARK, 1);
+++    g->phase = GeniTxWait;
+++}
+++
+++int geni_i2c_start_write(GeniI2c *g, uint8_t reg, uint8_t value)
+++{
+++    if (g->phase != GeniIdle) return -1;
+++    g->reading = 0; g->reg = reg; g->value = value; g->error = GeniOk;
+++    const uint8_t bytes[2] = {reg, value};
+++    write_command(g, bytes, 2, 0);
+++    return 0;
+++}
+++
+++int geni_i2c_start_read(GeniI2c *g, uint8_t reg)
+++{
+++    if (g->phase != GeniIdle) return -1;
+++    g->reading = 1; g->rx_length = 1; g->reg = reg; g->error = GeniOk;
+++    write_command(g, &reg, 1, 1);
+++    return 0;
+++}
+++
+++int geni_i2c_start_write_bytes(GeniI2c *g, const uint8_t *bytes, uint32_t length)
+++{
+++    if (g->phase != GeniIdle || !length || length > 8) return -1;
+++    g->reading = 0; g->error = GeniOk;
+++    write_command(g, bytes, length, 0);
+++    return 0;
+++}
+++
+++int geni_i2c_start_read_bytes(GeniI2c *g, const uint8_t *bytes, uint32_t length, uint32_t read_length)
+++{
+++    if (g->phase != GeniIdle || !length || length > 4 || !read_length || read_length > 4) return -1;
+++    g->reading = 1; g->rx_length = (uint8_t)read_length; g->error = GeniOk;
+++    write_command(g, bytes, length, 1);
+++    return 0;
+++}
+++
+++int geni_i2c_start_write_buffer(GeniI2c *g, const uint8_t *bytes, uint32_t length)
+++{
+++    if (g->phase != GeniIdle || !bytes || !length) return -1;
+++    g->reading = 0; g->error = GeniOk;
+++    g->tx_buffer = bytes; g->tx_done = 0;
+++    g->tx_words = 0;
+++    g->length = length;
+++    g->hold = 0;
+++    wr(g, GENI_TX_LEN, length);
+++    wr(g, GENI_M_CMD0, (GENI_OP_WRITE << 27) | ((uint32_t)g->address << 9));
+++    wr(g, GENI_TX_WATERMARK, 1);
+++    g->phase = GeniTxWait;
+++    return 0;
+++}
+++
+++int geni_i2c_start_read_buffer(GeniI2c *g, const uint8_t *command, uint32_t command_length, uint8_t *buffer, uint32_t length)
+++{
+++    if (g->phase != GeniIdle || !command || !command_length || command_length > 8 || !buffer || !length) return -1;
+++    g->reading = 1; g->error = GeniOk;
+++    g->rx_buffer = buffer; g->rx_done = 0; g->rx_total = length;
+++    write_command(g, command, command_length, 1);
+++    return 0;
+++}
+++
+++/* Fills the free TX FIFO words (a watermark event that finds the FIFO full writes nothing); the last word in ends the TX wait. */
+++static void feed(GeniI2c *g)
+++{
+++    const uint32_t used = GENI_TX_FIFO_WORDS(rd(g, GENI_TX_FIFO_STATUS));
+++    uint32_t room = used < g->tx_fifo_words ? g->tx_fifo_words - used : 0;
+++    while (room && g->tx_done < g->length) {
+++        uint32_t word = 0;
+++        for (unsigned k = 0; k < 4 && g->tx_done < g->length; ++k) word |= (uint32_t)g->tx_buffer[g->tx_done++] << (8 * k);
+++        wr(g, GENI_TX_FIFO, word);
+++        --room;
+++    }
+++    if (g->tx_done == g->length) {
+++        wr(g, GENI_TX_WATERMARK, 0);
+++        g->phase = GeniWriteDone;
+++    }
+++}
+++
+++/* Empties the RX FIFO into the read buffer; words past the requested length are dropped. */
+++static void drain(GeniI2c *g)
+++{
+++    for (uint32_t words = GENI_RX_FIFO_WORDS(rd(g, GENI_RX_FIFO_STATUS)); words; --words) {
+++        const uint32_t word = rd(g, GENI_RX_FIFO);
+++        for (unsigned k = 0; k < 4 && g->rx_buffer && g->rx_done < g->rx_total; ++k) g->rx_buffer[g->rx_done++] = (uint8_t)(word >> (8 * k));
+++    }
+++}
+++
+++static int finish(GeniI2c *g, int error, uint32_t status)
+++{
+++    g->phase = GeniIdle;
+++    wr(g, GENI_TX_WATERMARK, 0);
+++    if (g->rx_buffer) {
+++        /* A failed or cancelled read can leave words behind; the next transfer must not take them. */
+++        if (error) {uint8_t *keep = g->rx_buffer; g->rx_buffer = 0; drain(g); g->rx_buffer = keep;}
+++        wr(g, GENI_M_IRQ_EN, GENI_M_IRQ_WANTED);
+++    }
+++    g->tx_buffer = 0; g->rx_buffer = 0;
+++    if (!error) {g->done++; return GeniDone;}
+++    g->error = (uint8_t)error;
+++    g->error_status = status;
+++    g->failed++;
+++    return GeniFailed;
+++}
+++
+++int geni_i2c_event(GeniI2c *g, uint32_t status)
+++{
+++    if (!status) return GeniPending;
+++    switch (g->phase) {
+++    case GeniIdle:
+++        g->stray++;
+++        return GeniPending;
+++    case GeniCancelling:
+++        if (status & GENI_M_CMD_CANCEL) return finish(g, GeniErrTimeout, g->error_status);
+++        return GeniPending;
+++    case GeniAborting:
+++        if (status & GENI_M_CMD_ABORT) return finish(g, GeniErrTimeout, g->error_status);
+++        return GeniPending;
+++    default:
+++        break;
+++    }
+++    /* A failed command also ends with CMD_DONE; the error bits decide. */
+++    if (status & GENI_M_ERRORS) return finish(g, GeniErrBus, status);
+++    if (g->phase == GeniTxWait) {
+++        if ((status & GENI_M_TX_WATERMARK) && g->tx_buffer) feed(g);
+++        else if (status & GENI_M_TX_WATERMARK) {
+++            for (unsigned i = 0; i < g->tx_words; ++i) wr(g, GENI_TX_FIFO, g->tx[i]);
+++            wr(g, GENI_TX_WATERMARK, 0);
+++            g->phase = GeniWriteDone;
+++        }
+++        if (!(status & GENI_M_CMD_DONE)) return GeniPending;
+++        if (g->phase == GeniTxWait) return finish(g, GeniErrState, status);  /* done before the data went in */
+++    }
+++    if (g->phase == GeniReadDone && g->rx_buffer) {
+++        drain(g);
+++        if (!(status & GENI_M_CMD_DONE)) return GeniPending;
+++        drain(g);   /* the last words can land after the status was read */
+++        return g->rx_done == g->rx_total ? finish(g, GeniOk, 0) : finish(g, GeniErrNoData, status);
+++    }
+++    if (!(status & GENI_M_CMD_DONE)) return GeniPending;
+++    if (g->phase == GeniWriteDone) {
+++        if (!g->reading) return finish(g, GeniOk, 0);
+++        if (g->rx_buffer) {
+++            const uint32_t mark = g->rx_fifo_words > 1 ? g->rx_fifo_words - 1 : 1;
+++            wr(g, GENI_RX_WATERMARK, mark);
+++            wr(g, GENI_RX_RFR_WATERMARK, g->rx_fifo_words);
+++            wr(g, GENI_M_IRQ_EN, GENI_M_IRQ_WANTED | GENI_M_RX_WATERMARK | GENI_M_RX_LAST);
+++            wr(g, GENI_RX_LEN, g->rx_total);
+++        } else wr(g, GENI_RX_LEN, g->rx_length);
+++        wr(g, GENI_M_CMD0, (GENI_OP_READ << 27) | ((uint32_t)g->address << 9));
+++        g->phase = GeniReadDone;
+++        return GeniPending;
+++    }
+++    /* GeniReadDone */
+++    if (!(rd(g, GENI_RX_FIFO_STATUS) & 0x1ffffffu)) return finish(g, GeniErrNoData, status);
+++    g->rx = rd(g, GENI_RX_FIFO);
+++    g->data = (uint8_t)g->rx;
+++    return finish(g, GeniOk, 0);
+++}
+++
+++int geni_i2c_poll(GeniI2c *g)
+++{
+++    const uint32_t status = rd(g, GENI_M_IRQ_STATUS);
+++    if (status) wr(g, GENI_M_IRQ_CLEAR, status);
+++    return g->phase == GeniIdle ? GeniPending : geni_i2c_event(g, status);
+++}
+++
+++int geni_i2c_timeout(GeniI2c *g)
+++{
+++    switch (g->phase) {
+++    case GeniIdle:
+++        return GeniPending;
+++    case GeniCancelling:
+++        wr(g, GENI_M_CMD_CTRL, GENI_CMD_CTRL_ABORT);
+++        g->phase = GeniAborting;
+++        return GeniPending;
+++    case GeniAborting:
+++        return finish(g, GeniErrTimeout, g->error_status);
+++    default:
+++        g->timeouts++;
+++        g->error_status = rd(g, GENI_M_IRQ_STATUS);
+++        wr(g, GENI_TX_WATERMARK, 0);
+++        wr(g, GENI_M_CMD_CTRL, GENI_CMD_CTRL_CANCEL);
+++        g->phase = GeniCancelling;
+++        return GeniPending;
+++    }
+++}
++--- /dev/null
 ++++ b/bsd/dev/QcomSmem.h
 +@@ -0,0 +1,51 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
@@ -9000,6 +10282,129 @@ index 0000000..664c09f
 ++int fuxi_adsp_battery_wanted(void);
 ++/* 1 and the latest plausible reading (none yet: 0, and SweetBattery keeps its fallback). */
 ++int fuxi_adsp_battery_reading(FuxiAdspBattery *out);
+++
+++#ifdef __cplusplus
+++}
+++#endif
+++#endif
++--- /dev/null
+++++ b/bsd/dev/GeniI2c.h
++@@ -0,0 +1,120 @@
+++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
+++/* One register transfer at a time on a Qualcomm GENI serial engine running the I2C firmware, as an event-driven state machine: the owner
+++ * starts a transfer, then feeds the engine's M_IRQ status (from its interrupt handler or a timer poll) until the transfer is done or
+++ * failed, and calls the timeout step when its deadline passes. Nothing here waits or spins: every call does a few register accesses and
+++ * returns. A register write is one 2-byte write {register, value}; a register read is a 1-byte write {register} that holds the stop
+++ * condition, then a 1-byte read. A transfer that stops answering is cancelled, then aborted, as the engine documents. Buffered transfers
+++ * move any length through the FIFO: each TX watermark event fills the free FIFO words, each RX watermark or last event empties it. */
+++#ifndef GENI_I2C_H
+++#define GENI_I2C_H
+++#include <stdint.h>
+++#ifdef __cplusplus
+++extern "C" {
+++#endif
+++
+++/* Serial engine registers (offsets in the engine's 16 KiB window). */
+++#define GENI_FW_REVISION 0x68u
+++#define GENI_IF_DISABLE 0x64u
+++#define GENI_CLK_CFG 0x48u
+++#define GENI_BYTE_GRAN 0x254u
+++#define GENI_DMA_MODE 0x258u
+++#define GENI_TX_PACK0 0x260u
+++#define GENI_TX_PACK1 0x264u
+++#define GENI_TX_LEN 0x26cu
+++#define GENI_RX_LEN 0x270u
+++#define GENI_SCL_COUNTERS 0x278u
+++#define GENI_RX_PACK0 0x284u
+++#define GENI_RX_PACK1 0x288u
+++#define GENI_M_CMD0 0x600u
+++#define GENI_M_CMD_CTRL 0x604u
+++#define GENI_M_IRQ_STATUS 0x610u
+++#define GENI_M_IRQ_EN 0x614u
+++#define GENI_M_IRQ_CLEAR 0x618u
+++#define GENI_TX_FIFO 0x700u
+++#define GENI_RX_FIFO 0x780u
+++#define GENI_TX_FIFO_STATUS 0x800u
+++#define GENI_RX_FIFO_STATUS 0x804u
+++#define GENI_TX_WATERMARK 0x80cu
+++#define GENI_RX_WATERMARK 0x810u
+++#define GENI_RX_RFR_WATERMARK 0x814u
+++#define GENI_SE_IRQ_EN 0xe1cu
+++#define GENI_HW_PARAM_0 0xe24u          /* bits 21:16 TX FIFO depth in words */
+++#define GENI_HW_PARAM_1 0xe28u          /* bits 21:16 RX FIFO depth in words */
+++#define GENI_TX_FIFO_WORDS(status) ((status) & 0x0fffffffu)
+++#define GENI_RX_FIFO_WORDS(status) ((status) & 0x01ffffffu)
+++
+++/* M_IRQ bits. */
+++#define GENI_M_CMD_DONE (1u << 0)
+++#define GENI_M_CMD_OVERRUN (1u << 1)
+++#define GENI_M_ILLEGAL_CMD (1u << 2)
+++#define GENI_M_CMD_FAILURE (1u << 3)
+++#define GENI_M_CMD_CANCEL (1u << 4)
+++#define GENI_M_CMD_ABORT (1u << 5)
+++#define GENI_M_GP_IRQ (0x3fu << 9)      /* I2C: NACK, bus error, arbitration lost and the like */
+++#define GENI_M_RX_WATERMARK (1u << 26)
+++#define GENI_M_RX_LAST (1u << 27)
+++#define GENI_M_TX_WATERMARK (1u << 30)
+++#define GENI_M_ERRORS (GENI_M_CMD_OVERRUN | GENI_M_ILLEGAL_CMD | GENI_M_CMD_FAILURE | GENI_M_GP_IRQ)
+++/* What the engine is set to raise its line for. */
+++#define GENI_M_IRQ_WANTED (GENI_M_CMD_DONE | GENI_M_ERRORS | GENI_M_CMD_CANCEL | GENI_M_CMD_ABORT | GENI_M_TX_WATERMARK)
+++#define GENI_SE_M_IRQ_EN (1u << 2)
+++#define GENI_CMD_CTRL_ABORT (1u << 1)
+++#define GENI_CMD_CTRL_CANCEL (1u << 2)
+++#define GENI_PROTO_I2C 3u
+++#define GENI_OP_WRITE 1u
+++#define GENI_OP_READ 2u
+++#define GENI_STOP_STRETCH (1u << 2)
+++
+++typedef struct {
+++    uint32_t (*read)(void *ctx, uint32_t reg);
+++    void (*write)(void *ctx, uint32_t reg, uint32_t value);
+++    void *ctx;
+++} GeniIo;
+++
+++enum {GeniIdle, GeniTxWait, GeniWriteDone, GeniReadDone, GeniCancelling, GeniAborting};
+++enum {GeniPending = 0, GeniDone = 1, GeniFailed = 2};
+++/* Why the last transfer failed. */
+++enum {GeniOk = 0, GeniErrBusy = 1, GeniErrBus = 2, GeniErrTimeout = 3, GeniErrNoData = 4, GeniErrState = 5};
+++
+++typedef struct {
+++    GeniIo io;
+++    uint8_t address, phase, reading, hold;
+++    uint8_t reg, value, error, data;
+++    uint8_t tx_words, rx_length;
+++    uint32_t tx[2], length;
+++    uint32_t rx;                     /* the bytes read, first byte in bits 7:0 */
+++    uint32_t error_status;           /* the M_IRQ status of the last failure */
+++    uint32_t done, failed, timeouts, stray;
+++    /* Buffered transfers: the owner's buffers (its own until the transfer ends), the bytes moved so far, the FIFO depths in words. */
+++    const uint8_t *tx_buffer;
+++    uint8_t *rx_buffer;
+++    uint32_t tx_done, rx_done, rx_total;
+++    uint32_t tx_fifo_words, rx_fifo_words;
+++} GeniI2c;
+++
+++/* Checks the engine runs the I2C firmware with its clock and timing set (the boot loader's), selects FIFO mode with 8-bit packing and
+++ * enables the interrupts this core needs. Returns 0, or -1 when the engine is not usable. *config: proto << 24 | M_CLK_CFG bits 23:0. */
+++int geni_i2c_prepare(GeniI2c *g, const GeniIo *io, uint8_t address, uint32_t *config);
+++int geni_i2c_start_write(GeniI2c *g, uint8_t reg, uint8_t value);
+++int geni_i2c_start_read(GeniI2c *g, uint8_t reg);
+++/* Multi-byte forms for devices with wider registers: write 1..8 bytes; or write 1..4 bytes (holding the stop condition), then read 1..4
+++ * bytes into g->rx. */
+++int geni_i2c_start_write_bytes(GeniI2c *g, const uint8_t *bytes, uint32_t length);
+++int geni_i2c_start_read_bytes(GeniI2c *g, const uint8_t *bytes, uint32_t length, uint32_t read_length);
+++/* Buffered forms of any length: write length bytes from bytes; or write command_length (1..8) bytes holding the stop condition, then
+++ * read length bytes into buffer. RX watermark and last interrupts are enabled for the read only. */
+++int geni_i2c_start_write_buffer(GeniI2c *g, const uint8_t *bytes, uint32_t length);
+++int geni_i2c_start_read_buffer(GeniI2c *g, const uint8_t *command, uint32_t command_length, uint8_t *buffer, uint32_t length);
+++/* Feeds M_IRQ status bits (already cleared by whoever read them). Returns GeniPending, GeniDone (read value in g->data) or GeniFailed. */
+++int geni_i2c_event(GeniI2c *g, uint32_t status);
+++/* Reads and clears the status itself, then as geni_i2c_event (for a timer poll; the interrupt handler does the same in its context). */
+++int geni_i2c_poll(GeniI2c *g);
+++/* The owner's deadline for the current step passed: a pending transfer is cancelled, a cancel that is not acknowledged is aborted and an
+++ * abort that is not acknowledged ends the transfer anyway. Returns as geni_i2c_event. */
+++int geni_i2c_timeout(GeniI2c *g);
+++static inline int geni_i2c_busy(const GeniI2c *g) {return g->phase != GeniIdle;}
 ++
 ++#ifdef __cplusplus
 ++}
