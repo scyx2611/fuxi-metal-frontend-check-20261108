@@ -1,9 +1,9 @@
 diff --git a/docs-lanes/adsp.md b/docs-lanes/adsp.md
 new file mode 100644
-index 0000000..17d266f
+index 0000000..92ac167
 --- /dev/null
 +++ b/docs-lanes/adsp.md
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,73 @@
 +# Audio DSP and battery manager (`fuxiadsp`)
 +
 +Patch 0117 (`tools/sync-fuxi-adsp.py`, canonical sources `xnu/fuxi-adsp/`) starts the audio DSP (ADSP, LPASS) from XNU
@@ -18,7 +18,8 @@ index 0000000..17d266f
 +|---|---|
 +| 0 | nothing |
 +| 1 | survey only: maps SMEM, TCSR, IPCC, AOSS, the apps RSC and the GIC distributor, reads the SMEM partition and items, the DSP's SMP2P state, the AOSS link words, the RSC id and the GIC enables of SPI 229/5, logs one `FUXI ADSP: survey` line; writes nothing |
-+| 2 | also starts the DSP and brings up SMP2P, GLINK, the IPC router's service locator and the battery manager client |
++| 2 | also starts the DSP and brings up SMP2P, GLINK, the IPC router's service locator and the battery manager client (log only) |
++| 3 | as 2, and SweetBattery publishes the battery manager's readings to powerd (phase 2) |
 +
 +`fuxiadsp=2` is refused (survey only) when `fuxiwlan` is set: both drive the apps RSC (`fuxi_rpmh_arb.h` is not wired
 +into `fuxi_wlan.c` yet, see audio.md "RPMh serialization").
@@ -50,9 +51,21 @@ index 0000000..17d266f
 +
 +`fuxi_adsp_battery.c` runs ShengBattmgr's cycle (one request in flight, 2 s per request, a refresh every 60 s and at
 +each notification) in a thread call and logs each finished cycle as `FUXI BATTERY: percent=... mV=... mA=... temp=...`
-+(the first three and every tenth also as `FUXI BATTERY: raw ...`). Nothing is published to powerd yet: SweetBattery
-+keeps its 100 % default until the Fuxi readings have been checked against Android (single cell; sheng adds two
-+gauges). Phase 2 replaces SweetBattery with an IOPMPowerSource fed from these snapshots, as ShengBattery.cpp does.
++(the first three and every tenth also as `FUXI BATTERY: raw ...`). With mode 2 nothing is published to powerd:
++SweetBattery keeps its 100 % default, so the Fuxi readings can be checked against Android first (single cell; sheng adds
++two gauges, and ShengBattmgr falls back to the battery's capacity property when the gauge pair does not answer).
++
++## Phase 2: SweetBattery from the DSP (mode 3)
++
++`iokit/Kernel/arm/SweetBattery.cpp` (0062) gains a third source (`xnu/fuxi-adsp/SweetBattery.cpp`, carried by 0117;
++`bsd/dev/fuxi_adsp_battery.h` is the shared plain-data reading). With `fuxiadsp=3` it starts its timer even without
++`sweetbattery=1`, polls every 10 s until the first reading and every 30 s after, and publishes the latest plausible
++reading: charge known, 2.5-4.8 V when the voltage was read, the percentage at least 1 (a misread 0 must not make iOS shut
++down; the PMIC cuts off an empty cell by itself), never a critical level, mAh against the reported full / design
++capacity (4500 mAh when not reported), the charger state only when known (an unknown state never publishes a
++disconnect), temperature when valid, cycles, time remaining. Until a reading exists, and with modes 0-2, the source
++behaves exactly as before. Log: `FUXI BATTERY: first reading for SweetBattery: N%`, then
++`SWEET BATTERY: ADSP battery manager, N% ...` once.
 +
 +## Log lines
 +
@@ -66,10 +79,10 @@ index 0000000..17d266f
 +- `FUXI ADSP: stage=... ipcc=... glink in=.. out=.. qrtr ...` every 30 s ten times, then every 10 min
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..39b98f0
+index 0000000..f97cbe3
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,142 @@
 +#!/usr/bin/env python3
 +"""Generate/check patch 0117 (fuxi-adsp): the audio DSP owner (boot-arg fuxiadsp) and its battery manager client.
 +
@@ -77,6 +90,8 @@ index 0000000..39b98f0
 +ShengBattmgr.c/h, ShengAdsp.h, ShengQrtr.c) are UniXNU-sheng package/ files (6880068) copied unchanged, with that
 +repository's LICENSE as LICENSE.UniXNU-sheng. Every file goes to bsd/dev/ as a new file; the .c files are added to
 +bsd/conf/files right after bsd/dev/sweet_usb.c (the last of the board drivers, unchanged by any later patch).
++xnu/fuxi-adsp/SweetBattery.cpp is iokit/Kernel/arm/SweetBattery.cpp as 0062 creates it (no later patch touches it) plus the
++fuxiadsp=3 source; 0117 carries that difference.
 +--check also verifies that no earlier patch creates these paths and that the build-list context is what the earlier
 +patches leave (their bsd/conf/files hunks, merged).
 +"""
@@ -91,7 +106,8 @@ index 0000000..39b98f0
 +SOURCES = ('fuxi_adsp.c', 'fuxi_adsp_fw.c', 'fuxi_adsp_battery.c', 'QcomSmem.c', 'QcomSmp2p.c', 'QcomGlink.c', 'QcomMdt.c',
 +           'QcomQmp.c', 'QcomRpmh.c', 'QcomQrtr.c', 'FatVolume.c', 'ShengBattmgr.c', 'ShengQrtr.c')
 +HEADERS = ('QcomSmem.h', 'QcomSmp2p.h', 'QcomGlink.h', 'QcomMdt.h', 'QcomQmp.h', 'QcomRpmh.h', 'QcomScm.h', 'QcomQrtr.h',
-+           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h')
++           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h', 'fuxi_adsp_battery.h')
++MODIFIED = {'iokit/Kernel/arm/SweetBattery.cpp': ('0062-sweet-touch-power-battery.patch', 'SweetBattery.cpp')}
 +# bsd/dev/LICENSE.UniXNU-sheng already comes with 0098 (the GPU fence interrupt is adapted from sheng too); --check
 +# verifies that the local copy is the same text.
 +LICENSE = 'LICENSE.UniXNU-sheng'
@@ -122,7 +138,35 @@ index 0000000..39b98f0
 +        assert data.endswith(b'\n'), name + ' lacks a final newline'
 +    new = ''.join(''.join(difflib.unified_diff([], (SRC / name).read_text().splitlines(True), fromfile='/dev/null',
 +                                               tofile='b/bsd/dev/' + name)) for name in FILES)
-+    return build_list_hunk() + new
++    changed = ''
++    for path, (_, local) in MODIFIED.items():
++        data = (SRC / local).read_bytes()
++        assert b'\r' not in data and data.endswith(b'\n'), local
++        changed += ''.join(difflib.unified_diff(original(path).splitlines(True), (SRC / local).read_text().splitlines(True),
++                                                fromfile='a/' + path, tofile='b/' + path))
++    return build_list_hunk() + new + changed
++
++
++def original(path):
++    """The file as the one earlier patch that creates it leaves it (asserting that no other earlier patch touches it)."""
++    creator = MODIFIED[path][0]
++    text = None
++    for prior in sorted(PATCH.parent.glob('*.patch')):
++        if prior.name >= PATCH.name:
++            break
++        for chunk in re.split(r'(?=^--- (?:a/|/dev/null))', prior.read_text(errors='surrogateescape'), flags=re.M):
++            if not re.search(r'^\+\+\+ b/' + re.escape(path) + '$', chunk, re.M):
++                continue
++            assert prior.name == creator and chunk.startswith('--- /dev/null'), prior.name + ' touches ' + path
++            body = chunk.split('\n@@', 1)[1].split('\n', 1)[1]
++            lines = body.split('\n')
++            if lines and lines[-1] == '':
++                lines.pop()
++            lines = re.split(r'^diff --git ', '\n'.join(lines), flags=re.M)[0].split('\n')
++            assert all(x.startswith('+') for x in lines if x), path
++            text = ''.join(x[1:] + '\n' for x in lines if x)
++    assert text, creator + ' does not create ' + path
++    return text
 +
 +
 +def prior_region():
@@ -2955,12 +2999,430 @@ index 0000000..5633228
 +    gChannel = sheng_adsp_channel("IPCRTR", 1024, 8, 0, &client, NULL);
 +    native_qrtr_stats[0] = gChannel ? 1 : -1;
 +}
+diff --git a/xnu/fuxi-adsp/SweetBattery.cpp b/xnu/fuxi-adsp/SweetBattery.cpp
+new file mode 100644
+index 0000000..fb240db
+--- /dev/null
++++ b/xnu/fuxi-adsp/SweetBattery.cpp
+@@ -0,0 +1,412 @@
++/*
++ * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
++ * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
++ * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
++ * See report.md for binary evidence, register provenance and integration.
++ * FUXI fuxiadsp=3 (ADT /chosen fuxi,adsp=3): the battery manager on the audio DSP
++ * (bsd/dev/fuxi_adsp_battery.c) feeds this source once it has a plausible
++ * reading; until then, and if the DSP never answers, the fallback stays.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/pwr_mgt/IOPMPowerSource.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <pexpert/pexpert.h>
++/* bsd/dev/sweet_spmi.c */
++extern "C" int sweet_spmi_init(void);
++extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++#if defined(FUXI)
++#include "../../../bsd/dev/fuxi_adsp_battery.h"
++#endif
++
++class SweetBattery : public IOPMPowerSource {
++	OSDeclareDefaultStructors(SweetBattery);
++public:
++	bool init(OSDictionary *dictionary = NULL) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++private:
++	IOWorkLoop *fLoop;
++	IOTimerEventSource *fTimer;
++	bool fTimerAdded, fRunning, fReal, fAdsp, fAdspShown;
++	int fLastMode;
++	void putNumber(const char *key, UInt32 value);
++	void putBool(const char *key, bool value);
++	void publish(unsigned percent, unsigned mv, int ma, bool external,
++	    bool capable, bool charging, bool full, bool measured, bool currentValid);
++	void poll(void);
++#if defined(FUXI)
++	void publishAdsp(const FuxiAdspBattery &b);
++#endif
++	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
++	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
++	static bool readWord(unsigned address, uint16_t *value);
++	static unsigned estimatePercent(unsigned mv);
++};
++OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
++
++bool
++SweetBattery::init(OSDictionary *dictionary)
++{
++	/* IOCatalogue calls init(dictionary). This XNU's IOPMPowerSource only
++	 * overrides init(void): explicitly run it to allocate its PS dictionary
++	 * and symbols, then copy the matching personality into the registry. */
++	if (!IOPMPowerSource::init()) {
++		return false;
++	}
++	fLoop = NULL;
++	fTimer = NULL;
++	fTimerAdded = fRunning = fReal = fAdsp = fAdspShown = false;
++	if (dictionary) {
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
++		if (!it) {
++			return false;
++		}
++		OSObject *object;
++		bool ok = true;
++		while ((object = it->getNextObject())) {
++			const OSSymbol *key = OSDynamicCast(OSSymbol, object);
++			if (!key || !setProperty(key, dictionary->getObject(key))) {
++				ok = false;
++				break;
++			}
++		}
++		it->release();
++		if (!ok) {
++			return false;
++		}
++	}
++	fLastMode = -1;
++	return true;
++}
++
++void
++SweetBattery::putNumber(const char *key, UInt32 value)
++{
++	const OSSymbol *symbol = OSSymbol::withCString(key);
++	OSNumber *number = OSNumber::withNumber(value, 32);
++	if (symbol && number) {
++		setPSProperty(symbol, number);
++	}
++	OSSafeReleaseNULL(number);
++	OSSafeReleaseNULL(symbol);
++}
++
++void
++SweetBattery::putBool(const char *key, bool value)
++{
++	const OSSymbol *symbol = OSSymbol::withCString(key);
++	if (symbol) {
++		setPSProperty(symbol, value ? kOSBooleanTrue : kOSBooleanFalse);
++		symbol->release();
++	}
++}
++
++void
++SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
++    bool capable, bool charging, bool full, bool measured, bool currentValid)
++{
++	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
++	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	setBatteryInstalled(true);
++	setCurrentCapacity(capacity);
++	setMaxCapacity(5020);
++	setExternalConnected(external);
++	setExternalChargeCapable(capable);
++	setIsCharging(charging);
++	setAtWarnLevel(false);
++	/* An uncalibrated voltage curve must not assert a critical shutdown. */
++	setAtCriticalLevel(false);
++	setVoltage(mv);
++	setAmperage(ma);
++	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
++	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++	putBool("FullyCharged", full);
++	putBool("AppleRawExternalConnected", external);
++	putNumber("AppleRawCurrentCapacity", capacity);
++	putNumber("AppleRawMaxCapacity", 5020);
++	putNumber("DesignCapacity", 5020);
++	putNumber("InstantAmperage", (UInt32)ma);
++	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
++	putNumber("Temperature", 2500);
++	putBool("SweetBatteryHardwareSampleValid", measured);
++	putBool("SweetBatteryCurrentValid", currentValid);
++	putBool("SweetBatterySOCEstimated", measured);
++	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatteryFallback", !measured);
++	putNumber("SweetBatteryPercent", percent);
++
++	/* IOPMCopyBatteryInfo's per-source compatibility dictionary. */
++	OSDictionary *legacy = OSDictionary::withCapacity(7);
++	if (legacy) {
++		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
++		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
++		    kIOBatteryFlagsKey};
++		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
++		    (charging ? kIOBatteryCharge : 0))};
++		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
++			OSNumber *number = OSNumber::withNumber(values[i], 32);
++			if (number) {
++				legacy->setObject(keys[i], number);
++				number->release();
++			}
++		}
++		setLegacyIOBatteryInfo(legacy);
++		legacy->release();
++	}
++	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
++	int mode = measured ? 1 : 0;
++	if (mode != fLastMode) {
++		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
++		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    percent, mv, external, charging);
++		fLastMode = mode;
++	}
++}
++
++/* Keep the proven single-byte observer command. Read two matching whole
++ * words to reject most torn ADC samples without writing the QG HOLD bit.
++ * This is a bounded consistency check, not a hardware snapshot guarantee. */
++bool
++SweetBattery::readWord(unsigned address, uint16_t *value)
++{
++	uint16_t previous = 0;
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		uint8_t lo, hi;
++		if (sweet_spmi_read(0, address, &lo) ||
++		    sweet_spmi_read(0, address + 1, &hi)) {
++			return false;
++		}
++		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
++		if (attempt && next == previous) {
++			*value = next;
++			return true;
++		}
++		previous = next;
++	}
++	return false;
++}
++
++unsigned
++SweetBattery::estimatePercent(unsigned mv)
++{
++	/* Generic single-cell curve, intentionally NOT advertised as QG SOC.
++	 * Load sag, temperature, aging and charging introduce large errors. */
++	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
++	    4000, 4100, 4200, 4350};
++	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
++	if (mv <= volts[0]) {
++		return soc[0];
++	}
++	for (unsigned i = 1; i < sizeof(volts) / sizeof(volts[0]); ++i) {
++		if (mv < volts[i]) {
++			return soc[i - 1] + (mv - volts[i - 1]) * (soc[i] - soc[i - 1]) /
++			       (volts[i] - volts[i - 1]);
++		}
++	}
++	return 100;
++}
++
++#if defined(FUXI)
++void
++SweetBattery::publishAdsp(const FuxiAdspBattery &b)
++{
++	/* mAh as publish() uses them (powerd computes C*100/M); Xiaomi 13: 4500 mAh. */
++	const unsigned design = b.design_mah > 0 ? (unsigned)b.design_mah : 4500u;
++	const unsigned full = b.full_mah > 0 ? (unsigned)b.full_mah : design;
++	const unsigned capacity = (full * (unsigned)b.percent + 50u) / 100u;
++	setBatteryInstalled(b.present != 0);
++	setCurrentCapacity(capacity);
++	setMaxCapacity(full);
++	/* An unknown charger state must not publish a disconnect. */
++	if (b.external_known) {
++		setExternalConnected(b.external != 0);
++		setExternalChargeCapable(b.external != 0);
++		putBool("AppleRawExternalConnected", b.external != 0);
++	}
++	if (b.external_known && b.status_known) {
++		setIsCharging(b.charging != 0);
++		putBool("FullyCharged", b.fully_charged != 0);
++	}
++	setAtWarnLevel(false);
++	/* Never a critical shutdown from this path: the PMIC cuts off an empty cell. */
++	setAtCriticalLevel(false);
++	setVoltage(b.voltage_mv > 0 ? (unsigned)b.voltage_mv : 0);
++	setAmperage(b.current_ma);
++	const int minutes = b.charging ? b.minutes_to_full : b.minutes_to_empty;
++	setTimeRemaining(minutes >= 0 ? minutes : -1);
++	if (b.cycles > 0) {
++		setCycleCount((unsigned)b.cycles);
++	}
++	putNumber("AppleRawCurrentCapacity", b.raw_mah > 0 ? (UInt32)b.raw_mah : capacity);
++	putNumber("AppleRawMaxCapacity", full);
++	putNumber("NominalChargeCapacity", full);
++	putNumber("DesignCapacity", design);
++	putNumber("InstantAmperage", (UInt32)b.current_ma);
++	putNumber("Temperature", b.temperature_valid ? (UInt32)b.temperature : 2500u);
++	putBool("SweetBatteryHardwareSampleValid", true);
++	putBool("SweetBatteryCurrentValid", true);
++	putBool("SweetBatterySOCEstimated", false);
++	putBool("SweetBatteryTemperatureEstimated", !b.temperature_valid);
++	putBool("SweetBatteryFallback", false);
++	putBool("FuxiAdspBattery", true);
++	putNumber("SweetBatteryPercent", (UInt32)b.percent);
++	OSDictionary *legacy = OSDictionary::withCapacity(7);
++	if (legacy) {
++		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
++		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
++		    kIOBatteryFlagsKey};
++		UInt32 values[] = {capacity, full, (UInt32)(b.voltage_mv > 0 ? b.voltage_mv : 0), (UInt32)b.current_ma,
++		    (UInt32)(b.cycles > 0 ? b.cycles : 0),
++		    (UInt32)((b.present ? kIOBatteryInstalled : 0) | (b.external ? kIOBatteryChargerConnect : 0) |
++		    (b.charging ? kIOBatteryCharge : 0))};
++		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
++			OSNumber *number = OSNumber::withNumber(values[i], 32);
++			if (number) {
++				legacy->setObject(keys[i], number);
++				number->release();
++			}
++		}
++		setLegacyIOBatteryInfo(legacy);
++		legacy->release();
++	}
++	updateStatus();
++	fAdspShown = true;
++	if (fLastMode != 2) {
++		IOLog("SWEET BATTERY: ADSP battery manager, %d%% %dmV %dmA external=%d charging=%d\n",
++		    b.percent, b.voltage_mv, b.current_ma, b.external, b.charging);
++		fLastMode = 2;
++	}
++}
++#endif
++
++void
++SweetBattery::poll(void)
++{
++#if defined(FUXI)
++	FuxiAdspBattery adsp;
++	if (fAdsp && fuxi_adsp_battery_reading(&adsp)) {
++		publishAdsp(adsp);
++		return;
++	}
++#endif
++	uint8_t type, present, usb, path, charger, error, temperature;
++	uint16_t rawVoltage;
++	bool valid = fReal &&
++	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
++	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
++	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
++	    !sweet_spmi_read(0, 0x1310, &usb) &&
++	    !sweet_spmi_read(0, 0x110b, &path) &&
++	    !sweet_spmi_read(0, 0x1006, &charger) &&
++	    !sweet_spmi_read(0, 0x1007, &error) &&
++	    !sweet_spmi_read(0, 0x100d, &temperature);
++	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
++	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
++	valid = valid && mv >= 2800 && mv <= 4600;
++	if (!valid) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	bool external = (usb & 0x10u) != 0;
++	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
++	unsigned state = charger & 7u;
++	bool charging = capable && state >= 1 && state <= 4 &&
++	    !(error & 2u) && !(temperature & 0x0cu);
++	/* Inhibit (0) does not by itself establish full capacity. */
++	bool full = external && state == 5 && !(error & 2u);
++	int ma = 0;
++	uint8_t subtype;
++	uint16_t rawCurrent;
++	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
++	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
++	    rawCurrent != 0x8000;
++	if (currentValid) {
++		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
++		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
++		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
++	}
++	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
++	    charging, full, true, currentValid);
++}
++
++void
++SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
++	if (self && self->fRunning) {
++		self->poll();
++		/* Every 10 s until the DSP's first reading arrives, then every 30 s. */
++		sender->setTimeoutMS(self->fAdsp && !self->fAdspShown ? 10000 : 30000);
++	}
++}
++
++bool
++SweetBattery::start(IOService *provider)
++{
++	if (!IOPMPowerSource::start(provider)) {
++		return false;
++	}
++	int real = 0;
++	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++	fReal = real == 1 && sweet_spmi_init() == 0;
++#if defined(FUXI)
++	fAdsp = fuxi_adsp_battery_wanted() != 0;
++#endif
++	/* Publish a complete source BEFORE registerService wakes powerd. */
++	poll();
++	if (fReal || fAdsp) {
++		fLoop = IOWorkLoop::workLoop();
++		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
++		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
++			fTimerAdded = true;
++			fRunning = true;
++			fTimer->setTimeoutMS(fAdsp ? 10000 : 30000);
++		} else {
++			fReal = fAdsp = false;
++			poll();
++			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
++		}
++	}
++	registerService();
++	return true;
++}
++
++void
++SweetBattery::stop(IOService *provider)
++{
++	if (fLoop && fTimerAdded) {
++		/* Serialize against a running timer callback, including rearming. */
++		(void)fLoop->runAction(&SweetBattery::stopPolling, this);
++		fLoop->removeEventSource(fTimer);
++		fTimerAdded = false;
++	}
++	IOPMPowerSource::stop(provider);
++}
++
++IOReturn
++SweetBattery::stopPolling(OSObject *owner, void *, void *, void *, void *)
++{
++	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
++	if (!self) {
++		return kIOReturnBadArgument;
++	}
++	self->fRunning = false;
++	self->fTimer->cancelTimeout();
++	self->fTimer->disable();
++	return kIOReturnSuccess;
++}
++
++void
++SweetBattery::free(void)
++{
++	OSSafeReleaseNULL(fTimer);
++	OSSafeReleaseNULL(fLoop);
++	IOPMPowerSource::free();
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp.c b/xnu/fuxi-adsp/fuxi_adsp.c
 new file mode 100644
-index 0000000..050e672
+index 0000000..5151929
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp.c
-@@ -0,0 +1,838 @@
+@@ -0,0 +1,849 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 + *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -3027,7 +3489,7 @@ index 0000000..050e672
 +extern int fuxi_adsp_fw_read(void *handle, uint64_t offset, void *to, size_t length);
 +extern void fuxi_adsp_fw_close(void *handle);
 +extern void sheng_qrtr_start(void);
-+extern void fuxi_adsp_battery_start(void);
++extern void fuxi_adsp_battery_start(int publish);
 +extern volatile int32_t native_qrtr_stats[16];
 +extern char native_qrtr_text[96];
 +void fuxi_adsp_init(void);
@@ -3775,21 +4237,32 @@ index 0000000..050e672
 +    return mode;
 +}
 +
++/* The mode that runs: 0 off, 1 survey, 2 start the DSP and log the battery manager, 3 also feed SweetBattery. 2 and 3 fall back to
++ * 1 with fuxiwlan (both drive the apps RSC without a shared lock). Read again on every call, so SweetBattery can ask before or
++ * after fuxi_adsp_init ran. */
++unsigned fuxi_adsp_mode(void);
++unsigned fuxi_adsp_mode(void)
++{
++    char wlan[8];
++    const unsigned mode = fa_mode();
++    if (!mode) return 0;
++    if (mode >= 2 && PE_parse_boot_argn("fuxiwlan", wlan, sizeof(wlan))) return 1;
++    return mode > 3 ? 3 : mode;
++}
++
 +/* Called once from sweet_ufs.c after the UFS driver is ready (the firmware is read through it). */
 +void fuxi_adsp_init(void)
 +{
-+    const unsigned mode = fa_mode();
-+    char wlan[8];
++    const unsigned asked = fa_mode(), run = fuxi_adsp_mode();
 +    thread_t thread = NULL;
-+    if (!mode || gStarted) return;
-+    if (mode >= 2 && PE_parse_boot_argn("fuxiwlan", wlan, sizeof(wlan))) {
-+        printf("FUXI ADSP: fuxiadsp=%u refused with fuxiwlan (both drive the apps RSC without a shared lock); surveying only\n", mode);
++    if (!run || gStarted) return;
++    if (asked >= 2 && run < 2) {
++        printf("FUXI ADSP: fuxiadsp=%u refused with fuxiwlan (both drive the apps RSC without a shared lock); surveying only\n", asked);
 +    }
-+    const unsigned run = mode >= 2 && !PE_parse_boot_argn("fuxiwlan", wlan, sizeof(wlan)) ? 2u : 1u;
 +    gStarted = 1;
 +    if (run >= 2) {
-+        sheng_qrtr_start();         /* the router link registers before the DSP can open it */
-+        fuxi_adsp_battery_start();  /* PMIC_RTR_ADSP_APPS */
++        sheng_qrtr_start();               /* the router link registers before the DSP can open it */
++        fuxi_adsp_battery_start(run >= 3); /* PMIC_RTR_ADSP_APPS */
 +    }
 +    if (kernel_thread_start(adspThread, (void *)(uintptr_t)run, &thread) != KERN_SUCCESS) {
 +        fail(StMapped, -7);
@@ -3801,10 +4274,10 @@ index 0000000..050e672
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp_battery.c b/xnu/fuxi-adsp/fuxi_adsp_battery.c
 new file mode 100644
-index 0000000..f65dfcd
+index 0000000..652e1cb
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp_battery.c
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,239 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* fuxiadsp=2: the client of the battery manager the audio DSP runs (PMIC GLINK channel "PMIC_RTR_ADSP_APPS"). Phase 1 only reads:
 + * every refresh cycle of ShengBattmgr.c (one request in flight, 2 s per request, a cycle every 60 s and at each notification) ends
@@ -3813,7 +4286,11 @@ index 0000000..f65dfcd
 + * stays with the DSP firmware; nothing is written to it except the notification enable request.
 + * Adapted from UniXNU-sheng package/ShengBattery.cpp (6880068), BSD-2-Clause-Patent: Copyright (c) 2026, UniXNU contributors
 + * (LICENSE.UniXNU-sheng). Design as there: the DSP thread's callbacks only copy a message into a small ring and kick a thread
-+ * call, so the DSP thread never waits for this client and never re-enters sheng_adsp_send; the cycle runs in that thread call. */
++ * call, so the DSP thread never waits for this client and never re-enters sheng_adsp_send; the cycle runs in that thread call.
++ *
++ * fuxiadsp=3 (phase 2): each finished cycle whose snapshot is plausible (a charge reading, 2.5-4.8 V when the voltage was read)
++ * also becomes the reading SweetBattery publishes (fuxi_adsp_battery_reading, fuxi_adsp_battery.h). The percentage is published
++ * as at least 1: a misread 0 would make iOS shut down, and the PMIC cuts off a really empty cell by itself. */
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
@@ -3827,8 +4304,10 @@ index 0000000..f65dfcd
 +#include <pexpert/pexpert.h>
 +#include "ShengAdsp.h"
 +#include "ShengBattmgr.h"
++#include "fuxi_adsp_battery.h"
 +
-+void fuxi_adsp_battery_start(void);
++void fuxi_adsp_battery_start(int publish);
++extern unsigned fuxi_adsp_mode(void);
 +
 +#define FB_REQUEST_MS 2000u
 +#define FB_REFRESH_MS 60000u
@@ -3847,6 +4326,10 @@ index 0000000..f65dfcd
 +static int fb_was_up;
 +static uint64_t fb_request_due, fb_refresh_due; /* absolute time; 0 = none */
 +static uint32_t fb_refreshes, fb_logged, fb_send_refused;
++static LCK_MTX_DECLARE(fb_pub_lock, &fb_grp);  /* the published reading (the thread call vs. SweetBattery's work loop) */
++static FuxiAdspBattery fb_pub;
++static int fb_publish;
++static uint32_t fb_implausible;
 +
 +/* ---- the DSP thread: copy and kick, nothing else ---- */
 +static void fbState(void *context, int up)
@@ -3892,6 +4375,54 @@ index 0000000..f65dfcd
 +    }
 +    printf("FUXI BATTERY: raw valid=%#x last_timeout=%d%s\n", fb_bm.valid, fb_bm.last_timeout, line);
 +}
++/* fuxiadsp=3: a plausible snapshot becomes the reading SweetBattery publishes; anything else keeps the previous one. */
++static void fbPublish(const ShengBatterySnapshot *s)
++{
++    const int volts_read = s->voltage_mv != 0;
++    if (!s->charge_known || s->percent < 0 || s->percent > 100 || (volts_read && (s->voltage_mv < 2500 || s->voltage_mv > 4800))) {
++        if (fb_implausible++ < 8)
++            printf("FUXI BATTERY: not published (charge_known=%d percent=%d mV=%d)\n", s->charge_known, s->percent, s->voltage_mv);
++        return;
++    }
++    FuxiAdspBattery b;
++    bzero(&b, sizeof(b));
++    b.percent = s->percent < 1 ? 1 : s->percent;
++    b.voltage_mv = s->voltage_mv;
++    b.current_ma = s->current_ma;
++    b.temperature = s->temperature;
++    b.temperature_valid = s->temperature_valid ? 1 : 0;
++    b.raw_mah = s->raw_mah > 0 ? s->raw_mah : 0;
++    b.full_mah = s->full_mah > 0 ? s->full_mah : 0;
++    b.design_mah = s->design_mah > 0 ? s->design_mah : 0;
++    b.cycles = s->cycles > 0 ? s->cycles : 0;
++    b.minutes_to_empty = s->time_to_empty_min;
++    b.minutes_to_full = s->time_to_full_min;
++    b.present = s->present ? 1 : 0;
++    b.external = s->external ? 1 : 0;
++    b.external_known = s->external_known ? 1 : 0;
++    b.charging = s->charging ? 1 : 0;
++    b.status_known = s->status_known ? 1 : 0;
++    b.fully_charged = s->fully_charged ? 1 : 0;
++    lck_mtx_lock(&fb_pub_lock);
++    b.sequence = fb_pub.sequence + 1;
++    fb_pub = b;
++    lck_mtx_unlock(&fb_pub_lock);
++    if (b.sequence == 1) printf("FUXI BATTERY: first reading for SweetBattery: %d%%\n", b.percent);
++}
++
++int fuxi_adsp_battery_wanted(void) { return fuxi_adsp_mode() >= 3; }
++
++int fuxi_adsp_battery_reading(FuxiAdspBattery *out)
++{
++    int have;
++    if (!out || !fb_publish) return 0;
++    lck_mtx_lock(&fb_pub_lock);
++    have = fb_pub.sequence != 0;
++    if (have) *out = fb_pub;
++    lck_mtx_unlock(&fb_pub_lock);
++    return have;
++}
++
 +static void fbLog(void)
 +{
 +    ShengBatterySnapshot s;
@@ -3905,6 +4436,7 @@ index 0000000..f65dfcd
 +        s.adapter_mv, s.adapter_ma, s.adapter_watts, fb_bm.cycles_done, fb_bm.responses, fb_bm.timeouts, fb_bm.errors,
 +        fb_bm.notifications, fb_bm.ignored, fb_dropped, fb_send_refused);
 +    if (fb_logged++ < 3 || fb_logged % 10 == 0) fbRaw();
++    if (fb_publish) fbPublish(&s);
 +}
 +static void fbPump(void)
 +{
@@ -3973,16 +4505,53 @@ index 0000000..f65dfcd
 +    lck_mtx_unlock(&fb_lock);
 +}
 +
-+/* Called by fuxi_adsp_init before the DSP thread starts (the channel registers before the DSP can open it). */
-+void fuxi_adsp_battery_start(void)
++/* Called by fuxi_adsp_init before the DSP thread starts (the channel registers before the DSP can open it). publish: fuxiadsp=3. */
++void fuxi_adsp_battery_start(int publish)
 +{
 +    static const ShengAdspClient client = {fbState, fbReceive};
 +    sheng_battmgr_init(&fb_bm);
 +    thread_call_setup_with_options(&fb_call, fbRun, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
++    fb_publish = publish != 0;
 +    fb_channel = sheng_adsp_channel("PMIC_RTR_ADSP_APPS", 1024, 4, 0, &client, NULL);
-+    printf("FUXI BATTERY: battery manager client %s\n", fb_channel ? "registered" : "NOT registered");
++    printf("FUXI BATTERY: battery manager client %s%s\n", fb_channel ? "registered" : "NOT registered",
++        fb_publish ? ", readings go to SweetBattery" : "");
 +}
 +#endif /* FUXI */
+diff --git a/xnu/fuxi-adsp/fuxi_adsp_battery.h b/xnu/fuxi-adsp/fuxi_adsp_battery.h
+new file mode 100644
+index 0000000..547bc1e
+--- /dev/null
++++ b/xnu/fuxi-adsp/fuxi_adsp_battery.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* fuxiadsp=3: the battery manager's readings as SweetBattery (iokit/Kernel/arm/SweetBattery.cpp) publishes them to powerd.
++ * Shared by bsd/dev/fuxi_adsp_battery.c (C) and SweetBattery.cpp (C++); plain data only. */
++#ifndef FUXI_ADSP_BATTERY_H
++#define FUXI_ADSP_BATTERY_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct {
++    uint32_t sequence;                /* plausible readings taken so far (1 = the first) */
++    int32_t percent;                  /* 1..100: a reading never publishes 0 (iOS would shut down on a bad parse) */
++    int32_t voltage_mv, current_ma;   /* current positive while the battery takes charge */
++    int32_t temperature;              /* centidegrees C, valid only with temperature_valid */
++    int32_t raw_mah, full_mah, design_mah, cycles;  /* 0: not reported */
++    int32_t minutes_to_empty, minutes_to_full;      /* -1: unknown */
++    uint8_t present, external, external_known, charging, status_known, fully_charged, temperature_valid, pad;
++} FuxiAdspBattery;
++
++/* 1 when the DSP's battery manager is meant to feed the power source (fuxiadsp=3); SweetBattery then polls. */
++int fuxi_adsp_battery_wanted(void);
++/* 1 and the latest plausible reading (none yet: 0, and SweetBattery keeps its fallback). */
++int fuxi_adsp_battery_reading(FuxiAdspBattery *out);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
 diff --git a/xnu/fuxi-adsp/fuxi_adsp_fw.c b/xnu/fuxi-adsp/fuxi_adsp_fw.c
 new file mode 100644
 index 0000000..7755f92
@@ -4485,10 +5054,10 @@ index 8349337..7d08b57 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..1dfb65a
+index 0000000..664c09f
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,3843 @@
+@@ -0,0 +1,4120 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,19 @@
@@ -4513,7 +5082,7 @@ index 0000000..1dfb65a
 + bsd/dev/unix_startup.c			standard
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp.c
-+@@ -0,0 +1,838 @@
++@@ -0,0 +1,849 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 ++ *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -4580,7 +5149,7 @@ index 0000000..1dfb65a
 ++extern int fuxi_adsp_fw_read(void *handle, uint64_t offset, void *to, size_t length);
 ++extern void fuxi_adsp_fw_close(void *handle);
 ++extern void sheng_qrtr_start(void);
-++extern void fuxi_adsp_battery_start(void);
+++extern void fuxi_adsp_battery_start(int publish);
 ++extern volatile int32_t native_qrtr_stats[16];
 ++extern char native_qrtr_text[96];
 ++void fuxi_adsp_init(void);
@@ -5328,21 +5897,32 @@ index 0000000..1dfb65a
 ++    return mode;
 ++}
 ++
+++/* The mode that runs: 0 off, 1 survey, 2 start the DSP and log the battery manager, 3 also feed SweetBattery. 2 and 3 fall back to
+++ * 1 with fuxiwlan (both drive the apps RSC without a shared lock). Read again on every call, so SweetBattery can ask before or
+++ * after fuxi_adsp_init ran. */
+++unsigned fuxi_adsp_mode(void);
+++unsigned fuxi_adsp_mode(void)
+++{
+++    char wlan[8];
+++    const unsigned mode = fa_mode();
+++    if (!mode) return 0;
+++    if (mode >= 2 && PE_parse_boot_argn("fuxiwlan", wlan, sizeof(wlan))) return 1;
+++    return mode > 3 ? 3 : mode;
+++}
+++
 ++/* Called once from sweet_ufs.c after the UFS driver is ready (the firmware is read through it). */
 ++void fuxi_adsp_init(void)
 ++{
-++    const unsigned mode = fa_mode();
-++    char wlan[8];
+++    const unsigned asked = fa_mode(), run = fuxi_adsp_mode();
 ++    thread_t thread = NULL;
-++    if (!mode || gStarted) return;
-++    if (mode >= 2 && PE_parse_boot_argn("fuxiwlan", wlan, sizeof(wlan))) {
-++        printf("FUXI ADSP: fuxiadsp=%u refused with fuxiwlan (both drive the apps RSC without a shared lock); surveying only\n", mode);
+++    if (!run || gStarted) return;
+++    if (asked >= 2 && run < 2) {
+++        printf("FUXI ADSP: fuxiadsp=%u refused with fuxiwlan (both drive the apps RSC without a shared lock); surveying only\n", asked);
 ++    }
-++    const unsigned run = mode >= 2 && !PE_parse_boot_argn("fuxiwlan", wlan, sizeof(wlan)) ? 2u : 1u;
 ++    gStarted = 1;
 ++    if (run >= 2) {
-++        sheng_qrtr_start();         /* the router link registers before the DSP can open it */
-++        fuxi_adsp_battery_start();  /* PMIC_RTR_ADSP_APPS */
+++        sheng_qrtr_start();               /* the router link registers before the DSP can open it */
+++        fuxi_adsp_battery_start(run >= 3); /* PMIC_RTR_ADSP_APPS */
 ++    }
 ++    if (kernel_thread_start(adspThread, (void *)(uintptr_t)run, &thread) != KERN_SUCCESS) {
 ++        fail(StMapped, -7);
@@ -5499,7 +6079,7 @@ index 0000000..1dfb65a
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp_battery.c
-+@@ -0,0 +1,178 @@
++@@ -0,0 +1,239 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* fuxiadsp=2: the client of the battery manager the audio DSP runs (PMIC GLINK channel "PMIC_RTR_ADSP_APPS"). Phase 1 only reads:
 ++ * every refresh cycle of ShengBattmgr.c (one request in flight, 2 s per request, a cycle every 60 s and at each notification) ends
@@ -5508,7 +6088,11 @@ index 0000000..1dfb65a
 ++ * stays with the DSP firmware; nothing is written to it except the notification enable request.
 ++ * Adapted from UniXNU-sheng package/ShengBattery.cpp (6880068), BSD-2-Clause-Patent: Copyright (c) 2026, UniXNU contributors
 ++ * (LICENSE.UniXNU-sheng). Design as there: the DSP thread's callbacks only copy a message into a small ring and kick a thread
-++ * call, so the DSP thread never waits for this client and never re-enters sheng_adsp_send; the cycle runs in that thread call. */
+++ * call, so the DSP thread never waits for this client and never re-enters sheng_adsp_send; the cycle runs in that thread call.
+++ *
+++ * fuxiadsp=3 (phase 2): each finished cycle whose snapshot is plausible (a charge reading, 2.5-4.8 V when the voltage was read)
+++ * also becomes the reading SweetBattery publishes (fuxi_adsp_battery_reading, fuxi_adsp_battery.h). The percentage is published
+++ * as at least 1: a misread 0 would make iOS shut down, and the PMIC cuts off a really empty cell by itself. */
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
@@ -5522,8 +6106,10 @@ index 0000000..1dfb65a
 ++#include <pexpert/pexpert.h>
 ++#include "ShengAdsp.h"
 ++#include "ShengBattmgr.h"
+++#include "fuxi_adsp_battery.h"
 ++
-++void fuxi_adsp_battery_start(void);
+++void fuxi_adsp_battery_start(int publish);
+++extern unsigned fuxi_adsp_mode(void);
 ++
 ++#define FB_REQUEST_MS 2000u
 ++#define FB_REFRESH_MS 60000u
@@ -5542,6 +6128,10 @@ index 0000000..1dfb65a
 ++static int fb_was_up;
 ++static uint64_t fb_request_due, fb_refresh_due; /* absolute time; 0 = none */
 ++static uint32_t fb_refreshes, fb_logged, fb_send_refused;
+++static LCK_MTX_DECLARE(fb_pub_lock, &fb_grp);  /* the published reading (the thread call vs. SweetBattery's work loop) */
+++static FuxiAdspBattery fb_pub;
+++static int fb_publish;
+++static uint32_t fb_implausible;
 ++
 ++/* ---- the DSP thread: copy and kick, nothing else ---- */
 ++static void fbState(void *context, int up)
@@ -5587,6 +6177,54 @@ index 0000000..1dfb65a
 ++    }
 ++    printf("FUXI BATTERY: raw valid=%#x last_timeout=%d%s\n", fb_bm.valid, fb_bm.last_timeout, line);
 ++}
+++/* fuxiadsp=3: a plausible snapshot becomes the reading SweetBattery publishes; anything else keeps the previous one. */
+++static void fbPublish(const ShengBatterySnapshot *s)
+++{
+++    const int volts_read = s->voltage_mv != 0;
+++    if (!s->charge_known || s->percent < 0 || s->percent > 100 || (volts_read && (s->voltage_mv < 2500 || s->voltage_mv > 4800))) {
+++        if (fb_implausible++ < 8)
+++            printf("FUXI BATTERY: not published (charge_known=%d percent=%d mV=%d)\n", s->charge_known, s->percent, s->voltage_mv);
+++        return;
+++    }
+++    FuxiAdspBattery b;
+++    bzero(&b, sizeof(b));
+++    b.percent = s->percent < 1 ? 1 : s->percent;
+++    b.voltage_mv = s->voltage_mv;
+++    b.current_ma = s->current_ma;
+++    b.temperature = s->temperature;
+++    b.temperature_valid = s->temperature_valid ? 1 : 0;
+++    b.raw_mah = s->raw_mah > 0 ? s->raw_mah : 0;
+++    b.full_mah = s->full_mah > 0 ? s->full_mah : 0;
+++    b.design_mah = s->design_mah > 0 ? s->design_mah : 0;
+++    b.cycles = s->cycles > 0 ? s->cycles : 0;
+++    b.minutes_to_empty = s->time_to_empty_min;
+++    b.minutes_to_full = s->time_to_full_min;
+++    b.present = s->present ? 1 : 0;
+++    b.external = s->external ? 1 : 0;
+++    b.external_known = s->external_known ? 1 : 0;
+++    b.charging = s->charging ? 1 : 0;
+++    b.status_known = s->status_known ? 1 : 0;
+++    b.fully_charged = s->fully_charged ? 1 : 0;
+++    lck_mtx_lock(&fb_pub_lock);
+++    b.sequence = fb_pub.sequence + 1;
+++    fb_pub = b;
+++    lck_mtx_unlock(&fb_pub_lock);
+++    if (b.sequence == 1) printf("FUXI BATTERY: first reading for SweetBattery: %d%%\n", b.percent);
+++}
+++
+++int fuxi_adsp_battery_wanted(void) { return fuxi_adsp_mode() >= 3; }
+++
+++int fuxi_adsp_battery_reading(FuxiAdspBattery *out)
+++{
+++    int have;
+++    if (!out || !fb_publish) return 0;
+++    lck_mtx_lock(&fb_pub_lock);
+++    have = fb_pub.sequence != 0;
+++    if (have) *out = fb_pub;
+++    lck_mtx_unlock(&fb_pub_lock);
+++    return have;
+++}
+++
 ++static void fbLog(void)
 ++{
 ++    ShengBatterySnapshot s;
@@ -5600,6 +6238,7 @@ index 0000000..1dfb65a
 ++        s.adapter_mv, s.adapter_ma, s.adapter_watts, fb_bm.cycles_done, fb_bm.responses, fb_bm.timeouts, fb_bm.errors,
 ++        fb_bm.notifications, fb_bm.ignored, fb_dropped, fb_send_refused);
 ++    if (fb_logged++ < 3 || fb_logged % 10 == 0) fbRaw();
+++    if (fb_publish) fbPublish(&s);
 ++}
 ++static void fbPump(void)
 ++{
@@ -5668,14 +6307,16 @@ index 0000000..1dfb65a
 ++    lck_mtx_unlock(&fb_lock);
 ++}
 ++
-++/* Called by fuxi_adsp_init before the DSP thread starts (the channel registers before the DSP can open it). */
-++void fuxi_adsp_battery_start(void)
+++/* Called by fuxi_adsp_init before the DSP thread starts (the channel registers before the DSP can open it). publish: fuxiadsp=3. */
+++void fuxi_adsp_battery_start(int publish)
 ++{
 ++    static const ShengAdspClient client = {fbState, fbReceive};
 ++    sheng_battmgr_init(&fb_bm);
 ++    thread_call_setup_with_options(&fb_call, fbRun, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+++    fb_publish = publish != 0;
 ++    fb_channel = sheng_adsp_channel("PMIC_RTR_ADSP_APPS", 1024, 4, 0, &client, NULL);
-++    printf("FUXI BATTERY: battery manager client %s\n", fb_channel ? "registered" : "NOT registered");
+++    printf("FUXI BATTERY: battery manager client %s%s\n", fb_channel ? "registered" : "NOT registered",
+++        fb_publish ? ", readings go to SweetBattery" : "");
 ++}
 ++#endif /* FUXI */
 +--- /dev/null
@@ -8332,3 +8973,208 @@ index 0000000..1dfb65a
 ++}
 ++#endif
 ++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_adsp_battery.h
++@@ -0,0 +1,29 @@
+++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
+++/* fuxiadsp=3: the battery manager's readings as SweetBattery (iokit/Kernel/arm/SweetBattery.cpp) publishes them to powerd.
+++ * Shared by bsd/dev/fuxi_adsp_battery.c (C) and SweetBattery.cpp (C++); plain data only. */
+++#ifndef FUXI_ADSP_BATTERY_H
+++#define FUXI_ADSP_BATTERY_H
+++#include <stdint.h>
+++#ifdef __cplusplus
+++extern "C" {
+++#endif
+++
+++typedef struct {
+++    uint32_t sequence;                /* plausible readings taken so far (1 = the first) */
+++    int32_t percent;                  /* 1..100: a reading never publishes 0 (iOS would shut down on a bad parse) */
+++    int32_t voltage_mv, current_ma;   /* current positive while the battery takes charge */
+++    int32_t temperature;              /* centidegrees C, valid only with temperature_valid */
+++    int32_t raw_mah, full_mah, design_mah, cycles;  /* 0: not reported */
+++    int32_t minutes_to_empty, minutes_to_full;      /* -1: unknown */
+++    uint8_t present, external, external_known, charging, status_known, fully_charged, temperature_valid, pad;
+++} FuxiAdspBattery;
+++
+++/* 1 when the DSP's battery manager is meant to feed the power source (fuxiadsp=3); SweetBattery then polls. */
+++int fuxi_adsp_battery_wanted(void);
+++/* 1 and the latest plausible reading (none yet: 0, and SweetBattery keeps its fallback). */
+++int fuxi_adsp_battery_reading(FuxiAdspBattery *out);
+++
+++#ifdef __cplusplus
+++}
+++#endif
+++#endif
++--- a/iokit/Kernel/arm/SweetBattery.cpp
+++++ b/iokit/Kernel/arm/SweetBattery.cpp
++@@ -3,6 +3,9 @@
++  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
++  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
++  * See report.md for binary evidence, register provenance and integration.
+++ * FUXI fuxiadsp=3 (ADT /chosen fuxi,adsp=3): the battery manager on the audio DSP
+++ * (bsd/dev/fuxi_adsp_battery.c) feeds this source once it has a plausible
+++ * reading; until then, and if the DSP never answers, the fallback stays.
++  */
++ #if defined(ARM64_BOARD_CONFIG_SWEET)
++ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
++@@ -15,6 +18,9 @@
++ /* bsd/dev/sweet_spmi.c */
++ extern "C" int sweet_spmi_init(void);
++ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+++#if defined(FUXI)
+++#include "../../../bsd/dev/fuxi_adsp_battery.h"
+++#endif
++ 
++ class SweetBattery : public IOPMPowerSource {
++ 	OSDeclareDefaultStructors(SweetBattery);
++@@ -26,13 +32,16 @@
++ private:
++ 	IOWorkLoop *fLoop;
++ 	IOTimerEventSource *fTimer;
++-	bool fTimerAdded, fRunning, fReal;
+++	bool fTimerAdded, fRunning, fReal, fAdsp, fAdspShown;
++ 	int fLastMode;
++ 	void putNumber(const char *key, UInt32 value);
++ 	void putBool(const char *key, bool value);
++ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
++ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
++ 	void poll(void);
+++#if defined(FUXI)
+++	void publishAdsp(const FuxiAdspBattery &b);
+++#endif
++ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
++ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
++ 	static bool readWord(unsigned address, uint16_t *value);
++@@ -51,7 +60,7 @@
++ 	}
++ 	fLoop = NULL;
++ 	fTimer = NULL;
++-	fTimerAdded = fRunning = fReal = false;
+++	fTimerAdded = fRunning = fReal = fAdsp = fAdspShown = false;
++ 	if (dictionary) {
++ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
++ 		if (!it) {
++@@ -203,9 +212,89 @@
++ 	return 100;
++ }
++ 
+++#if defined(FUXI)
+++void
+++SweetBattery::publishAdsp(const FuxiAdspBattery &b)
+++{
+++	/* mAh as publish() uses them (powerd computes C*100/M); Xiaomi 13: 4500 mAh. */
+++	const unsigned design = b.design_mah > 0 ? (unsigned)b.design_mah : 4500u;
+++	const unsigned full = b.full_mah > 0 ? (unsigned)b.full_mah : design;
+++	const unsigned capacity = (full * (unsigned)b.percent + 50u) / 100u;
+++	setBatteryInstalled(b.present != 0);
+++	setCurrentCapacity(capacity);
+++	setMaxCapacity(full);
+++	/* An unknown charger state must not publish a disconnect. */
+++	if (b.external_known) {
+++		setExternalConnected(b.external != 0);
+++		setExternalChargeCapable(b.external != 0);
+++		putBool("AppleRawExternalConnected", b.external != 0);
+++	}
+++	if (b.external_known && b.status_known) {
+++		setIsCharging(b.charging != 0);
+++		putBool("FullyCharged", b.fully_charged != 0);
+++	}
+++	setAtWarnLevel(false);
+++	/* Never a critical shutdown from this path: the PMIC cuts off an empty cell. */
+++	setAtCriticalLevel(false);
+++	setVoltage(b.voltage_mv > 0 ? (unsigned)b.voltage_mv : 0);
+++	setAmperage(b.current_ma);
+++	const int minutes = b.charging ? b.minutes_to_full : b.minutes_to_empty;
+++	setTimeRemaining(minutes >= 0 ? minutes : -1);
+++	if (b.cycles > 0) {
+++		setCycleCount((unsigned)b.cycles);
+++	}
+++	putNumber("AppleRawCurrentCapacity", b.raw_mah > 0 ? (UInt32)b.raw_mah : capacity);
+++	putNumber("AppleRawMaxCapacity", full);
+++	putNumber("NominalChargeCapacity", full);
+++	putNumber("DesignCapacity", design);
+++	putNumber("InstantAmperage", (UInt32)b.current_ma);
+++	putNumber("Temperature", b.temperature_valid ? (UInt32)b.temperature : 2500u);
+++	putBool("SweetBatteryHardwareSampleValid", true);
+++	putBool("SweetBatteryCurrentValid", true);
+++	putBool("SweetBatterySOCEstimated", false);
+++	putBool("SweetBatteryTemperatureEstimated", !b.temperature_valid);
+++	putBool("SweetBatteryFallback", false);
+++	putBool("FuxiAdspBattery", true);
+++	putNumber("SweetBatteryPercent", (UInt32)b.percent);
+++	OSDictionary *legacy = OSDictionary::withCapacity(7);
+++	if (legacy) {
+++		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+++		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+++		    kIOBatteryFlagsKey};
+++		UInt32 values[] = {capacity, full, (UInt32)(b.voltage_mv > 0 ? b.voltage_mv : 0), (UInt32)b.current_ma,
+++		    (UInt32)(b.cycles > 0 ? b.cycles : 0),
+++		    (UInt32)((b.present ? kIOBatteryInstalled : 0) | (b.external ? kIOBatteryChargerConnect : 0) |
+++		    (b.charging ? kIOBatteryCharge : 0))};
+++		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+++			OSNumber *number = OSNumber::withNumber(values[i], 32);
+++			if (number) {
+++				legacy->setObject(keys[i], number);
+++				number->release();
+++			}
+++		}
+++		setLegacyIOBatteryInfo(legacy);
+++		legacy->release();
+++	}
+++	updateStatus();
+++	fAdspShown = true;
+++	if (fLastMode != 2) {
+++		IOLog("SWEET BATTERY: ADSP battery manager, %d%% %dmV %dmA external=%d charging=%d\n",
+++		    b.percent, b.voltage_mv, b.current_ma, b.external, b.charging);
+++		fLastMode = 2;
+++	}
+++}
+++#endif
+++
++ void
++ SweetBattery::poll(void)
++ {
+++#if defined(FUXI)
+++	FuxiAdspBattery adsp;
+++	if (fAdsp && fuxi_adsp_battery_reading(&adsp)) {
+++		publishAdsp(adsp);
+++		return;
+++	}
+++#endif
++ 	uint8_t type, present, usb, path, charger, error, temperature;
++ 	uint16_t rawVoltage;
++ 	bool valid = fReal &&
++@@ -252,7 +341,8 @@
++ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
++ 	if (self && self->fRunning) {
++ 		self->poll();
++-		sender->setTimeoutMS(30000);
+++		/* Every 10 s until the DSP's first reading arrives, then every 30 s. */
+++		sender->setTimeoutMS(self->fAdsp && !self->fAdspShown ? 10000 : 30000);
++ 	}
++ }
++ 
++@@ -265,17 +355,20 @@
++ 	int real = 0;
++ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++ 	fReal = real == 1 && sweet_spmi_init() == 0;
+++#if defined(FUXI)
+++	fAdsp = fuxi_adsp_battery_wanted() != 0;
+++#endif
++ 	/* Publish a complete source BEFORE registerService wakes powerd. */
++ 	poll();
++-	if (fReal) {
+++	if (fReal || fAdsp) {
++ 		fLoop = IOWorkLoop::workLoop();
++ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
++ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
++ 			fTimerAdded = true;
++ 			fRunning = true;
++-			fTimer->setTimeoutMS(30000);
+++			fTimer->setTimeoutMS(fAdsp ? 10000 : 30000);
++ 		} else {
++-			fReal = false;
+++			fReal = fAdsp = false;
++ 			poll();
++ 			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
++ 		}
