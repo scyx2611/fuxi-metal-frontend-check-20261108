@@ -1,5 +1,5 @@
 diff --git a/xnu/fuxi-unixnu/SweetFramebuffer.cpp b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
-index 8b38ece..7477e47 100644
+index 8b38ece..cb44733 100644
 --- a/xnu/fuxi-unixnu/SweetFramebuffer.cpp
 +++ b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
 @@ -637,7 +637,7 @@ AppleCLCD::start(IOService *provider)
@@ -11,36 +11,52 @@ index 8b38ece..7477e47 100644
   fSwapHist = sweet_fb_adt_u32(provider, "fuxi,swap-hist") == 1;
   nanoseconds_to_absolutetime(100000000ULL, &fSwapIdle);
   if (fSwapHist) IOLog("SWEET FB: swap interval histogram on (fuxi,swap-hist)\n");
-@@ -1879,9 +1879,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -1879,15 +1879,15 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
  		bzero(args->structureOutput, args->structureOutputSize);
  	}
 -	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
 -		if (selector < 64) {
 -			sweet_fb_logged |= 1ULL << selector;
-+	static uint64_t sweet_fb_logged_hi; /* 64..127 once each too: SetParameter (68) returns every 62 swaps with the analytics */ uint64_t &seen = selector < 64 ? sweet_fb_logged : sweet_fb_logged_hi; if (selector >= 128 || !(seen & (1ULL << (selector & 63)))) {
++	static uint64_t sweet_fb_logged_hi; static uint32_t sweet_fb_n68; /* 64..127 once each too; SetParameter (68) also at its call 1, 2, 4, 8, ...: kern_SwapEnd makes it twice per display analytics send (every 62 swaps), so the count shows whether that path runs */ uint64_t &seen = selector < 64 ? sweet_fb_logged : sweet_fb_logged_hi; uint32_t n68 = selector == 68 ? ++sweet_fb_n68 : 0; if (selector >= 128 || !(seen & (1ULL << (selector & 63))) || (n68 != 0 && (n68 & (n68 - 1)) == 0)) {
 +		if (selector < 128) {
 +			seen |= 1ULL << (selector & 63);
  		}
  		char name[32];
  		proc_selfname(name, sizeof(name));
+-		IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u -> 0x%x n68 %u p0 0x%llx\n", name, selector,
+ 		    args->scalarInputCount, args->structureInputSize,
+-		    args->scalarOutputCount, args->structureOutputSize, ret);
++		    args->scalarOutputCount, args->structureOutputSize, ret, n68, args->scalarInputCount ? (unsigned long long)args->scalarInput[0] : 0ULL);
+ 	}
+ 	return ret;
+ }
 diff --git a/xnu/patches/0046-sweet-iosurface-iomfb.patch b/xnu/patches/0046-sweet-iosurface-iomfb.patch
-index 9c87be8..cd20965 100644
+index 9c87be8..493f295 100644
 --- a/xnu/patches/0046-sweet-iosurface-iomfb.patch
 +++ b/xnu/patches/0046-sweet-iosurface-iomfb.patch
-@@ -1437,9 +1437,9 @@
+@@ -1437,15 +1437,15 @@
  +	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
  +		bzero(args->structureOutput, args->structureOutputSize);
  +	}
 -+	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
 -+		if (selector < 64) {
 -+			sweet_fb_logged |= 1ULL << selector;
-++	static uint64_t sweet_fb_logged_hi; /* 64..127 once each too: SetParameter (68) returns every 62 swaps with the analytics */ uint64_t &seen = selector < 64 ? sweet_fb_logged : sweet_fb_logged_hi; if (selector >= 128 || !(seen & (1ULL << (selector & 63)))) {
+++	static uint64_t sweet_fb_logged_hi; static uint32_t sweet_fb_n68; /* 64..127 once each too; SetParameter (68) also at its call 1, 2, 4, 8, ...: kern_SwapEnd makes it twice per display analytics send (every 62 swaps), so the count shows whether that path runs */ uint64_t &seen = selector < 64 ? sweet_fb_logged : sweet_fb_logged_hi; uint32_t n68 = selector == 68 ? ++sweet_fb_n68 : 0; if (selector >= 128 || !(seen & (1ULL << (selector & 63))) || (n68 != 0 && (n68 & (n68 - 1)) == 0)) {
 ++		if (selector < 128) {
 ++			seen |= 1ULL << (selector & 63);
  +		}
  +		char name[32];
  +		proc_selfname(name, sizeof(name));
+-+		IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u -> 0x%x\n", name, selector,
+++		IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u -> 0x%x n68 %u p0 0x%llx\n", name, selector,
+ +		    args->scalarInputCount, args->structureInputSize,
+-+		    args->scalarOutputCount, args->structureOutputSize, ret);
+++		    args->scalarOutputCount, args->structureOutputSize, ret, n68, args->scalarInputCount ? (unsigned long long)args->scalarInput[0] : 0ULL);
+ +	}
+ +	return ret;
+ +}
 diff --git a/xnu/patches/0106-fuxi-unixnu.patch b/xnu/patches/0106-fuxi-unixnu.patch
 index d95faff..1fc1e40 100644
 --- a/xnu/patches/0106-fuxi-unixnu.patch
