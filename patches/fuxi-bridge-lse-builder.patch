@@ -1,0 +1,15 @@
+diff --git a/tools/build-fuxi-nativemetal.py b/tools/build-fuxi-nativemetal.py
+index b9c555b..8097bbb 100644
+--- a/tools/build-fuxi-nativemetal.py
++++ b/tools/build-fuxi-nativemetal.py
+@@ -197,6 +197,10 @@ def main():
+     env['CARGO_TARGET_'+target.upper().replace('-', '_')+'_RUSTFLAGS'] = '-C link-arg=-Wl,-install_name,'+install_name
+     if args.target == 'ios':
+         env['CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS'] += ' -C link-arg=-miphoneos-version-min=16.0'
++        # Fuxi: the aarch64-apple-ios target defaults to apple-a7 (ARMv8.0), so every Rust atomic (Arc counts, locks,
++        # queues) is an ldxr/stxr retry loop; the phone's cores are ARMv9 and the system libraries already run their
++        # ARMv8.1 LSE variants, so build the bridge, the runtime and the translator with single-instruction atomics.
++        env['CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS'] += ' -C target-feature=+lse'
+     run('rustup', 'toolchain', 'install', PINS['RUST_VERSION'], '--profile', 'minimal')
+     run('rustup', '+'+PINS['RUST_VERSION'], 'target', 'add', target)
+     run('cargo', '+'+PINS['RUST_VERSION'], 'build', '--release', '--manifest-path', manifest, '--target', target, env=env)
