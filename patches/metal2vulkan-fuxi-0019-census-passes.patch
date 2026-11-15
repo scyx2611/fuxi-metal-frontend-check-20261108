@@ -1,0 +1,154 @@
+diff --git a/crates/metal2vulkan-runtime/src/clear_reach.rs b/crates/metal2vulkan-runtime/src/clear_reach.rs
+index 40aacd5..49a4c8a 100644
+--- a/crates/metal2vulkan-runtime/src/clear_reach.rs
++++ b/crates/metal2vulkan-runtime/src/clear_reach.rs
+@@ -488,6 +488,11 @@ pub(super) struct ReachClears {
+ }
+ 
+ impl ReachClears {
++    /// How many reach clears, each a render pass of its own (the census's `passes` line).
++    pub(super) fn len(&self) -> usize {
++        self.clears.len()
++    }
++
+     /// The clears of `layout`'s attachments, a pass with a draw call where `called` (the module
+     /// docs); `left_out` names the color indices whose clear the pass must make before it
+     /// whatever their store action (its first instance leaves them out, and no whole-subresource
+diff --git a/crates/metal2vulkan-runtime/src/fuxi_census.rs b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+index 32c7c0e..8a22b38 100644
+--- a/crates/metal2vulkan-runtime/src/fuxi_census.rs
++++ b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+@@ -387,6 +387,8 @@ thread_local! {
+     static PHASE_NS: [[Cell<u64>; PHASES + 1]; 2] = const { [const { [const { Cell::new(0) }; PHASES + 1] }; 2] };
+     static PHASE_N: [Cell<u64>; 2] = const { [const { Cell::new(0) }; 2] };
+     static LOGGING_ENCODERS: Cell<u64> = const { Cell::new(0) };
++    /// What the render encoders ended in this window turned into (`passes` line, [`PASS_NAMES`]).
++    static PASS_COUNTS: [Cell<u64>; PASS_KINDS] = const { [const { Cell::new(0) }; PASS_KINDS] };
+     static STATS: RefCell<Option<Box<Stats>>> = const { RefCell::new(None) };
+ }
+ 
+@@ -623,6 +625,30 @@ pub(crate) fn setter(kind: Set) -> Timed {
+     }
+ }
+ 
++/// The `passes` line's counts, added up over the window's ended render encoders: encoders,
++/// instances, the pass's tile reach (none, every tile, the tiles the draws touch), the
++/// attachments whose `DontCare` load took an answer and the encoders where it was bounded to the
++/// drawn tiles, the reach clears' own render passes, the later depth/stencil resolve passes, the
++/// encoders with a resolving instance, the encoders whose pass recorded later, the colors' final
++/// loads (`Clear`, `Load`, `DontCare`), and the colors larger than the render area.
++pub(crate) const PASS_NAMES: [&str; PASS_KINDS] = [
++    "enc", "inst", "rnone", "revery", "rdraws", "dc", "bounded", "reach", "later", "resolving",
++    "deferred", "lclear", "lload", "ldc", "big",
++];
++pub(crate) const PASS_KINDS: usize = 15;
++
++/// An ended render encoder's [`PASS_NAMES`] counts.
++#[inline]
++pub(crate) fn pass(counts: [u64; PASS_KINDS]) {
++    if on() {
++        PASS_COUNTS.with(|c| {
++            for (cell, n) in c.iter().zip(counts) {
++                cell.set(cell.get() + n);
++            }
++        });
++    }
++}
++
+ /// A render encoder opened that logs its calls (for a rebind).
+ #[inline]
+ pub(crate) fn logging_encoder() {
+@@ -890,6 +916,13 @@ fn report(stats: &Stats, t: u64) {
+         text.push('\n');
+         line(&text);
+     }
++    let counts = PASS_COUNTS.with(|c| c.each_ref().map(|x| x.replace(0)));
++    let mut passes = format!("{head} passes");
++    for (name, count) in PASS_NAMES.iter().zip(counts) {
++        passes.push_str(&format!(" {name}={count}"));
++    }
++    passes.push('\n');
++    line(&passes);
+     line(&format!(
+         "{head} lane samplers={:.1} states={:.1} set0={} set0same={} layouts={}\n",
+         stats.samplers as f64 / n as f64,
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index db1ad2b..5ed1ce8 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -3415,6 +3415,17 @@ impl RenderCommandEncoder {
+         // no tile, else cleared to zero or its clear value, Metal's answer in each tile a draw
+         // reaches (`clear_reach.rs`), and only in those `tiles` bounds.
+         let dont_care = clear_reach::dont_care_loads(&mut layout, reach);
++        // FUXI (census): the pass's reach and its `DontCare` answers, for the `passes` line.
++        let census_reach = match reach {
++            clear_reach::PassReach::Nothing => [1, 0, 0],
++            clear_reach::PassReach::Every => [0, 1, 0],
++            clear_reach::PassReach::Draws => [0, 0, 1],
++        };
++        let census_dont_care = (0..layout.colors.len())
++            .filter(|&index| dont_care.color(index))
++            .count() as u64
++            + dont_care.aspects().iter().filter(|&&taken| taken).count() as u64;
++        let census_bounded = u64::from(census_dont_care > 0 && tiles.is_some());
+         if let Some(named) = dont_care.named.clone() {
+             device.degrade(Degradation::DontCareLoadTiles, || {
+                 (
+@@ -3752,6 +3763,7 @@ impl RenderCommandEncoder {
+         let clears = Clears::plan(&clears)?;
+         let bounded = tiles.as_ref().map(|tiles| (&dont_care, tiles));
+         let reach_clears = ReachClears::plan(&device, &layout, called, &left_out, bounded)?;
++        let census_reach_passes = reach_clears.as_ref().map_or(0, ReachClears::len) as u64;
+         // An attachment the reach clear covers loads in the pass: that clear holds the render
+         // area too, and a pass's own clear on a device that renders through Metal (MoltenVK)
+         // reaches the whole attachment where the pass has no draw (`clear_reach.rs`). The pass
+@@ -3854,6 +3866,7 @@ impl RenderCommandEncoder {
+             .map(|step| render_target::later_resolve(&device, resolving_layout, step))
+             .collect::<Result<Vec<_>, Error>>()?;
+         let resolve_copies = ResolveCopies::plan(&device, &resolved, layout.extent)?;
++        let census_later = (later_resolves.len() as u64, u64::from(resolve_instance.is_some()));
+         // The tile dispatches' copies, from the pass's attachments as it ends.
+         let mut staging = Vec::with_capacity(dispatches.len());
+         for dispatch in &dispatches {
+@@ -4094,6 +4107,7 @@ impl RenderCommandEncoder {
+             render_area,
+         };
+         crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 8);
++        let census_deferred = u64::from(!(executions.is_empty() && pending.is_empty()));
+         // The passes of the runs an execution may split an instance into (`render/executions.rs`).
+         let mut run_objects = Vec::new();
+         // The steps of a pass recorded now, or the pass that records later.
+@@ -4324,6 +4338,33 @@ impl RenderCommandEncoder {
+         // which lets go of them in this order: the command buffer lets go of what it holds from
+         // the last retained back.
+         crate::fuxi_census::phase_mark(crate::fuxi_census::Around::End, 12);
++        if crate::fuxi_census::active() {
++            let colors = layout.colors.iter().flatten();
++            let loads = |action: LoadAction| {
++                colors.clone().filter(|c| c.load == action).count() as u64
++            };
++            let big = (colors.clone())
++                .filter(|c| c.target.extent != layout.extent)
++                .count() as u64;
++            let [rnone, revery, rdraws] = census_reach;
++            crate::fuxi_census::pass([
++                1,
++                count as u64,
++                rnone,
++                revery,
++                rdraws,
++                census_dont_care,
++                census_bounded,
++                census_reach_passes,
++                census_later.0,
++                census_later.1,
++                census_deferred,
++                loads(LoadAction::Clear),
++                loads(LoadAction::Load),
++                loads(LoadAction::DontCare),
++                big,
++            ]);
++        }
+         match crate::fuxi_census::lane() {
+             true => core.retain(leftovers),
+             false => drop(leftovers),

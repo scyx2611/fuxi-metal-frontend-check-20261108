@@ -79,6 +79,7 @@ jobs:
           cp harness/patches/metal2vulkan-fuxi-0016-lane-logs.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0017-lane-quiet.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0018-lane-leftovers.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0019-census-passes.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |
