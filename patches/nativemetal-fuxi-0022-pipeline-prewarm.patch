@@ -1,0 +1,271 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index a2b7c1f..1ca21b9 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -19,6 +19,7 @@
+ #include <vector>
+ #include <sys/mman.h>
+ #include <sys/sysctl.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ #include <CommonCrypto/CommonDigest.h>
+ #include <dlfcn.h>
+@@ -260,6 +261,7 @@ static NSString *lastError() {return [NSString stringWithUTF8String:nmb_last_err
+ static std::mutex gJournalLock;
+ static std::string gJournalPath;
+ static uint64_t gJournalBegan;
++static uint64_t gJournalOpenSize;   // the journal's size when the device opened: earlier boots' lines only (patch 0022's prewarm reads them)
+ static void journal(const std::string &line) {
+  if(gJournalPath.empty())return;
+  std::lock_guard<std::mutex> lock(gJournalLock);
+@@ -501,6 +503,9 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
+ @property(nonatomic) MTLFunctionType functionType;
+ @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
+ @end
++// Pipeline prewarm (patch 0022, defined after renderDescriptor): a library a function is made of, and CoreAnimation's first render pipeline.
++static void fuxiPrewarmLibrary(NBLibrary *library);
++static void fuxiPrewarmKick();
+ @implementation NBFunction
+ - (void)dealloc { try { @try {nmb_function_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (MTLFunctionOptions)options { try { @try {return MTLFunctionOptionNone;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -543,6 +548,7 @@ static std::string quartzCoreCallers();
+ @implementation NBLibrary
+ - (void)dealloc { try { @try {nmb_library_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error { try { @try {
++ fuxiPrewarmLibrary(self);
+  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
+   if(error)*error=nbError(@"unqualified function constant values");return nil;
+  }
+@@ -603,6 +609,7 @@ static std::string quartzCoreCallers();
+  return names;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLFunction>)newFunctionWithName:(NSString *)name { try { @try {
++ fuxiPrewarmLibrary(self);
+  const uint64_t functionBegan=nowUs();
+  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
+  if(!handle){noteProblem(lastError());return nil;}
+@@ -1465,6 +1472,204 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+  return true;
+ }
+ 
++// ---- pipeline prewarm (patch 0022) ----
++// CoreAnimation makes each render pipeline on the draw that first needs it, on its display thread, so the first open of a screen
++// (App Library, Control Center, Spotlight, an app) made 14-33 of them in one burst: 30-75 ms although every one hit the shader cache
++// (1.5-3 ms each, some 12-16 ms; pipelines.log of the 0039 boots), several late frames at 120 Hz on every cold boot. The journal names
++// every pipeline earlier boots made, so in backboardd a utility-QoS queue makes them again once CoreAnimation made its first one,
++// straight through the bridge: no Objective-C device method, since a refusal there reaches the failure hook, which latches
++// backboardd's gate. The states it keeps hold their live variants (shader modules, layouts, VkPipelines; pipeline/memo.rs), so
++// CoreAnimation's own creation of the same descriptor shares them instead of making them. It reads the journal's last 4 MiB as it
++// stood when the device opened (this boot's lines excluded): the R lines that succeeded, one per descriptor, by the earliest time a
++// boot made it, without those a boot made in its first second (CoreAnimation makes them itself while the queue starts), at most 400.
++// A function whose library is not made yet waits for the next library (a pass per new library, eight passes at most). Each creation
++// is a P line in the journal, each pass a FUXI PREWARM line. The flag nopw in fuxitudebug= turns it off.
++struct PrewarmConstant {std::string name;uint64_t index=0,type=0;std::vector<uint8_t> bytes;};
++struct PrewarmStage {std::string name;std::vector<PrewarmConstant> constants;};
++struct PrewarmPipeline {std::string key,label;uint64_t t=0;NmbRenderPipelineDescriptor d{};PrewarmStage vertex,fragment;bool fragmentOn=false,done=false;};
++static std::mutex gPrewarmLock;            // gPrewarmLibraries, gPrewarmQueue, gPrewarmDue
++static NSHashTable *gPrewarmLibraries;     // every library a function was made of (weak)
++static dispatch_queue_t gPrewarmQueue;
++static bool gPrewarmDue;
++static std::atomic<bool> gPrewarmKicked;
++static std::atomic<unsigned> gPrewarmPasses,gPrewarmWaiting{1};
++// The queue's only:
++static std::vector<PrewarmPipeline> gPrewarmList;
++static bool gPrewarmLoaded;
++static unsigned gPrewarmUnread;
++static std::vector<NmbRenderPipeline *> gPrewarmStates;   // kept for the process
++static bool fuxiPrewarmOn() {
++ static const bool on=[]{
++  const char *name=getprogname();
++  if(!name || strcmp(name,"backboardd"))return false;
++  char args[4096]={};size_t size=sizeof(args)-1;
++  return !(sysctlbyname("kern.bootargs",args,&size,nullptr,0)==0 && fuxiTuDebugHasFlag(args,"nopw"));
++ }();
++ return on && !gJournalPath.empty();
++}
++// One stage of an R line, "NAME CONSTANTS": the constants are name:type:hex words (#index for an indexed one), as the journal writes them.
++static bool prewarmStage(const std::string &segment,PrewarmStage &stage) {
++ const size_t space=segment.find(' ');
++ stage.name=segment.substr(0,space);
++ if(stage.name.empty() || stage.name=="-")return false;
++ auto nibble=[](char x)->int{return x>='0' && x<='9'?x-'0':x>='a' && x<='f'?x-'a'+10:-1;};
++ for(size_t at=space==std::string::npos?segment.size():space+1;at<segment.size();) {
++  size_t end=segment.find(' ',at);if(end==std::string::npos)end=segment.size();
++  const std::string word=segment.substr(at,end-at);at=end+1;
++  if(word.empty())continue;
++  const size_t last=word.rfind(':');
++  if(last==std::string::npos || last<2)return false;
++  const size_t middle=word.rfind(':',last-1);
++  if(middle==std::string::npos || middle==0 || middle+1==last)return false;
++  PrewarmConstant c;const std::string name=word.substr(0,middle),hex=word.substr(last+1);
++  char *stop=nullptr;c.type=strtoull(word.c_str()+middle+1,&stop,10);if(stop!=word.c_str()+last)return false;
++  if(name[0]=='#'){if(name.size()<2)return false;c.index=strtoull(name.c_str()+1,&stop,10);if(*stop)return false;}else c.name=name;
++  if(hex.empty() || hex.size()%2)return false;
++  for(size_t i=0;i<hex.size();i+=2) {
++   const int high=nibble(hex[i]),low=nibble(hex[i+1]);if(high<0 || low<0)return false;
++   c.bytes.push_back((uint8_t)(high*16+low));
++  }
++  if(constantBytes(c.type)!=c.bytes.size())return false;
++  stage.constants.push_back(std::move(c));
++ }
++ return true;
++}
++// An R line that succeeded (journalRenderPipeline's form) as a descriptor; its key is everything but the time, the cost and the callers.
++static bool prewarmParse(const char *text,size_t length,PrewarmPipeline &p) {
++ const std::string s(text,length);
++ if(s.compare(0,4,"R t=") || s.find(" ok=1 ")==std::string::npos)return false;
++ unsigned long long t=0,samples=0,topology=0,depth=0,stencil=0;
++ if(sscanf(s.c_str(),"R t=%llu",&t)!=1)return false;
++ const size_t head=s.find(" samples="),label=s.find(" label=");
++ if(head==std::string::npos || label==std::string::npos || label<head)return false;
++ const size_t v=s.find(" | v ",label),f=v==std::string::npos?v:s.find(" | f ",v+5);
++ if(f==std::string::npos)return false;
++ size_t end=s.find(" | ",f+5);if(end==std::string::npos)end=s.size();
++ if(sscanf(s.c_str()+head," samples=%llu topo=%llu ds=%llu/%llu",&samples,&topology,&depth,&stencil)!=4)return false;
++ p.t=t;
++ NmbRenderPipelineDescriptor &d=p.d;
++ d.samples=samples;d.topology=topology;d.depth_format=depth;d.stencil_format=stencil;d.rasterization=1;
++ size_t at=label+7,word=s.find(' ',at);if(word==std::string::npos || word>v)word=v;
++ p.label=s.substr(at,word-at);
++ for(at=word;at<v;) {
++  while(at<v && s[at]==' ')at++;
++  size_t stop=s.find(' ',at);if(stop==std::string::npos || stop>v)stop=v;
++  const std::string w=s.substr(at,stop-at);at=stop;
++  if(w.empty())continue;
++  unsigned i=0;unsigned long long x[9]={};
++  if(w[0]=='c' && sscanf(w.c_str(),"c%u=%llu:%llu:%llu:%llu:%llu:%llu:%llu:%llu:%llu",&i,x,x+1,x+2,x+3,x+4,x+5,x+6,x+7,x+8)==10 && i<8)
++   d.colors[i]={x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7],x[8]};
++  else if(w[0]=='a' && sscanf(w.c_str(),"a%u=%llu:%llu:%llu:%llu:%llu:%llu",&i,x,x+1,x+2,x+3,x+4,x+5)==7 && i<31 && x[2]<31)
++   {d.vertex_inputs=1;d.attributes[i]={x[0],x[1],x[2]};d.layouts[x[2]]={x[3],x[4],x[5]};}
++  else return false;
++ }
++ if(!prewarmStage(s.substr(v+5,f-(v+5)),p.vertex))return false;
++ const std::string fragment=s.substr(f+5,end-(f+5));
++ p.fragmentOn=fragment!="-" && fragment.compare(0,2,"- ")!=0;
++ if(p.fragmentOn && !prewarmStage(fragment,p.fragment))return false;
++ char key[96];snprintf(key,sizeof key,"%llu/%llu/%llu/%llu",samples,topology,depth,stencil);
++ p.key=std::string(key)+s.substr(label,end-label);
++ return true;
++}
++static void prewarmLoad() {
++ gPrewarmLoaded=true;
++ const uint64_t window=4ull<<20,size=gJournalOpenSize,from=size>window?size-window:0;
++ if(!size)return;
++ FILE *file=fopen(gJournalPath.c_str(),"r");if(!file)return;
++ std::string text((size_t)(size-from),'\0');
++ const size_t got=fseeko(file,(off_t)from,SEEK_SET)==0?fread(&text[0],1,text.size(),file):0;
++ fclose(file);text.resize(got);
++ size_t at=0;
++ if(from){at=text.find('\n');at=at==std::string::npos?text.size():at+1;}   // the window's first line is a part of one
++ std::unordered_map<std::string,size_t> index;
++ while(at<text.size()) {
++  size_t end=text.find('\n',at);if(end==std::string::npos)end=text.size();
++  if(end-at>4 && !text.compare(at,4,"R t=")) {
++   PrewarmPipeline p;
++   if(prewarmParse(text.data()+at,end-at,p)) {
++    const auto found=index.find(p.key);
++    if(found==index.end()){index.emplace(p.key,gPrewarmList.size());gPrewarmList.push_back(std::move(p));}
++    else gPrewarmList[found->second].t=std::min(gPrewarmList[found->second].t,p.t);
++   } else if(text.find(" ok=1 ",at)<end)gPrewarmUnread++;
++  }
++  at=end+1;
++ }
++ gPrewarmList.erase(std::remove_if(gPrewarmList.begin(),gPrewarmList.end(),[](const PrewarmPipeline &p){return p.t<1000;}),gPrewarmList.end());
++ std::stable_sort(gPrewarmList.begin(),gPrewarmList.end(),[](const PrewarmPipeline &a,const PrewarmPipeline &b){return a.t<b.t;});
++ if(gPrewarmList.size()>400)gPrewarmList.resize(400);
++}
++static NmbFunction *prewarmFunction(NmbLibrary *library,const PrewarmStage &stage) {
++ if(stage.constants.empty())return nmb_function_new(library,stage.name.c_str());
++ std::vector<NmbConstant> constants;
++ for(const PrewarmConstant &c:stage.constants)constants.push_back({c.type,c.index,c.name.empty()?nullptr:c.name.c_str(),c.bytes.data(),(uint64_t)c.bytes.size()});
++ return nmb_function_new_specialized(library,stage.name.c_str(),constants.data(),(uint32_t)constants.size());
++}
++static void prewarmPass() {
++ if(fuxiBlocked())return;
++ if(!gPrewarmLoaded)prewarmLoad();
++ NSArray *libraries=nil;
++ {std::lock_guard<std::mutex> lock(gPrewarmLock);gPrewarmDue=false;libraries=gPrewarmLibraries.allObjects;}
++ std::unordered_map<std::string,NmbLibrary *> owner;
++ for(NBLibrary *library in libraries)for(uint32_t i=0,n=nmb_library_function_count(library.handle);i<n;i++) {
++  char name[256]={};nmb_library_function_name(library.handle,i,name,sizeof name);owner.emplace(name,library.handle);
++ }
++ const uint64_t began=nowUs();uint64_t spent=0,slowest=0;unsigned made=0,refused=0,waiting=0;
++ for(PrewarmPipeline &p:gPrewarmList) {
++  if(p.done)continue;
++  if(fuxiBlocked())break;
++  const auto v=owner.find(p.vertex.name),f=p.fragmentOn?owner.find(p.fragment.name):owner.end();
++  if(v==owner.end() || (p.fragmentOn && f==owner.end())){waiting++;continue;}
++  p.done=true;
++  const uint64_t one=nowUs();
++  NmbFunction *vf=prewarmFunction(v->second,p.vertex),*ff=p.fragmentOn?prewarmFunction(f->second,p.fragment):nullptr;
++  NmbRenderPipeline *state=nullptr;
++  if(vf && (!p.fragmentOn || ff)) {
++   NmbRenderPipelineDescriptor d=p.d;d.vertex=vf;d.fragment=ff;
++   const NmbPipelineOptions defaults={0,nullptr,0};
++   state=nmb_render_pipeline_new_with_options(gDevice,&d,&defaults);
++  }
++  const char *error=state?nullptr:nmb_last_error();
++  const std::string why=state?std::string():std::string(error?error:"?");
++  if(vf)nmb_function_release(vf);
++  if(ff)nmb_function_release(ff);
++  const uint64_t took=nowUs()-one;spent+=took;slowest=std::max(slowest,took);
++  if(state){gPrewarmStates.push_back(state);made++;}else refused++;
++  char head[96];
++  snprintf(head,sizeof head,"P t=%llu us=%llu ok=%d label=",(unsigned long long)((one-gJournalBegan)/1000),(unsigned long long)took,state?1:0);
++  journal(head+p.label+" v="+p.vertex.name+" f="+(p.fragmentOn?p.fragment.name:std::string("-"))+(state?std::string():" err="+why));
++ }
++ gPrewarmWaiting=waiting;
++ fprintf(stderr,"FUXI PREWARM: pass=%u libraries=%lu keys=%zu unread=%u made=%u refused=%u waiting=%u spent_ms=%llu slowest_ms=%llu wall_ms=%llu kept=%zu\n",
++  gPrewarmPasses.fetch_add(1)+1,(unsigned long)libraries.count,gPrewarmList.size(),gPrewarmUnread,made,refused,waiting,
++  (unsigned long long)(spent/1000),(unsigned long long)(slowest/1000),(unsigned long long)((nowUs()-began)/1000),gPrewarmStates.size());
++}
++static void prewarmRun() {
++ @autoreleasepool {
++  try { @try {prewarmPass();} @catch(NSException *e){fprintf(stderr,"FUXI PREWARM: exception %s\n",e.reason.UTF8String?:"?");} }
++  catch(const std::exception &e){fprintf(stderr,"FUXI PREWARM: exception %s\n",e.what());}
++  catch(...){fprintf(stderr,"FUXI PREWARM: exception\n");}
++ }
++}
++static void fuxiPrewarmKick() {
++ if(gPrewarmKicked.load(std::memory_order_relaxed) || gPrewarmKicked.exchange(true) || !fuxiPrewarmOn())return;
++ dispatch_queue_t queue=dispatch_queue_create("org.blu-sharky.native-metal.prewarm",
++     dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_UTILITY,0));
++ {std::lock_guard<std::mutex> lock(gPrewarmLock);gPrewarmQueue=queue;gPrewarmDue=true;}
++ dispatch_async(queue,^{prewarmRun();});
++}
++static void fuxiPrewarmLibrary(NBLibrary *library) {
++ if(!library || !fuxiPrewarmOn())return;
++ dispatch_queue_t queue=nil;
++ {
++  std::lock_guard<std::mutex> lock(gPrewarmLock);
++  if(!gPrewarmLibraries)gPrewarmLibraries=[NSHashTable weakObjectsHashTable];
++  if([gPrewarmLibraries containsObject:library])return;
++  [gPrewarmLibraries addObject:library];
++  if(gPrewarmQueue && !gPrewarmDue && gPrewarmWaiting.load() && gPrewarmPasses.load()<8){gPrewarmDue=true;queue=gPrewarmQueue;}
++ }
++ if(queue)dispatch_async(queue,^{prewarmRun();});
++}
++
+ // ---- heaps ----
+ // Metal heaps over the runtime's: an automatic heap places each resource, a placement heap takes an offset. Resources made from one keep it
+ // alive (their `heap`); a heap's resources share its storage mode, CPU cache mode and (here) hazard tracking mode.
+@@ -1827,7 +2032,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  FrameMake make(&FrameMakes::pipelines);NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
+  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
+  if(!handle){auto refused=failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);if(fuxiBlocked()){if(error)*error=nil;return (id)[NBRenderPipeline new];}return refused;}
+- NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
++ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;
++ fuxiPrewarmKick();   // patch 0022: CoreAnimation's first render pipeline starts the prewarm
++ if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
+ // newFunctionWithName:constantValues:completionHandler: does (RenderBox's pipeline loader, Core Image's bilateral solver).
+@@ -1948,6 +2155,8 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
+  gDevice=nmb_device_open(loader?turnip.c_str():nullptr,cache);
+  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
+  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
++ // Before this boot's first line (the F lines below): the prewarm reads only what earlier boots wrote.
++ if(!gJournalPath.empty()){struct stat st;if(stat(gJournalPath.c_str(),&st)==0)gJournalOpenSize=(uint64_t)st.st_size;}
+  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
+  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
+  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
