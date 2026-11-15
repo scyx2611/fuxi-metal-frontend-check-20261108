@@ -1,0 +1,104 @@
+diff --git a/xnu/fuxi-h1/fuxi_keys.c b/xnu/fuxi-h1/fuxi_keys.c
+index 8f1d60f..52bfd97 100644
+--- a/xnu/fuxi-h1/fuxi_keys.c
++++ b/xnu/fuxi-h1/fuxi_keys.c
+@@ -661,11 +661,11 @@ fk_taps(void *arg, wait_result_t wr)
+ /*
+  * fuxitour=S: S seconds after the key thread starts, walk a fixed tour of
+  * screens for screenshots: lock screen, home, Today view, Spotlight, Control
+- * Center, Settings (General, About), Clock, Calendar and Photos. Each screen
+- * prints "FUXI TOUR: shot N name" and holds for fuxitourhold=H seconds
+- * (default 45) so the USB monitor can read the framebuffer. Tap targets match
+- * the stock iOS 16 home layout at 1080x2400; fuxitourg=Y and fuxitoura=Y move
+- * the General and About rows in Settings. Device tests only (synthetic touch).
++ * Center, Settings (General, About), Photos, App Store, Safari, Messages, Phone.
++ * Each screen prints "FUXI TOUR: shot N name" and holds for fuxitourhold=H
++ * seconds (default 45) so the USB monitor can read the framebuffer. Taps match
++ * this root's home page 1 at 1080x2400 (Settings row 2 col 1, dock); fuxitourg=Y
++ * and fuxitoura=Y move the General and About rows. Device tests only (synthetic touch).
+  */
+ static unsigned fk_tour_hold = 45, fk_tour_general = 2100, fk_tour_about = 400;
+ 
+@@ -742,22 +742,22 @@ fk_tour(void *arg, wait_result_t wr)
+ 	/* A home gesture on another page only returns to page 1 the second time. */
+ 	fk_tour_home();
+ 	fk_tour_home();
+-	/* Settings reopens its last page: tap Back twice to reach the top list. */
+-	fk_tap(670, 1710);
++	/* Settings reopens its last page: tap Back twice, then the status bar (left of the notch) scrolls the list to the top. */
++	fk_tap(148, 570);
+ 	fk_script_sleep(4000);
+ 	fk_tap(110, 180);
+ 	fk_script_sleep(1500);
+-	fk_tap(110, 180);
++	fk_tap(110, 180); fk_script_sleep(1500); fk_tap(200, 40);
+ 	fk_script_sleep(2000);
+ 	fk_tour_shot(&shot, "settings");
+ 	fk_tour_app(&shot, 540, (int)fk_tour_general, "general");
+ 	fk_tour_app(&shot, 540, (int)fk_tour_about, "about");
++	fk_tour_home(); fk_tour_app(&shot, 148, 285, "photos");
++	fk_tour_home(); fk_tour_app(&shot, 410, 285, "app-store");
++	fk_tour_home(); fk_tour_app(&shot, 540, 2245, "safari");
++	fk_tour_home(); fk_tour_app(&shot, 800, 2245, "messages");
++	fk_tour_home(); fk_tour_app(&shot, 280, 2245, "phone");
+ 	fk_tour_home();
+-	fk_tour_app(&shot, 670, 1140, "clock");
+-	fk_tour_home();
+-	fk_tour_app(&shot, 410, 860, "calendar");
+-	fk_tour_home();
+-	fk_tour_app(&shot, 670, 860, "photos");
+ 	fk_tour_home();
+ 	printf("FUXI TOUR: done\n");
+ 	(void)thread_terminate(current_thread());
+diff --git a/xnu/patches/0103-fuxi-kernel-h1.patch b/xnu/patches/0103-fuxi-kernel-h1.patch
+index 39be642..d35eb12 100644
+--- a/xnu/patches/0103-fuxi-kernel-h1.patch
++++ b/xnu/patches/0103-fuxi-kernel-h1.patch
+@@ -625,11 +625,11 @@
+ +/*
+ + * fuxitour=S: S seconds after the key thread starts, walk a fixed tour of
+ + * screens for screenshots: lock screen, home, Today view, Spotlight, Control
+-+ * Center, Settings (General, About), Clock, Calendar and Photos. Each screen
+-+ * prints "FUXI TOUR: shot N name" and holds for fuxitourhold=H seconds
+-+ * (default 45) so the USB monitor can read the framebuffer. Tap targets match
+-+ * the stock iOS 16 home layout at 1080x2400; fuxitourg=Y and fuxitoura=Y move
+-+ * the General and About rows in Settings. Device tests only (synthetic touch).
+++ * Center, Settings (General, About), Photos, App Store, Safari, Messages, Phone.
+++ * Each screen prints "FUXI TOUR: shot N name" and holds for fuxitourhold=H
+++ * seconds (default 45) so the USB monitor can read the framebuffer. Taps match
+++ * this root's home page 1 at 1080x2400 (Settings row 2 col 1, dock); fuxitourg=Y
+++ * and fuxitoura=Y move the General and About rows. Device tests only (synthetic touch).
+ + */
+ +static unsigned fk_tour_hold = 45, fk_tour_general = 2100, fk_tour_about = 400;
+ +
+@@ -706,22 +706,22 @@
+ +	/* A home gesture on another page only returns to page 1 the second time. */
+ +	fk_tour_home();
+ +	fk_tour_home();
+-+	/* Settings reopens its last page: tap Back twice to reach the top list. */
+-+	fk_tap(670, 1710);
+++	/* Settings reopens its last page: tap Back twice, then the status bar (left of the notch) scrolls the list to the top. */
+++	fk_tap(148, 570);
+ +	fk_script_sleep(4000);
+ +	fk_tap(110, 180);
+ +	fk_script_sleep(1500);
+-+	fk_tap(110, 180);
+++	fk_tap(110, 180); fk_script_sleep(1500); fk_tap(200, 40);
+ +	fk_script_sleep(2000);
+ +	fk_tour_shot(&shot, "settings");
+ +	fk_tour_app(&shot, 540, (int)fk_tour_general, "general");
+ +	fk_tour_app(&shot, 540, (int)fk_tour_about, "about");
+++	fk_tour_home(); fk_tour_app(&shot, 148, 285, "photos");
+++	fk_tour_home(); fk_tour_app(&shot, 410, 285, "app-store");
+++	fk_tour_home(); fk_tour_app(&shot, 540, 2245, "safari");
+++	fk_tour_home(); fk_tour_app(&shot, 800, 2245, "messages");
+++	fk_tour_home(); fk_tour_app(&shot, 280, 2245, "phone");
+ +	fk_tour_home();
+-+	fk_tour_app(&shot, 670, 1140, "clock");
+-+	fk_tour_home();
+-+	fk_tour_app(&shot, 410, 860, "calendar");
+-+	fk_tour_home();
+-+	fk_tour_app(&shot, 670, 860, "photos");
+ +	fk_tour_home();
+ +	printf("FUXI TOUR: done\n");
+ +	(void)thread_terminate(current_thread());
