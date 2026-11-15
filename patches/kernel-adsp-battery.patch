@@ -5752,7 +5752,7 @@ index 8f1d60f..e71e7c2 100644
  	(void)thread_terminate(current_thread());
  	thread_block(THREAD_CONTINUE_NULL);
 diff --git a/xnu/fuxi-unixnu/sweet_ufs.c b/xnu/fuxi-unixnu/sweet_ufs.c
-index c8376e4..26df269 100644
+index c8376e4..d363e22 100644
 --- a/xnu/fuxi-unixnu/sweet_ufs.c
 +++ b/xnu/fuxi-unixnu/sweet_ufs.c
 @@ -60,7 +60,11 @@ extern void sweet_touch_init(void);
@@ -5767,18 +5767,20 @@ index c8376e4..26df269 100644
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -215,6 +219,27 @@ fx_load_extents(void)
+@@ -215,6 +219,29 @@ fx_load_extents(void)
  	fx_root = true;
  	return 0;
  }
 +
 +/*
 + * Standalone-boot console log (a slot-b boot has no USB, so no live log): ADT /chosen u32 "fuxi,log"=1 (or boot-arg
-+ * fuxilog=1) and a GPT partition named "logdump" whose first block Android stamped with "FUXILOG1 STAMPED" at byte 2048
-+ * (tools/fuxi-log-prep.sh); without the stamp nothing is written. Area = the partition's first FX_LOG_AREA_BLOCKS 4 KiB
++ * fuxilog=1) and the GPT partition FX_LOG_PART whose first block Android stamped with "FUXILOG1 STAMPED" at byte 2048
++ * (work/adsp-battery/hw000/fuxi-log.sh stamp); without the stamp nothing is written. Fuxi has no "logdump": "mtdblk" (LUN 0,
++ * 32 MiB) was all zeros on 2026-11-16 and nothing in Android, abl, xbl or uefi names it (block2mtd/mtdoops use "oops"). Area = the partition's first FX_LOG_AREA_BLOCKS 4 KiB
 + * blocks: 0 = SWEETLOG header (version 2, struct fx_log_header) + the stamp, 1..1024 = ring (the console's last 4 MiB),
 + * 1025..2048 = head (its first 4 MiB, frozen once the ring wraps). No other block of any partition is ever written.
 + */
++#define FX_LOG_PART "mtdblk"
 +#define FX_LOG_AREA_BLOCKS 2049u
 +static const char fx_log_stamp[16] = {'F', 'U', 'X', 'I', 'L', 'O', 'G', '1', ' ', 'S', 'T', 'A', 'M', 'P', 'E', 'D'};
 +static uint8_t fx_log_lun;
@@ -5795,7 +5797,7 @@ index c8376e4..26df269 100644
  #endif
  
  static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
-@@ -301,7 +326,11 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+@@ -301,7 +328,11 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
              (uint64_t)cdb[7]<<8|cdb[8]) && len==((uint32_t)cdb[7]<<8|cdb[8])*UFS_BLOCK;
      bool root_sync=!write && len==0 && su.writable && fx_root && su.lun==0 &&
          cdb_len==10 && cdb[0]==0x35;
@@ -5808,7 +5810,7 @@ index c8376e4..26df269 100644
          (write || !cdb_len || (cdb[0]!=0x00 && cdb[0]!=0x28 && !active_power))) return EROFS;
  #endif
  
-@@ -554,6 +583,98 @@ ufs_find_partition(const char *want)
+@@ -554,6 +585,98 @@ ufs_find_partition(const char *want)
  	return ENOENT;
  }
  
@@ -5907,18 +5909,18 @@ index c8376e4..26df269 100644
  static int
  ufs_take_over_host(void)
  {
-@@ -951,6 +1072,10 @@ sweet_ufs_init(void)
+@@ -951,6 +1074,10 @@ sweet_ufs_init(void)
  	fuxi_keys_init();
  	/* WCN7850 PCIe0/MHI probe, boot-arg fuxiwlan (bsd/dev/fuxi_wlan.c). */
  	fuxi_wlan_init();
-+	/* Console log to the stamped logdump area, for standalone boots (fx_log_start); before the DSP so its bring-up is kept. */
++	/* Console log to the stamped mtdblk area, for standalone boots (fx_log_start); before the DSP so its bring-up is kept. */
 +	fx_log_start();
 +	/* Audio DSP (ADSP) and its battery manager, boot-arg fuxiadsp (bsd/dev/fuxi_adsp.c); needs this driver for the firmware. */
 +	fuxi_adsp_init();
  #else
  	sweet_log_start();
  	sweet_sample_start();
-@@ -1126,6 +1251,178 @@ sweet_log_start(void)
+@@ -1126,6 +1253,178 @@ sweet_log_start(void)
  	}
  }
  
@@ -6056,7 +6058,7 @@ index c8376e4..26df269 100644
 +			break;
 +		}
 +		su.lun = luns[i];
-+		if (!fx_gpt_lookup("logdump", &first, &blocks)) {
++		if (!fx_gpt_lookup(FX_LOG_PART, &first, &blocks)) {
 +			lun = luns[i];
 +			found = 1;
 +		}
@@ -6077,7 +6079,7 @@ index c8376e4..26df269 100644
 +	su.lun = saved;
 +	lck_mtx_unlock(&sweet_ufs_lock);
 +	if (!found || blocks < FX_LOG_AREA_BLOCKS || error || !stamped) {
-+		printf("FUXI LOG: off (logdump %s%s, error %d)\n", found ? "found" : "not found",
++		printf("FUXI LOG: off (" FX_LOG_PART " %s%s, error %d)\n", found ? "found" : "not found",
 +		    found && blocks < FX_LOG_AREA_BLOCKS ? " but too small" : found && !stamped ? " but not stamped" : "", error);
 +		return;
 +	}
@@ -6086,7 +6088,7 @@ index c8376e4..26df269 100644
 +	fx_log_ok = true;
 +	if (kernel_thread_start(fx_log_thread, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
-+		printf("FUXI LOG: console to logdump (LUN %u, block 0x%llx, %u KiB), boot #%u, every %u s\n", lun, first,
++		printf("FUXI LOG: console to " FX_LOG_PART " (LUN %u, block 0x%llx, %u KiB), boot #%u, every %u s\n", lun, first,
 +		    FX_LOG_AREA_BLOCKS * UFS_BLOCK >> 10, fx_log_boot, sweet_log_secs);
 +	} else {
 +		fx_log_ok = false;
@@ -6343,7 +6345,7 @@ index 39be642..fac61cc 100644
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
 diff --git a/xnu/patches/0106-fuxi-unixnu.patch b/xnu/patches/0106-fuxi-unixnu.patch
-index d95faff..bac3a96 100644
+index d95faff..cac8cfa 100644
 --- a/xnu/patches/0106-fuxi-unixnu.patch
 +++ b/xnu/patches/0106-fuxi-unixnu.patch
 @@ -42,7 +42,19 @@
@@ -6367,24 +6369,26 @@ index d95faff..bac3a96 100644
   	int bmajor, cmajor;
   	dev_t bdev;
   	bool ready;
-@@ -51,10 +63,40 @@
+@@ -51,10 +63,42 @@
   } su;
   
   #if defined(FUXI)
 -@@ -237,6 +244,44 @@
 - 	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
-+@@ -208,6 +219,27 @@
++@@ -208,6 +219,29 @@
 + 	fx_root = true;
 + 	return 0;
   }
 ++
 ++/*
 ++ * Standalone-boot console log (a slot-b boot has no USB, so no live log): ADT /chosen u32 "fuxi,log"=1 (or boot-arg
-++ * fuxilog=1) and a GPT partition named "logdump" whose first block Android stamped with "FUXILOG1 STAMPED" at byte 2048
-++ * (tools/fuxi-log-prep.sh); without the stamp nothing is written. Area = the partition's first FX_LOG_AREA_BLOCKS 4 KiB
+++ * fuxilog=1) and the GPT partition FX_LOG_PART whose first block Android stamped with "FUXILOG1 STAMPED" at byte 2048
+++ * (work/adsp-battery/hw000/fuxi-log.sh stamp); without the stamp nothing is written. Fuxi has no "logdump": "mtdblk" (LUN 0,
+++ * 32 MiB) was all zeros on 2026-11-16 and nothing in Android, abl, xbl or uefi names it (block2mtd/mtdoops use "oops"). Area = the partition's first FX_LOG_AREA_BLOCKS 4 KiB
 ++ * blocks: 0 = SWEETLOG header (version 2, struct fx_log_header) + the stamp, 1..1024 = ring (the console's last 4 MiB),
 ++ * 1025..2048 = head (its first 4 MiB, frozen once the ring wraps). No other block of any partition is ever written.
 ++ */
+++#define FX_LOG_PART "mtdblk"
 ++#define FX_LOG_AREA_BLOCKS 2049u
 ++static const char fx_log_stamp[16] = {'F', 'U', 'X', 'I', 'L', 'O', 'G', '1', ' ', 'S', 'T', 'A', 'M', 'P', 'E', 'D'};
 ++static uint8_t fx_log_lun;
@@ -6401,7 +6405,7 @@ index d95faff..bac3a96 100644
 + #endif
   
 + static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
-+@@ -235,6 +267,44 @@
++@@ -235,6 +269,44 @@
 + dma_clean(uint32_t off, uint32_t len)
 + {
 + 	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
@@ -6410,7 +6414,7 @@ index d95faff..bac3a96 100644
  +/* All ranges live in our dedicated, permanently allocated, cache-line-aligned DMA area. */
  +static void
  +fuxi_ufs_cache(uint32_t off, uint32_t len, bool invalidate)
-@@ -91,12 +133,10 @@
+@@ -91,12 +135,10 @@
  +	if (db || (status & FUXI_UFS_FATAL_STATUS))
  +		return fuxi_ufs_poison("preflight", db, status, 15, EIO);
  +	return 0;
@@ -6422,16 +6426,16 @@ index d95faff..bac3a96 100644
 -  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
 -  * (to the device when write is set). Returns 0 or an errno.
 -@@ -244,6 +289,9 @@
-+@@ -244,6 +314,9 @@
++@@ -244,6 +316,9 @@
   static int
   ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
   {
-@@ -106,7 +146,20 @@
+@@ -106,7 +148,20 @@
   #if defined(FUXI)
       /* Also permit only the exact device-WLUN ACTIVE power command used by Linux. */
       bool active_power=!write && len==0 && cdb_len==6 && su.lun==0xd0 &&
 -@@ -292,27 +340,34 @@
-+@@ -253,7 +326,11 @@
++@@ -253,7 +328,11 @@
 +             (uint64_t)cdb[7]<<8|cdb[8]) && len==((uint32_t)cdb[7]<<8|cdb[8])*UFS_BLOCK;
 +     bool root_sync=!write && len==0 && su.writable && fx_root && su.lun==0 &&
 +         cdb_len==10 && cdb[0]==0x35;
@@ -6444,34 +6448,34 @@ index d95faff..bac3a96 100644
 +         (write || !cdb_len || (cdb[0]!=0x00 && cdb[0]!=0x28 && !active_power))) return EROFS;
 + #endif
 + 
-+@@ -292,27 +369,34 @@
++@@ -292,27 +371,34 @@
   		utrd->prdt = (1024u / 4) << 16 | n;
   	}
   
-@@ -161,7 +214,7 @@
+@@ -161,7 +216,7 @@
   	ufs_wr(REG_UTRLDBR, 1);
   	uint64_t deadline;
   	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
 -@@ -325,12 +380,28 @@
-+@@ -325,12 +409,28 @@
++@@ -325,12 +411,28 @@
   		spin_until += mach_absolute_time();
   		nanoseconds_to_absolutetime(CMD_SLEEP_NS, &sleep_interval);
   	}
-@@ -195,7 +248,7 @@
+@@ -195,7 +250,7 @@
   		}
   		if (sleepable && now >= spin_until) {
   			uint64_t wake = now + MIN(sleep_interval, deadline - now);
 -@@ -344,16 +415,25 @@
-+@@ -344,16 +444,25 @@
++@@ -344,16 +446,25 @@
   		}
   	}
   	__builtin_arm_dsb(0xf);
-@@ -230,7 +283,106 @@
+@@ -230,7 +285,106 @@
   	}
   
   	uint32_t ocs = utrd->dw2 & 0xff;
 -@@ -492,8 +572,10 @@
-+@@ -474,6 +583,98 @@
++@@ -474,6 +585,98 @@
 + 	return ENOENT;
 + }
 + 
@@ -6570,62 +6574,62 @@ index d95faff..bac3a96 100644
 + static int
 + ufs_take_over_host(void)
 + {
-+@@ -492,8 +693,10 @@
++@@ -492,8 +695,10 @@
   		    su.dma_pa);
   		return ENXIO;
   	}
-@@ -242,7 +394,7 @@
+@@ -242,7 +396,7 @@
   	ufs_wr(REG_UTRLRSR, 0);
   	uint64_t list = su.dma_pa + DMA_UTRL;
   	ufs_wr(REG_UTRLBA, (uint32_t)list);
 -@@ -553,6 +635,7 @@
-+@@ -553,6 +756,7 @@
++@@ -553,6 +758,7 @@
   
   	lck_mtx_lock(&sweet_ufs_lock);
   	for (uint32_t done = 0; done < count;) {
-@@ -250,7 +402,7 @@
+@@ -250,7 +404,7 @@
   		uint64_t pos = off + done;
   		uint64_t lba = pos / UFS_BLOCK;
   		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
 -@@ -721,6 +804,7 @@
-+@@ -721,6 +925,7 @@
++@@ -721,6 +927,7 @@
   static int
   sweet_ufs_init(void)
   {
-@@ -258,7 +410,7 @@
+@@ -258,7 +412,7 @@
   #if defined(FUXI)
       uint32_t requested=0;
       if (!PE_parse_boot_argn("fuxi_ufs_probe", &requested, sizeof(requested)) || requested!=1)
 -@@ -770,6 +854,12 @@
-+@@ -770,6 +975,12 @@
++@@ -770,6 +977,12 @@
   	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
   	su.cache = (cache == 1);
   	su.wait = (wait == 1);
-@@ -271,7 +423,18 @@
+@@ -271,7 +425,18 @@
   
   	su.regs = ml_io_map(reg[0], reg[1]);
   	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
 -@@ -985,6 +1075,7 @@
-+@@ -861,6 +1072,10 @@
++@@ -861,6 +1074,10 @@
 + 	fuxi_keys_init();
 + 	/* WCN7850 PCIe0/MHI probe, boot-arg fuxiwlan (bsd/dev/fuxi_wlan.c). */
 + 	fuxi_wlan_init();
-++	/* Console log to the stamped logdump area, for standalone boots (fx_log_start); before the DSP so its bring-up is kept. */
+++	/* Console log to the stamped mtdblk area, for standalone boots (fx_log_start); before the DSP so its bring-up is kept. */
 ++	fx_log_start();
 ++	/* Audio DSP (ADSP) and its battery manager, boot-arg fuxiadsp (bsd/dev/fuxi_adsp.c); needs this driver for the firmware. */
 ++	fuxi_adsp_init();
 + #else
 + 	sweet_log_start();
 + 	sweet_sample_start();
-+@@ -985,6 +1200,7 @@
++@@ -985,6 +1202,7 @@
   		int error = 0;
   
   		lck_mtx_lock(&sweet_ufs_lock);
-@@ -279,6 +442,185 @@
+@@ -279,6 +444,185 @@
   		while (pos < total && !error) {
   			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
   			uint32_t blk = off / UFS_BLOCK;
-+@@ -1035,6 +1251,178 @@
++@@ -1035,6 +1253,178 @@
 + 	}
 + }
 + 
@@ -6763,7 +6767,7 @@ index d95faff..bac3a96 100644
 ++			break;
 ++		}
 ++		su.lun = luns[i];
-++		if (!fx_gpt_lookup("logdump", &first, &blocks)) {
+++		if (!fx_gpt_lookup(FX_LOG_PART, &first, &blocks)) {
 ++			lun = luns[i];
 ++			found = 1;
 ++		}
@@ -6784,7 +6788,7 @@ index d95faff..bac3a96 100644
 ++	su.lun = saved;
 ++	lck_mtx_unlock(&sweet_ufs_lock);
 ++	if (!found || blocks < FX_LOG_AREA_BLOCKS || error || !stamped) {
-++		printf("FUXI LOG: off (logdump %s%s, error %d)\n", found ? "found" : "not found",
+++		printf("FUXI LOG: off (" FX_LOG_PART " %s%s, error %d)\n", found ? "found" : "not found",
 ++		    found && blocks < FX_LOG_AREA_BLOCKS ? " but too small" : found && !stamped ? " but not stamped" : "", error);
 ++		return;
 ++	}
@@ -6793,7 +6797,7 @@ index d95faff..bac3a96 100644
 ++	fx_log_ok = true;
 ++	if (kernel_thread_start(fx_log_thread, NULL, &thread) == KERN_SUCCESS) {
 ++		thread_deallocate(thread);
-++		printf("FUXI LOG: console to logdump (LUN %u, block 0x%llx, %u KiB), boot #%u, every %u s\n", lun, first,
+++		printf("FUXI LOG: console to " FX_LOG_PART " (LUN %u, block 0x%llx, %u KiB), boot #%u, every %u s\n", lun, first,
 ++		    FX_LOG_AREA_BLOCKS * UFS_BLOCK >> 10, fx_log_boot, sweet_log_secs);
 ++	} else {
 ++		fx_log_ok = false;
@@ -6808,7 +6812,7 @@ index d95faff..bac3a96 100644
  +++ b/bsd/dev/fuxi_unixnu_ufs.h
  @@ -0,0 +1,36 @@
 diff --git a/xnu/patches/0111-fuxi-user-profiler.patch b/xnu/patches/0111-fuxi-user-profiler.patch
-index 8349337..9bb9d6d 100644
+index 8349337..34b8d1c 100644
 --- a/xnu/patches/0111-fuxi-user-profiler.patch
 +++ b/xnu/patches/0111-fuxi-user-profiler.patch
 @@ -18,7 +18,7 @@
@@ -6816,7 +6820,7 @@ index 8349337..9bb9d6d 100644
   extern void sweet_touch_init(void);
   extern void fuxi_touch_init(void);
 -@@ -941,6 +942,7 @@
-+@@ -1062,6 +1063,7 @@
++@@ -1064,6 +1065,7 @@
   	 * Stack sampler only, and only on request. sweet_log_start() stays off: it
   	 * would write the tail of ufsroot0, which here is the HFS image itself.
   	 */
