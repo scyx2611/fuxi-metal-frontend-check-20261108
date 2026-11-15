@@ -1,5 +1,5 @@
 diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
-index 9222ec6..4438c86 100644
+index 9222ec6..8ce9d83 100644
 --- a/NativeBridgeMetalFrontend.mm
 +++ b/NativeBridgeMetalFrontend.mm
 @@ -19,6 +19,7 @@
@@ -10,26 +10,46 @@ index 9222ec6..4438c86 100644
  #include <CommonCrypto/CommonDigest.h>
  #include <dlfcn.h>
  #include <execinfo.h>
-@@ -108,6 +109,27 @@ static bool fuxiSwapWaitEnabled() {
+@@ -108,6 +109,47 @@ static bool fuxiSwapWaitEnabled() {
   }();
   return bootEnabled;
  }
-+// Hybrid Turnip (patch 0019): with fuxiturnip=1 on the boot line the device opens libvulkan_freedreno_hyb.dylib, the hybrid
-+// lane's Turnip build (Mesa patches mesa-hyb-*.patch), from the directory of the default loader instead of that loader, so one
-+// root image A/B tests a Turnip change by boot argument. Without the argument, or without that file, the loader is unchanged.
++// True when the boot line's first fuxitudebug=<flags> word lists flag as one of its comma-separated flags.
++static bool fuxiTuDebugHasFlag(const char *args,const char *flag) {
++ static const char key[]="fuxitudebug=";const size_t keyLength=sizeof(key)-1,length=strlen(flag);
++ for(const char *at=args;at && *at;) {
++  while(*at==' ' || *at=='\t' || *at=='\n')at++;
++  const char *end=at;while(*end && *end!=' ' && *end!='\t' && *end!='\n')end++;
++  if((size_t)(end-at)>keyLength && !strncmp(at,key,keyLength)) {
++   for(const char *f=at+keyLength;f<end;) {
++    const char *stop=f;while(stop<end && *stop!=',')stop++;
++    if((size_t)(stop-f)==length && !strncmp(f,flag,length))return true;
++    f=stop<end?stop+1:end;
++   }
++   return false;
++  }
++  at=end;
++ }
++ return false;
++}
++// Hybrid Turnip (patch 0019): with the flag hyb in the boot line's fuxitudebug= list (e.g. fuxitudebug=nocb,hyb) the device
++// opens libvulkan_freedreno_hyb.dylib, the hybrid lane's Turnip build (Mesa patches mesa-hyb-*.patch), from the directory of the
++// default loader instead of that loader, so one root image A/B tests a Turnip change by boot argument. It rides on fuxitudebug=
++// because the boot line is at XNU's 608-byte limit and a token of its own does not fit; Turnip ignores the unknown flag in
++// TU_DEBUG. Without the flag, or without that file, the loader is unchanged.
 +static std::string fuxiTurnipLoader(const char *loader) {
 + if(!loader)return std::string();
 + const std::string given(loader);
 + char args[4096]={};size_t size=sizeof(args)-1;
-+ if(sysctlbyname("kern.bootargs",args,&size,nullptr,0)!=0 || !fuxiBootArgsHaveToken(args,"fuxiturnip=1"))return given;
++ if(sysctlbyname("kern.bootargs",args,&size,nullptr,0)!=0 || !fuxiTuDebugHasFlag(args,"hyb"))return given;
 + static const std::string name="/libvulkan_freedreno.dylib";
 + if(given.size()<=name.size() || given.compare(given.size()-name.size(),name.size(),name)!=0) {
-+  fprintf(stderr,"FUXI TURNIP: fuxiturnip=1 but the loader is %s; unchanged\n",loader);
++  fprintf(stderr,"FUXI TURNIP: fuxitudebug has hyb but the loader is %s; unchanged\n",loader);
 +  return given;
 + }
 + const std::string hybrid=given.substr(0,given.size()-name.size())+"/libvulkan_freedreno_hyb.dylib";
 + if(access(hybrid.c_str(),R_OK)!=0) {
-+  fprintf(stderr,"FUXI TURNIP: fuxiturnip=1 but %s is missing; default loader\n",hybrid.c_str());
++  fprintf(stderr,"FUXI TURNIP: fuxitudebug has hyb but %s is missing; default loader\n",hybrid.c_str());
 +  return given;
 + }
 + fprintf(stderr,"FUXI TURNIP: loader=%s\n",hybrid.c_str());
@@ -38,7 +58,7 @@ index 9222ec6..4438c86 100644
  struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;bool storedSurface;};
  // Frame diagnostics (patch 0017, always on, report only): per display frame (a commit that stored an IOSurface), the time from
  // the command buffer's creation to its commit, the gap since the previous frame's commit in display periods, and what the
-@@ -1796,7 +1818,8 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
+@@ -1796,7 +1838,8 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  #endif
  
   gMissing=missing;gInFlight=[NSMutableSet set];gSplitOpen=[NSMutableSet set];
