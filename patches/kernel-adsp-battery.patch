@@ -247,6 +247,114 @@ index 0000000..043a11f
 +
 +if __name__ == '__main__':
 +    main()
+diff --git a/xnu/fuxi-adreno/fuxi_gpu_scanout.inc b/xnu/fuxi-adreno/fuxi_gpu_scanout.inc
+index 5d17fe5..fa35c84 100644
+--- a/xnu/fuxi-adreno/fuxi_gpu_scanout.inc
++++ b/xnu/fuxi-adreno/fuxi_gpu_scanout.inc
+@@ -1801,16 +1801,22 @@ uncertain:
+  * command is on the link. A waiting level goes out right before the next START (animated screens) or from a short thread call
+  * (static screens); a newer level replaces one not sent yet. The AppleARMBacklight service (FuxiDsiBacklight.cpp) only stores the
+  * level here and never touches the hardware. Needs fuxigpuscanout=1 (ownership) and fuxipanel120=1 (only then is the DSI0 window
+- * mapped). After an uncertain command (error raised, or no completion) the registers are restored as after a good one and no
+- * further level is sent this boot; if the controller is then not idle, scanout stops (panel held) as after a failed panel120. */
++ * mapped). After an uncertain command (error raised, or no completion) the registers are restored as after a good one, the DSI
++ * error status is read, logged and cleared the way Linux's dsi_error() does, and the level stays pending for the next window; only
++ * FG_BL_UNCERTAIN_MAX uncertain commands in a row halt brightness for this boot (2026-11-16 daily use: one uncertain command used
++ * to halt it at once, so the slider worked twice and then stopped). A latched error bit found before a send is cleared the same
++ * way instead of deferring every later level. If the controller is not idle after an uncertain command, scanout stops (panel
++ * held) as after a failed panel120. */
+ #define FG_BL_PENDING 0x80000000u
+ #define FG_BL_MAX 2047u
+ #define FG_BL_IDLE_US 50u      /* MDP engine finishing the last lines after the write line went idle */
+ #define FG_BL_DONE_US 2000u    /* a 3-byte HS long write completes in microseconds */
+ #define FG_BL_RETRY_US 4000u   /* static screen: retry while a transfer still runs */
+ #define FG_BL_TRIES 12u        /* ~48 ms, longer than one 60 Hz transfer; later the next START sends it */
++#define FG_BL_UNCERTAIN_MAX 6u /* uncertain commands in a row before brightness halts for this boot */
+ enum { FG_BL_D_OWNER, FG_BL_D_PANEL120, FG_BL_D_AR, FG_BL_D_XFER, FG_BL_D_DSI, FG_BL_D_GAVE_UP, FG_BL_D_N };
+ static unsigned fg_bl_want, fg_bl_tries, fg_bl_halted, fg_bl_call_setup, fg_bl_sent, fg_bl_said, fg_bl_defer[FG_BL_D_N];
++static unsigned fg_bl_uncertain_run, fg_bl_uncertain, fg_bl_errclears;
+ static uint64_t fg_bl_ticks_max;
+ static thread_call_data_t fg_bl_call;
+ /* The two FIFO words of one DCS long write: header (flags 0xc0 = long packet + last of the batch, data type 0x39, 3 bytes), then
+@@ -1882,6 +1888,33 @@ static int fg_bl_send(unsigned level, unsigned trigger, unsigned dma, unsigned i
+  __asm__ volatile("dsb sy" ::: "memory");
+  return triggered ? result : 0;
+ }
++/* Under FG_GUARD, controller idle. Read the DSI error sources and clear them as Linux's dsi_error() does (dsi_host.c: ACK error
++ * status written back then 0, timeout / FIFO status written back, DLN0 PHY errors ESC|SYNC_ESC|CONTROL|CONTENTION_LP0|LP1,
++ * STATUS0 interleave contention bit 31, CLK_STATUS PLL unlocked bit 16), then the latched ERROR status bit 24 of INTR_CTRL (write
++ * one to clear; the mask bits are written back unchanged). Offsets are the 6G ones (dsi.xml.h + 4, as every offset here).
++ * 1: the error bit reads clear afterwards, 0: still set, -1: MMIO failure. */
++static int fg_bl_errclear(const char *why, unsigned level)
++{
++ unsigned st0, fifo, ack, dln0, tmo, clk, irq, after;
++ if (!fg_scanout_read(FG_SCAN_DSI+0x008, &st0) || !fg_scanout_read(FG_SCAN_DSI+0x00c, &fifo) ||
++     !fg_scanout_read(FG_SCAN_DSI+0x068, &ack) || !fg_scanout_read(FG_SCAN_DSI+0x0b4, &dln0) ||
++     !fg_scanout_read(FG_SCAN_DSI+0x0c0, &tmo) || !fg_scanout_read(FG_SCAN_DSI+0x120, &clk) ||
++     !fg_scanout_read(FG_SCAN_DSI+0x110, &irq)) return -1;
++ if (ack && (!fg_scanout_write(FG_SCAN_DSI+0x068, ack) || !fg_scanout_write(FG_SCAN_DSI+0x068, 0))) return -1;
++ if (tmo && !fg_scanout_write(FG_SCAN_DSI+0x0c0, tmo)) return -1;
++ if (fifo && !fg_scanout_write(FG_SCAN_DSI+0x00c, fifo)) return -1;
++ if ((dln0 & 0x11111u) && !fg_scanout_write(FG_SCAN_DSI+0x0b4, dln0)) return -1;
++ if ((st0 & 0x80000000u) && !fg_scanout_write(FG_SCAN_DSI+0x008, st0)) return -1;
++ if ((clk & 0x10000u) && !fg_scanout_write(FG_SCAN_DSI+0x120, clk)) return -1;
++ __asm__ volatile("dsb sy" ::: "memory");
++ if (!fg_scanout_write(FG_SCAN_DSI+0x110, (irq & 0xaaaaaaaau) | (1u << 24))) return -1;
++ __asm__ volatile("dsb sy" ::: "memory");
++ if (!fg_scanout_read(FG_SCAN_DSI+0x110, &after)) return -1;
++ if (fg_bl_errclears++ < 12)
++  printf("FUXI BACKLIGHT DSI: %s level=%u errors status0=%#x fifo=%#x ack=%#x dln0=%#x timeout=%#x clk=%#x irq=%#x -> %#x (#%u)\n",
++      why, level, st0, fifo, ack, dln0, tmo, clk, irq, after, fg_bl_errclears);
++ return (after & (1u << 24)) ? 0 : 1;
++}
+ /* Under FG_GUARD. 1: nothing waiting, or sent; 0: deferred (the level keeps waiting); -1: scanout stopped. via: 0 START, 1 timer. */
+ static int fg_bl_flush(unsigned via)
+ {
+@@ -1914,6 +1947,12 @@ static int fg_bl_flush(unsigned via)
+      !fg_scanout_read(FG_SCAN_DSI+0x084, &trigger) || !fg_scanout_read(FG_SCAN_DSI+0x110, &irq) ||
+      !fg_scanout_read(FG_SCAN_DSI+0x15c, &tpg) || !fg_scanout_read(FG_SCAN_DSI+0x04c, &length))
+   return fg_scanout_stop("backlight setup MMIO");
++ /* A latched error (from the link or an earlier uncertain command): clear it once here rather than deferring every later level. */
++ if (idle && (ctrl & 7) == 5 && !tpg && (irq & (1u << 24))) {
++  int c = fg_bl_errclear("latched error before send", want & FG_BL_MAX);
++  if (c < 0) return fg_scanout_stop("backlight error clear MMIO");
++  if (!fg_scanout_read(FG_SCAN_DSI+0x110, &irq)) return fg_scanout_stop("backlight setup MMIO");
++ }
+  /* The inherited command engine, an idle TPG and no pending error, as fg_panel120_switch requires. */
+  if (!idle || (ctrl & 7) != 5 || tpg || (irq & (1u << 24))) {
+   if (fg_bl_defer[FG_BL_D_DSI]++ < 4)
+@@ -1931,14 +1970,25 @@ static int fg_bl_flush(unsigned via)
+  if (!r) { fg_bl_defer[FG_BL_D_DSI]++; return 0; }
+  if (r == 2) {
+   unsigned after = 0;
+-  fg_bl_halted = 1;
+-  (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+   int quiet = fg_bl_poll(0x008, 0x1f, 0, 0, FG_SCAN_DSI_TIMEOUT_US, &after);
+-  printf("FUXI BACKLIGHT DSI: level=%u no clean completion (status=%#x); registers restored, brightness halted for this boot\n",
+-      level, after);
+-  if (quiet != 1) return fg_scanout_stop("backlight command incomplete");
+-  return 1;
++  fg_bl_uncertain++;
++  if (quiet != 1) {
++   printf("FUXI BACKLIGHT DSI: level=%u no clean completion and the controller stays busy (status=%#x)\n", level, after);
++   return fg_scanout_stop("backlight command incomplete");
++  }
++  int c = fg_bl_errclear("no clean completion", level);
++  if (c < 0) return fg_scanout_stop("backlight error clear MMIO");
++  if (++fg_bl_uncertain_run >= FG_BL_UNCERTAIN_MAX) {
++   fg_bl_halted = 1;
++   (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++   printf("FUXI BACKLIGHT DSI: level=%u %u uncertain commands in a row (%u in all, %u sent); brightness halted for this boot\n",
++       level, fg_bl_uncertain_run, fg_bl_uncertain, fg_bl_sent);
++   return 1;
++  }
++  /* The level stays pending: the next window (START or the retry timer) sends it again. */
++  return 0;
+  }
++ fg_bl_uncertain_run = 0;
+  /* Sent: clear the request unless a newer level arrived meanwhile (it stays pending for the next window). */
+  (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+  if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/fuxi-adsp/FatVolume.c b/xnu/fuxi-adsp/FatVolume.c
 new file mode 100644
 index 0000000..2afa75f
@@ -3387,10 +3495,10 @@ index 0000000..5633228
 +}
 diff --git a/xnu/fuxi-adsp/SweetBattery.cpp b/xnu/fuxi-adsp/SweetBattery.cpp
 new file mode 100644
-index 0000000..fb240db
+index 0000000..485241f
 --- /dev/null
 +++ b/xnu/fuxi-adsp/SweetBattery.cpp
-@@ -0,0 +1,412 @@
+@@ -0,0 +1,425 @@
 +/*
 + * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
 + * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
@@ -3427,6 +3535,7 @@ index 0000000..fb240db
 +	IOTimerEventSource *fTimer;
 +	bool fTimerAdded, fRunning, fReal, fAdsp, fAdspShown;
 +	int fLastMode;
++	unsigned fShown, fShownLogs;
 +	void putNumber(const char *key, UInt32 value);
 +	void putBool(const char *key, bool value);
 +	void publish(unsigned percent, unsigned mv, int ma, bool external,
@@ -3474,6 +3583,8 @@ index 0000000..fb240db
 +		}
 +	}
 +	fLastMode = -1;
++	fShown = ~0u;
++	fShownLogs = 0;
 +	return true;
 +}
 +
@@ -3675,6 +3786,16 @@ index 0000000..fb240db
 +		    b.percent, b.voltage_mv, b.current_ma, b.external, b.charging);
 +		fLastMode = 2;
 +	}
++	/* What iOS is shown, each time it changes (bounded): percent, charger, charging, full. */
++	const unsigned shown = ((unsigned)b.percent & 0xffu) | ((b.external_known ? 1u + b.external : 0u) << 8) |
++	    ((b.status_known ? 1u + b.charging : 0u) << 12) | ((unsigned)b.fully_charged << 16);
++	if (shown != fShown) {
++		fShown = shown;
++		if (fShownLogs++ < 48)
++			IOLog("SWEET BATTERY: published #%u %d%% external=%d%s charging=%d%s full=%d %dmA\n", fShownLogs, b.percent,
++			    b.external, b.external_known ? "" : "(unknown)", b.charging, b.status_known ? "" : "(unknown)",
++			    b.fully_charged, b.current_ma);
++	}
 +}
 +#endif
 +
@@ -3805,10 +3926,10 @@ index 0000000..fb240db
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp.c b/xnu/fuxi-adsp/fuxi_adsp.c
 new file mode 100644
-index 0000000..a4e4a96
+index 0000000..a899f5a
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp.c
-@@ -0,0 +1,851 @@
+@@ -0,0 +1,859 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 + *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -4637,6 +4758,14 @@ index 0000000..a4e4a96
 +    return mode > 3 ? 3 : mode;
 +}
 +
++/* fuxi,adsp=4 (test loaders only): runs as 3, and the boot tour may ask fuxi_adsp_battery.c for a staged "unplugged, 57%" reading
++ * to check that iOS's battery display follows a published change (fuxi_adsp_battery_test_unplug). */
++unsigned fuxi_adsp_battery_test_mode(void);
++unsigned fuxi_adsp_battery_test_mode(void)
++{
++    return fa_mode() == 4 && fuxi_adsp_mode() == 3;
++}
++
 +/* Called once from sweet_ufs.c after the UFS driver is ready (the firmware is read through it). */
 +void fuxi_adsp_init(void)
 +{
@@ -4662,10 +4791,10 @@ index 0000000..a4e4a96
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp_battery.c b/xnu/fuxi-adsp/fuxi_adsp_battery.c
 new file mode 100644
-index 0000000..c886e0e
+index 0000000..67cd53c
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp_battery.c
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,292 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* fuxiadsp=2: the client of the battery manager the audio DSP runs (PMIC GLINK channel "PMIC_RTR_ADSP_APPS"). Phase 1 only reads:
 + * every refresh cycle of ShengBattmgr.c (one request in flight, 2 s per request, a cycle every 60 s and at each notification) ends
@@ -4800,6 +4929,13 @@ index 0000000..c886e0e
 +
 +int fuxi_adsp_battery_wanted(void) { return fuxi_adsp_mode() >= 3; }
 +
++/* Test loaders only (fuxi,adsp=4, fuxi_adsp.c): once the boot tour sets fuxi_tour_battery_test (bsd/dev/fuxi_keys.c), every
++ * reading handed to SweetBattery says "57%, unplugged, discharging" while the log keeps the real one, so a screenshot shows whether
++ * iOS's battery display follows a published change. Without fuxi,adsp=4 the flag is ignored. */
++extern unsigned fuxi_adsp_battery_test_mode(void);
++extern volatile uint32_t fuxi_tour_battery_test;
++static uint32_t fb_test_said;
++
 +int fuxi_adsp_battery_reading(FuxiAdspBattery *out)
 +{
 +    int have;
@@ -4808,6 +4944,18 @@ index 0000000..c886e0e
 +    have = fb_pub.sequence != 0;
 +    if (have) *out = fb_pub;
 +    lck_mtx_unlock(&fb_pub_lock);
++    if (have && __atomic_load_n(&fuxi_tour_battery_test, __ATOMIC_ACQUIRE) && fuxi_adsp_battery_test_mode()) {
++        if (!__atomic_exchange_n(&fb_test_said, 1u, __ATOMIC_ACQ_REL))
++            printf("FUXI BATTERY: TEST (fuxi,adsp=4) SweetBattery now gets a staged reading: 57%%, unplugged, -300 mA\n");
++        out->percent = 57;
++        out->current_ma = -300;
++        out->external = 0;
++        out->external_known = 1;
++        out->charging = 0;
++        out->status_known = 1;
++        out->fully_charged = 0;
++        out->minutes_to_full = -1;
++    }
 +    return have;
 +}
 +
@@ -5464,10 +5612,19 @@ index 0000000..09ce08d
 +}
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-h1/fuxi_keys.c b/xnu/fuxi-h1/fuxi_keys.c
-index 8f1d60f..74cbfc5 100644
+index 8f1d60f..e71e7c2 100644
 --- a/xnu/fuxi-h1/fuxi_keys.c
 +++ b/xnu/fuxi-h1/fuxi_keys.c
-@@ -739,6 +739,17 @@ fk_tour(void *arg, wait_result_t wr)
+@@ -668,6 +668,8 @@ fk_taps(void *arg, wait_result_t wr)
+  * the General and About rows in Settings. Device tests only (synthetic touch).
+  */
+ static unsigned fk_tour_hold = 45, fk_tour_general = 2100, fk_tour_about = 400;
++/* Set by the tour's last step; read by bsd/dev/fuxi_adsp_battery.c, which ignores it unless fuxi,adsp=4 (a test loader). */
++volatile uint32_t fuxi_tour_battery_test;
+ 
+ static void
+ fk_tap(int x, int y)
+@@ -739,6 +741,34 @@ fk_tour(void *arg, wait_result_t wr)
  	fk_swipe(1000, 10, 1000, 1100, 250);    /* Control Center */
  	fk_script_sleep(2000);
  	fk_tour_shot(&shot, "control-center");
@@ -5482,9 +5639,43 @@ index 8f1d60f..74cbfc5 100644
 +	fk_swipe(666, 1360, 666, 1000, 700);
 +	fk_script_sleep(2000);
 +	fk_tour_shot(&shot, "brightness-high");
++	/* 2026-11-16 daily use: the slider worked twice and then stopped. Drag it eight more times, fast and slow, short and long, so
++	 * the log shows whether every level still reaches the panel; then leave it low and take a shot, and high again. */
++	for (unsigned i = 0; i < 8; ++i) {
++		const int span = (i & 1) ? 200 : 360, ms = (i & 2) ? 250 : 900;
++		printf("FUXI TOUR: brightness drag %u down %d px in %d ms\n", i + 1, span, ms);
++		fk_swipe(666, 1000, 666, 1000 + span, ms);
++		fk_script_sleep(700);
++		fk_swipe(666, 1000 + span, 666, 1000, ms);
++		fk_script_sleep(700);
++	}
++	printf("FUXI TOUR: brightness slider down (after the drags)\n");
++	fk_swipe(666, 1000, 666, 1360, 700);
++	fk_script_sleep(2000);
++	fk_tour_shot(&shot, "brightness-low-again");
++	printf("FUXI TOUR: brightness slider up (after the drags)\n");
++	fk_swipe(666, 1360, 666, 1000, 700);
++	fk_script_sleep(2000);
  	/* A home gesture on another page only returns to page 1 the second time. */
  	fk_tour_home();
  	fk_tour_home();
+@@ -759,6 +789,16 @@ fk_tour(void *arg, wait_result_t wr)
+ 	fk_tour_home();
+ 	fk_tour_app(&shot, 670, 860, "photos");
+ 	fk_tour_home();
++	/* fuxi,adsp=4 test loaders: the battery source switches to a staged "57%, unplugged" reading (fuxi_adsp_battery.c); after
++	 * SweetBattery's next 30 s poll, Control Center's battery percentage and the status bar show whether iOS followed it. */
++	printf("FUXI TOUR: battery staged unplug (shown only with fuxi,adsp=4)\n");
++	__atomic_store_n(&fuxi_tour_battery_test, 1u, __ATOMIC_RELEASE);
++	fk_script_sleep(40000);
++	fk_tour_shot(&shot, "battery-staged-home");
++	fk_swipe(1000, 10, 1000, 1100, 250);    /* Control Center: the percentage is shown top right */
++	fk_script_sleep(2000);
++	fk_tour_shot(&shot, "battery-staged-cc");
++	fk_tour_home();
+ 	printf("FUXI TOUR: done\n");
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
 diff --git a/xnu/fuxi-unixnu/sweet_ufs.c b/xnu/fuxi-unixnu/sweet_ufs.c
 index c8376e4..9c1dbe9 100644
 --- a/xnu/fuxi-unixnu/sweet_ufs.c
@@ -5605,8 +5796,125 @@ index c8376e4..9c1dbe9 100644
  #else
  	sweet_log_start();
  	sweet_sample_start();
+diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
+index 0ca2838..3568e3a 100644
+--- a/xnu/patches/0098-fuxi-native-adreno-abi.patch
++++ b/xnu/patches/0098-fuxi-native-adreno-abi.patch
+@@ -1628,7 +1628,7 @@
+ +#endif
+ --- a/bsd/dev/fuxi_gpu_scanout.inc
+ +++ b/bsd/dev/fuxi_gpu_scanout.inc
+-@@ -0,0 +1,2575 @@
++@@ -0,0 +1,2625 @@
+ +/* SPDX-License-Identifier: MIT
+ + * Copyright (c) 2026 NativeMetal contributors
+ + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
+@@ -3432,16 +3432,22 @@
+ + * command is on the link. A waiting level goes out right before the next START (animated screens) or from a short thread call
+ + * (static screens); a newer level replaces one not sent yet. The AppleARMBacklight service (FuxiDsiBacklight.cpp) only stores the
+ + * level here and never touches the hardware. Needs fuxigpuscanout=1 (ownership) and fuxipanel120=1 (only then is the DSI0 window
+-+ * mapped). After an uncertain command (error raised, or no completion) the registers are restored as after a good one and no
+-+ * further level is sent this boot; if the controller is then not idle, scanout stops (panel held) as after a failed panel120. */
+++ * mapped). After an uncertain command (error raised, or no completion) the registers are restored as after a good one, the DSI
+++ * error status is read, logged and cleared the way Linux's dsi_error() does, and the level stays pending for the next window; only
+++ * FG_BL_UNCERTAIN_MAX uncertain commands in a row halt brightness for this boot (2026-11-16 daily use: one uncertain command used
+++ * to halt it at once, so the slider worked twice and then stopped). A latched error bit found before a send is cleared the same
+++ * way instead of deferring every later level. If the controller is not idle after an uncertain command, scanout stops (panel
+++ * held) as after a failed panel120. */
+ +#define FG_BL_PENDING 0x80000000u
+ +#define FG_BL_MAX 2047u
+ +#define FG_BL_IDLE_US 50u      /* MDP engine finishing the last lines after the write line went idle */
+ +#define FG_BL_DONE_US 2000u    /* a 3-byte HS long write completes in microseconds */
+ +#define FG_BL_RETRY_US 4000u   /* static screen: retry while a transfer still runs */
+ +#define FG_BL_TRIES 12u        /* ~48 ms, longer than one 60 Hz transfer; later the next START sends it */
+++#define FG_BL_UNCERTAIN_MAX 6u /* uncertain commands in a row before brightness halts for this boot */
+ +enum { FG_BL_D_OWNER, FG_BL_D_PANEL120, FG_BL_D_AR, FG_BL_D_XFER, FG_BL_D_DSI, FG_BL_D_GAVE_UP, FG_BL_D_N };
+ +static unsigned fg_bl_want, fg_bl_tries, fg_bl_halted, fg_bl_call_setup, fg_bl_sent, fg_bl_said, fg_bl_defer[FG_BL_D_N];
+++static unsigned fg_bl_uncertain_run, fg_bl_uncertain, fg_bl_errclears;
+ +static uint64_t fg_bl_ticks_max;
+ +static thread_call_data_t fg_bl_call;
+ +/* The two FIFO words of one DCS long write: header (flags 0xc0 = long packet + last of the batch, data type 0x39, 3 bytes), then
+@@ -3513,6 +3519,33 @@
+ + __asm__ volatile("dsb sy" ::: "memory");
+ + return triggered ? result : 0;
+ +}
+++/* Under FG_GUARD, controller idle. Read the DSI error sources and clear them as Linux's dsi_error() does (dsi_host.c: ACK error
+++ * status written back then 0, timeout / FIFO status written back, DLN0 PHY errors ESC|SYNC_ESC|CONTROL|CONTENTION_LP0|LP1,
+++ * STATUS0 interleave contention bit 31, CLK_STATUS PLL unlocked bit 16), then the latched ERROR status bit 24 of INTR_CTRL (write
+++ * one to clear; the mask bits are written back unchanged). Offsets are the 6G ones (dsi.xml.h + 4, as every offset here).
+++ * 1: the error bit reads clear afterwards, 0: still set, -1: MMIO failure. */
+++static int fg_bl_errclear(const char *why, unsigned level)
+++{
+++ unsigned st0, fifo, ack, dln0, tmo, clk, irq, after;
+++ if (!fg_scanout_read(FG_SCAN_DSI+0x008, &st0) || !fg_scanout_read(FG_SCAN_DSI+0x00c, &fifo) ||
+++     !fg_scanout_read(FG_SCAN_DSI+0x068, &ack) || !fg_scanout_read(FG_SCAN_DSI+0x0b4, &dln0) ||
+++     !fg_scanout_read(FG_SCAN_DSI+0x0c0, &tmo) || !fg_scanout_read(FG_SCAN_DSI+0x120, &clk) ||
+++     !fg_scanout_read(FG_SCAN_DSI+0x110, &irq)) return -1;
+++ if (ack && (!fg_scanout_write(FG_SCAN_DSI+0x068, ack) || !fg_scanout_write(FG_SCAN_DSI+0x068, 0))) return -1;
+++ if (tmo && !fg_scanout_write(FG_SCAN_DSI+0x0c0, tmo)) return -1;
+++ if (fifo && !fg_scanout_write(FG_SCAN_DSI+0x00c, fifo)) return -1;
+++ if ((dln0 & 0x11111u) && !fg_scanout_write(FG_SCAN_DSI+0x0b4, dln0)) return -1;
+++ if ((st0 & 0x80000000u) && !fg_scanout_write(FG_SCAN_DSI+0x008, st0)) return -1;
+++ if ((clk & 0x10000u) && !fg_scanout_write(FG_SCAN_DSI+0x120, clk)) return -1;
+++ __asm__ volatile("dsb sy" ::: "memory");
+++ if (!fg_scanout_write(FG_SCAN_DSI+0x110, (irq & 0xaaaaaaaau) | (1u << 24))) return -1;
+++ __asm__ volatile("dsb sy" ::: "memory");
+++ if (!fg_scanout_read(FG_SCAN_DSI+0x110, &after)) return -1;
+++ if (fg_bl_errclears++ < 12)
+++  printf("FUXI BACKLIGHT DSI: %s level=%u errors status0=%#x fifo=%#x ack=%#x dln0=%#x timeout=%#x clk=%#x irq=%#x -> %#x (#%u)\n",
+++      why, level, st0, fifo, ack, dln0, tmo, clk, irq, after, fg_bl_errclears);
+++ return (after & (1u << 24)) ? 0 : 1;
+++}
+ +/* Under FG_GUARD. 1: nothing waiting, or sent; 0: deferred (the level keeps waiting); -1: scanout stopped. via: 0 START, 1 timer. */
+ +static int fg_bl_flush(unsigned via)
+ +{
+@@ -3545,6 +3578,12 @@
+ +     !fg_scanout_read(FG_SCAN_DSI+0x084, &trigger) || !fg_scanout_read(FG_SCAN_DSI+0x110, &irq) ||
+ +     !fg_scanout_read(FG_SCAN_DSI+0x15c, &tpg) || !fg_scanout_read(FG_SCAN_DSI+0x04c, &length))
+ +  return fg_scanout_stop("backlight setup MMIO");
+++ /* A latched error (from the link or an earlier uncertain command): clear it once here rather than deferring every later level. */
+++ if (idle && (ctrl & 7) == 5 && !tpg && (irq & (1u << 24))) {
+++  int c = fg_bl_errclear("latched error before send", want & FG_BL_MAX);
+++  if (c < 0) return fg_scanout_stop("backlight error clear MMIO");
+++  if (!fg_scanout_read(FG_SCAN_DSI+0x110, &irq)) return fg_scanout_stop("backlight setup MMIO");
+++ }
+ + /* The inherited command engine, an idle TPG and no pending error, as fg_panel120_switch requires. */
+ + if (!idle || (ctrl & 7) != 5 || tpg || (irq & (1u << 24))) {
+ +  if (fg_bl_defer[FG_BL_D_DSI]++ < 4)
+@@ -3562,14 +3601,25 @@
+ + if (!r) { fg_bl_defer[FG_BL_D_DSI]++; return 0; }
+ + if (r == 2) {
+ +  unsigned after = 0;
+-+  fg_bl_halted = 1;
+-+  (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+ +  int quiet = fg_bl_poll(0x008, 0x1f, 0, 0, FG_SCAN_DSI_TIMEOUT_US, &after);
+-+  printf("FUXI BACKLIGHT DSI: level=%u no clean completion (status=%#x); registers restored, brightness halted for this boot\n",
+-+      level, after);
+-+  if (quiet != 1) return fg_scanout_stop("backlight command incomplete");
+-+  return 1;
+++  fg_bl_uncertain++;
+++  if (quiet != 1) {
+++   printf("FUXI BACKLIGHT DSI: level=%u no clean completion and the controller stays busy (status=%#x)\n", level, after);
+++   return fg_scanout_stop("backlight command incomplete");
+++  }
+++  int c = fg_bl_errclear("no clean completion", level);
+++  if (c < 0) return fg_scanout_stop("backlight error clear MMIO");
+++  if (++fg_bl_uncertain_run >= FG_BL_UNCERTAIN_MAX) {
+++   fg_bl_halted = 1;
+++   (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+++   printf("FUXI BACKLIGHT DSI: level=%u %u uncertain commands in a row (%u in all, %u sent); brightness halted for this boot\n",
+++       level, fg_bl_uncertain_run, fg_bl_uncertain, fg_bl_sent);
+++   return 1;
+++  }
+++  /* The level stays pending: the next window (START or the retry timer) sends it again. */
+++  return 0;
+ + }
+++ fg_bl_uncertain_run = 0;
+ + /* Sent: clear the request unless a newer level arrived meanwhile (it stays pending for the next window). */
+ + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+ + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0103-fuxi-kernel-h1.patch b/xnu/patches/0103-fuxi-kernel-h1.patch
-index 39be642..3717a8c 100644
+index 39be642..fac61cc 100644
 --- a/xnu/patches/0103-fuxi-kernel-h1.patch
 +++ b/xnu/patches/0103-fuxi-kernel-h1.patch
 @@ -332,7 +332,7 @@
@@ -5614,11 +5922,20 @@ index 39be642..3717a8c 100644
   	(void)arg;
   	(void)result;
 -@@ -236,38 +390,435 @@
-+@@ -236,38 +390,446 @@
++@@ -236,38 +390,475 @@
   	}
   	for (;;) {
   		uint8_t pon = 0, gpio = 1;
-@@ -703,6 +703,17 @@
+@@ -632,6 +632,8 @@
+ + * the General and About rows in Settings. Device tests only (synthetic touch).
+ + */
+ +static unsigned fk_tour_hold = 45, fk_tour_general = 2100, fk_tour_about = 400;
+++/* Set by the tour's last step; read by bsd/dev/fuxi_adsp_battery.c, which ignores it unless fuxi,adsp=4 (a test loader). */
+++volatile uint32_t fuxi_tour_battery_test;
+ +
+ +static void
+ +fk_tap(int x, int y)
+@@ -703,6 +705,34 @@
  +	fk_swipe(1000, 10, 1000, 1100, 250);    /* Control Center */
  +	fk_script_sleep(2000);
  +	fk_tour_shot(&shot, "control-center");
@@ -5633,15 +5950,49 @@ index 39be642..3717a8c 100644
 ++	fk_swipe(666, 1360, 666, 1000, 700);
 ++	fk_script_sleep(2000);
 ++	fk_tour_shot(&shot, "brightness-high");
+++	/* 2026-11-16 daily use: the slider worked twice and then stopped. Drag it eight more times, fast and slow, short and long, so
+++	 * the log shows whether every level still reaches the panel; then leave it low and take a shot, and high again. */
+++	for (unsigned i = 0; i < 8; ++i) {
+++		const int span = (i & 1) ? 200 : 360, ms = (i & 2) ? 250 : 900;
+++		printf("FUXI TOUR: brightness drag %u down %d px in %d ms\n", i + 1, span, ms);
+++		fk_swipe(666, 1000, 666, 1000 + span, ms);
+++		fk_script_sleep(700);
+++		fk_swipe(666, 1000 + span, 666, 1000, ms);
+++		fk_script_sleep(700);
+++	}
+++	printf("FUXI TOUR: brightness slider down (after the drags)\n");
+++	fk_swipe(666, 1000, 666, 1360, 700);
+++	fk_script_sleep(2000);
+++	fk_tour_shot(&shot, "brightness-low-again");
+++	printf("FUXI TOUR: brightness slider up (after the drags)\n");
+++	fk_swipe(666, 1360, 666, 1000, 700);
+++	fk_script_sleep(2000);
  +	/* A home gesture on another page only returns to page 1 the second time. */
  +	fk_tour_home();
  +	fk_tour_home();
-@@ -786,7 +797,7 @@
+@@ -723,6 +753,16 @@
+ +	fk_tour_home();
+ +	fk_tour_app(&shot, 670, 860, "photos");
+ +	fk_tour_home();
+++	/* fuxi,adsp=4 test loaders: the battery source switches to a staged "57%, unplugged" reading (fuxi_adsp_battery.c); after
+++	 * SweetBattery's next 30 s poll, Control Center's battery percentage and the status bar show whether iOS followed it. */
+++	printf("FUXI TOUR: battery staged unplug (shown only with fuxi,adsp=4)\n");
+++	__atomic_store_n(&fuxi_tour_battery_test, 1u, __ATOMIC_RELEASE);
+++	fk_script_sleep(40000);
+++	fk_tour_shot(&shot, "battery-staged-home");
+++	fk_swipe(1000, 10, 1000, 1100, 250);    /* Control Center: the percentage is shown top right */
+++	fk_script_sleep(2000);
+++	fk_tour_shot(&shot, "battery-staged-cc");
+++	fk_tour_home();
+ +	printf("FUXI TOUR: done\n");
+ +	(void)thread_terminate(current_thread());
+ +	thread_block(THREAD_CONTINUE_NULL);
+@@ -786,7 +826,7 @@
   }
   
   void
 -@@ -289,5 +840,227 @@
-+@@ -289,5 +851,227 @@
++@@ -289,5 +880,227 @@
   	} else {
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
@@ -5879,10 +6230,10 @@ index 8349337..7d08b57 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..1508e43
+index 0000000..eb6d1e0
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,4854 @@
+@@ -0,0 +1,4901 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,21 @@
@@ -5909,7 +6260,7 @@ index 0000000..1508e43
 + bsd/dev/unix_startup.c			standard
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp.c
-+@@ -0,0 +1,851 @@
++@@ -0,0 +1,859 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 ++ *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -6738,6 +7089,14 @@ index 0000000..1508e43
 ++    return mode > 3 ? 3 : mode;
 ++}
 ++
+++/* fuxi,adsp=4 (test loaders only): runs as 3, and the boot tour may ask fuxi_adsp_battery.c for a staged "unplugged, 57%" reading
+++ * to check that iOS's battery display follows a published change (fuxi_adsp_battery_test_unplug). */
+++unsigned fuxi_adsp_battery_test_mode(void);
+++unsigned fuxi_adsp_battery_test_mode(void)
+++{
+++    return fa_mode() == 4 && fuxi_adsp_mode() == 3;
+++}
+++
 ++/* Called once from sweet_ufs.c after the UFS driver is ready (the firmware is read through it). */
 ++void fuxi_adsp_init(void)
 ++{
@@ -6908,7 +7267,7 @@ index 0000000..1508e43
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp_battery.c
-+@@ -0,0 +1,273 @@
++@@ -0,0 +1,292 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* fuxiadsp=2: the client of the battery manager the audio DSP runs (PMIC GLINK channel "PMIC_RTR_ADSP_APPS"). Phase 1 only reads:
 ++ * every refresh cycle of ShengBattmgr.c (one request in flight, 2 s per request, a cycle every 60 s and at each notification) ends
@@ -7043,6 +7402,13 @@ index 0000000..1508e43
 ++
 ++int fuxi_adsp_battery_wanted(void) { return fuxi_adsp_mode() >= 3; }
 ++
+++/* Test loaders only (fuxi,adsp=4, fuxi_adsp.c): once the boot tour sets fuxi_tour_battery_test (bsd/dev/fuxi_keys.c), every
+++ * reading handed to SweetBattery says "57%, unplugged, discharging" while the log keeps the real one, so a screenshot shows whether
+++ * iOS's battery display follows a published change. Without fuxi,adsp=4 the flag is ignored. */
+++extern unsigned fuxi_adsp_battery_test_mode(void);
+++extern volatile uint32_t fuxi_tour_battery_test;
+++static uint32_t fb_test_said;
+++
 ++int fuxi_adsp_battery_reading(FuxiAdspBattery *out)
 ++{
 ++    int have;
@@ -7051,6 +7417,18 @@ index 0000000..1508e43
 ++    have = fb_pub.sequence != 0;
 ++    if (have) *out = fb_pub;
 ++    lck_mtx_unlock(&fb_pub_lock);
+++    if (have && __atomic_load_n(&fuxi_tour_battery_test, __ATOMIC_ACQUIRE) && fuxi_adsp_battery_test_mode()) {
+++        if (!__atomic_exchange_n(&fb_test_said, 1u, __ATOMIC_ACQ_REL))
+++            printf("FUXI BATTERY: TEST (fuxi,adsp=4) SweetBattery now gets a staged reading: 57%%, unplugged, -300 mA\n");
+++        out->percent = 57;
+++        out->current_ma = -300;
+++        out->external = 0;
+++        out->external_known = 1;
+++        out->charging = 0;
+++        out->status_known = 1;
+++        out->fully_charged = 0;
+++        out->minutes_to_full = -1;
+++    }
 ++    return have;
 ++}
 ++
@@ -10586,13 +10964,14 @@ index 0000000..1508e43
 + 
 + class SweetBattery : public IOPMPowerSource {
 + 	OSDeclareDefaultStructors(SweetBattery);
-+@@ -26,13 +32,16 @@
++@@ -26,13 +32,17 @@
 + private:
 + 	IOWorkLoop *fLoop;
 + 	IOTimerEventSource *fTimer;
 +-	bool fTimerAdded, fRunning, fReal;
 ++	bool fTimerAdded, fRunning, fReal, fAdsp, fAdspShown;
 + 	int fLastMode;
+++	unsigned fShown, fShownLogs;
 + 	void putNumber(const char *key, UInt32 value);
 + 	void putBool(const char *key, bool value);
 + 	void publish(unsigned percent, unsigned mv, int ma, bool external,
@@ -10604,7 +10983,7 @@ index 0000000..1508e43
 + 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
 + 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
 + 	static bool readWord(unsigned address, uint16_t *value);
-+@@ -51,7 +60,7 @@
++@@ -51,7 +61,7 @@
 + 	}
 + 	fLoop = NULL;
 + 	fTimer = NULL;
@@ -10613,7 +10992,16 @@ index 0000000..1508e43
 + 	if (dictionary) {
 + 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
 + 		if (!it) {
-+@@ -203,9 +212,89 @@
++@@ -72,6 +82,8 @@
++ 		}
++ 	}
++ 	fLastMode = -1;
+++	fShown = ~0u;
+++	fShownLogs = 0;
++ 	return true;
++ }
++ 
++@@ -203,9 +215,99 @@
 + 	return 100;
 + }
 + 
@@ -10687,6 +11075,16 @@ index 0000000..1508e43
 ++		    b.percent, b.voltage_mv, b.current_ma, b.external, b.charging);
 ++		fLastMode = 2;
 ++	}
+++	/* What iOS is shown, each time it changes (bounded): percent, charger, charging, full. */
+++	const unsigned shown = ((unsigned)b.percent & 0xffu) | ((b.external_known ? 1u + b.external : 0u) << 8) |
+++	    ((b.status_known ? 1u + b.charging : 0u) << 12) | ((unsigned)b.fully_charged << 16);
+++	if (shown != fShown) {
+++		fShown = shown;
+++		if (fShownLogs++ < 48)
+++			IOLog("SWEET BATTERY: published #%u %d%% external=%d%s charging=%d%s full=%d %dmA\n", fShownLogs, b.percent,
+++			    b.external, b.external_known ? "" : "(unknown)", b.charging, b.status_known ? "" : "(unknown)",
+++			    b.fully_charged, b.current_ma);
+++	}
 ++}
 ++#endif
 ++
@@ -10703,7 +11101,7 @@ index 0000000..1508e43
 + 	uint8_t type, present, usb, path, charger, error, temperature;
 + 	uint16_t rawVoltage;
 + 	bool valid = fReal &&
-+@@ -252,7 +341,8 @@
++@@ -252,7 +354,8 @@
 + 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
 + 	if (self && self->fRunning) {
 + 		self->poll();
@@ -10713,7 +11111,7 @@ index 0000000..1508e43
 + 	}
 + }
 + 
-+@@ -265,17 +355,20 @@
++@@ -265,17 +368,20 @@
 + 	int real = 0;
 + 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
 + 	fReal = real == 1 && sweet_spmi_init() == 0;
