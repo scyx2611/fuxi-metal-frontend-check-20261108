@@ -4662,10 +4662,10 @@ index 0000000..a4e4a96
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp_battery.c b/xnu/fuxi-adsp/fuxi_adsp_battery.c
 new file mode 100644
-index 0000000..652e1cb
+index 0000000..72bae7d
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp_battery.c
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,259 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* fuxiadsp=2: the client of the battery manager the audio DSP runs (PMIC GLINK channel "PMIC_RTR_ADSP_APPS"). Phase 1 only reads:
 + * every refresh cycle of ShengBattmgr.c (one request in flight, 2 s per request, a cycle every 60 s and at each notification) ends
@@ -4811,10 +4811,30 @@ index 0000000..652e1cb
 +    return have;
 +}
 +
++/* Fuxi has one cell and one fuel gauge. ShengBattmgr's snapshot adds the sheng tablet's second gauge (board properties
++ * 0xa6/0xa7), which this firmware answers with 0 and with the first gauge's remaining charge, so the sum read about half
++ * (2026-11-16 adsp2: 4002/(4265+4002) mAh = 48% while Android showed 97% and the firmware's capacity property was 9600).
++ * Use the firmware's state of charge (battery property 4, hundredths of a percent) as Android does, and the first gauge's
++ * remaining charge (uAh) as the raw capacity: property 15 answers 4002 here, i.e. mAh, which the snapshot turns into 4. */
++static void fbBoard(ShengBatterySnapshot *s)
++{
++#define FB_HAS(f) ((fb_bm.valid >> (f)) & 1u)
++    if (FB_HAS(BmCapacity) && fb_bm.value[BmCapacity] >= 0 && fb_bm.value[BmCapacity] <= 10000) {
++        s->percent = (fb_bm.value[BmCapacity] + 50) / 100;
++        s->charge_known = 1;
++        s->fully_charged = s->external && ((FB_HAS(BmStatus) && fb_bm.value[BmStatus] == 4) || s->percent == 100);
++        s->critical = s->present && s->external_known && !s->external && s->percent <= 2;
++    }
++    if (FB_HAS(BmGauge1Remaining) && fb_bm.value[BmGauge1Remaining] > 0)
++        s->raw_mah = fb_bm.value[BmGauge1Remaining] / 1000;
++#undef FB_HAS
++}
++
 +static void fbLog(void)
 +{
 +    ShengBatterySnapshot s;
 +    sheng_battmgr_snapshot(&fb_bm, &s);
++    fbBoard(&s);
 +    printf("FUXI BATTERY: percent=%d%s mV=%d mA=%d temp=%d%s present=%d external=%d%s charging=%d%s full=%d critical=%d "
 +        "mAh raw=%d full=%d design=%d cycles=%d tte_min=%d ttf_min=%d adapter=%#x %dmV %dmA %dW | cycles=%u answers=%u timeouts=%u "
 +        "errors=%u notifications=%u ignored=%u dropped=%u refused=%u\n",
@@ -5771,10 +5791,10 @@ index 8349337..7d08b57 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..0212b6a
+index 0000000..841390d
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,4808 @@
+@@ -0,0 +1,4828 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,21 @@
@@ -6800,7 +6820,7 @@ index 0000000..0212b6a
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp_battery.c
-+@@ -0,0 +1,239 @@
++@@ -0,0 +1,259 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* fuxiadsp=2: the client of the battery manager the audio DSP runs (PMIC GLINK channel "PMIC_RTR_ADSP_APPS"). Phase 1 only reads:
 ++ * every refresh cycle of ShengBattmgr.c (one request in flight, 2 s per request, a cycle every 60 s and at each notification) ends
@@ -6946,10 +6966,30 @@ index 0000000..0212b6a
 ++    return have;
 ++}
 ++
+++/* Fuxi has one cell and one fuel gauge. ShengBattmgr's snapshot adds the sheng tablet's second gauge (board properties
+++ * 0xa6/0xa7), which this firmware answers with 0 and with the first gauge's remaining charge, so the sum read about half
+++ * (2026-11-16 adsp2: 4002/(4265+4002) mAh = 48% while Android showed 97% and the firmware's capacity property was 9600).
+++ * Use the firmware's state of charge (battery property 4, hundredths of a percent) as Android does, and the first gauge's
+++ * remaining charge (uAh) as the raw capacity: property 15 answers 4002 here, i.e. mAh, which the snapshot turns into 4. */
+++static void fbBoard(ShengBatterySnapshot *s)
+++{
+++#define FB_HAS(f) ((fb_bm.valid >> (f)) & 1u)
+++    if (FB_HAS(BmCapacity) && fb_bm.value[BmCapacity] >= 0 && fb_bm.value[BmCapacity] <= 10000) {
+++        s->percent = (fb_bm.value[BmCapacity] + 50) / 100;
+++        s->charge_known = 1;
+++        s->fully_charged = s->external && ((FB_HAS(BmStatus) && fb_bm.value[BmStatus] == 4) || s->percent == 100);
+++        s->critical = s->present && s->external_known && !s->external && s->percent <= 2;
+++    }
+++    if (FB_HAS(BmGauge1Remaining) && fb_bm.value[BmGauge1Remaining] > 0)
+++        s->raw_mah = fb_bm.value[BmGauge1Remaining] / 1000;
+++#undef FB_HAS
+++}
+++
 ++static void fbLog(void)
 ++{
 ++    ShengBatterySnapshot s;
 ++    sheng_battmgr_snapshot(&fb_bm, &s);
+++    fbBoard(&s);
 ++    printf("FUXI BATTERY: percent=%d%s mV=%d mA=%d temp=%d%s present=%d external=%d%s charging=%d%s full=%d critical=%d "
 ++        "mAh raw=%d full=%d design=%d cycles=%d tte_min=%d ttf_min=%d adapter=%#x %dmV %dmA %dW | cycles=%u answers=%u timeouts=%u "
 ++        "errors=%u notifications=%u ignored=%u dropped=%u refused=%u\n",
