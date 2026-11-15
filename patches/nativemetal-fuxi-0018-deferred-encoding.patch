@@ -1,0 +1,1101 @@
+diff --git a/bridge/FuxiDeferred.rs b/bridge/FuxiDeferred.rs
+new file mode 100644
+index 0000000..0d73d30
+--- /dev/null
++++ b/bridge/FuxiDeferred.rs
+@@ -0,0 +1,590 @@
++// SPDX-License-Identifier: MIT
++//! Fuxi patch 0018: deferred render encoding, opt-in with `fuxihyb=7` (backboardd's CoreAnimation display threads only).
++//!
++//! CoreAnimation's display thread builds a frame and the metal2vulkan runtime records it, one after the other on the same
++//! thread. Here a render encoder that thread opens is run by one worker thread instead: the encoder's opening, settings,
++//! draws and end are queued in their order (each with its own references to the objects it names and a copy of its bytes)
++//! and answer at once, and the worker runs them on the runtime while the display thread goes on building the frame.
++//! Every other bridge call of a thread with queued calls first waits until the worker has run that thread's last one, so
++//! the runtime still sees each call in the order the frontend made it. A queued call the runtime refuses fails its command
++//! buffer at commit, as the frontend's own refusal does. One queue for every thread: a call is queued after every call
++//! queued before it, by any thread.
++
++use metal2vulkan::metal::{CullMode, IndexType, PrimitiveType, RenderStages, TriangleFillMode, Winding};
++use metal2vulkan_runtime::{
++    Buffer, CommandBuffer, DepthStencilState, Fence, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, SamplerState,
++    ScissorRect, Texture, Viewport, VisibilityResultMode,
++};
++use std::cell::Cell;
++use std::ffi::{c_char, c_int, c_void, CStr};
++use std::panic::{AssertUnwindSafe, Location};
++use std::ptr::NonNull;
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
++use std::thread::Thread;
++use std::time::{Duration, Instant};
++
++unsafe extern "C" {
++    fn sysctlbyname(name: *const c_char, old: *mut c_void, old_len: *mut usize, new: *mut c_void, new_len: usize) -> c_int;
++    fn getprogname() -> *const c_char;
++    fn pthread_self() -> *mut c_void;
++    fn pthread_getname_np(thread: *mut c_void, name: *mut c_char, len: usize) -> c_int;
++    fn pthread_getschedparam(thread: *mut c_void, policy: *mut c_int, param: *mut SchedParam) -> c_int;
++    fn pthread_setschedparam(thread: *mut c_void, policy: c_int, param: *const SchedParam) -> c_int;
++    fn pthread_get_qos_class_np(thread: *mut c_void, qos: *mut u32, relative: *mut c_int) -> c_int;
++    fn pthread_set_qos_class_self_np(qos: u32, relative: c_int) -> c_int;
++    fn mach_thread_self() -> u32;
++    fn mach_port_deallocate(task: u32, name: u32) -> c_int;
++    fn thread_policy_get(thread: u32, flavor: u32, info: *mut u32, count: *mut u32, get_default: *mut c_int) -> c_int;
++    fn thread_policy_set(thread: u32, flavor: u32, info: *const u32, count: u32) -> c_int;
++    static mach_task_self_: u32;
++}
++
++/// Darwin's `struct sched_param`.
++#[repr(C)]
++#[derive(Clone, Copy, Default)]
++struct SchedParam {
++    priority: c_int,
++    opaque: [u8; 4],
++}
++
++const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
++/// How long the worker looks for more work before it sleeps, and a waiting thread spins before it sleeps.
++const WORKER_SPIN: Duration = Duration::from_micros(50);
++const WAIT_SPIN: Duration = Duration::from_micros(40);
++const REPORT: Duration = Duration::from_secs(10);
++/// Bytes a queued `set*Bytes` keeps inline; longer ones go to the heap.
++const INLINE_BYTES: usize = 128;
++
++/// A command buffer's first refusal among its deferred calls, which its commit returns.
++pub(crate) type Failure = Arc<Mutex<Option<String>>>;
++
++fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
++    mutex.lock().unwrap_or_else(PoisonError::into_inner)
++}
++
++/// The refusal a deferred call left for this command buffer, taken (its commit fails with it).
++pub(crate) fn take_failure(failure: &Failure) -> Option<String> {
++    lock(failure).take()
++}
++
++pub(crate) fn has_failed(failure: &Failure) -> bool {
++    lock(failure).is_some()
++}
++
++// ---- the gate ----
++
++/// `fuxihyb=7` on the boot line and this process is backboardd.
++fn process_on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| {
++        let mut args = [0u8; 2048];
++        let mut len = args.len();
++        // SAFETY: a fixed buffer and its length.
++        let read = unsafe { sysctlbyname(c"kern.bootargs".as_ptr(), args.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) } == 0;
++        let hyb7 = read
++            && args[..len.min(args.len())]
++                .split(|&b| b == b' ' || b == b'\t' || b == b'\n' || b == 0)
++                .any(|word| word == b"fuxihyb=7");
++        // SAFETY: getprogname returns the process's static name.
++        let name = unsafe { getprogname() };
++        let backboardd = !name.is_null() && unsafe { CStr::from_ptr(name) }.to_bytes() == b"backboardd";
++        if hyb7 {
++            eprintln!("FUXI WORKER gate fuxihyb=7 process={}", if backboardd { "backboardd (on)" } else { "other (off)" });
++        }
++        hyb7 && backboardd
++    })
++}
++
++thread_local! {
++    /// 0 not decided, 1 this thread's render encoders are deferred, 2 they are not.
++    static ELIGIBLE: Cell<u8> = const { Cell::new(0) };
++    /// The sequence number of this thread's last queued call (0: none).
++    static MINE: Cell<u64> = const { Cell::new(0) };
++}
++
++/// Whether a render encoder this thread opens now is deferred.
++pub(crate) fn eligible() -> bool {
++    match ELIGIBLE.get() {
++        1 => true,
++        2 => false,
++        _ => decide(),
++    }
++}
++
++#[cold]
++fn decide() -> bool {
++    let on = process_on() && {
++        let mut name = [0 as c_char; 64];
++        // SAFETY: the thread's own name into a fixed buffer.
++        let named = unsafe { pthread_getname_np(pthread_self(), name.as_mut_ptr(), name.len()) } == 0;
++        // SAFETY: NUL-terminated by pthread_getname_np (the buffer starts zeroed).
++        let name = if named { unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned() } else { String::new() };
++        let on = name.contains("coreanimation.display");
++        static LOGGED: AtomicUsize = AtomicUsize::new(0);
++        if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
++            eprintln!("FUXI WORKER thread {name:.80} deferred={}", u8::from(on));
++        }
++        on
++    };
++    ELIGIBLE.set(if on { 1 } else { 2 });
++    on
++}
++
++// ---- deferred encoders ----
++
++/// A deferred render encoder: the runtime encoder its queued opening made, used by the worker only (its calls are queued).
++pub struct Slot {
++    encoder: Option<RenderCommandEncoder>,
++    failure: Failure,
++}
++
++/// A deferred encoder's slot, as its handle and its queued calls name it.
++#[derive(Clone, Copy)]
++pub struct SlotPtr(NonNull<Slot>);
++// SAFETY: a slot is used by the worker only, one call at a time, and freed by its last queued call (its end or discard).
++unsafe impl Send for SlotPtr {}
++
++/// The bytes of a queued `set*Bytes`, copied at the call.
++pub(crate) enum Bytes {
++    Inline(usize, [u8; INLINE_BYTES]),
++    Heap(Box<[u8]>),
++}
++
++impl Bytes {
++    pub(crate) fn new(bytes: &[u8]) -> Self {
++        if bytes.len() <= INLINE_BYTES {
++            let mut inline = [0u8; INLINE_BYTES];
++            inline[..bytes.len()].copy_from_slice(bytes);
++            Bytes::Inline(bytes.len(), inline)
++        } else {
++            Bytes::Heap(bytes.into())
++        }
++    }
++
++    fn get(&self) -> &[u8] {
++        match self {
++            Bytes::Inline(n, inline) => &inline[..*n],
++            Bytes::Heap(bytes) => bytes,
++        }
++    }
++}
++
++/// A queued call; raw Metal values were checked at the call. `fragment` picks the fragment stage over the vertex stage.
++pub(crate) enum Op {
++    Open { command_buffer: CommandBuffer, pass: Box<RenderPassDescriptor> },
++    Buffer { fragment: bool, buffer: Option<Buffer>, offset: u64, index: u32 },
++    BufferOffset { fragment: bool, offset: u64, index: u32 },
++    Bytes { fragment: bool, bytes: Bytes, index: u32 },
++    Texture { fragment: bool, texture: Option<Texture>, index: u32 },
++    Sampler { fragment: bool, sampler: Option<SamplerState>, index: u32 },
++    Pipeline(RenderPipelineState),
++    DepthStencil(Option<DepthStencilState>),
++    Viewport(Viewport),
++    Scissor(ScissorRect),
++    Raster { cull: CullMode, winding: Winding, fill: TriangleFillMode },
++    StencilReference { front: u32, back: u32 },
++    DepthBias { bias: f32, slope_scale: f32, clamp: f32 },
++    LineWidth(f32),
++    Visibility { mode: VisibilityResultMode, offset: u64 },
++    BlendColor([f32; 4]),
++    Draw { primitive: PrimitiveType, start: u32, count: u32, instances: u32, base_instance: u32 },
++    DrawIndexed {
++        primitive: PrimitiveType,
++        count: u32,
++        index_type: IndexType,
++        indices: Buffer,
++        offset: u64,
++        instances: u32,
++        base_vertex: i32,
++        base_instance: u32,
++    },
++    Fence { fence: Fence, stages: RenderStages, update: bool },
++    End,
++    Discard,
++}
++
++/// Queues a render encoder's opening on `command_buffer` (its current part) and returns its slot.
++pub(crate) fn open(command_buffer: CommandBuffer, pass: RenderPassDescriptor, failure: Failure) -> SlotPtr {
++    QUEUE.worker.get_or_init(start);
++    let slot = SlotPtr(NonNull::from(Box::leak(Box::new(Slot { encoder: None, failure }))));
++    push(slot, Op::Open { command_buffer, pass: Box::new(pass) });
++    slot
++}
++
++struct Entry {
++    slot: SlotPtr,
++    op: Op,
++}
++
++struct Queue {
++    pending: Mutex<Vec<Entry>>,
++    /// Sequence numbers: of the last call queued, and of the last call the worker ran.
++    queued: AtomicU64,
++    done: AtomicU64,
++    /// The worker is asleep or about to be: a call queued now unparks it.
++    sleeping: AtomicBool,
++    /// Threads asleep until the worker has run their call `.0`.
++    waiting: AtomicUsize,
++    waiters: Mutex<Vec<(u64, Thread)>>,
++    worker: OnceLock<Thread>,
++    waits: Mutex<Waits>,
++}
++
++/// Calls that had to wait for the worker since the last report, by their line in NativeMetalObjects.rs.
++struct Waits {
++    sites: Vec<(u32, u64, u64)>,
++    count: u64,
++    micros: u64,
++}
++
++static QUEUE: Queue = Queue {
++    pending: Mutex::new(Vec::new()),
++    queued: AtomicU64::new(0),
++    done: AtomicU64::new(0),
++    sleeping: AtomicBool::new(false),
++    waiting: AtomicUsize::new(0),
++    waiters: Mutex::new(Vec::new()),
++    worker: OnceLock::new(),
++    waits: Mutex::new(Waits { sites: Vec::new(), count: 0, micros: 0 }),
++};
++
++/// Queues a call of the deferred encoder `slot`.
++pub(crate) fn push(slot: SlotPtr, op: Op) {
++    let q = &QUEUE;
++    let seq = {
++        let mut pending = lock(&q.pending);
++        pending.push(Entry { slot, op });
++        let seq = q.queued.load(Ordering::Relaxed) + 1;
++        q.queued.store(seq, Ordering::SeqCst);
++        seq
++    };
++    MINE.set(seq);
++    if q.sleeping.load(Ordering::SeqCst) && q.sleeping.swap(false, Ordering::SeqCst) {
++        if let Some(worker) = q.worker.get() {
++            worker.unpark();
++        }
++    }
++}
++
++/// Before any other bridge call: waits until the worker has run this thread's queued calls (none: returns at once).
++#[inline]
++pub(crate) fn drain(site: &'static Location<'static>) {
++    let mine = MINE.get();
++    if mine != 0 && QUEUE.done.load(Ordering::Acquire) < mine {
++        wait(mine, site);
++    }
++}
++
++#[cold]
++#[inline(never)]
++fn wait(target: u64, site: &'static Location<'static>) {
++    let q = &QUEUE;
++    let began = Instant::now();
++    let spin_until = began + WAIT_SPIN;
++    while q.done.load(Ordering::Acquire) < target {
++        if Instant::now() < spin_until {
++            std::hint::spin_loop();
++            continue;
++        }
++        let me = std::thread::current();
++        lock(&q.waiters).push((target, me.clone()));
++        q.waiting.fetch_add(1, Ordering::SeqCst);
++        while q.done.load(Ordering::SeqCst) < target {
++            std::thread::park_timeout(Duration::from_micros(500));
++        }
++        q.waiting.fetch_sub(1, Ordering::SeqCst);
++        lock(&q.waiters).retain(|(_, thread)| thread.id() != me.id());
++        break;
++    }
++    let micros = began.elapsed().as_micros() as u64;
++    let mut waits = lock(&q.waits);
++    waits.count += 1;
++    waits.micros += micros;
++    let line = site.line();
++    match waits.sites.iter_mut().find(|s| s.0 == line) {
++        Some(s) => {
++            s.1 += 1;
++            s.2 += micros;
++        }
++        None => waits.sites.push((line, 1, micros)),
++    }
++}
++
++// ---- the worker ----
++
++/// The scheduling of the thread that opened the first deferred encoder, which the worker takes on.
++#[derive(Clone, Copy, Default)]
++struct Scheduling {
++    qos: u32,
++    relative: c_int,
++    policy: c_int,
++    param: SchedParam,
++    sched: bool,
++    constraint: [u32; 4],
++    constrained: bool,
++}
++
++fn scheduling() -> Scheduling {
++    let mut s = Scheduling::default();
++    // SAFETY: plain queries of the calling thread into locals.
++    unsafe {
++        let me = pthread_self();
++        pthread_get_qos_class_np(me, &mut s.qos, &mut s.relative);
++        s.sched = pthread_getschedparam(me, &mut s.policy, &mut s.param) == 0;
++        let port = mach_thread_self();
++        let mut count = 4u32;
++        let mut get_default: c_int = 1;
++        s.constrained = thread_policy_get(port, THREAD_TIME_CONSTRAINT_POLICY, s.constraint.as_mut_ptr(), &mut count, &mut get_default) == 0
++            && get_default == 0;
++        mach_port_deallocate(mach_task_self_, port);
++    }
++    s
++}
++
++fn take_on(s: &Scheduling) -> [c_int; 3] {
++    let mut rc = [-1; 3];
++    // SAFETY: plain settings of the calling thread from values another thread of this process runs with.
++    unsafe {
++        if s.qos != 0 {
++            rc[0] = pthread_set_qos_class_self_np(s.qos, s.relative);
++        }
++        if s.sched {
++            rc[1] = pthread_setschedparam(pthread_self(), s.policy, &s.param);
++        }
++        if s.constrained {
++            let port = mach_thread_self();
++            rc[2] = thread_policy_set(port, THREAD_TIME_CONSTRAINT_POLICY, s.constraint.as_ptr(), 4);
++            mach_port_deallocate(mach_task_self_, port);
++        }
++    }
++    rc
++}
++
++#[cold]
++fn start() -> Thread {
++    let s = scheduling();
++    let worker = std::thread::Builder::new()
++        .name("fuxi.deferred-render".into())
++        .stack_size(8 << 20)
++        .spawn(move || {
++            let rc = take_on(&s);
++            eprintln!("FUXI WORKER start qos={:#x}/{} sched={}:{}:{} tc={}:{}/{}/{}/{} rc={},{},{}", s.qos, s.relative, u8::from(s.sched),
++                      s.policy, s.param.priority, u8::from(s.constrained), s.constraint[0], s.constraint[1], s.constraint[2],
++                      s.constraint[3], rc[0], rc[1], rc[2]);
++            work()
++        })
++        .expect("deferred render worker");
++    worker.thread().clone()
++}
++
++/// What the worker did since its last report.
++#[derive(Default)]
++struct Stats {
++    ops: u64,
++    opens: u64,
++    draws: u64,
++    ends: u64,
++    batches: u64,
++    max_batch: usize,
++    max_lag: u64,
++    parks: u64,
++    busy: Duration,
++    failures: u64,
++}
++
++fn work() -> ! {
++    let q = &QUEUE;
++    let mut batch: Vec<Entry> = Vec::with_capacity(512);
++    let mut done = 0u64;
++    let mut stats = Stats::default();
++    let began = Instant::now();
++    let mut next_report = began + REPORT;
++    loop {
++        std::mem::swap(&mut *lock(&q.pending), &mut batch);
++        if batch.is_empty() {
++            let now = Instant::now();
++            if now >= next_report {
++                report(&mut stats, began);
++                next_report = now + REPORT;
++            }
++            let spin_until = now + WORKER_SPIN;
++            while q.queued.load(Ordering::Acquire) == done && Instant::now() < spin_until {
++                std::hint::spin_loop();
++            }
++            if q.queued.load(Ordering::Acquire) == done {
++                q.sleeping.store(true, Ordering::SeqCst);
++                if q.queued.load(Ordering::SeqCst) == done {
++                    stats.parks += 1;
++                    std::thread::park_timeout(REPORT);
++                }
++                q.sleeping.store(false, Ordering::SeqCst);
++            }
++            continue;
++        }
++        let busy = Instant::now();
++        stats.batches += 1;
++        stats.max_batch = stats.max_batch.max(batch.len());
++        stats.max_lag = stats.max_lag.max(q.queued.load(Ordering::Relaxed) - done);
++        for Entry { slot, op } in batch.drain(..) {
++            stats.ops += 1;
++            match op {
++                Op::Open { .. } => stats.opens += 1,
++                Op::Draw { .. } | Op::DrawIndexed { .. } => stats.draws += 1,
++                Op::End => stats.ends += 1,
++                _ => {}
++            }
++            if !run(slot, op) {
++                stats.failures += 1;
++            }
++            done += 1;
++            q.done.store(done, Ordering::SeqCst);
++            if q.waiting.load(Ordering::SeqCst) > 0 {
++                for (target, thread) in lock(&q.waiters).iter() {
++                    if *target <= done {
++                        thread.unpark();
++                    }
++                }
++            }
++        }
++        stats.busy += busy.elapsed();
++    }
++}
++
++fn report(stats: &mut Stats, began: Instant) {
++    let mut waits = std::mem::replace(&mut *lock(&QUEUE.waits), Waits { sites: Vec::new(), count: 0, micros: 0 });
++    if stats.ops == 0 && waits.count == 0 {
++        return;
++    }
++    waits.sites.sort_by(|a, b| b.2.cmp(&a.2));
++    let top: Vec<String> = waits.sites.iter().take(4).map(|(line, n, us)| format!("{line}:{n}/{us}")).collect();
++    eprintln!("FUXI WORKER s={} ops={} open={} draw={} end={} busy={} batch={}/{} lag={} park={} fail={} wait={}/{} top={}",
++              began.elapsed().as_secs(), stats.ops, stats.opens, stats.draws, stats.ends, stats.busy.as_micros(),
++              stats.ops / stats.batches.max(1), stats.max_batch, stats.max_lag, stats.parks, stats.failures, waits.count, waits.micros,
++              top.join(","));
++    *stats = Stats::default();
++}
++
++fn e<E: std::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> String {
++    move |error| format!("{what}: {error:?}")
++}
++
++fn catch<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
++    std::panic::catch_unwind(AssertUnwindSafe(body)).unwrap_or_else(|_| Err("panic in the Metal runtime".into()))
++}
++
++fn fail(failure: &Failure, why: String) {
++    static LOGGED: AtomicUsize = AtomicUsize::new(0);
++    if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
++        eprintln!("FUXI WORKER fail {why:.200}");
++    }
++    let mut first = lock(failure);
++    if first.is_none() {
++        *first = Some(format!("deferred {why}"));
++    }
++}
++
++/// Runs one queued call; false where the runtime refused it.
++fn run(slot: SlotPtr, op: Op) -> bool {
++    let raw = slot.0.as_ptr();
++    match op {
++        Op::End => {
++            // SAFETY: made by `open`; its end is the last call queued for it and frees it.
++            let Slot { encoder, failure } = *unsafe { Box::from_raw(raw) };
++            let Some(encoder) = encoder else { return true };
++            match catch(|| encoder.end_encoding().map_err(e("end encoding"))) {
++                Ok(()) => true,
++                Err(why) => {
++                    fail(&failure, why);
++                    false
++                }
++            }
++        }
++        Op::Discard => {
++            // SAFETY: as for the end; a discarded encoder goes unended, as the frontend's discard does.
++            drop(unsafe { Box::from_raw(raw) });
++            true
++        }
++        Op::Open { command_buffer, pass } => {
++            // SAFETY: made by `open` and not freed before its end or discard, which come after this.
++            let slot = unsafe { &mut *raw };
++            match catch(|| command_buffer.render_command_encoder(&pass).map_err(e("render encoder"))) {
++                Ok(encoder) => {
++                    slot.encoder = Some(encoder);
++                    true
++                }
++                Err(why) => {
++                    fail(&slot.failure, why);
++                    false
++                }
++            }
++        }
++        op => {
++            // SAFETY: as for the opening.
++            let slot = unsafe { &mut *raw };
++            // Its opening was refused, which its command buffer carries already.
++            let Some(encoder) = slot.encoder.as_mut() else { return false };
++            match catch(|| apply(encoder, op)) {
++                Ok(()) => true,
++                Err(why) => {
++                    fail(&slot.failure, why);
++                    false
++                }
++            }
++        }
++    }
++}
++
++fn apply(r: &mut RenderCommandEncoder, op: Op) -> Result<(), String> {
++    match op {
++        Op::Buffer { fragment, buffer, offset, index } => {
++            if fragment { r.set_fragment_buffer(buffer.as_ref(), offset, index) } else { r.set_vertex_buffer(buffer.as_ref(), offset, index) }
++                .map_err(e("set buffer"))
++        }
++        Op::BufferOffset { fragment, offset, index } => {
++            if fragment { r.set_fragment_buffer_offset(offset, index) } else { r.set_vertex_buffer_offset(offset, index) }
++                .map_err(e("set buffer offset"))
++        }
++        Op::Bytes { fragment, bytes, index } => {
++            if fragment { r.set_fragment_bytes(bytes.get(), index) } else { r.set_vertex_bytes(bytes.get(), index) }.map_err(e("set bytes"))
++        }
++        Op::Texture { fragment, texture, index } => {
++            if fragment { r.set_fragment_texture(texture.as_ref(), index) } else { r.set_vertex_texture(texture.as_ref(), index) }
++                .map_err(e("set texture"))
++        }
++        Op::Sampler { fragment, sampler, index } => {
++            if fragment { r.set_fragment_sampler_state(sampler.as_ref(), index) } else { r.set_vertex_sampler_state(sampler.as_ref(), index) }
++                .map_err(e("set sampler"))
++        }
++        Op::Pipeline(pipeline) => r.set_render_pipeline_state(&pipeline).map_err(e("render pipeline")),
++        Op::DepthStencil(state) => r.set_depth_stencil_state(state.as_ref()).map_err(e("depth/stencil state")),
++        Op::Viewport(viewport) => r.set_viewport(viewport).map_err(e("viewport")),
++        Op::Scissor(rect) => r.set_scissor_rect(rect).map_err(e("scissor")),
++        Op::Raster { cull, winding, fill } => {
++            r.set_cull_mode(cull);
++            r.set_front_facing_winding(winding);
++            r.set_triangle_fill_mode(fill).map_err(e("fill mode"))
++        }
++        Op::StencilReference { front, back } => {
++            r.set_stencil_reference_values(front, back);
++            Ok(())
++        }
++        Op::DepthBias { bias, slope_scale, clamp } => r.set_depth_bias(bias, slope_scale, clamp).map_err(e("depth bias")),
++        Op::LineWidth(width) => r.set_line_width(width).map_err(e("line width")),
++        Op::Visibility { mode, offset } => r.set_visibility_result_mode(mode, offset).map_err(e("visibility result mode")),
++        Op::BlendColor(c) => {
++            r.set_blend_color(c[0], c[1], c[2], c[3]);
++            Ok(())
++        }
++        Op::Draw { primitive, start, count, instances, base_instance } => {
++            r.draw_primitives(primitive, start, count, instances, base_instance).map_err(e("draw"))
++        }
++        Op::DrawIndexed { primitive, count, index_type, indices, offset, instances, base_vertex, base_instance } => r
++            .draw_indexed_primitives(primitive, count, index_type, &indices, offset, instances, base_vertex, base_instance)
++            .map_err(e("indexed draw")),
++        Op::Fence { fence, stages, update } => {
++            if update { r.update_fence(&fence, stages).map_err(e("update fence")) } else { r.wait_for_fence(&fence, stages).map_err(e("wait for fence")) }
++        }
++        Op::Open { .. } | Op::End | Op::Discard => unreachable!("run handles the encoder's opening and end"),
++    }
++}
+diff --git a/bridge/NativeMetalBridge.rs b/bridge/NativeMetalBridge.rs
+index b09e1d2..4dde389 100644
+--- a/bridge/NativeMetalBridge.rs
++++ b/bridge/NativeMetalBridge.rs
+@@ -15,6 +15,10 @@ pub mod objects;
+ #[path = "FuxiThreadCache.rs"]
+ mod fuxi_thread_cache;
+ 
++// Fuxi patch 0018: deferred render encoding on a worker thread, opt-in with fuxihyb=7 (FuxiDeferred.rs).
++#[path = "FuxiDeferred.rs"]
++mod fuxi_deferred;
++
+ use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
+ use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
+ use metal2vulkan_runtime::{
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 69f9a74..b1dfcfd 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -24,12 +24,15 @@ use metal2vulkan_runtime::{
+ };
+ use std::cell::RefCell;
+ use std::ffi::{c_char, c_void, CStr};
++use std::panic::Location;
+ use std::path::PathBuf;
+ use std::ptr::NonNull;
+ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+ use std::time::Duration;
+ 
++use crate::fuxi_deferred::{self, Bytes, Op, SlotPtr};
++
+ thread_local! {
+     static LAST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+ }
+@@ -43,8 +46,17 @@ fn set_error(why: String) {
+     });
+ }
+ 
+-/// Runs `body`, turning an error or a panic into the per-thread reason and `fallback`.
++/// Runs `body`, turning an error or a panic into the per-thread reason and `fallback`. Patch 0018: first waits until the
++/// deferred-encoding worker has run this thread's queued render calls (FuxiDeferred.rs; none queued: no wait).
++#[track_caller]
+ fn guard<T>(fallback: T, body: impl FnOnce() -> Result<T, String>) -> T {
++    fuxi_deferred::drain(Location::caller());
++    guard_free(fallback, body)
++}
++
++/// `guard` without the wait (patch 0018), for a call that cannot depend on queued render calls: a query of a value fixed at
++/// an object's making, a new object, or the queuing itself.
++fn guard_free<T>(fallback: T, body: impl FnOnce() -> Result<T, String>) -> T {
+     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+         Ok(Ok(value)) => value,
+         Ok(Err(why)) => {
+@@ -528,7 +540,7 @@ pub struct NmbBuffer(Buffer);
+ /// `bytes` is null or holds `length` bytes.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn nmb_buffer_new(device: *mut NmbDevice, length: u64, options_word: u64, bytes: *const c_void) -> *mut NmbBuffer {
+-    guard(std::ptr::null_mut(), || {
++    guard_free(std::ptr::null_mut(), || {
+         let device = &get(device)?.0;
+         let options = options(options_word)?;
+         let buffer = if bytes.is_null() {
+@@ -610,17 +622,17 @@ pub extern "C" fn nmb_buffer_release(buffer: *mut NmbBuffer) {
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_buffer_contents(buffer: *const NmbBuffer) -> *mut c_void {
+-    guard(std::ptr::null_mut(), || Ok(get(buffer)?.0.contents().map_or(std::ptr::null_mut(), |p| p.as_ptr() as *mut c_void)))
++    guard_free(std::ptr::null_mut(), || Ok(get(buffer)?.0.contents().map_or(std::ptr::null_mut(), |p| p.as_ptr() as *mut c_void)))
+ }
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_buffer_length(buffer: *const NmbBuffer) -> u64 {
+-    guard(0, || Ok(get(buffer)?.0.length()))
++    guard_free(0, || Ok(get(buffer)?.0.length()))
+ }
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_buffer_gpu_address(buffer: *const NmbBuffer) -> u64 {
+-    guard(0, || Ok(get(buffer)?.0.gpu_address().0))
++    guard_free(0, || Ok(get(buffer)?.0.gpu_address().0))
+ }
+ 
+ // ---- heaps ----
+@@ -732,7 +744,7 @@ fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescripto
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_texture_new(device: *mut NmbDevice, descriptor: *const NmbTextureDescriptor) -> *mut NmbTexture {
+-    guard(std::ptr::null_mut(), || {
++    guard_free(std::ptr::null_mut(), || {
+         let descriptor = texture_descriptor(descriptor)?;
+         Ok(boxed(NmbTexture(get(device)?.0.new_texture(&descriptor).map_err(e("texture"))?)))
+     })
+@@ -830,7 +842,7 @@ pub extern "C" fn nmb_texture_release(texture: *mut NmbTexture) {
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_texture_describe(texture: *const NmbTexture, out: *mut NmbTextureDescriptor) {
+-    guard((), || {
++    guard_free((), || {
+         let t = &get(texture)?.0;
+         let out = get_mut(out)?;
+         *out = NmbTextureDescriptor {
+@@ -1338,7 +1350,7 @@ pub struct NmbSamplerDescriptor {
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_sampler_new(device: *mut NmbDevice, descriptor: *const NmbSamplerDescriptor) -> *mut NmbSampler {
+-    guard(std::ptr::null_mut(), || {
++    guard_free(std::ptr::null_mut(), || {
+         let d = get(descriptor)?;
+         let mut out = SamplerDescriptor::new();
+         out.min_filter = raw::<SamplerMinMagFilter>(d.min_filter, "min filter")?;
+@@ -1433,6 +1445,8 @@ pub struct NmbQueue {
+ pub struct NmbCommandBuffer {
+     pieces: Mutex<Pieces>,
+     queue: Arc<QueueOpen>,
++    /// Patch 0018: the first refusal among its deferred render calls, which its commit returns.
++    deferred: fuxi_deferred::Failure,
+ }
+ 
+ struct Pieces {
+@@ -1493,7 +1507,7 @@ pub extern "C" fn nmb_command_buffer_new(queue: *mut NmbQueue) -> *mut NmbComman
+             queue.open.overlapped.store(true, Ordering::Release);
+         }
+         let pieces = Pieces { current, earlier: Vec::new(), counted: true };
+-        Ok(boxed(NmbCommandBuffer { pieces: Mutex::new(pieces), queue: Arc::clone(&queue.open) }))
++        Ok(boxed(NmbCommandBuffer { pieces: Mutex::new(pieces), queue: Arc::clone(&queue.open), deferred: Default::default() }))
+     })
+ }
+ 
+@@ -1568,6 +1582,10 @@ pub extern "C" fn nmb_command_buffer_wait_scheduled(command_buffer: *mut NmbComm
+ pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffer) -> bool {
+     guard(false, || {
+         let command_buffer = get(command_buffer)?;
++        // Patch 0018: a deferred render call it refused fails the commit, as the frontend's refusal would have.
++        if let Some(why) = fuxi_deferred::take_failure(&command_buffer.deferred) {
++            return Err(why);
++        }
+         command_buffer.current().commit().map_err(e("commit"))?;
+         command_buffer.uncount();
+         Ok(true)
+@@ -1587,6 +1605,10 @@ pub extern "C" fn nmb_command_buffer_split(command_buffer: *mut NmbCommandBuffer
+             if !pieces.counted || queue.overlapped.load(Ordering::Acquire) || queue.open.load(Ordering::Acquire) != 1 {
+                 return Ok(0);
+             }
++            // Patch 0018: refused already (a deferred call), as the frontend does not split a refused command buffer.
++            if fuxi_deferred::has_failed(&command_buffer.deferred) {
++                return Ok(0);
++            }
+             pieces.current.clone()
+         };
+         let next = current.command_queue().command_buffer().map_err(e("command buffer"))?;
+@@ -1802,12 +1824,16 @@ pub extern "C" fn nmb_fence_release(fence: *mut NmbFence) {
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_encoder_update_fence(encoder: *mut NmbEncoder, fence: *mut NmbFence, stages: u64) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || Ok(Op::Fence { fence: get(fence)?.0.clone(), stages: raw::<RenderStages>(stages, "render stages")?, update: true }));
++    }
+     guard(false, || {
+         let fence = &get(fence)?.0;
+         match get_mut(encoder)? {
+             NmbEncoder::Compute(c) => c.update_fence(fence),
+             NmbEncoder::Blit(b) => b.update_fence(fence),
+             NmbEncoder::Render(r) => r.update_fence(fence, raw::<RenderStages>(stages, "render stages")?),
++            NmbEncoder::Deferred(_) => return Err("deferred encoder".into()),
+         }
+         .map_err(e("update fence"))?;
+         Ok(true)
+@@ -1816,12 +1842,16 @@ pub extern "C" fn nmb_encoder_update_fence(encoder: *mut NmbEncoder, fence: *mut
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_encoder_wait_fence(encoder: *mut NmbEncoder, fence: *mut NmbFence, stages: u64) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || Ok(Op::Fence { fence: get(fence)?.0.clone(), stages: raw::<RenderStages>(stages, "render stages")?, update: false }));
++    }
+     guard(false, || {
+         let fence = &get(fence)?.0;
+         match get_mut(encoder)? {
+             NmbEncoder::Compute(c) => c.wait_for_fence(fence),
+             NmbEncoder::Blit(b) => b.wait_for_fence(fence),
+             NmbEncoder::Render(r) => r.wait_for_fence(fence, raw::<RenderStages>(stages, "render stages")?),
++            NmbEncoder::Deferred(_) => return Err("deferred encoder".into()),
+         }
+         .map_err(e("wait for fence"))?;
+         Ok(true)
+@@ -1834,6 +1864,34 @@ pub enum NmbEncoder {
+     Compute(ComputeCommandEncoder),
+     Render(RenderCommandEncoder),
+     Blit(BlitCommandEncoder),
++    /// Patch 0018: a render encoder whose calls the deferred-encoding worker runs (FuxiDeferred.rs).
++    Deferred(SlotPtr),
++}
++
++/// Patch 0018: a deferred render encoder's slot; its calls are queued for the worker.
++fn deferred(encoder: *mut NmbEncoder) -> Option<SlotPtr> {
++    // SAFETY: as in `get`; only the handle's kind is read, never the encoder the worker uses.
++    match unsafe { encoder.as_ref() } {
++        Some(NmbEncoder::Deferred(slot)) => Some(*slot),
++        _ => None,
++    }
++}
++
++/// Patch 0018: queues a deferred encoder's call, true at once; a refusal by the runtime fails its command buffer's commit.
++fn queue(slot: SlotPtr, op: impl FnOnce() -> Result<Op, String>) -> bool {
++    guard_free(false, || {
++        fuxi_deferred::push(slot, op()?);
++        Ok(true)
++    })
++}
++
++/// Patch 0018: whether a render-encoder call's stage is the fragment stage.
++fn fragment(stage: u32) -> Result<bool, String> {
++    match stage {
++        VERTEX => Ok(false),
++        FRAGMENT => Ok(true),
++        _ => Err(bad_stage(stage)),
++    }
+ }
+ 
+ #[unsafe(no_mangle)]
+@@ -1878,7 +1936,12 @@ fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, descriptor: *const NmbRenderPassDescriptor)
+                                          -> *mut NmbEncoder {
+-    guard(std::ptr::null_mut(), || {
++    // Patch 0018: a deferred encoder's opening is queued behind this thread's earlier calls; any other waits for them.
++    let deferring = fuxi_deferred::eligible();
++    if !deferring {
++        fuxi_deferred::drain(Location::caller());
++    }
++    guard_free(std::ptr::null_mut(), || {
+         let d = get(descriptor)?;
+         let mut pass = RenderPassDescriptor::new();
+         for (slot, a) in pass.color_attachments.iter_mut().zip(d.colors.iter()) {
+@@ -1913,13 +1976,26 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer,
+         if !d.visibility.is_null() {
+             pass.visibility_result_buffer = Some(get(d.visibility)?.0.clone());
+         }
+-        let encoder = get(command_buffer)?.current().render_command_encoder(&pass).map_err(e("render encoder"))?;
++        let command_buffer = get(command_buffer)?;
++        if deferring {
++            let slot = fuxi_deferred::open(command_buffer.current(), pass, Arc::clone(&command_buffer.deferred));
++            return Ok(boxed(NmbEncoder::Deferred(slot)));
++        }
++        let encoder = command_buffer.current().render_command_encoder(&pass).map_err(e("render encoder"))?;
+         Ok(boxed(NmbEncoder::Render(encoder)))
+     })
+ }
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_encoder_end(encoder: *mut NmbEncoder) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        // The worker ends it and frees its slot; the handle goes now.
++        return guard_free(false, || {
++            fuxi_deferred::push(slot, Op::End);
++            release(encoder);
++            Ok(true)
++        });
++    }
+     guard(false, || {
+         if encoder.is_null() {
+             return Err("null encoder".into());
+@@ -1930,6 +2006,7 @@ pub extern "C" fn nmb_encoder_end(encoder: *mut NmbEncoder) -> bool {
+             NmbEncoder::Compute(c) => c.end_encoding(),
+             NmbEncoder::Render(r) => r.end_encoding(),
+             NmbEncoder::Blit(b) => b.end_encoding(),
++            NmbEncoder::Deferred(_) => return Err("deferred encoder".into()),
+         }
+         .map_err(e("end encoding"))?;
+         Ok(true)
+@@ -1938,6 +2015,9 @@ pub extern "C" fn nmb_encoder_end(encoder: *mut NmbEncoder) -> bool {
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_encoder_discard(encoder: *mut NmbEncoder) {
++    if let Some(slot) = deferred(encoder) {
++        fuxi_deferred::push(slot, Op::Discard);
++    }
+     release(encoder)
+ }
+ 
+@@ -1976,6 +2056,9 @@ fn bad_stage(stage: u32) -> String {
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_encoder_set_buffer(encoder: *mut NmbEncoder, stage: u32, buffer: *mut NmbBuffer, offset: u64, index: u32) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || Ok(Op::Buffer { fragment: fragment(stage)?, buffer: optional(buffer)?.map(|b| b.0.clone()), offset, index }));
++    }
+     guard(false, || {
+         let buffer = optional(buffer)?.map(|b| &b.0);
+         match (get_mut(encoder)?, stage) {
+@@ -1991,6 +2074,9 @@ pub extern "C" fn nmb_encoder_set_buffer(encoder: *mut NmbEncoder, stage: u32, b
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_encoder_set_buffer_offset(encoder: *mut NmbEncoder, stage: u32, offset: u64, index: u32) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || Ok(Op::BufferOffset { fragment: fragment(stage)?, offset, index }));
++    }
+     guard(false, || {
+         match (get_mut(encoder)?, stage) {
+             (NmbEncoder::Compute(c), COMPUTE) => c.set_buffer_offset(offset, index),
+@@ -2008,6 +2094,16 @@ pub extern "C" fn nmb_encoder_set_buffer_offset(encoder: *mut NmbEncoder, stage:
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn nmb_encoder_set_bytes(encoder: *mut NmbEncoder, stage: u32, bytes: *const c_void, length: usize, index: u32)
+                                                -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            if bytes.is_null() {
++                return Err("null bytes".into());
++            }
++            // SAFETY: the caller's contract; the bytes are copied now, as Metal's set*Bytes does.
++            let bytes = Bytes::new(unsafe { std::slice::from_raw_parts(bytes as *const u8, length) });
++            Ok(Op::Bytes { fragment: fragment(stage)?, bytes, index })
++        });
++    }
+     guard(false, || {
+         if bytes.is_null() {
+             return Err("null bytes".into());
+@@ -2027,6 +2123,9 @@ pub unsafe extern "C" fn nmb_encoder_set_bytes(encoder: *mut NmbEncoder, stage:
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_encoder_set_texture(encoder: *mut NmbEncoder, stage: u32, texture: *mut NmbTexture, index: u32) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || Ok(Op::Texture { fragment: fragment(stage)?, texture: optional(texture)?.map(|t| t.0.clone()), index }));
++    }
+     guard(false, || {
+         let texture = optional(texture)?.map(|t| &t.0);
+         match (get_mut(encoder)?, stage) {
+@@ -2042,6 +2141,9 @@ pub extern "C" fn nmb_encoder_set_texture(encoder: *mut NmbEncoder, stage: u32,
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_encoder_set_sampler(encoder: *mut NmbEncoder, stage: u32, sampler: *mut NmbSampler, index: u32) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || Ok(Op::Sampler { fragment: fragment(stage)?, sampler: optional(sampler)?.map(|s| s.0.clone()), index }));
++    }
+     guard(false, || {
+         let sampler = optional(sampler)?.map(|s| &s.0);
+         match (get_mut(encoder)?, stage) {
+@@ -2084,6 +2186,9 @@ pub extern "C" fn nmb_compute_dispatch(encoder: *mut NmbEncoder, size: *const u6
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_pipeline(encoder: *mut NmbEncoder, pipeline: *mut NmbRenderPipeline) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || Ok(Op::Pipeline(get(pipeline)?.0.clone())));
++    }
+     guard(false, || {
+         render(encoder)?.set_render_pipeline_state(&get(pipeline)?.0).map_err(e("render pipeline"))?;
+         Ok(true)
+@@ -2092,6 +2197,9 @@ pub extern "C" fn nmb_render_set_pipeline(encoder: *mut NmbEncoder, pipeline: *m
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_depth_stencil(encoder: *mut NmbEncoder, state: *mut NmbDepthStencil) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || Ok(Op::DepthStencil(optional(state)?.map(|s| s.0.clone()))));
++    }
+     guard(false, || {
+         render(encoder)?.set_depth_stencil_state(optional(state)?.map(|s| &s.0)).map_err(e("depth/stencil state"))?;
+         Ok(true)
+@@ -2100,12 +2208,17 @@ pub extern "C" fn nmb_render_set_depth_stencil(encoder: *mut NmbEncoder, state:
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_viewport(encoder: *mut NmbEncoder, viewport: *const f64) -> bool {
+-    guard(false, || {
++    guard_free(false, || {
+         if viewport.is_null() {
+             return Err("null viewport".into());
+         }
+         // SAFETY: the header's six values.
+         let v = unsafe { std::slice::from_raw_parts(viewport, 6) };
++        if let Some(slot) = deferred(encoder) {
++            fuxi_deferred::push(slot, Op::Viewport(Viewport::new(v[0], v[1], v[2], v[3], v[4], v[5])));
++            return Ok(true);
++        }
++        fuxi_deferred::drain(Location::caller());
+         render(encoder)?.set_viewport(Viewport::new(v[0], v[1], v[2], v[3], v[4], v[5])).map_err(e("viewport"))?;
+         Ok(true)
+     })
+@@ -2113,12 +2226,17 @@ pub extern "C" fn nmb_render_set_viewport(encoder: *mut NmbEncoder, viewport: *c
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_scissor(encoder: *mut NmbEncoder, rect: *const u64) -> bool {
+-    guard(false, || {
++    guard_free(false, || {
+         if rect.is_null() {
+             return Err("null scissor".into());
+         }
+         // SAFETY: the header's four values.
+         let r = unsafe { std::slice::from_raw_parts(rect, 4) };
++        if let Some(slot) = deferred(encoder) {
++            fuxi_deferred::push(slot, Op::Scissor(ScissorRect::new(r[0], r[1], r[2], r[3])));
++            return Ok(true);
++        }
++        fuxi_deferred::drain(Location::caller());
+         render(encoder)?.set_scissor_rect(ScissorRect::new(r[0], r[1], r[2], r[3])).map_err(e("scissor"))?;
+         Ok(true)
+     })
+@@ -2126,6 +2244,15 @@ pub extern "C" fn nmb_render_set_scissor(encoder: *mut NmbEncoder, rect: *const
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_raster(encoder: *mut NmbEncoder, cull_mode: u64, winding: u64, fill_mode: u64) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            Ok(Op::Raster {
++                cull: raw::<CullMode>(cull_mode, "cull mode")?,
++                winding: raw::<Winding>(winding, "winding")?,
++                fill: raw::<TriangleFillMode>(fill_mode, "fill mode")?,
++            })
++        });
++    }
+     guard(false, || {
+         let r = render(encoder)?;
+         r.set_cull_mode(raw::<CullMode>(cull_mode, "cull mode")?);
+@@ -2137,6 +2264,9 @@ pub extern "C" fn nmb_render_set_raster(encoder: *mut NmbEncoder, cull_mode: u64
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_stencil_reference(encoder: *mut NmbEncoder, front: u32, back: u32) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || Ok(Op::StencilReference { front, back }));
++    }
+     guard(false, || {
+         render(encoder)?.set_stencil_reference_values(front, back);
+         Ok(true)
+@@ -2145,6 +2275,9 @@ pub extern "C" fn nmb_render_set_stencil_reference(encoder: *mut NmbEncoder, fro
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_depth_bias(encoder: *mut NmbEncoder, bias: f32, slope_scale: f32, clamp: f32) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || Ok(Op::DepthBias { bias, slope_scale, clamp }));
++    }
+     guard(false, || {
+         render(encoder)?.set_depth_bias(bias, slope_scale, clamp).map_err(e("depth bias"))?;
+         Ok(true)
+@@ -2154,6 +2287,9 @@ pub extern "C" fn nmb_render_set_depth_bias(encoder: *mut NmbEncoder, bias: f32,
+ /// SPI `setLineWidth:`: the runtime accepts Metal's default width of 1 and refuses any other (Apple's wide-line rule is unmeasured).
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_line_width(encoder: *mut NmbEncoder, width: f32) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || Ok(Op::LineWidth(width)));
++    }
+     guard(false, || {
+         render(encoder)?.set_line_width(width).map_err(e("line width"))?;
+         Ok(true)
+@@ -2162,6 +2298,11 @@ pub extern "C" fn nmb_render_set_line_width(encoder: *mut NmbEncoder, width: f32
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_visibility_mode(encoder: *mut NmbEncoder, mode: u64, offset: u64) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            Ok(Op::Visibility { mode: VisibilityResultMode::from_raw(mode).map_err(e("visibility result mode"))?, offset })
++        });
++    }
+     guard(false, || {
+         let mode = VisibilityResultMode::from_raw(mode).map_err(e("visibility result mode"))?;
+         render(encoder)?.set_visibility_result_mode(mode, offset).map_err(e("visibility result mode"))?;
+@@ -2171,12 +2312,17 @@ pub extern "C" fn nmb_render_set_visibility_mode(encoder: *mut NmbEncoder, mode:
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_blend_color(encoder: *mut NmbEncoder, color: *const f32) -> bool {
+-    guard(false, || {
++    guard_free(false, || {
+         if color.is_null() {
+             return Err("null color".into());
+         }
+         // SAFETY: the header's four values.
+         let c = unsafe { std::slice::from_raw_parts(color, 4) };
++        if let Some(slot) = deferred(encoder) {
++            fuxi_deferred::push(slot, Op::BlendColor([c[0], c[1], c[2], c[3]]));
++            return Ok(true);
++        }
++        fuxi_deferred::drain(Location::caller());
+         render(encoder)?.set_blend_color(c[0], c[1], c[2], c[3]);
+         Ok(true)
+     })
+@@ -2185,6 +2331,11 @@ pub extern "C" fn nmb_render_set_blend_color(encoder: *mut NmbEncoder, color: *c
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_draw(encoder: *mut NmbEncoder, primitive: u64, start: u32, count: u32, instances: u32, base_instance: u32)
+                                   -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            Ok(Op::Draw { primitive: raw::<PrimitiveType>(primitive, "primitive")?, start, count, instances, base_instance })
++        });
++    }
+     guard(false, || {
+         render(encoder)?.draw_primitives(raw::<PrimitiveType>(primitive, "primitive")?, start, count, instances, base_instance)
+             .map_err(e("draw"))?;
+@@ -2196,6 +2347,20 @@ pub extern "C" fn nmb_render_draw(encoder: *mut NmbEncoder, primitive: u64, star
+ #[allow(clippy::too_many_arguments)]
+ pub extern "C" fn nmb_render_draw_indexed(encoder: *mut NmbEncoder, primitive: u64, count: u32, index_type: u64, indices: *mut NmbBuffer,
+                                           offset: u64, instances: u32, base_vertex: i32, base_instance: u32) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            Ok(Op::DrawIndexed {
++                primitive: raw::<PrimitiveType>(primitive, "primitive")?,
++                count,
++                index_type: raw::<IndexType>(index_type, "index type")?,
++                indices: get(indices)?.0.clone(),
++                offset,
++                instances,
++                base_vertex,
++                base_instance,
++            })
++        });
++    }
+     guard(false, || {
+         render(encoder)?.draw_indexed_primitives(raw::<PrimitiveType>(primitive, "primitive")?, count,
+                                                  raw::<IndexType>(index_type, "index type")?, &get(indices)?.0, offset, instances,
