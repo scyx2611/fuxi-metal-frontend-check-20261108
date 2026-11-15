@@ -3495,10 +3495,10 @@ index 0000000..5633228
 +}
 diff --git a/xnu/fuxi-adsp/SweetBattery.cpp b/xnu/fuxi-adsp/SweetBattery.cpp
 new file mode 100644
-index 0000000..485241f
+index 0000000..32e5255
 --- /dev/null
 +++ b/xnu/fuxi-adsp/SweetBattery.cpp
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,455 @@
 +/*
 + * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
 + * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
@@ -3519,6 +3519,8 @@ index 0000000..485241f
 +/* bsd/dev/sweet_spmi.c */
 +extern "C" int sweet_spmi_init(void);
 +extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/kern/proc.c */
++extern "C" void proc_selfname(char *buf, int size);
 +#if defined(FUXI)
 +#include "../../../bsd/dev/fuxi_adsp_battery.h"
 +#endif
@@ -3530,6 +3532,7 @@ index 0000000..485241f
 +	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 +	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
 +	void free(void) APPLE_KEXT_OVERRIDE;
++	bool serializeProperties(OSSerialize *s) const APPLE_KEXT_OVERRIDE;
 +private:
 +	IOWorkLoop *fLoop;
 +	IOTimerEventSource *fTimer;
@@ -3550,6 +3553,33 @@ index 0000000..485241f
 +	static unsigned estimatePercent(unsigned mv);
 +};
 +OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
++
++/* Who reads the battery from user space (IORegistryEntryCreateCFProperties) and what it then
++ * sees, bounded: the first 16 reads, then the first 4 after each change of what is published. */
++static uint32_t gSbReads, gSbReadLogs, gSbReadKey = ~0u, gSbReadsSinceChange;
++
++bool
++SweetBattery::serializeProperties(OSSerialize *s) const
++{
++	const uint32_t n = __atomic_add_fetch(&gSbReads, 1u, __ATOMIC_RELAXED);
++	const unsigned key = fShown;
++	if (key != gSbReadKey) {
++		gSbReadKey = key;
++		gSbReadsSinceChange = 0;
++	}
++	if ((n <= 16 || gSbReadsSinceChange++ < 4) && gSbReadLogs < 96) {
++		char name[32];
++		gSbReadLogs++;
++		proc_selfname(name, (int)sizeof(name));
++		if (key == ~0u)
++			IOLog("SWEET BATTERY: read #%u by %s (still the fallback)\n", n, name);
++		else
++			IOLog("SWEET BATTERY: read #%u by %s (published #%u: %u%% external=%u charging=%u)\n", n, name,
++			    fShownLogs, key & 0xffu, (key >> 8) & 0xfu ? ((key >> 8) & 0xfu) - 1u : 9u,
++			    (key >> 12) & 0xfu ? ((key >> 12) & 0xfu) - 1u : 9u);
++	}
++	return IOPMPowerSource::serializeProperties(s);
++}
 +
 +bool
 +SweetBattery::init(OSDictionary *dictionary)
@@ -6230,10 +6260,10 @@ index 8349337..7d08b57 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..eb6d1e0
+index 0000000..031c394
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,4901 @@
+@@ -0,0 +1,4941 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,21 @@
@@ -10954,17 +10984,23 @@ index 0000000..eb6d1e0
 +  */
 + #if defined(ARM64_BOARD_CONFIG_SWEET)
 + #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
-+@@ -15,6 +18,9 @@
++@@ -15,6 +18,11 @@
 + /* bsd/dev/sweet_spmi.c */
 + extern "C" int sweet_spmi_init(void);
 + extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+++/* bsd/kern/proc.c */
+++extern "C" void proc_selfname(char *buf, int size);
 ++#if defined(FUXI)
 ++#include "../../../bsd/dev/fuxi_adsp_battery.h"
 ++#endif
 + 
 + class SweetBattery : public IOPMPowerSource {
 + 	OSDeclareDefaultStructors(SweetBattery);
-+@@ -26,13 +32,17 @@
++@@ -23,16 +31,21 @@
++ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++ 	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++ 	void free(void) APPLE_KEXT_OVERRIDE;
+++	bool serializeProperties(OSSerialize *s) const APPLE_KEXT_OVERRIDE;
 + private:
 + 	IOWorkLoop *fLoop;
 + 	IOTimerEventSource *fTimer;
@@ -10983,7 +11019,41 @@ index 0000000..eb6d1e0
 + 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
 + 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
 + 	static bool readWord(unsigned address, uint16_t *value);
-+@@ -51,7 +61,7 @@
++@@ -40,6 +53,33 @@
++ };
++ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
++ 
+++/* Who reads the battery from user space (IORegistryEntryCreateCFProperties) and what it then
+++ * sees, bounded: the first 16 reads, then the first 4 after each change of what is published. */
+++static uint32_t gSbReads, gSbReadLogs, gSbReadKey = ~0u, gSbReadsSinceChange;
+++
+++bool
+++SweetBattery::serializeProperties(OSSerialize *s) const
+++{
+++	const uint32_t n = __atomic_add_fetch(&gSbReads, 1u, __ATOMIC_RELAXED);
+++	const unsigned key = fShown;
+++	if (key != gSbReadKey) {
+++		gSbReadKey = key;
+++		gSbReadsSinceChange = 0;
+++	}
+++	if ((n <= 16 || gSbReadsSinceChange++ < 4) && gSbReadLogs < 96) {
+++		char name[32];
+++		gSbReadLogs++;
+++		proc_selfname(name, (int)sizeof(name));
+++		if (key == ~0u)
+++			IOLog("SWEET BATTERY: read #%u by %s (still the fallback)\n", n, name);
+++		else
+++			IOLog("SWEET BATTERY: read #%u by %s (published #%u: %u%% external=%u charging=%u)\n", n, name,
+++			    fShownLogs, key & 0xffu, (key >> 8) & 0xfu ? ((key >> 8) & 0xfu) - 1u : 9u,
+++			    (key >> 12) & 0xfu ? ((key >> 12) & 0xfu) - 1u : 9u);
+++	}
+++	return IOPMPowerSource::serializeProperties(s);
+++}
+++
++ bool
++ SweetBattery::init(OSDictionary *dictionary)
++ {
++@@ -51,7 +91,7 @@
 + 	}
 + 	fLoop = NULL;
 + 	fTimer = NULL;
@@ -10992,7 +11062,7 @@ index 0000000..eb6d1e0
 + 	if (dictionary) {
 + 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
 + 		if (!it) {
-+@@ -72,6 +82,8 @@
++@@ -72,6 +112,8 @@
 + 		}
 + 	}
 + 	fLastMode = -1;
@@ -11001,7 +11071,7 @@ index 0000000..eb6d1e0
 + 	return true;
 + }
 + 
-+@@ -203,9 +215,99 @@
++@@ -203,9 +245,99 @@
 + 	return 100;
 + }
 + 
@@ -11101,7 +11171,7 @@ index 0000000..eb6d1e0
 + 	uint8_t type, present, usb, path, charger, error, temperature;
 + 	uint16_t rawVoltage;
 + 	bool valid = fReal &&
-+@@ -252,7 +354,8 @@
++@@ -252,7 +384,8 @@
 + 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
 + 	if (self && self->fRunning) {
 + 		self->poll();
@@ -11111,7 +11181,7 @@ index 0000000..eb6d1e0
 + 	}
 + }
 + 
-+@@ -265,17 +368,20 @@
++@@ -265,17 +398,20 @@
 + 	int real = 0;
 + 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
 + 	fReal = real == 1 && sweet_spmi_init() == 0;
