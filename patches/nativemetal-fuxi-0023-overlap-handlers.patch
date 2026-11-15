@@ -1,0 +1,88 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 1ca21b9..dfd1605 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -72,17 +72,26 @@ static std::atomic<uint64_t> gSwapWaitRefused;
+ // that has a writer), dropped once the runtime has submitted the work (its scheduled handler) or the commit failed. So
+ // commitAndWaitUntilSubmitted need not wait for the submission before CoreAnimation's swap, unless the command buffer has
+ // scheduled handlers of its own or blit/compute work (which may write surfaces the leases do not name).
++// Patch 0023: fuxitudebug=...,ovsh lets a command buffer with scheduled handlers overlap too. QuartzCore adds them in three
++// places: MetalContext::delete_image (dispatch_async of the deleted image's releases to the context's queue, safe from any
++// thread and at any later time), copy_submitted_callbacks (the commit path that does not wait) and flush (a debug switch).
++// The handlers still run, on the worker once the runtime has submitted the work. The waits that do happen are counted by
++// reason: waits_handlers (handlers, ovsh off), waits_other (blit/compute), waits_direct (not queued on the worker).
+ static Timed gTimeOverlapLock,gTimeOverlapUnlock;
+ static std::atomic<uint64_t> gOverlapCommits,gOverlapLeases,gOverlapLockFailed,gOverlapRefused,gOverlapSkipped,gOverlapKept,gOverlapStatus;
++static std::atomic<uint64_t> gOverlapWaitHandlers,gOverlapWaitOther,gOverlapWaitDirect,gOverlapSkippedHandlers;
++static bool fuxiOverlapHandlersAllowed();
+ static void fuxiOverlapReport() {
+  const uint64_t n=gOverlapCommits.load();
+  if(n!=1 && n%1200)return;
+  const uint64_t locks=gTimeOverlapLock.count.load(),unlocks=gTimeOverlapUnlock.count.load();
+- fprintf(stderr,"FUXI OVERLAP: commits=%llu skipped_waits=%llu kept_waits=%llu leases=%llu lock_failed=%llu refused=%llu status=%llu lock_us=%llu/%llu unlock_us=%llu/%llu\n",
++ fprintf(stderr,"FUXI OVERLAP: commits=%llu skipped_waits=%llu kept_waits=%llu leases=%llu lock_failed=%llu refused=%llu status=%llu lock_us=%llu/%llu unlock_us=%llu/%llu waits_handlers=%llu waits_other=%llu waits_direct=%llu skips_handlers=%llu ovsh=%d\n",
+   (unsigned long long)n,(unsigned long long)gOverlapSkipped.load(),(unsigned long long)gOverlapKept.load(),(unsigned long long)gOverlapLeases.load(),
+   (unsigned long long)gOverlapLockFailed.load(),(unsigned long long)gOverlapRefused.load(),(unsigned long long)gOverlapStatus.load(),
+   (unsigned long long)(locks?gTimeOverlapLock.total.load()/locks:0),(unsigned long long)gTimeOverlapLock.slowest.load(),
+-  (unsigned long long)(unlocks?gTimeOverlapUnlock.total.load()/unlocks:0),(unsigned long long)gTimeOverlapUnlock.slowest.load());
++  (unsigned long long)(unlocks?gTimeOverlapUnlock.total.load()/unlocks:0),(unsigned long long)gTimeOverlapUnlock.slowest.load(),
++  (unsigned long long)gOverlapWaitHandlers.load(),(unsigned long long)gOverlapWaitOther.load(),(unsigned long long)gOverlapWaitDirect.load(),
++  (unsigned long long)gOverlapSkippedHandlers.load(),fuxiOverlapHandlersAllowed()?1:0);
+ }
+ // True when args holds token as one whole whitespace-delimited word.
+ static bool fuxiBootArgsHaveToken(const char *args,const char *token) {
+@@ -146,6 +155,14 @@ static bool fuxiTuDebugHasFlag(const char *args,const char *flag) {
+  }
+  return false;
+ }
++// Patch 0023: fuxitudebug=...,ovsh (read once).
++static bool fuxiOverlapHandlersAllowed() {
++ static const bool on=[]{
++  char args[4096]={};size_t size=sizeof(args)-1;
++  return sysctlbyname("kern.bootargs",args,&size,nullptr,0)==0 && fuxiTuDebugHasFlag(args,"ovsh");
++ }();
++ return on;
++}
+ // Hybrid Turnip (patch 0019): with the flag hyb in the boot line's fuxitudebug= list (e.g. fuxitudebug=nocb,hyb) the device
+ // opens libvulkan_freedreno_hyb.dylib, the hybrid lane's Turnip build (Mesa patches mesa-hyb-*.patch), from the directory of the
+ // default loader instead of that loader, so one root image A/B tests a Turnip change by boot argument. It rides on fuxitudebug=
+@@ -706,6 +723,7 @@ static void notified(void *context,uint64_t value) {
+  uint32_t partEncoders,splits;
+  std::vector<IOSurfaceRef> fuxiLeases;   // patch 0020: pending writer leases (retained), under @synchronized(self)
+  bool fuxiOtherWork;                     // patch 0020: a blit or compute encoder was opened
++ uint8_t fuxiOverlapReason;              // patch 0023: 1 scheduled handlers, 2 blit/compute, 0 not queued on the worker
+ }
+ @property(atomic) BOOL fuxiOverlapPending;   // patch 0020: queued on the worker, not yet taken by the runtime
+ @property(atomic) BOOL fuxiOverlapped;       // patch 0020: commitAndWaitUntilSubmitted returns without the scheduling wait
+@@ -1046,7 +1064,11 @@ static void overlapCommitted(void *context,const char *why);
+ // Patch 0020: an overlapped commit's pending leases hold the swap's present back until the runtime has submitted the work.
+ - (BOOL)commitAndWaitUntilSubmitted { try { @try {
+  [(id<MTLCommandBuffer>)self commit];
+- if(self.fuxiOverlapped)gOverlapSkipped++;else [self waitUntilScheduled];
++ if(self.fuxiOverlapped){gOverlapSkipped++;if(fuxiOverlapReason==1)gOverlapSkippedHandlers++;}
++ else {
++  if(fuxiOverlapReason==1)gOverlapWaitHandlers++;else if(fuxiOverlapReason==2)gOverlapWaitOther++;else gOverlapWaitDirect++;
++  [self waitUntilScheduled];
++ }
+  [self fuxiWaitStoredSurface];return !self.failedLocally;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (CFTimeInterval)GPUStartTime { try { @try {return nmb_command_buffer_gpu_time(_handle,false);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (CFTimeInterval)GPUEndTime { try { @try {return nmb_command_buffer_gpu_time(_handle,true);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1240,7 +1262,8 @@ static void overlapCommitted(void *context,const char *why);
+ - (BOOL)fuxiCommitOverlapped:(void *)context { try { @try {
+  if(!nmb_command_buffer_commit_deferrable() || ![self fuxiTakeLeases])return NO;
+  BOOL handlers=NO;@synchronized(self){handlers=_scheduledHandlers.count!=0;}
+- self.fuxiOverlapped=!handlers && !fuxiOtherWork;
++ fuxiOverlapReason=fuxiOtherWork?2:handlers?1:0;
++ self.fuxiOverlapped=(!handlers || fuxiOverlapHandlersAllowed()) && !fuxiOtherWork;
+  self.fuxiOverlapPending=YES;
+  CFRetain(context);
+  const int queued=nmb_command_buffer_commit_deferred(_handle,completed,scheduled,overlapCommitted,context);
+@@ -1249,7 +1272,7 @@ static void overlapCommitted(void *context,const char *why);
+   gOverlapCommits++;fuxiOverlapReport();
+   return YES;
+  }
+- self.fuxiOverlapPending=NO;self.fuxiOverlapped=NO;
++ self.fuxiOverlapPending=NO;self.fuxiOverlapped=NO;fuxiOverlapReason=0;
+  CFRelease(context);
+  [self fuxiDropLeases];
+  if(queued<0){gOverlapRefused++;NBLOG(@"native-metal: overlapped commit refused: %@",lastError());}
