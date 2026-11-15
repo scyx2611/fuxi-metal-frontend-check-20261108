@@ -1,0 +1,530 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 67c6031..6943174 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -76,6 +76,30 @@ static bool fuxiBootArgsHaveToken(const char *args,const char *token) {
+  }
+  return false;
+ }
++// Split commits (patch 0016): with fuxisplit=<us> on the boot line, a command buffer that has encoded for at least that long
++// commits what it ended so far as a part of its own when it opens its next encoder (at most three parts early), so the GPU runs
++// the frame's first passes while the CPU encodes the rest. The bridge splits only where the queue has no other open command
++// buffer and never had two at once, so the queue's order stays Metal's. Without the argument nothing splits.
++static uint64_t fuxiSplitUs() {
++ static const uint64_t us=[]{
++  char args[4096]={};size_t size=sizeof(args)-1;
++  if(sysctlbyname("kern.bootargs",args,&size,nullptr,0)!=0)return (uint64_t)0;
++  for(const char *at=args;*at;) {
++   while(*at==' ' || *at=='\t' || *at=='\n')at++;
++   const char *end=at;while(*end && *end!=' ' && *end!='\t' && *end!='\n')end++;
++   if(end-at>10 && !strncmp(at,"fuxisplit=",10)) {
++    uint64_t value=0;bool digits=true;
++    for(const char *c=at+10;c<end;c++){if(*c<'0' || *c>'9'){digits=false;break;}value=value*10+(uint64_t)(*c-'0');}
++    if(digits && value<=1000000)return value;
++   }
++   at=end;
++  }
++  return (uint64_t)0;
++ }();
++ return us;
++}
++static std::atomic<uint64_t> gSplitParts,gSplitCommandBuffers,gSplitRefused,gSplitFailed;
++static NSMutableSet *gSplitOpen;   // uncommitted command buffers with parts committed early (patch 0016)
+ static bool fuxiSwapWaitEnabled() {
+  if(const char *value=getenv("FUXI_NATIVE_SWAP_WAIT"))return strcmp(value,"0")!=0;
+  static const bool bootEnabled=[]{
+@@ -568,6 +592,8 @@ static void notified(void *context,uint64_t value) {
+ @public
+  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
+  uint64_t createdUs;
++ uint64_t partUs;           // patch 0016: when its current part began; encoders opened in it; parts committed early
++ uint32_t partEncoders,splits;
+ }
+ @property(nonatomic) BOOL fuxiNoop;
+ @property(nonatomic,strong) NSMutableArray *fuxiSignals;
+@@ -588,6 +614,7 @@ static void notified(void *context,uint64_t value) {
+ @property(nonatomic) BOOL completionDelivered;
+ - (void)refuse:(NSString *)what;
+ - (void)fuxiWaitStoredSurface;
++- (void)fuxiMaybeSplit;
+ @end
+ @interface NBEncoder : NBObject
+ @property(nonatomic) NmbEncoder *handle;
+@@ -605,6 +632,15 @@ static void waitForResource(id resource) {
+   // (or GPU work already completed), not a fabricated completion for a pending dependency.
+   if(dependency!=0)[(id<MTLCommandBuffer>)commandBuffer waitUntilCompleted];else gResourceSkipped++;
+  }
++ // Patch 0016: an uncommitted command buffer's parts committed early run already; wait for them where they use the resource.
++ NSArray *split;@synchronized(gSplitOpen){split=gSplitOpen.allObjects;}
++ for(NBCommandBuffer *commandBuffer in split) {
++  int dependency=-1;
++  if([resource isKindOfClass:[NBBuffer class]])dependency=nmb_command_buffer_earlier_uses(commandBuffer.handle,[(NBBuffer *)resource handle],nullptr);
++  else if([resource isKindOfClass:[NBTexture class]])dependency=nmb_command_buffer_earlier_uses(commandBuffer.handle,nullptr,[(NBTexture *)resource handle]);
++  gResourceChecks++;
++  if(dependency!=0)nmb_command_buffer_wait_earlier(commandBuffer.handle);else gResourceSkipped++;
++ }
+  gTimeResourceWait.add(began);
+ }
+ @implementation NBEncoder
+@@ -856,7 +892,7 @@ static void scheduled(void *context);
+ @implementation NBCommandBuffer
+ - (instancetype)init { try { @try {
+  if((self=[super init])){_fuxiSignals=[NSMutableArray array];_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+- if(self)createdUs=nowUs();
++ if(self){createdUs=nowUs();partUs=createdUs;}
+  return self;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)dealloc { try { @try {nmb_command_buffer_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -892,12 +928,37 @@ static void scheduled(void *context);
+ - (BOOL)commitAndWaitUntilSubmitted { try { @try {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];[self fuxiWaitStoredSurface];return !self.failedLocally;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (CFTimeInterval)GPUStartTime { try { @try {return nmb_command_buffer_gpu_time(_handle,false);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (CFTimeInterval)GPUEndTime { try { @try {return nmb_command_buffer_gpu_time(_handle,true);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++// Patch 0016: before an encoder opens, the part encoded since the last split goes to the GPU where it has run for fuxisplit us
++// and holds an encoder. Its attachments' surfaces are maintained first, as at commit (and again at commit and completion).
++- (void)fuxiMaybeSplit { try { @try {
++ const uint64_t threshold=fuxiSplitUs();
++ if(!threshold || self.committed || self.encodeFailure || fuxiBlocked())return;
++ if(partEncoders++==0 || splits>=3)return;
++ const uint64_t now=nowUs();
++ if(now-partUs<threshold)return;
++ flushSurfaces(_surfaces);
++ const int split=nmb_command_buffer_split(_handle);
++ if(split==1) {
++  if(splits++==0){gSplitCommandBuffers++;@synchronized(gSplitOpen){[gSplitOpen addObject:self];}}
++  partUs=now;partEncoders=1;   // the encoder opening now begins the new part
++  const uint64_t n=++gSplitParts;
++  if(n==1 || n%6000==0)fprintf(stderr,"FUXI SPLIT: parts=%llu command_buffers=%llu refused=%llu failed=%llu threshold_us=%llu\n",
++   (unsigned long long)n,(unsigned long long)gSplitCommandBuffers.load(),(unsigned long long)gSplitRefused.load(),
++   (unsigned long long)gSplitFailed.load(),(unsigned long long)threshold);
++ } else if(split==0) {
++  const uint64_t n=++gSplitRefused;
++  if(n==1 || n%6000==0)fprintf(stderr,"FUXI SPLIT: refused=%llu (a queue with another open command buffer)\n",(unsigned long long)n);
++ } else {
++  gSplitFailed++;NBLOG(@"native-metal: split refused: %@",lastError());
++ }
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)what { try { @try {
+  if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
+  if(!handle){[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];return nil;}
+  encoder.handle=handle;encoder.commandBuffer=self;return encoder;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoder { try { @try {
++ [self fuxiMaybeSplit];
+  return [self encoder:[NBComputeEncoder new] handle:self.committed?nullptr:nmb_compute_encoder_new(_handle) what:@"computeCommandEncoder"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type { try { @try {
+@@ -906,6 +967,7 @@ static void scheduled(void *context);
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLBlitCommandEncoder>)blitCommandEncoder { try { @try {
+  gBlits++;encodedWork.blits++;
++ [self fuxiMaybeSplit];
+  return [self encoder:[NBBlitEncoder new] handle:self.committed?nullptr:nmb_blit_encoder_new(_handle) what:@"blitCommandEncoder"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d { try { @try {
+@@ -946,6 +1008,7 @@ static void scheduled(void *context);
+   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
+  }
+  NBRenderEncoder *encoder=[NBRenderEncoder new];encoder.fuxiStoredSurface=storesSurface;
++ [self fuxiMaybeSplit];
+  return [self encoder:encoder handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)addScheduledHandler:(MTLCommandBufferHandler)block { try { @try {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1029,6 +1092,7 @@ static void scheduled(void *context);
+  dispatch_group_enter(_handlers);
+  dispatch_group_enter(_schedulingHandlers);
+  @synchronized(gInFlight){[gInFlight addObject:self];}
++ if(splits)@synchronized(gSplitOpen){[gSplitOpen removeObject:self];}
+  if(fuxiBlocked()){
+   self.fuxiNoop=YES;
+   for(NSArray *signal in _fuxiSignals)if(!nmb_shared_event_set_value([(NBEvent *)signal[0] handle],[signal[1] unsignedLongLongValue]))noteProblem(@"survey event signal refused");
+@@ -1086,8 +1150,9 @@ static void completed(void *context) {
+   fuxiFailure(text);
+  }else if(gFuxiHooks.completed){
+   // Report actual completion counters; only stored IOSurface passes qualify the gate.
+-  double start=nmb_command_buffer_gpu_time(commandBuffer.handle,false),end=nmb_command_buffer_gpu_time(commandBuffer.handle,true);
+-  gFuxiHooks.completed(end>start?uint64_t((end-start)*1e9):0,double(nowUs()-commandBuffer.committedUs)/1000.0,
++  // Patch 0016: the parts' GPU times added up (end less start where nothing split).
++  const double busy=nmb_command_buffer_gpu_busy(commandBuffer.handle);
++  gFuxiHooks.completed(busy>0?uint64_t(busy*1e9):0,double(nowUs()-commandBuffer.committedUs)/1000.0,
+    commandBuffer->encodedWork.draws,commandBuffer->encodedWork.storedSurface);
+  }
+ 
+@@ -1686,7 +1751,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
+  if(!guardedBase || class_getInstanceSize(guardedBase)!=528){fuxiFailure("NativeMetal _MTLDevice size must be 528");return nil;}
+ #endif
+ 
+- gMissing=missing;gInFlight=[NSMutableSet set];
++ gMissing=missing;gInFlight=[NSMutableSet set];gSplitOpen=[NSMutableSet set];
+  gDevice=nmb_device_open(loader,cache);
+  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
+  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index ebee31e..6de5b6e 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -193,6 +193,15 @@ int nmb_command_buffer_wait(NmbCommandBuffer *, uint64_t timeout_ms);
+ uint64_t nmb_command_buffer_status(const NmbCommandBuffer *);
+ size_t nmb_command_buffer_error(const NmbCommandBuffer *, char *out, size_t size);
+ double nmb_command_buffer_gpu_time(const NmbCommandBuffer *, bool end);
++// Fuxi patch 0016: commit what is encoded so far as a part of its own and go on in a new runtime command buffer of the queue
++// (between encoders only). 1 split, 0 not allowed (the queue has or had another open command buffer, or it is committed), -1
++// refused. The parts run in order; handlers, waits, status and times stand for the whole, as without a split.
++int nmb_command_buffer_split(NmbCommandBuffer *);
++// Patch 0016: whether a part committed early uses the buffer or the texture (pass one, the other NULL); wait for those parts.
++int nmb_command_buffer_earlier_uses(const NmbCommandBuffer *, const NmbBuffer *, const NmbTexture *);
++bool nmb_command_buffer_wait_earlier(NmbCommandBuffer *);
++// Patch 0016: the parts' GPU times added up (gpu_time's span less the gaps between parts).
++double nmb_command_buffer_gpu_busy(const NmbCommandBuffer *);
+ 
+ /* Events: an MTLEvent (shared false) or an MTLSharedEvent within this process. */
+ NmbEvent *nmb_event_new(NmbDevice *, bool shared);
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index fb8102d..69f9a74 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -26,6 +26,8 @@ use std::cell::RefCell;
+ use std::ffi::{c_char, c_void, CStr};
+ use std::path::PathBuf;
+ use std::ptr::NonNull;
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+ use std::time::Duration;
+ 
+ thread_local! {
+@@ -1410,12 +1412,71 @@ pub extern "C" fn nmb_depth_stencil_release(state: *mut NmbDepthStencil) {
+ 
+ // ---- queues and command buffers ----
+ 
+-pub struct NmbQueue(CommandQueue);
+-pub struct NmbCommandBuffer(CommandBuffer);
++/// Fuxi patch 0016: how many of a queue's command buffers are made and neither committed nor released, and whether two were ever
++/// open at once there. A command buffer commits a part of its work early (`nmb_command_buffer_split`) only while it is its queue's
++/// one open command buffer and none ever overlapped another on that queue: no other command buffer of the queue can then commit
++/// between its parts, so the queue runs them in the order Metal's commit order gives.
++#[derive(Default)]
++struct QueueOpen {
++    open: AtomicUsize,
++    overlapped: AtomicBool,
++}
++
++pub struct NmbQueue {
++    queue: CommandQueue,
++    open: Arc<QueueOpen>,
++}
++
++/// A frontend command buffer: the runtime command buffer it encodes into now and, in their order on the queue, the parts it
++/// committed early (patch 0016). The frontend splits only with `fuxisplit` on the boot line; without it there is never a part and
++/// this is exactly one runtime command buffer, as before.
++pub struct NmbCommandBuffer {
++    pieces: Mutex<Pieces>,
++    queue: Arc<QueueOpen>,
++}
++
++struct Pieces {
++    current: CommandBuffer,
++    earlier: Vec<CommandBuffer>,
++    /// Still counted among its queue's open command buffers: until its commit or its release.
++    counted: bool,
++}
++
++impl NmbCommandBuffer {
++    /// Its parts. Never held across a runtime call that may run a handler: a handler may ask for its status.
++    fn pieces(&self) -> MutexGuard<'_, Pieces> {
++        self.pieces.lock().unwrap_or_else(PoisonError::into_inner)
++    }
++
++    /// The runtime command buffer it encodes into now (its last part).
++    fn current(&self) -> CommandBuffer {
++        self.pieces().current.clone()
++    }
++
++    /// Its parts, the early ones first.
++    fn all(&self) -> Vec<CommandBuffer> {
++        let pieces = self.pieces();
++        let mut all = Vec::with_capacity(pieces.earlier.len() + 1);
++        all.extend(pieces.earlier.iter().cloned());
++        all.push(pieces.current.clone());
++        all
++    }
++
++    fn uncount(&self) {
++        let mut pieces = self.pieces();
++        if pieces.counted {
++            pieces.counted = false;
++            self.queue.open.fetch_sub(1, Ordering::AcqRel);
++        }
++    }
++}
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_queue_new(device: *mut NmbDevice) -> *mut NmbQueue {
+-    guard(std::ptr::null_mut(), || Ok(boxed(NmbQueue(get(device)?.0.new_command_queue().map_err(e("queue"))?))))
++    guard(std::ptr::null_mut(), || {
++        let queue = get(device)?.0.new_command_queue().map_err(e("queue"))?;
++        Ok(boxed(NmbQueue { queue, open: Arc::default() }))
++    })
+ }
+ 
+ #[unsafe(no_mangle)]
+@@ -1425,27 +1486,41 @@ pub extern "C" fn nmb_queue_release(queue: *mut NmbQueue) {
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_command_buffer_new(queue: *mut NmbQueue) -> *mut NmbCommandBuffer {
+-    guard(std::ptr::null_mut(), || Ok(boxed(NmbCommandBuffer(get(queue)?.0.command_buffer().map_err(e("command buffer"))?))))
++    guard(std::ptr::null_mut(), || {
++        let queue = get(queue)?;
++        let current = queue.queue.command_buffer().map_err(e("command buffer"))?;
++        if queue.open.open.fetch_add(1, Ordering::AcqRel) > 0 {
++            queue.open.overlapped.store(true, Ordering::Release);
++        }
++        let pieces = Pieces { current, earlier: Vec::new(), counted: true };
++        Ok(boxed(NmbCommandBuffer { pieces: Mutex::new(pieces), queue: Arc::clone(&queue.open) }))
++    })
+ }
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_command_buffer_release(command_buffer: *mut NmbCommandBuffer) {
+-    release(command_buffer)
++    guard((), || {
++        if let Ok(command_buffer) = get(command_buffer) {
++            command_buffer.uncount();
++        }
++        release(command_buffer);
++        Ok(())
++    })
+ }
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_command_buffer_uses_buffer(command_buffer: *const NmbCommandBuffer, buffer: *const NmbBuffer) -> i32 {
+     guard(-1, || {
+-        let used = get(command_buffer)?.0.used_resources();
+-        Ok(i32::from(used.references_resource(get(buffer)?.0.as_resource())))
++        let resource = get(buffer)?.0.as_resource();
++        Ok(i32::from(get(command_buffer)?.all().iter().any(|part| part.used_resources().references_resource(resource))))
+     })
+ }
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_command_buffer_uses_texture(command_buffer: *const NmbCommandBuffer, texture: *const NmbTexture) -> i32 {
+     guard(-1, || {
+-        let used = get(command_buffer)?.0.used_resources();
+-        Ok(i32::from(used.references_resource(get(texture)?.0.as_resource())))
++        let resource = get(texture)?.0.as_resource();
++        Ok(i32::from(get(command_buffer)?.all().iter().any(|part| part.used_resources().references_resource(resource))))
+     })
+ }
+ 
+@@ -1459,7 +1534,7 @@ pub extern "C" fn nmb_command_buffer_on_completed(command_buffer: *mut NmbComman
+     guard(false, || {
+         let handler = handler.ok_or("null handler")?;
+         let context = Context(context);
+-        get(command_buffer)?.0.add_completed_handler(Box::new(move |_| {
++        get(command_buffer)?.current().add_completed_handler(Box::new(move |_| {
+             let context = context;
+             handler(context.0)
+         })).map_err(e("completed handler"))?;
+@@ -1473,7 +1548,7 @@ pub extern "C" fn nmb_command_buffer_on_scheduled(command_buffer: *mut NmbComman
+     guard(false, || {
+         let handler = handler.ok_or("null handler")?;
+         let context = Context(context);
+-        get(command_buffer)?.0.add_scheduled_handler(Box::new(move |_| {
++        get(command_buffer)?.current().add_scheduled_handler(Box::new(move |_| {
+             let context = context;
+             handler(context.0)
+         })).map_err(e("scheduled handler"))?;
+@@ -1484,7 +1559,7 @@ pub extern "C" fn nmb_command_buffer_on_scheduled(command_buffer: *mut NmbComman
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_command_buffer_wait_scheduled(command_buffer: *mut NmbCommandBuffer) -> bool {
+     guard(false, || {
+-        get(command_buffer)?.0.wait_until_scheduled().map_err(e("wait scheduled"))?;
++        get(command_buffer)?.current().wait_until_scheduled().map_err(e("wait scheduled"))?;
+         Ok(true)
+     })
+ }
+@@ -1492,7 +1567,67 @@ pub extern "C" fn nmb_command_buffer_wait_scheduled(command_buffer: *mut NmbComm
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffer) -> bool {
+     guard(false, || {
+-        get(command_buffer)?.0.commit().map_err(e("commit"))?;
++        let command_buffer = get(command_buffer)?;
++        command_buffer.current().commit().map_err(e("commit"))?;
++        command_buffer.uncount();
++        Ok(true)
++    })
++}
++
++/// Patch 0016: commit the work encoded so far as a part of its own and go on encoding into a new runtime command buffer of the
++/// same queue: 1 where it split, 0 where it may not (its queue has another open command buffer, or had two at once; or it is
++/// committed), -1 where the runtime refused (nothing changed then). The frontend calls it between encoders only.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_command_buffer_split(command_buffer: *mut NmbCommandBuffer) -> i32 {
++    guard(-1, || {
++        let command_buffer = get(command_buffer)?;
++        let current = {
++            let pieces = command_buffer.pieces();
++            let queue = &command_buffer.queue;
++            if !pieces.counted || queue.overlapped.load(Ordering::Acquire) || queue.open.load(Ordering::Acquire) != 1 {
++                return Ok(0);
++            }
++            pieces.current.clone()
++        };
++        let next = current.command_queue().command_buffer().map_err(e("command buffer"))?;
++        current.commit().map_err(e("early commit"))?;
++        let mut pieces = command_buffer.pieces();
++        let pieces = &mut *pieces;
++        let done = std::mem::replace(&mut pieces.current, next);
++        pieces.earlier.push(done);
++        Ok(1)
++    })
++}
++
++/// Patch 0016: whether a part it committed early uses `buffer` or `texture` (one of them, the other null).
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_command_buffer_earlier_uses(command_buffer: *const NmbCommandBuffer, buffer: *const NmbBuffer,
++                                                  texture: *const NmbTexture) -> i32 {
++    guard(-1, || {
++        let earlier = get(command_buffer)?.pieces().earlier.clone();
++        let uses = match (buffer.is_null(), texture.is_null()) {
++            (false, true) => {
++                let resource = get(buffer)?.0.as_resource();
++                earlier.iter().any(|part| part.used_resources().references_resource(resource))
++            }
++            (true, false) => {
++                let resource = get(texture)?.0.as_resource();
++                earlier.iter().any(|part| part.used_resources().references_resource(resource))
++            }
++            _ => return Err("one resource".into()),
++        };
++        Ok(i32::from(uses))
++    })
++}
++
++/// Patch 0016: wait until every part it committed early completed.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_command_buffer_wait_earlier(command_buffer: *mut NmbCommandBuffer) -> bool {
++    guard(false, || {
++        let earlier = get(command_buffer)?.pieces().earlier.clone();
++        for part in &earlier {
++            part.wait_until_completed().map_err(e("wait"))?;
++        }
+         Ok(true)
+     })
+ }
+@@ -1500,36 +1635,65 @@ pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffe
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_command_buffer_wait(command_buffer: *mut NmbCommandBuffer, timeout_ms: u64) -> i32 {
+     guard(-1, || {
+-        let command_buffer = &get(command_buffer)?.0;
+-        if timeout_ms == 0 {
+-            command_buffer.wait_until_completed().map_err(e("wait"))?;
+-            return Ok(0);
++        let parts = get(command_buffer)?.all();
++        for part in &parts {
++            if timeout_ms == 0 {
++                part.wait_until_completed().map_err(e("wait"))?;
++            } else if part.wait_until_completed_for(Duration::from_millis(timeout_ms)).is_err() {
++                return Ok(1);
++            }
+         }
+-        Ok(if command_buffer.wait_until_completed_for(Duration::from_millis(timeout_ms)).is_ok() { 0 } else { 1 })
++        Ok(0)
+     })
+ }
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_command_buffer_status(command_buffer: *const NmbCommandBuffer) -> u64 {
+     guard(5, || {
+-        Ok(get(command_buffer)?.0.status().raw())
++        let parts = get(command_buffer)?.all();
++        let (current, earlier) = parts.split_last().ok_or("no command buffer")?;
++        // A part that failed fails the whole; the last part is last on the queue, so it is never further along than the others.
++        match earlier.iter().find(|part| part.status() == metal2vulkan_runtime::CommandBufferStatus::Error) {
++            Some(failed) => Ok(failed.status().raw()),
++            None => Ok(current.status().raw()),
++        }
+     })
+ }
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_command_buffer_error(command_buffer: *const NmbCommandBuffer, out: *mut c_char, size: usize) -> usize {
+-    guard(0, || Ok(get(command_buffer)?.0.error_description().map_or(0, |text| copy_out(&text, out, size))))
++    guard(0, || {
++        let parts = get(command_buffer)?.all();
++        Ok(parts.iter().find_map(|part| part.error_description()).map_or(0, |text| copy_out(&text, out, size)))
++    })
+ }
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_command_buffer_gpu_time(command_buffer: *const NmbCommandBuffer, end: bool) -> f64 {
+     guard(0.0, || {
+-        let command_buffer = &get(command_buffer)?.0;
+-        let time = if end { command_buffer.gpu_end_time() } else { command_buffer.gpu_start_time() };
++        let parts = get(command_buffer)?.all();
++        // From its first part's start to its last part's end.
++        let time = if end { parts.last().ok_or("no command buffer")?.gpu_end_time() } else { parts[0].gpu_start_time() };
+         time.map_err(e("GPU time"))
+     })
+ }
+ 
++/// Patch 0016: the GPU time of its parts added up (each part's end less its start): `gpu_time`'s span less the gaps between parts.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_command_buffer_gpu_busy(command_buffer: *const NmbCommandBuffer) -> f64 {
++    guard(0.0, || {
++        let parts = get(command_buffer)?.all();
++        let mut busy = 0.0;
++        for part in &parts {
++            let (start, end) = (part.gpu_start_time().map_err(e("GPU time"))?, part.gpu_end_time().map_err(e("GPU time"))?);
++            if end > start {
++                busy += end - start;
++            }
++        }
++        Ok(busy)
++    })
++}
++
+ // ---- events and fences ----
+ 
+ pub enum NmbEvent {
+@@ -1613,7 +1777,7 @@ pub extern "C" fn nmb_shared_event_notify(event: *mut NmbEvent, value: u64, hand
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_command_buffer_signal_event(command_buffer: *mut NmbCommandBuffer, event: *mut NmbEvent, value: u64) -> bool {
+     guard(false, || {
+-        get(command_buffer)?.0.encode_signal_event(get(event)?.as_ref(), value).map_err(e("signal event"))?;
++        get(command_buffer)?.current().encode_signal_event(get(event)?.as_ref(), value).map_err(e("signal event"))?;
+         Ok(true)
+     })
+ }
+@@ -1621,7 +1785,7 @@ pub extern "C" fn nmb_command_buffer_signal_event(command_buffer: *mut NmbComman
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_command_buffer_wait_event(command_buffer: *mut NmbCommandBuffer, event: *mut NmbEvent, value: u64) -> bool {
+     guard(false, || {
+-        get(command_buffer)?.0.encode_wait_for_event(get(event)?.as_ref(), value).map_err(e("wait for event"))?;
++        get(command_buffer)?.current().encode_wait_for_event(get(event)?.as_ref(), value).map_err(e("wait for event"))?;
+         Ok(true)
+     })
+ }
+@@ -1675,13 +1839,13 @@ pub enum NmbEncoder {
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_compute_encoder_new(command_buffer: *mut NmbCommandBuffer) -> *mut NmbEncoder {
+     guard(std::ptr::null_mut(), || {
+-        Ok(boxed(NmbEncoder::Compute(get(command_buffer)?.0.compute_command_encoder().map_err(e("compute encoder"))?)))
++        Ok(boxed(NmbEncoder::Compute(get(command_buffer)?.current().compute_command_encoder().map_err(e("compute encoder"))?)))
+     })
+ }
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_blit_encoder_new(command_buffer: *mut NmbCommandBuffer) -> *mut NmbEncoder {
+-    guard(std::ptr::null_mut(), || Ok(boxed(NmbEncoder::Blit(get(command_buffer)?.0.blit_command_encoder().map_err(e("blit encoder"))?))))
++    guard(std::ptr::null_mut(), || Ok(boxed(NmbEncoder::Blit(get(command_buffer)?.current().blit_command_encoder().map_err(e("blit encoder"))?))))
+ }
+ 
+ #[repr(C)]
+@@ -1749,7 +1913,7 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer,
+         if !d.visibility.is_null() {
+             pass.visibility_result_buffer = Some(get(d.visibility)?.0.clone());
+         }
+-        let encoder = get(command_buffer)?.0.render_command_encoder(&pass).map_err(e("render encoder"))?;
++        let encoder = get(command_buffer)?.current().render_command_encoder(&pass).map_err(e("render encoder"))?;
+         Ok(boxed(NmbEncoder::Render(encoder)))
+     })
+ }
