@@ -1,0 +1,24 @@
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 1f89dab..cf7800c 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -1749,7 +1749,18 @@ pub extern "C" fn nmb_command_buffer_status(command_buffer: *const NmbCommandBuf
+ pub extern "C" fn nmb_command_buffer_error(command_buffer: *const NmbCommandBuffer, out: *mut c_char, size: usize) -> usize {
+     guard(0, || {
+         let parts = get(command_buffer)?.all();
+-        Ok(parts.iter().find_map(|part| part.error_description()).map_or(0, |text| copy_out(&text, out, size)))
++        // Patch 0021: a failure the driver did not relay (every one on Turnip) is named by the runtime's error and any
++        // host-step refusal, so a lost device's first failure says what it was.
++        let named = || {
++            parts.iter().find_map(|part| {
++                part.error().map(|why| match part.refusal() {
++                    Some(refusal) => format!("{why:?}: {refusal}"),
++                    None => format!("{why:?}"),
++                })
++            })
++        };
++        let text = parts.iter().find_map(|part| part.error_description()).filter(|text| !text.is_empty()).or_else(named);
++        Ok(text.map_or(0, |text| copy_out(&text, out, size)))
+     })
+ }
+ 
