@@ -1,0 +1,471 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 8ce9d83..a2b7c1f 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -65,6 +65,24 @@ static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
+ // before that call returns. FUXI_NATIVE_SWAP_WAIT=0 or the boot argument fuxiswapwait=0 turns it off.
+ static Timed gTimeSwapWait;
+ static std::atomic<uint64_t> gSwapWaitRefused;
++// Overlap (patch 0020, fuxihyb=8 with the bridge's deferred encoding): a display-thread commit is queued on the bridge's worker
++// behind the render calls it queued, and returns at once. First every IOSurface it renders into takes a pending writer lease
++// (IOSurfaceLock with kIOSurfaceLockAvoidSync: the kernel counts a writer without waiting, and the display copies no surface
++// that has a writer), dropped once the runtime has submitted the work (its scheduled handler) or the commit failed. So
++// commitAndWaitUntilSubmitted need not wait for the submission before CoreAnimation's swap, unless the command buffer has
++// scheduled handlers of its own or blit/compute work (which may write surfaces the leases do not name).
++static Timed gTimeOverlapLock,gTimeOverlapUnlock;
++static std::atomic<uint64_t> gOverlapCommits,gOverlapLeases,gOverlapLockFailed,gOverlapRefused,gOverlapSkipped,gOverlapKept,gOverlapStatus;
++static void fuxiOverlapReport() {
++ const uint64_t n=gOverlapCommits.load();
++ if(n!=1 && n%1200)return;
++ const uint64_t locks=gTimeOverlapLock.count.load(),unlocks=gTimeOverlapUnlock.count.load();
++ fprintf(stderr,"FUXI OVERLAP: commits=%llu skipped_waits=%llu kept_waits=%llu leases=%llu lock_failed=%llu refused=%llu status=%llu lock_us=%llu/%llu unlock_us=%llu/%llu\n",
++  (unsigned long long)n,(unsigned long long)gOverlapSkipped.load(),(unsigned long long)gOverlapKept.load(),(unsigned long long)gOverlapLeases.load(),
++  (unsigned long long)gOverlapLockFailed.load(),(unsigned long long)gOverlapRefused.load(),(unsigned long long)gOverlapStatus.load(),
++  (unsigned long long)(locks?gTimeOverlapLock.total.load()/locks:0),(unsigned long long)gTimeOverlapLock.slowest.load(),
++  (unsigned long long)(unlocks?gTimeOverlapUnlock.total.load()/unlocks:0),(unsigned long long)gTimeOverlapUnlock.slowest.load());
++}
+ // True when args holds token as one whole whitespace-delimited word.
+ static bool fuxiBootArgsHaveToken(const char *args,const char *token) {
+  if(!args || !token || !*token)return false;
+@@ -679,7 +697,11 @@ static void notified(void *context,uint64_t value) {
+  uint64_t createdUs;
+  uint64_t partUs;           // patch 0016: when its current part began; encoders opened in it; parts committed early
+  uint32_t partEncoders,splits;
++ std::vector<IOSurfaceRef> fuxiLeases;   // patch 0020: pending writer leases (retained), under @synchronized(self)
++ bool fuxiOtherWork;                     // patch 0020: a blit or compute encoder was opened
+ }
++@property(atomic) BOOL fuxiOverlapPending;   // patch 0020: queued on the worker, not yet taken by the runtime
++@property(atomic) BOOL fuxiOverlapped;       // patch 0020: commitAndWaitUntilSubmitted returns without the scheduling wait
+ @property(nonatomic) BOOL fuxiNoop;
+ @property(nonatomic,strong) NSMutableArray *fuxiSignals;
+ @property(nonatomic) NmbCommandBuffer *handle;
+@@ -700,6 +722,8 @@ static void notified(void *context,uint64_t value) {
+ - (void)refuse:(NSString *)what;
+ - (void)fuxiWaitStoredSurface;
+ - (void)fuxiMaybeSplit;
++- (void)fuxiDropLeases;
++- (void)finish;
+ @end
+ @interface NBEncoder : NBObject
+ @property(nonatomic) NmbEncoder *handle;
+@@ -974,13 +998,14 @@ static void waitForResource(id resource) {
+ 
+ static void completed(void *context);
+ static void scheduled(void *context);
++static void overlapCommitted(void *context,const char *why);
+ @implementation NBCommandBuffer
+ - (instancetype)init { try { @try {
+  if((self=[super init])){_fuxiSignals=[NSMutableArray array];_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+  if(self){createdUs=nowUs();partUs=createdUs;}
+  return self;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (void)dealloc { try { @try {nmb_command_buffer_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)dealloc { try { @try {[self fuxiDropLeases];nmb_command_buffer_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLCommandQueue>)commandQueue { try { @try {return (id<MTLCommandQueue>)_queue;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (BOOL)retainedReferences { try { @try {return YES;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // Protected content is not supported (the runtime's AppleOnlyCall::SetProtectionOptions takes Metal's default only): any other option fails
+@@ -993,6 +1018,7 @@ static void scheduled(void *context);
+ - (MTLCommandBufferStatus)status { try { @try {
+  if(self.fuxiNoop)return MTLCommandBufferStatusCompleted;
+  if(self.failedLocally)return MTLCommandBufferStatusError;
++ if(self.fuxiOverlapPending){gOverlapStatus++;return MTLCommandBufferStatusCommitted;}   // patch 0020: still on the worker
+  return (MTLCommandBufferStatus)nmb_command_buffer_status(_handle);
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (NSError *)error { try { @try {
+@@ -1010,7 +1036,11 @@ static void scheduled(void *context);
+ // The kernel driver's own submission times are not recorded: 0 is Metal's answer where they are unavailable.
+ - (CFTimeInterval)kernelStartTime { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (CFTimeInterval)kernelEndTime { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (BOOL)commitAndWaitUntilSubmitted { try { @try {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];[self fuxiWaitStoredSurface];return !self.failedLocally;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++// Patch 0020: an overlapped commit's pending leases hold the swap's present back until the runtime has submitted the work.
++- (BOOL)commitAndWaitUntilSubmitted { try { @try {
++ [(id<MTLCommandBuffer>)self commit];
++ if(self.fuxiOverlapped)gOverlapSkipped++;else [self waitUntilScheduled];
++ [self fuxiWaitStoredSurface];return !self.failedLocally;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (CFTimeInterval)GPUStartTime { try { @try {return nmb_command_buffer_gpu_time(_handle,false);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (CFTimeInterval)GPUEndTime { try { @try {return nmb_command_buffer_gpu_time(_handle,true);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // Patch 0016: before an encoder opens, the part encoded since the last split goes to the GPU where it has run for fuxisplit us
+@@ -1043,6 +1073,7 @@ static void scheduled(void *context);
+  encoder.handle=handle;encoder.commandBuffer=self;return encoder;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoder { try { @try {
++ fuxiOtherWork=true;
+  [self fuxiMaybeSplit];
+  return [self encoder:[NBComputeEncoder new] handle:self.committed?nullptr:nmb_compute_encoder_new(_handle) what:@"computeCommandEncoder"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1051,7 +1082,7 @@ static void scheduled(void *context);
+  return [self computeCommandEncoder];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLBlitCommandEncoder>)blitCommandEncoder { try { @try {
+- gBlits++;encodedWork.blits++;
++ gBlits++;encodedWork.blits++;fuxiOtherWork=true;
+  [self fuxiMaybeSplit];
+  return [self encoder:[NBBlitEncoder new] handle:self.committed?nullptr:nmb_blit_encoder_new(_handle) what:@"blitCommandEncoder"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1120,6 +1151,7 @@ static void scheduled(void *context);
+ - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value { try { @try {[self event:event value:value signal:false];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // The runtime has submitted the work. Deliver scheduling without waiting for GPU completion.
+ - (void)didSchedule { try { @try {
++ [self fuxiDropLeases];   // patch 0020: submitted, so the display's copy of a surface now runs after this work
+  {
+   const uint64_t took=nowUs()-self.committedUs;
+   std::lock_guard<std::mutex> lock(gCommitLock);
+@@ -1140,6 +1172,7 @@ static void scheduled(void *context);
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
+ - (void)finish { try { @try {
++ [self fuxiDropLeases];   // patch 0020: a failed or never-scheduled command buffer still lets its surfaces go
+  flushSurfaces(_surfaces);
+  // Actual GPU completion (or a local refusal that never submitted) is the
+  // release point. A retained completed command must not pin every old frame.
+@@ -1163,6 +1196,58 @@ static void scheduled(void *context);
+  dispatch_queue_t queue=_queue.completionQueue;
+  if(queue)dispatch_async(queue,run);else run();
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++// Patch 0020: a pending writer lease on each distinct IOSurface its render passes name; NO (none held) where one is refused.
++- (BOOL)fuxiTakeLeases { try { @try {
++ std::vector<IOSurfaceRef> taken;
++ for(NBTexture *texture in _surfaces) {
++  IOSurfaceRef surface=texture.surface;
++  if(!surface || std::find(taken.begin(),taken.end(),surface)!=taken.end())continue;
++  const uint64_t began=nowUs();
++  const kern_return_t locked=IOSurfaceLock(surface,kIOSurfaceLockAvoidSync,nullptr);
++  gTimeOverlapLock.add(began);
++  if(locked!=KERN_SUCCESS) {
++   gOverlapLockFailed++;
++   for(IOSurfaceRef held:taken){(void)IOSurfaceUnlock(held,0,nullptr);CFRelease(held);}
++   return NO;
++  }
++  CFRetain(surface);taken.push_back(surface);
++ }
++ gOverlapLeases+=taken.size();
++ @synchronized(self){fuxiLeases.swap(taken);}
++ for(IOSurfaceRef held:taken){(void)IOSurfaceUnlock(held,0,nullptr);CFRelease(held);}   // none: a command buffer commits once
++ return YES;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++// Patch 0020: the leases go once the runtime has submitted the work, or the commit failed; a second call finds none.
++- (void)fuxiDropLeases { try { @try {
++ std::vector<IOSurfaceRef> held;
++ @synchronized(self){held.swap(fuxiLeases);}
++ for(IOSurfaceRef surface:held) {
++  const uint64_t began=nowUs();
++  (void)IOSurfaceUnlock(surface,0,nullptr);
++  gTimeOverlapUnlock.add(began);
++  CFRelease(surface);
++ }
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++// Patch 0020: queue the registrations and the commit on the bridge's worker (gOverlapCommits); NO where it commits as before.
++// context is the completion's reference, taken by commit; the worker's own goes back in overlapCommitted.
++- (BOOL)fuxiCommitOverlapped:(void *)context { try { @try {
++ if(!nmb_command_buffer_commit_deferrable() || ![self fuxiTakeLeases])return NO;
++ BOOL handlers=NO;@synchronized(self){handlers=_scheduledHandlers.count!=0;}
++ self.fuxiOverlapped=!handlers && !fuxiOtherWork;
++ self.fuxiOverlapPending=YES;
++ CFRetain(context);
++ const int queued=nmb_command_buffer_commit_deferred(_handle,completed,scheduled,overlapCommitted,context);
++ if(queued==1) {
++  if(!self.fuxiOverlapped)gOverlapKept++;
++  gOverlapCommits++;fuxiOverlapReport();
++  return YES;
++ }
++ self.fuxiOverlapPending=NO;self.fuxiOverlapped=NO;
++ CFRelease(context);
++ [self fuxiDropLeases];
++ if(queued<0){gOverlapRefused++;NBLOG(@"native-metal: overlapped commit refused: %@",lastError());}
++ return NO;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)commit { try { @try {
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
+  self.committed=YES;
+@@ -1189,6 +1274,7 @@ static void scheduled(void *context);
+   flushSurfaces(_surfaces);
+   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
+   void *context=(__bridge_retained void *)self;
++  if([self fuxiCommitOverlapped:context])return;
+   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
+      nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle))return;
+   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
+@@ -1225,6 +1311,26 @@ static void scheduled(void *context);
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
++// Patch 0020: the worker ran an overlapped commit (why null) or refused it (no handler runs then: the commit's failure path).
++// Runs on the worker; context holds the completion's reference and the worker's, both taken by fuxiCommitOverlapped's caller.
++static void overlapCommitted(void *context,const char *why) {
++ @autoreleasepool {
++  @try {
++   NBCommandBuffer *commandBuffer=(__bridge NBCommandBuffer *)context;
++   if(why) {
++    gOverlapRefused++;
++    NSString *text=[NSString stringWithUTF8String:why]?:@"(unprintable)";
++    [commandBuffer refuse:[@"commit: " stringByAppendingString:text]];
++    commandBuffer.failedLocally=YES;gCommitFailures++;
++    [commandBuffer fuxiDropLeases];
++    commandBuffer.fuxiOverlapPending=NO;
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[commandBuffer finish];});
++    CFRelease(context);   // the completion's: a refused registration or commit runs no handler
++   }else commandBuffer.fuxiOverlapPending=NO;
++  } @catch(NSException *e) {fuxiFailure(e.reason.UTF8String);}
++  CFRelease(context);   // the worker's
++ }
++}
+ // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
+ static void completed(void *context) {
+  gCompleted++;
+diff --git a/bridge/FuxiDeferred.rs b/bridge/FuxiDeferred.rs
+index 0d73d30..293270e 100644
+--- a/bridge/FuxiDeferred.rs
++++ b/bridge/FuxiDeferred.rs
+@@ -9,6 +9,10 @@
+ //! the runtime still sees each call in the order the frontend made it. A queued call the runtime refuses fails its command
+ //! buffer at commit, as the frontend's own refusal does. One queue for every thread: a call is queued after every call
+ //! queued before it, by any thread.
++//!
++//! Patch 0020, `fuxihyb=8`: the same, and a deferred thread's commit is queued too (`task`), so the display thread goes on
++//! to CoreAnimation's swap and its next frame while the worker still records and submits this one. The frontend holds the
++//! swap's present back with pending IOSurface writer leases until the runtime has submitted the work.
+ 
+ use metal2vulkan::metal::{CullMode, IndexType, PrimitiveType, RenderStages, TriangleFillMode, Winding};
+ use metal2vulkan_runtime::{
+@@ -74,28 +78,44 @@ pub(crate) fn has_failed(failure: &Failure) -> bool {
+ 
+ // ---- the gate ----
+ 
+-/// `fuxihyb=7` on the boot line and this process is backboardd.
+-fn process_on() -> bool {
+-    static ON: OnceLock<bool> = OnceLock::new();
+-    *ON.get_or_init(|| {
++/// The boot line's `fuxihyb=7` (7) or `fuxihyb=8` (8, patch 0020: commits go to the worker too) where this process is
++/// backboardd; 0 otherwise.
++fn process_mode() -> u8 {
++    static MODE: OnceLock<u8> = OnceLock::new();
++    *MODE.get_or_init(|| {
+         let mut args = [0u8; 2048];
+         let mut len = args.len();
+         // SAFETY: a fixed buffer and its length.
+         let read = unsafe { sysctlbyname(c"kern.bootargs".as_ptr(), args.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) } == 0;
+-        let hyb7 = read
+-            && args[..len.min(args.len())]
+-                .split(|&b| b == b' ' || b == b'\t' || b == b'\n' || b == 0)
+-                .any(|word| word == b"fuxihyb=7");
++        let mut mode = 0u8;
++        if read {
++            for word in args[..len.min(args.len())].split(|&b| b == b' ' || b == b'\t' || b == b'\n' || b == 0) {
++                match word {
++                    b"fuxihyb=7" => mode = 7,
++                    b"fuxihyb=8" => mode = 8,
++                    _ => {}
++                }
++            }
++        }
+         // SAFETY: getprogname returns the process's static name.
+         let name = unsafe { getprogname() };
+         let backboardd = !name.is_null() && unsafe { CStr::from_ptr(name) }.to_bytes() == b"backboardd";
+-        if hyb7 {
+-            eprintln!("FUXI WORKER gate fuxihyb=7 process={}", if backboardd { "backboardd (on)" } else { "other (off)" });
++        if mode != 0 {
++            eprintln!("FUXI WORKER gate fuxihyb={mode} process={}", if backboardd { "backboardd (on)" } else { "other (off)" });
+         }
+-        hyb7 && backboardd
++        if backboardd { mode } else { 0 }
+     })
+ }
+ 
++fn process_on() -> bool {
++    process_mode() != 0
++}
++
++/// Patch 0020: whether a command buffer this thread commits now goes to the worker (`fuxihyb=8`, a deferred thread).
++pub(crate) fn overlap() -> bool {
++    process_mode() == 8 && eligible()
++}
++
+ thread_local! {
+     /// 0 not decided, 1 this thread's render encoders are deferred, 2 they are not.
+     static ELIGIBLE: Cell<u8> = const { Cell::new(0) };
+@@ -202,6 +222,8 @@ pub(crate) enum Op {
+     Fence { fence: Fence, stages: RenderStages, update: bool },
+     End,
+     Discard,
++    /// Patch 0020: a command buffer's commit, queued with no encoder (`task`); it reports its own outcome.
++    Task(Box<dyn FnOnce() + Send>),
+ }
+ 
+ /// Queues a render encoder's opening on `command_buffer` (its current part) and returns its slot.
+@@ -213,7 +235,8 @@ pub(crate) fn open(command_buffer: CommandBuffer, pass: RenderPassDescriptor, fa
+ }
+ 
+ struct Entry {
+-    slot: SlotPtr,
++    /// None for a task (patch 0020).
++    slot: Option<SlotPtr>,
+     op: Op,
+ }
+ 
+@@ -251,10 +274,21 @@ static QUEUE: Queue = Queue {
+ 
+ /// Queues a call of the deferred encoder `slot`.
+ pub(crate) fn push(slot: SlotPtr, op: Op) {
++    queue(Entry { slot: Some(slot), op });
++}
++
++/// Patch 0020: queues `body` after every call queued before it; this thread's later bridge calls wait for it as for a
++/// queued render call. The worker runs it with no encoder and counts it as a task.
++pub(crate) fn task(body: Box<dyn FnOnce() + Send>) {
++    QUEUE.worker.get_or_init(start);
++    queue(Entry { slot: None, op: Op::Task(body) });
++}
++
++fn queue(entry: Entry) {
+     let q = &QUEUE;
+     let seq = {
+         let mut pending = lock(&q.pending);
+-        pending.push(Entry { slot, op });
++        pending.push(entry);
+         let seq = q.queued.load(Ordering::Relaxed) + 1;
+         q.queued.store(seq, Ordering::SeqCst);
+         seq
+@@ -385,6 +419,7 @@ struct Stats {
+     opens: u64,
+     draws: u64,
+     ends: u64,
++    tasks: u64,
+     batches: u64,
+     max_batch: usize,
+     max_lag: u64,
+@@ -432,6 +467,7 @@ fn work() -> ! {
+                 Op::Open { .. } => stats.opens += 1,
+                 Op::Draw { .. } | Op::DrawIndexed { .. } => stats.draws += 1,
+                 Op::End => stats.ends += 1,
++                Op::Task(_) => stats.tasks += 1,
+                 _ => {}
+             }
+             if !run(slot, op) {
+@@ -458,8 +494,8 @@ fn report(stats: &mut Stats, began: Instant) {
+     }
+     waits.sites.sort_by(|a, b| b.2.cmp(&a.2));
+     let top: Vec<String> = waits.sites.iter().take(4).map(|(line, n, us)| format!("{line}:{n}/{us}")).collect();
+-    eprintln!("FUXI WORKER s={} ops={} open={} draw={} end={} busy={} batch={}/{} lag={} park={} fail={} wait={}/{} top={}",
+-              began.elapsed().as_secs(), stats.ops, stats.opens, stats.draws, stats.ends, stats.busy.as_micros(),
++    eprintln!("FUXI WORKER s={} ops={} open={} draw={} end={} task={} busy={} batch={}/{} lag={} park={} fail={} wait={}/{} top={}",
++              began.elapsed().as_secs(), stats.ops, stats.opens, stats.draws, stats.ends, stats.tasks, stats.busy.as_micros(),
+               stats.ops / stats.batches.max(1), stats.max_batch, stats.max_lag, stats.parks, stats.failures, waits.count, waits.micros,
+               top.join(","));
+     *stats = Stats::default();
+@@ -485,7 +521,14 @@ fn fail(failure: &Failure, why: String) {
+ }
+ 
+ /// Runs one queued call; false where the runtime refused it.
+-fn run(slot: SlotPtr, op: Op) -> bool {
++fn run(slot: Option<SlotPtr>, op: Op) -> bool {
++    let Some(slot) = slot else {
++        // Patch 0020: a task catches and reports its own refusals; a panic past it is counted here.
++        return match op {
++            Op::Task(body) => std::panic::catch_unwind(AssertUnwindSafe(body)).is_ok(),
++            _ => unreachable!("only a task is queued without an encoder"),
++        };
++    };
+     let raw = slot.0.as_ptr();
+     match op {
+         Op::End => {
+@@ -585,6 +628,6 @@ fn apply(r: &mut RenderCommandEncoder, op: Op) -> Result<(), String> {
+         Op::Fence { fence, stages, update } => {
+             if update { r.update_fence(&fence, stages).map_err(e("update fence")) } else { r.wait_for_fence(&fence, stages).map_err(e("wait for fence")) }
+         }
+-        Op::Open { .. } | Op::End | Op::Discard => unreachable!("run handles the encoder's opening and end"),
++        Op::Open { .. } | Op::End | Op::Discard | Op::Task(_) => unreachable!("run handles the encoder's opening and end, and tasks"),
+     }
+ }
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index 6de5b6e..b834c98 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -185,6 +185,14 @@ bool nmb_command_buffer_on_completed(NmbCommandBuffer *, void (*handler)(void *c
+  * The caller keeps context alive until completion (or a refused commit). */
+ bool nmb_command_buffer_on_scheduled(NmbCommandBuffer *, void (*handler)(void *context), void *context);
+ bool nmb_command_buffer_commit(NmbCommandBuffer *);
++/* Patch 0020 (fuxihyb=8): whether this thread's commit may go to the deferred-encoding worker. */
++bool nmb_command_buffer_commit_deferrable(void);
++/* Patch 0020: the two registrations and the commit above, queued on the worker behind this thread's queued render calls;
++ * returns at once: 1 queued, 0 not for this thread (nothing queued), -1 refused. The worker then calls after(context, why),
++ * why NULL where the runtime took the commit, else the refusal (neither handler runs then). The caller keeps the command
++ * buffer alive until after has run; nothing touches the handle after it. */
++int nmb_command_buffer_commit_deferred(NmbCommandBuffer *, void (*completed)(void *context), void (*scheduled)(void *context),
++                                       void (*after)(void *context, const char *why), void *context);
+ /* Wait for scheduling and scheduled handlers only; false on a refused wait. */
+ bool nmb_command_buffer_wait_scheduled(NmbCommandBuffer *);
+ /* 0 completed in time, 1 timed out (timeout_ms 0 waits without a bound). */
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index b1dfcfd..1f89dab 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -1592,6 +1592,69 @@ pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffe
+     })
+ }
+ 
++/// Patch 0020: whether a command buffer this thread commits now may go to the deferred-encoding worker (`fuxihyb=8` and a
++/// deferred thread, FuxiDeferred.rs).
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_command_buffer_commit_deferrable() -> bool {
++    guard_free(false, || Ok(fuxi_deferred::overlap()))
++}
++
++struct Committing(*mut NmbCommandBuffer);
++// SAFETY: the frontend keeps the command buffer (and so its handle) alive until `after` has run, as the header states.
++unsafe impl Send for Committing {}
++
++/// Patch 0020: `nmb_command_buffer_on_completed`, `_on_scheduled` and `_commit`, queued on the worker behind this thread's
++/// queued render calls, returning at once: 1 queued, 0 not for this thread (nothing queued: commit as before), -1 refused.
++/// The worker runs them in that order and then `after(context, why)`: `why` null where the runtime took the commit, else
++/// the refusal (a refused registration or commit runs neither handler). Nothing touches the handle after `after`.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_command_buffer_commit_deferred(command_buffer: *mut NmbCommandBuffer,
++                                                     completed: Option<extern "C" fn(*mut c_void)>,
++                                                     scheduled: Option<extern "C" fn(*mut c_void)>,
++                                                     after: Option<extern "C" fn(*mut c_void, *const c_char)>,
++                                                     context: *mut c_void) -> i32 {
++    guard_free(-1, || {
++        if !fuxi_deferred::overlap() {
++            return Ok(0);
++        }
++        let (completed, scheduled, after) = (completed.ok_or("null handler")?, scheduled.ok_or("null handler")?, after.ok_or("null handler")?);
++        get(command_buffer)?;
++        let target = Committing(command_buffer);
++        let context = Context(context);
++        fuxi_deferred::task(Box::new(move || {
++            let (target, context) = (target, context);
++            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
++                let command_buffer = get(target.0)?;
++                let on_completed = Context(context.0);
++                command_buffer.current().add_completed_handler(Box::new(move |_| {
++                    let context = on_completed;
++                    completed(context.0)
++                })).map_err(e("completed handler"))?;
++                let on_scheduled = Context(context.0);
++                command_buffer.current().add_scheduled_handler(Box::new(move |_| {
++                    let context = on_scheduled;
++                    scheduled(context.0)
++                })).map_err(e("scheduled handler"))?;
++                if let Some(why) = fuxi_deferred::take_failure(&command_buffer.deferred) {
++                    return Err(why);
++                }
++                command_buffer.current().commit().map_err(e("commit"))?;
++                command_buffer.uncount();
++                Ok(())
++            }))
++            .unwrap_or_else(|_| Err("panic in the Metal runtime".into()));
++            match outcome {
++                Ok(()) => after(context.0, std::ptr::null()),
++                Err(why) => {
++                    let why = std::ffi::CString::new(why.replace('\0', " ")).unwrap_or_default();
++                    after(context.0, why.as_ptr())
++                }
++            }
++        }));
++        Ok(1)
++    })
++}
++
+ /// Patch 0016: commit the work encoded so far as a part of its own and go on encoding into a new runtime command buffer of the
+ /// same queue: 1 where it split, 0 where it may not (its queue has another open command buffer, or had two at once; or it is
+ /// committed), -1 where the runtime refused (nothing changed then). The frontend calls it between encoders only.
