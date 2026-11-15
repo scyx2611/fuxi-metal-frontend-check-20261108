@@ -1,0 +1,148 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 6943174..9222ec6 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -109,6 +109,49 @@ static bool fuxiSwapWaitEnabled() {
+  return bootEnabled;
+ }
+ struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;bool storedSurface;};
++// Frame diagnostics (patch 0017, always on, report only): per display frame (a commit that stored an IOSurface), the time from
++// the command buffer's creation to its commit, the gap since the previous frame's commit in display periods, and what the
++// committing thread made since its previous frame (textures, buffers, pipelines, surface imports, and the time inside them).
++// Every 600 frames two lines: the distributions, and heavy (>= 6 ms) against light (< 4 ms) frames.
++struct FrameMakes {uint32_t textures=0,buffers=0,pipelines=0,imports=0;uint64_t us=0;};
++static thread_local FrameMakes tMakes;
++struct FrameMake {
++ const uint64_t began;uint32_t FrameMakes::*const kind;
++ explicit FrameMake(uint32_t FrameMakes::*what):began(nowUs()),kind(what){}
++ ~FrameMake(){tMakes.*kind+=1;tMakes.us+=nowUs()-began;}
++};
++struct FrameClass {uint32_t n=0,textures=0,buffers=0,pipelines=0,imports=0;uint64_t encodeUs=0,makeUs=0,draws=0,passes=0;};
++struct FrameStats {uint64_t lastUs=0;uint32_t n=0,encode[8]={},gap[5]={};FrameClass heavy,light;};
++static std::mutex gFrameLock;
++static FrameStats gFrames;
++static void fuxiFrameNote(uint64_t committedUs,uint64_t encodeUs,const EncodedWork &work) {
++ const FrameMakes made=tMakes;tMakes=FrameMakes();
++ std::lock_guard<std::mutex> lock(gFrameLock);
++ FrameStats &f=gFrames;
++ static const uint64_t limits[7]={2000,4000,6000,8000,10000,13000,17000};
++ unsigned bucket=0;while(bucket<7 && encodeUs>=limits[bucket])bucket++;
++ f.encode[bucket]++;
++ if(f.lastUs && committedUs>f.lastUs) {
++  const uint64_t gap=committedUs-f.lastUs;
++  f.gap[gap>=50000?4:std::min<uint64_t>(3,(gap+4135)/8270>0?(gap+4135)/8270-1:0)]++;
++ }
++ f.lastUs=committedUs;
++ FrameClass *c=encodeUs>=6000?&f.heavy:encodeUs<4000?&f.light:nullptr;
++ if(c) {
++  c->n++;c->encodeUs+=encodeUs;c->makeUs+=made.us;c->draws+=work.draws;c->passes+=work.passes;
++  c->textures+=made.textures>0;c->buffers+=made.buffers>0;c->pipelines+=made.pipelines>0;c->imports+=made.imports>0;
++ }
++ if(++f.n<600)return;
++ fprintf(stderr,"FUXI FRAME: n=%u encode_ms <2/<4/<6/<8/<10/<13/<17/more %u/%u/%u/%u/%u/%u/%u/%u gap_periods 1/2/3/4+/idle %u/%u/%u/%u/%u\n",
++  f.n,f.encode[0],f.encode[1],f.encode[2],f.encode[3],f.encode[4],f.encode[5],f.encode[6],f.encode[7],f.gap[0],f.gap[1],f.gap[2],f.gap[3],f.gap[4]);
++ auto line=[](const char *name,const FrameClass &c){
++  const double n=c.n?double(c.n):1.0;
++  fprintf(stderr,"FUXI FRAME: %s n=%u encode_us=%.0f draws=%.1f passes=%.1f make_us=%.0f with_tex=%u with_buf=%u with_pipe=%u with_import=%u\n",
++   name,c.n,c.encodeUs/n,c.draws/n,c.passes/n,c.makeUs/n,c.textures,c.buffers,c.pipelines,c.imports);
++ };
++ line("heavy",f.heavy);line("light",f.light);
++ const uint64_t last=f.lastUs;f=FrameStats();f.lastUs=last;
++}
+ struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
+ static CommitRecord gCommitRing[32];
+ static std::mutex gCommitLock;
+@@ -1082,6 +1125,7 @@ static void scheduled(void *context);
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
+  self.committed=YES;
+  self.committedUs=nowUs();
++ if(encodedWork.storedSurface)fuxiFrameNote(self.committedUs,self.committedUs-createdUs,encodedWork);
+  {
+   std::lock_guard<std::mutex> lock(gCommitLock);
+   // Assign once under the same lock as publication. A concurrent commit cannot reuse this index.
+@@ -1299,7 +1343,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+  return (MTLPurgeableState)answer;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset { try { @try {
+- NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
++ FrameMake make(&FrameMakes::buffers);NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
+  if(!handle){NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
+  buffer.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLBuffer>)buffer;
+@@ -1310,7 +1354,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLTexture>)textureWithDescriptor:(MTLTextureDescriptor *)d offset:(uint64_t)offset { try { @try {
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+- NmbTexture *handle=nmb_heap_new_texture(_handle,&descriptor,offset);
++ FrameMake make(&FrameMakes::textures);NmbTexture *handle=nmb_heap_new_texture(_handle,&descriptor,offset);
+  if(!handle){NBLOG(@"native-metal: heap texture refused: %@",lastError());return nil;}
+  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+  texture.parentHeap=(id<MTLHeap>)self;texture.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLTexture>)texture;
+@@ -1521,19 +1565,19 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count { try { @try {(void)count;return [(id<MTLDevice>)self newCommandQueue];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options { try { @try {
+- NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
++ FrameMake make(&FrameMakes::buffers);NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
+  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options { try { @try {
+  if(!bytes){noteProblem(@"missing library or buffer bytes");return nil;}
+- NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,bytes);
++ FrameMake make(&FrameMakes::buffers);NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,bytes);
+  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator { try { @try {
+  void *context=deallocator?(__bridge_retained void *)[deallocator copy]:nullptr;
+- NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,pointer,length,options,context?releaseBlock:nullptr,context);
++ FrameMake make(&FrameMakes::buffers);NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,pointer,length,options,context?releaseBlock:nullptr,context);
+  if(!handle) {
+   if(context)(void)(__bridge_transfer id)context;
+   NBLOG(@"native-metal: no-copy buffer refused: %@",lastError());return nil;
+@@ -1544,7 +1588,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d { try { @try {
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+- NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
++ FrameMake make(&FrameMakes::textures);NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+  if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
+  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1562,7 +1606,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  const size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
+  if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){refuseSurface(3,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  const size_t bytes=(allocation+page-1)&~(page-1);
+- NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
++ FrameMake make(&FrameMakes::imports);NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
+  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+@@ -1601,7 +1645,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  if(![(id)function isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign function");noteProblem(@"NBComputePipeline descriptor or function refused");if(fuxiBlocked()){if(error)*error=nil;return (id)[NBComputePipeline new];}return nil;}
+  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
+  const uint64_t pipelineBegan=nowUs();
+- NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);gTimePipeline.add(pipelineBegan);
++ FrameMake make(&FrameMakes::pipelines);NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);gTimePipeline.add(pipelineBegan);
+  if(!handle){auto refused=failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);if(fuxiBlocked()){if(error)*error=nil;return (id)[NBComputePipeline new];}return refused;}
+  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1614,7 +1658,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  if(!pipelineArchives(d.binaryArchives,archives,error)){noteProblem(@"NBComputePipeline descriptor or function refused");if(fuxiBlocked()){if(error)*error=nil;return (id)[NBComputePipeline new];}return nil;}
+  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
+  const uint64_t pipelineBegan=nowUs();
+- NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);gTimePipeline.add(pipelineBegan);
++ FrameMake make(&FrameMakes::pipelines);NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);gTimePipeline.add(pipelineBegan);
+  if(!handle){auto refused=failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);if(fuxiBlocked()){if(error)*error=nil;return (id)[NBComputePipeline new];}return refused;}
+  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
+  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+@@ -1632,7 +1676,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;noteProblem(@"NBRenderPipeline descriptor or function refused");if(fuxiBlocked()){if(error)*error=nil;return (id)[NBRenderPipeline new];}return nil;}
+  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
+  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
+- NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
++ FrameMake make(&FrameMakes::pipelines);NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
+  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
+  if(!handle){auto refused=failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);if(fuxiBlocked()){if(error)*error=nil;return (id)[NBRenderPipeline new];}return refused;}
+  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
