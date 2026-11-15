@@ -4662,10 +4662,10 @@ index 0000000..a4e4a96
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp_battery.c b/xnu/fuxi-adsp/fuxi_adsp_battery.c
 new file mode 100644
-index 0000000..72bae7d
+index 0000000..c886e0e
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp_battery.c
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,273 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* fuxiadsp=2: the client of the battery manager the audio DSP runs (PMIC GLINK channel "PMIC_RTR_ADSP_APPS"). Phase 1 only reads:
 + * every refresh cycle of ShengBattmgr.c (one request in flight, 2 s per request, a cycle every 60 s and at each notification) ends
@@ -4827,6 +4827,20 @@ index 0000000..72bae7d
 +    }
 +    if (FB_HAS(BmGauge1Remaining) && fb_bm.value[BmGauge1Remaining] > 0)
 +        s->raw_mah = fb_bm.value[BmGauge1Remaining] / 1000;
++    /* The adapter's kind: this firmware keeps the USB property 1 (BmUsbType) at SDP for the whole session and reports what charger
++     * detection found in property 20 (BmUsbAdapter): 2026-11-16 adsp2b went SDP -> PD there (input limit 500 mA -> 1.2 A) while
++     * BmUsbType stayed 1, so the log named a PD charger a computer port (SweetBattery does not publish the family yet). Same
++     * POWER_SUPPLY_USB_TYPE -> kIOPSFamilyCode mapping as ShengBattmgr.c family(). */
++    if (s->external && FB_HAS(BmUsbAdapter) && fb_bm.value[BmUsbAdapter] > 0) {
++        switch (fb_bm.value[BmUsbAdapter]) {
++        case 1: s->adapter_family = 0xe0004000u; break;
++        case 2: s->adapter_family = 0xe0004004u; break;
++        case 3: s->adapter_family = 0xe0004005u; break;
++        case 5: s->adapter_family = 0xe0004009u; break;
++        case 6: case 7: case 8: s->adapter_family = 0xe000400au; break;
++        default: s->adapter_family = 0xe0004007u; break;
++        }
++    }
 +#undef FB_HAS
 +}
 +
@@ -5110,10 +5124,10 @@ index 0000000..7755f92
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_amp.c b/xnu/fuxi-adsp/fuxi_amp.c
 new file mode 100644
-index 0000000..9b12633
+index 0000000..09ce08d
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_amp.c
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,335 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* FUXI speaker amplifiers: two Cirrus CS35L41 on QUP2 SE0 I2C (live DT i2c@880000: cs35l41@40 "B", reset GPIO 183; cs35l41@42
 + * "T", reset GPIO 182, both active low; pins gpio0 SDA / gpio1 SCL, function 2 = qup2_se0_l0/l1_mirb, 2 mA, pull-up; engine SPI
@@ -5125,7 +5139,8 @@ index 0000000..9b12633
 + *   2  brings the bus up as UniXNU-sheng AudioProbe.cpp setupClocks / setupPins / setupBus do for this same engine on sheng
 + *      (6880068): GPLL0 and the five QUP2 votes, the I2C pins, the engine at 400 kHz from the 19.2 MHz DFS level if the boot stages
 + *      left it unconfigured, FIFO mode (GeniI2c.c, sheng's, unchanged); SPI 373 is masked in the distributor first (no handler
-+ *      here, every transfer is polled). Then each amplifier comes out of reset (low 2 ms, high, 10 ms for its OTP boot) and DEVID
++ *      here, every transfer is polled). Then each amplifier comes out of reset (its eGPIO taken from the LPASS island, low 2 ms,
++ *      high, 10 ms for its OTP boot; the pad's input is logged low and high) and DEVID
 + *      0x0 (0x35a40 expected), REVID 0x4, IRQ1_STATUS3 0x10018 and IRQ1_STATUS4 0x1001c (OTP boot error / done) are read. Nothing
 + *      is written to the amplifiers. At the end both are held in reset again and the pins and votes go back to what they were.
 + * Facts: QUP2 SE0 window 0x880000 + 0x4000, GCC 0x100000, TLMM 0xf100000 (0x1000 per pin: ctl, io at +4), GICD 0x17100000.
@@ -5167,6 +5182,13 @@ index 0000000..9b12633
 +#define FM_SCL_COUNTERS (5u << 20 | 11u << 10 | 22u) /* 400 kHz from 19.2 MHz (i2c-qcom-geni.c): high 5, low 11, cycle 22 */
 +#define FM_CLK_CFG (2u << 4 | 1u)                     /* divider 2, enable */
 +#define FM_DEVID 0x35a40u
++/* GPIO 182/183 are eGPIOs (pinctrl-sm8550.c: egpio_present bit 11, egpio_enable bit 12, egpio_func 9). The boot stages leave them
++ * at 0x801: present, enable clear = the LPASS island TLMM owns the pad, so the APPS io register drives nothing. pinctrl-msm sets
++ * enable whenever it muxes a non-egpio function (the DT's cirrus_reset_default: gpio, output-high, 16 mA, no bias). amp2 (ksrc
++ * 417dcf3) wrote 1 << 9 alone, kept the island as owner, and both amplifiers stayed in reset: NACK at 0x40 and 0x42. */
++#define FM_EGPIO_PRESENT (1u << 11)
++#define FM_EGPIO_ENABLE (1u << 12)
++#define FM_RESET_CTL (1u << 9 | 7u << 6)  /* GPIO, output enabled, 16 mA, no pull */
 +
 +static const uint32_t kHalts[5] = {0x233d4u, 0x233d0u, 0x233ccu, 0x23004u, 0x1e004u};
 +static const unsigned kPins[4] = {0, 1, 183, 182};    /* SDA, SCL, reset B, reset T */
@@ -5356,17 +5378,21 @@ index 0000000..9b12633
 +    /* the amplifiers, one at a time */
 +    for (unsigned a = 0; a < 2; ++a) {
 +        const unsigned p = pinIndex(kReset[a]);
++        const uint32_t egpio = (savedCtl[p] & FM_EGPIO_PRESENT) ? FM_EGPIO_ENABLE : 0;
 +        wr(&gPin[p], pinPa(kReset[a]) + 4, 0);           /* output low */
-+        wr(&gPin[p], pinPa(kReset[a]), 1u << 9);         /* GPIO, output enabled, 2 mA, no pull */
++        wr(&gPin[p], pinPa(kReset[a]), egpio | FM_RESET_CTL); /* APPS takes the pad (eGPIO), GPIO out, 16 mA */
 +        IOSleep(2);
++        const uint32_t ctlNow = pinCtl(p), lowIn = pinIo(p) & 1u;
 +        wr(&gPin[p], pinPa(kReset[a]) + 4, 1u << 1);     /* release */
 +        IOSleep(10);
++        const uint32_t highIn = pinIo(p) & 1u;
 +        uint32_t devid = 0, revid = 0, st3 = 0, st4 = 0;
 +        const int ok = ampRead(kAddr[a], 0x0, &devid);
 +        const int ok2 = ok && ampRead(kAddr[a], 0x4, &revid) && ampRead(kAddr[a], 0x10018, &st3) && ampRead(kAddr[a], 0x1001c, &st4);
 +        printf("FUXI AMP: amp %c@%#x %s devid=%#x%s revid=%#x irq1_status3=%#x irq1_status4=%#x (geni error %u status %#x done %u "
-+            "failed %u timeouts %u)\n", kName[a], kAddr[a], ok2 ? "answers" : ok ? "partly" : "no answer", devid,
-+            devid == FM_DEVID ? " (CS35L41)" : "", revid, st3, st4, gBus.error, gBus.error_status, gBus.done, gBus.failed, gBus.timeouts);
++            "failed %u timeouts %u; reset gpio%u ctl %#x in low/high %u/%u)\n", kName[a], kAddr[a], ok2 ? "answers" : ok ? "partly" :
++            "no answer", devid, devid == FM_DEVID ? " (CS35L41)" : "", revid, st3, st4, gBus.error, gBus.error_status, gBus.done,
++            gBus.failed, gBus.timeouts, kReset[a], ctlNow, lowIn, highIn);
 +        wr(&gPin[p], pinPa(kReset[a]) + 4, 0);           /* back into reset */
 +    }
 +    step = 6;
@@ -5791,10 +5817,10 @@ index 8349337..7d08b57 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..841390d
+index 0000000..1508e43
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,4828 @@
+@@ -0,0 +1,4854 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,21 @@
@@ -6820,7 +6846,7 @@ index 0000000..841390d
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp_battery.c
-+@@ -0,0 +1,259 @@
++@@ -0,0 +1,273 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* fuxiadsp=2: the client of the battery manager the audio DSP runs (PMIC GLINK channel "PMIC_RTR_ADSP_APPS"). Phase 1 only reads:
 ++ * every refresh cycle of ShengBattmgr.c (one request in flight, 2 s per request, a cycle every 60 s and at each notification) ends
@@ -6982,6 +7008,20 @@ index 0000000..841390d
 ++    }
 ++    if (FB_HAS(BmGauge1Remaining) && fb_bm.value[BmGauge1Remaining] > 0)
 ++        s->raw_mah = fb_bm.value[BmGauge1Remaining] / 1000;
+++    /* The adapter's kind: this firmware keeps the USB property 1 (BmUsbType) at SDP for the whole session and reports what charger
+++     * detection found in property 20 (BmUsbAdapter): 2026-11-16 adsp2b went SDP -> PD there (input limit 500 mA -> 1.2 A) while
+++     * BmUsbType stayed 1, so the log named a PD charger a computer port (SweetBattery does not publish the family yet). Same
+++     * POWER_SUPPLY_USB_TYPE -> kIOPSFamilyCode mapping as ShengBattmgr.c family(). */
+++    if (s->external && FB_HAS(BmUsbAdapter) && fb_bm.value[BmUsbAdapter] > 0) {
+++        switch (fb_bm.value[BmUsbAdapter]) {
+++        case 1: s->adapter_family = 0xe0004000u; break;
+++        case 2: s->adapter_family = 0xe0004004u; break;
+++        case 3: s->adapter_family = 0xe0004005u; break;
+++        case 5: s->adapter_family = 0xe0004009u; break;
+++        case 6: case 7: case 8: s->adapter_family = 0xe000400au; break;
+++        default: s->adapter_family = 0xe0004007u; break;
+++        }
+++    }
 ++#undef FB_HAS
 ++}
 ++
@@ -7082,7 +7122,7 @@ index 0000000..841390d
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_amp.c
-+@@ -0,0 +1,323 @@
++@@ -0,0 +1,335 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* FUXI speaker amplifiers: two Cirrus CS35L41 on QUP2 SE0 I2C (live DT i2c@880000: cs35l41@40 "B", reset GPIO 183; cs35l41@42
 ++ * "T", reset GPIO 182, both active low; pins gpio0 SDA / gpio1 SCL, function 2 = qup2_se0_l0/l1_mirb, 2 mA, pull-up; engine SPI
@@ -7094,7 +7134,8 @@ index 0000000..841390d
 ++ *   2  brings the bus up as UniXNU-sheng AudioProbe.cpp setupClocks / setupPins / setupBus do for this same engine on sheng
 ++ *      (6880068): GPLL0 and the five QUP2 votes, the I2C pins, the engine at 400 kHz from the 19.2 MHz DFS level if the boot stages
 ++ *      left it unconfigured, FIFO mode (GeniI2c.c, sheng's, unchanged); SPI 373 is masked in the distributor first (no handler
-++ *      here, every transfer is polled). Then each amplifier comes out of reset (low 2 ms, high, 10 ms for its OTP boot) and DEVID
+++ *      here, every transfer is polled). Then each amplifier comes out of reset (its eGPIO taken from the LPASS island, low 2 ms,
+++ *      high, 10 ms for its OTP boot; the pad's input is logged low and high) and DEVID
 ++ *      0x0 (0x35a40 expected), REVID 0x4, IRQ1_STATUS3 0x10018 and IRQ1_STATUS4 0x1001c (OTP boot error / done) are read. Nothing
 ++ *      is written to the amplifiers. At the end both are held in reset again and the pins and votes go back to what they were.
 ++ * Facts: QUP2 SE0 window 0x880000 + 0x4000, GCC 0x100000, TLMM 0xf100000 (0x1000 per pin: ctl, io at +4), GICD 0x17100000.
@@ -7136,6 +7177,13 @@ index 0000000..841390d
 ++#define FM_SCL_COUNTERS (5u << 20 | 11u << 10 | 22u) /* 400 kHz from 19.2 MHz (i2c-qcom-geni.c): high 5, low 11, cycle 22 */
 ++#define FM_CLK_CFG (2u << 4 | 1u)                     /* divider 2, enable */
 ++#define FM_DEVID 0x35a40u
+++/* GPIO 182/183 are eGPIOs (pinctrl-sm8550.c: egpio_present bit 11, egpio_enable bit 12, egpio_func 9). The boot stages leave them
+++ * at 0x801: present, enable clear = the LPASS island TLMM owns the pad, so the APPS io register drives nothing. pinctrl-msm sets
+++ * enable whenever it muxes a non-egpio function (the DT's cirrus_reset_default: gpio, output-high, 16 mA, no bias). amp2 (ksrc
+++ * 417dcf3) wrote 1 << 9 alone, kept the island as owner, and both amplifiers stayed in reset: NACK at 0x40 and 0x42. */
+++#define FM_EGPIO_PRESENT (1u << 11)
+++#define FM_EGPIO_ENABLE (1u << 12)
+++#define FM_RESET_CTL (1u << 9 | 7u << 6)  /* GPIO, output enabled, 16 mA, no pull */
 ++
 ++static const uint32_t kHalts[5] = {0x233d4u, 0x233d0u, 0x233ccu, 0x23004u, 0x1e004u};
 ++static const unsigned kPins[4] = {0, 1, 183, 182};    /* SDA, SCL, reset B, reset T */
@@ -7325,17 +7373,21 @@ index 0000000..841390d
 ++    /* the amplifiers, one at a time */
 ++    for (unsigned a = 0; a < 2; ++a) {
 ++        const unsigned p = pinIndex(kReset[a]);
+++        const uint32_t egpio = (savedCtl[p] & FM_EGPIO_PRESENT) ? FM_EGPIO_ENABLE : 0;
 ++        wr(&gPin[p], pinPa(kReset[a]) + 4, 0);           /* output low */
-++        wr(&gPin[p], pinPa(kReset[a]), 1u << 9);         /* GPIO, output enabled, 2 mA, no pull */
+++        wr(&gPin[p], pinPa(kReset[a]), egpio | FM_RESET_CTL); /* APPS takes the pad (eGPIO), GPIO out, 16 mA */
 ++        IOSleep(2);
+++        const uint32_t ctlNow = pinCtl(p), lowIn = pinIo(p) & 1u;
 ++        wr(&gPin[p], pinPa(kReset[a]) + 4, 1u << 1);     /* release */
 ++        IOSleep(10);
+++        const uint32_t highIn = pinIo(p) & 1u;
 ++        uint32_t devid = 0, revid = 0, st3 = 0, st4 = 0;
 ++        const int ok = ampRead(kAddr[a], 0x0, &devid);
 ++        const int ok2 = ok && ampRead(kAddr[a], 0x4, &revid) && ampRead(kAddr[a], 0x10018, &st3) && ampRead(kAddr[a], 0x1001c, &st4);
 ++        printf("FUXI AMP: amp %c@%#x %s devid=%#x%s revid=%#x irq1_status3=%#x irq1_status4=%#x (geni error %u status %#x done %u "
-++            "failed %u timeouts %u)\n", kName[a], kAddr[a], ok2 ? "answers" : ok ? "partly" : "no answer", devid,
-++            devid == FM_DEVID ? " (CS35L41)" : "", revid, st3, st4, gBus.error, gBus.error_status, gBus.done, gBus.failed, gBus.timeouts);
+++            "failed %u timeouts %u; reset gpio%u ctl %#x in low/high %u/%u)\n", kName[a], kAddr[a], ok2 ? "answers" : ok ? "partly" :
+++            "no answer", devid, devid == FM_DEVID ? " (CS35L41)" : "", revid, st3, st4, gBus.error, gBus.error_status, gBus.done,
+++            gBus.failed, gBus.timeouts, kReset[a], ctlNow, lowIn, highIn);
 ++        wr(&gPin[p], pinPa(kReset[a]) + 4, 0);           /* back into reset */
 ++    }
 ++    step = 6;
