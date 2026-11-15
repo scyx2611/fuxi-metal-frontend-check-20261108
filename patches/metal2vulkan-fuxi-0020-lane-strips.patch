@@ -1,0 +1,293 @@
+diff --git a/crates/metal2vulkan-runtime/src/clear_reach.rs b/crates/metal2vulkan-runtime/src/clear_reach.rs
+index 49a4c8a..cf4675e 100644
+--- a/crates/metal2vulkan-runtime/src/clear_reach.rs
++++ b/crates/metal2vulkan-runtime/src/clear_reach.rs
+@@ -459,6 +459,8 @@ impl DrawnTiles {
+ /// One attachment's clear before its pass: the attachment, a render pass of it alone, its
+ /// framebuffer over the clear's extent and the pass's layers, the rectangles cleared (the extent,
+ /// or the tiles a `DontCare` load's draws may reach), the aspects cleared, and the clear value.
++/// FUXI: `apart` where only the strips past the render area are cleared, each rectangle in a
++/// render pass over itself, and the pass keeps its own `Clear` load ([`strips`]).
+ struct ReachClear {
+     attachment: Reached,
+     pass: RenderPassObject,
+@@ -468,6 +470,41 @@ struct ReachClear {
+     layers: u32,
+     aspects: vk::ImageAspectFlags,
+     value: vk::ClearValue,
++    apart: bool,
++}
++
++/// FUXI (`fuxihyb=5`, `6`): the rectangles of a `Clear` load's `reach` past the render area
++/// `area` (both from the origin, `reach` no smaller on either axis): the strip right of the render
++/// area over the reach's height, and the one below it over the render area's width. The pass's
++/// own `Clear` load clears the render area, so the pass and these clear the reach's texels, and
++/// no texel twice; none is empty.
++fn strips(area: [u32; 2], reach: [u32; 2]) -> Vec<vk::Rect2D> {
++    let mut out = Vec::with_capacity(2);
++    if reach[0] > area[0] {
++        out.push(vk::Rect2D {
++            offset: vk::Offset2D {
++                x: area[0] as i32,
++                y: 0,
++            },
++            extent: vk::Extent2D {
++                width: reach[0] - area[0],
++                height: reach[1],
++            },
++        });
++    }
++    if reach[1] > area[1] && area[0] > 0 {
++        out.push(vk::Rect2D {
++            offset: vk::Offset2D {
++                x: 0,
++                y: area[1] as i32,
++            },
++            extent: vk::Extent2D {
++                width: area[0],
++                height: reach[1] - area[1],
++            },
++        });
++    }
++    out
+ }
+ 
+ /// The attachment a [`ReachClear`] clears: a color attachment's index, or the depth/stencil
+@@ -493,18 +530,33 @@ impl ReachClears {
+         self.clears.len()
+     }
+ 
++    /// FUXI (census `passes` line): how many reach clears clear only their strips (`apart`), the
++    /// pixels every reach clear's reach covers, and the pixels the strips cover, in units of 1024.
++    pub(super) fn census(&self) -> [u64; 3] {
++        let px = |r: &vk::Rect2D| u64::from(r.extent.width) * u64::from(r.extent.height);
++        let apart = self.clears.iter().filter(|c| c.apart);
++        [
++            apart.clone().count() as u64,
++            self.clears.iter().map(|c| px(&c.area)).sum::<u64>() / 1024,
++            apart.flat_map(|c| c.rects.iter()).map(px).sum::<u64>() / 1024,
++        ]
++    }
++
+     /// The clears of `layout`'s attachments, a pass with a draw call where `called` (the module
+     /// docs); `left_out` names the color indices whose clear the pass must make before it
+     /// whatever their store action (its first instance leaves them out, and no whole-subresource
+     /// clear stands for them). Where `bounded` gives the `DontCare` loads that took a `Clear` and
+     /// the tiles the pass's draws may reach, each of those clears only those tiles, before the
+-    /// pass. `None` when there is none.
++    /// pass. `None` when there is none. FUXI: where `strip`, a stored color's whole-reach clear
++    /// (not bounded, not left out, in no sample planes and no stand-in) clears only its strips
++    /// past the render area, and the pass keeps that color's `Clear` load ([`strips`]).
+     pub(super) fn plan(
+         device: &Device,
+         layout: &PassLayout,
+         called: bool,
+         left_out: &[u32],
+         bounded: Option<(&DontCareLoads, &DrawnTiles)>,
++        strip: bool,
+     ) -> Result<Option<ReachClears>, Error> {
+         let area = layout.extent;
+         let mut clears = Vec::new();
+@@ -528,7 +580,18 @@ impl ReachClears {
+             if extent == area && !left_out.contains(&(index as u32)) && tiles.is_none() {
+                 continue;
+             }
+-            let rects = tiles.map_or_else(|| vec![rect(extent)], |t| t.rects(extent));
++            let apart = strip
++                && tiles.is_none()
++                && !left_out.contains(&(index as u32))
++                && color.planes.is_none()
++                && color.stand_in.is_none()
++                && stores(color.store)
++                && extent[0] >= area[0]
++                && extent[1] >= area[1];
++            let rects = match apart {
++                true => strips(area, extent),
++                false => tiles.map_or_else(|| vec![rect(extent)], |t| t.rects(extent)),
++            };
+             let (pass, framebuffer, made) =
+                 render_target::reach_pass(device, &color.target, false, extent)?;
+             uses.extend(made);
+@@ -541,6 +604,7 @@ impl ReachClears {
+                 layers: color.target.layers,
+                 aspects: vk::ImageAspectFlags::COLOR,
+                 value: vk::ClearValue { color: color.clear },
++                apart,
+             });
+         }
+         if let Some(ds) = layout
+@@ -604,6 +668,7 @@ impl ReachClears {
+                     value: vk::ClearValue {
+                         depth_stencil: value,
+                     },
++                    apart: false,
+                 });
+             }
+         }
+@@ -615,8 +680,10 @@ impl ReachClears {
+     /// renders through Metal (MoltenVK) reaches the whole attachment in a pass without a draw,
+     /// where Metal's own reaches whole tiles in a pass with a draw call (the module docs). A
+     /// color attachment held in sample planes keeps its load (`sample_planes.rs` clears them).
++    /// FUXI: so does a color whose clear clears only its strips (`apart`): the pass's own clear
++    /// clears the render area, on a device that does not render through Metal (Turnip).
+     pub(super) fn load_in_pass(&self, layout: &mut PassLayout) {
+-        for clear in &self.clears {
++        for clear in self.clears.iter().filter(|clear| !clear.apart) {
+             match clear.attachment {
+                 Reached::Color(index) => {
+                     if let Some(color) = layout
+@@ -661,10 +728,6 @@ impl ReachClears {
+             |raw, command_buffer| {
+                 // A bounded clear of no tile clears nothing; its attachment still loads.
+                 for clear in clears.iter().filter(|clear| !clear.rects.is_empty()) {
+-                    let begin = vk::RenderPassBeginInfo::default()
+-                        .render_pass(clear.pass.raw)
+-                        .framebuffer(clear.framebuffer.raw)
+-                        .render_area(clear.area);
+                     let attachments = [vk::ClearAttachment {
+                         aspect_mask: clear.aspects,
+                         color_attachment: 0,
+@@ -679,21 +742,34 @@ impl ReachClears {
+                             layer_count: clear.layers,
+                         })
+                         .collect();
+-                    // SAFETY: the encoder's command buffer is recording outside a render pass; the
+-                    // pass, its framebuffer and the attachment are live until it completes (held
+-                    // below, and the texture by the encoder); its image rests in `GENERAL`, the
+-                    // pass's layout; the area is the framebuffer's, and the layers its own; the
+-                    // aspects are the attachment format's, and the subpass's one attachment, color
+-                    // 0 or its depth/stencil attachment, is the one cleared; every rectangle lies
+-                    // in the area.
+-                    unsafe {
+-                        raw.cmd_begin_render_pass(
+-                            command_buffer,
+-                            &begin,
+-                            vk::SubpassContents::INLINE,
+-                        );
+-                        raw.cmd_clear_attachments(command_buffer, &attachments, &rects);
+-                        raw.cmd_end_render_pass(command_buffer);
++                    // FUXI: a strips-only clear (`apart`) renders each strip in a pass over that
++                    // strip alone, so a tiler loads and stores the strip, not the whole reach.
++                    let pieces: Vec<(vk::Rect2D, &[vk::ClearRect])> = match clear.apart {
++                        true => (clear.rects.iter().copied()).zip(rects.chunks(1)).collect(),
++                        false => vec![(clear.area, &rects[..])],
++                    };
++                    for (area, rects) in pieces {
++                        let begin = vk::RenderPassBeginInfo::default()
++                            .render_pass(clear.pass.raw)
++                            .framebuffer(clear.framebuffer.raw)
++                            .render_area(area);
++                        // SAFETY: the encoder's command buffer is recording outside a render pass;
++                        // the pass, its framebuffer and the attachment are live until it completes
++                        // (held below, and the texture by the encoder); its image rests in
++                        // `GENERAL`, the pass's layout; the area lies in the framebuffer's (a strip
++                        // lies in the reach, the framebuffer's extent), and the layers are its own;
++                        // the aspects are the attachment format's, and the subpass's one
++                        // attachment, color 0 or its depth/stencil attachment, is the one cleared;
++                        // every rectangle lies in the area.
++                        unsafe {
++                            raw.cmd_begin_render_pass(
++                                command_buffer,
++                                &begin,
++                                vk::SubpassContents::INLINE,
++                            );
++                            raw.cmd_clear_attachments(command_buffer, &attachments, rects);
++                            raw.cmd_end_render_pass(command_buffer);
++                        }
+                     }
+                 }
+             },
+diff --git a/crates/metal2vulkan-runtime/src/fuxi_census.rs b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+index 8a22b38..9149b99 100644
+--- a/crates/metal2vulkan-runtime/src/fuxi_census.rs
++++ b/crates/metal2vulkan-runtime/src/fuxi_census.rs
+@@ -432,8 +432,9 @@ fn boot_value() -> Option<u64> {
+ 
+ #[cold]
+ fn start() -> bool {
+-    // `fuxihyb=4` runs the lane without the census (its own cost stays off).
+-    let on = boot_value().is_some_and(|v| (1..=3).contains(&v));
++    // `fuxihyb=4` and `5` run the lane without the census (its own cost stays off); `6` is `5`
++    // with it.
++    let on = boot_value().is_some_and(|v| (1..=3).contains(&v) || v == 6);
+     if STATE
+         .compare_exchange(
+             UNKNOWN,
+@@ -501,6 +502,30 @@ pub(crate) fn lane() -> bool {
+     }
+ }
+ 
++static STRIP: AtomicU8 = AtomicU8::new(UNKNOWN);
++
++#[cold]
++fn strip_start() -> bool {
++    let state = match boot_value() {
++        Some(5 | 6) => ON,
++        _ => OFF,
++    };
++    let _ = STRIP.compare_exchange(UNKNOWN, state, Ordering::AcqRel, Ordering::Acquire);
++    STRIP.load(Ordering::Acquire) == ON
++}
++
++/// FUXI: whether a stored color's `Clear` load clears past the render area by its strips alone,
++/// the pass keeping its own `Clear` load (`fuxihyb=5`, or `6` with the census; the lane is on in
++/// both), the boot value read once per process (`clear_reach.rs`'s `strips`).
++#[inline]
++pub(crate) fn strip() -> bool {
++    match STRIP.load(Ordering::Relaxed) {
++        ON => true,
++        OFF => false,
++        _ => strip_start(),
++    }
++}
++
+ /// The draw listed `count` argument samplers.
+ #[inline]
+ pub(crate) fn samplers(count: usize) {
+@@ -630,12 +655,14 @@ pub(crate) fn setter(kind: Set) -> Timed {
+ /// attachments whose `DontCare` load took an answer and the encoders where it was bounded to the
+ /// drawn tiles, the reach clears' own render passes, the later depth/stencil resolve passes, the
+ /// encoders with a resolving instance, the encoders whose pass recorded later, the colors' final
+-/// loads (`Clear`, `Load`, `DontCare`), and the colors larger than the render area.
++/// loads (`Clear`, `Load`, `DontCare`), the colors larger than the render area, the reach clears
++/// that cleared only their strips (`fuxihyb=6`), the reach clears' pixels and the strips' pixels
++/// (both in units of 1024).
+ pub(crate) const PASS_NAMES: [&str; PASS_KINDS] = [
+     "enc", "inst", "rnone", "revery", "rdraws", "dc", "bounded", "reach", "later", "resolving",
+-    "deferred", "lclear", "lload", "ldc", "big",
++    "deferred", "lclear", "lload", "ldc", "big", "strip", "rkpx", "skpx",
+ ];
+-pub(crate) const PASS_KINDS: usize = 15;
++pub(crate) const PASS_KINDS: usize = 18;
+ 
+ /// An ended render encoder's [`PASS_NAMES`] counts.
+ #[inline]
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 5ed1ce8..d311ea1 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -3762,8 +3762,13 @@ impl RenderCommandEncoder {
+         }
+         let clears = Clears::plan(&clears)?;
+         let bounded = tiles.as_ref().map(|tiles| (&dont_care, tiles));
+-        let reach_clears = ReachClears::plan(&device, &layout, called, &left_out, bounded)?;
++        // FUXI (`fuxihyb=5`, `6`): a stored color's whole-reach clear clears only its strips past
++        // the render area, and the pass keeps its `Clear` load (`clear_reach.rs`'s `strips`); not
++        // in a pass with tile dispatches, whose scratch edges follow the loads.
++        let strip = crate::fuxi_census::strip() && tile_scratch.is_empty();
++        let reach_clears = ReachClears::plan(&device, &layout, called, &left_out, bounded, strip)?;
+         let census_reach_passes = reach_clears.as_ref().map_or(0, ReachClears::len) as u64;
++        let census_strips = reach_clears.as_ref().map_or([0; 3], ReachClears::census);
+         // An attachment the reach clear covers loads in the pass: that clear holds the render
+         // area too, and a pass's own clear on a device that renders through Metal (MoltenVK)
+         // reaches the whole attachment where the pass has no draw (`clear_reach.rs`). The pass
+@@ -4363,6 +4368,9 @@ impl RenderCommandEncoder {
+                 loads(LoadAction::Load),
+                 loads(LoadAction::DontCare),
+                 big,
++                census_strips[0],
++                census_strips[1],
++                census_strips[2],
+             ]);
+         }
+         match crate::fuxi_census::lane() {
