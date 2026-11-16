@@ -140,10 +140,10 @@ index 0000000..7349474
 +results are recorded separately.
 diff --git a/docs-lanes/pmic-torch.md b/docs-lanes/pmic-torch.md
 new file mode 100644
-index 0000000..237aa7d
+index 0000000..1dee5fc
 --- /dev/null
 +++ b/docs-lanes/pmic-torch.md
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,39 @@
 +# PM8550 torch control
 +
 +`fuxi,pmic=1` surveys the PMIC. Mode 2 runs one 40 mA, 80 ms pulse with a
@@ -152,7 +152,8 @@ index 0000000..237aa7d
 +separate acceptance checks.
 +
 +Mode 3 maps the same owner-0 flash channel, starts an idle worker, and exposes
-+the root-write `kern.fuxitorch` integer. Values 1 through 4 request 20, 40,
++the `kern.fuxitorch` integer. Writes admit root or the platform-signed
++SpringBoard process, including its normal mobile UID. Values 1 through 4 request 20, 40,
 +60 or 80 mA; zero stops. Each write renews a two-second lease. The worker
 +performs bounded 80 ms pulses, each protected by a verified 100 ms hardware
 +timer and followed by output-disable verification and register restoration.
@@ -175,7 +176,7 @@ index 0000000..237aa7d
 +`tools/test-fuxi-torch-pulse.py` exercises the production register sequence,
 +all four current levels, injected failures, dropped writes and restoration.
 +`tools/test-fuxi-torch-runtime.py` exercises the production lease state,
-+renewal, expiration, invalid levels, overflow and latched failure. These
++caller admission, renewal, expiration, invalid levels, overflow and latched failure. These
 +checks do not establish visible light, continuous output quality, sandbox
 +permission or UI behavior. Mode 3 still requires a device run.
 +
@@ -932,10 +933,10 @@ index 0000000..3c6b447
 +    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-torch-runtime.py b/tools/test-fuxi-torch-runtime.py
 new file mode 100644
-index 0000000..4fac3c1
+index 0000000..f23f150
 --- /dev/null
 +++ b/tools/test-fuxi-torch-runtime.py
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,60 @@
 +import os
 +from pathlib import Path
 +import subprocess
@@ -949,6 +950,14 @@ index 0000000..4fac3c1
 +#include <string.h>
 +#include "fuxi_torch_runtime.h"
 +int main(void) {
++    assert(fuxi_torch_caller_allowed(1,0,NULL));
++    assert(fuxi_torch_caller_allowed(0,1,"SpringBoard"));
++    assert(!fuxi_torch_caller_allowed(0,0,"SpringBoard"));
++    assert(!fuxi_torch_caller_allowed(0,1,"SpringBoardX"));
++    assert(!fuxi_torch_caller_allowed(0,1,"Spring"));
++    assert(!fuxi_torch_caller_allowed(0,1,"springboard"));
++    assert(!fuxi_torch_caller_allowed(0,1,NULL));
++    assert(!fuxi_torch_caller_allowed(0,1,""));
 +    FuxiTorchRuntime state={0}, saved;
 +    assert(!fuxi_torch_requested(&state,0));
 +    assert(!fuxi_torch_request(&state,4,100));
@@ -976,7 +985,7 @@ index 0000000..4fac3c1
 +    assert(!fuxi_torch_request(&state,0,3));
 +    assert(!fuxi_torch_request(&state,0,UINT64_MAX));
 +    assert(fuxi_torch_request(NULL,1,0)<0);
-+    puts("PASS: production torch lease expires, renews, stops immediately, rejects overflow and latches hardware failure");
++    puts("PASS: production torch caller admission and lease expiration, renewal, stop, overflow and latched failure");
 +    return 0;
 +}
 +'''
@@ -6561,10 +6570,10 @@ index 0000000..09ce08d
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_pmic.c b/xnu/fuxi-adsp/fuxi_pmic.c
 new file mode 100644
-index 0000000..e3c8e51
+index 0000000..1e91059
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_pmic.c
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,334 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
@@ -6572,6 +6581,8 @@ index 0000000..e3c8e51
 +#include <sys/errno.h>
 +#include <sys/kauth.h>
 +#include <sys/sysctl.h>
++#include <sys/proc.h>
++#include <sys/codesign.h>
 +#include <kern/clock.h>
 +#include <kern/locks.h>
 +#include <kern/thread.h>
@@ -6786,7 +6797,14 @@ index 0000000..e3c8e51
 +    (void)arg1;
 +    (void)arg2;
 +    if (!__atomic_load_n(&fp_torch_ready, __ATOMIC_ACQUIRE)) return ENOTSUP;
-+    if (req->newptr && !kauth_cred_issuser(kauth_cred_get())) return EPERM;
++    if (req->newptr) {
++        char name[32] = {0};
++        proc_selfname(name, sizeof(name));
++        proc_t process = proc_self();
++        int platform = process && csproc_get_platform_binary(process) != 0;
++        if (process) proc_rele(process);
++        if (!fuxi_torch_caller_allowed(kauth_cred_issuser(kauth_cred_get()), platform, name)) return EPERM;
++    }
 +    lck_mtx_lock(&fp_torch_lock);
 +    int value = (int)fuxi_torch_requested(&fp_torch_state, fp_torch_now());
 +    int failed = fp_torch_state.failed;
@@ -6802,8 +6820,8 @@ index 0000000..e3c8e51
 +    return error;
 +}
 +
-+SYSCTL_PROC(_kern, OID_AUTO, fuxitorch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-+    0, 0, fp_torch_sysctl, "I", "Fuxi torch level 0..4, root writes, two second lease");
++SYSCTL_PROC(_kern, OID_AUTO, fuxitorch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, fp_torch_sysctl, "I", "Fuxi torch level 0..4, platform SpringBoard or root, two second lease");
 +
 +static void fp_torch_wait(void *context, unsigned microseconds)
 +{
@@ -6854,7 +6872,7 @@ index 0000000..e3c8e51
 +    }
 +    thread_deallocate(thread);
 +    __atomic_store_n(&fp_torch_ready, 1u, __ATOMIC_RELEASE);
-+    printf("FUXI PMIC: torch runtime ready; root sysctl kern.fuxitorch, 20..80mA, output off\n");
++    printf("FUXI PMIC: torch runtime ready; admitted sysctl kern.fuxitorch, 20..80mA, output off\n");
 +}
 +
 +void fuxi_pmic_init(void)
@@ -7184,10 +7202,10 @@ index 0000000..df93326
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_torch_runtime.h b/xnu/fuxi-adsp/fuxi_torch_runtime.h
 new file mode 100644
-index 0000000..bee12e9
+index 0000000..6bd480a
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_torch_runtime.h
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,37 @@
 +#ifndef FUXI_TORCH_RUNTIME_H
 +#define FUXI_TORCH_RUNTIME_H
 +#include <stdint.h>
@@ -7198,6 +7216,18 @@ index 0000000..bee12e9
 +    uint64_t pulses;
 +    uint64_t deadline;
 +} FuxiTorchRuntime;
++
++static inline int fuxi_torch_caller_allowed(unsigned root, unsigned platform, const char *name)
++{
++    if (root) return 1;
++    if (!platform || !name) return 0;
++    const char expected[] = "SpringBoard";
++    unsigned index = 0;
++    for (; expected[index]; index++) {
++        if (name[index] != expected[index]) return 0;
++    }
++    return name[index] == 0;
++}
 +
 +static inline int fuxi_torch_request(FuxiTorchRuntime *state, unsigned level, uint64_t now)
 +{
@@ -8529,10 +8559,10 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..c19047a
+index 0000000..e1aab52
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,5650 @@
+@@ -0,0 +1,5671 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,24 @@
@@ -10245,7 +10275,7 @@ index 0000000..c19047a
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_pmic.c
-+@@ -0,0 +1,325 @@
++@@ -0,0 +1,334 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
@@ -10253,6 +10283,8 @@ index 0000000..c19047a
 ++#include <sys/errno.h>
 ++#include <sys/kauth.h>
 ++#include <sys/sysctl.h>
+++#include <sys/proc.h>
+++#include <sys/codesign.h>
 ++#include <kern/clock.h>
 ++#include <kern/locks.h>
 ++#include <kern/thread.h>
@@ -10467,7 +10499,14 @@ index 0000000..c19047a
 ++    (void)arg1;
 ++    (void)arg2;
 ++    if (!__atomic_load_n(&fp_torch_ready, __ATOMIC_ACQUIRE)) return ENOTSUP;
-++    if (req->newptr && !kauth_cred_issuser(kauth_cred_get())) return EPERM;
+++    if (req->newptr) {
+++        char name[32] = {0};
+++        proc_selfname(name, sizeof(name));
+++        proc_t process = proc_self();
+++        int platform = process && csproc_get_platform_binary(process) != 0;
+++        if (process) proc_rele(process);
+++        if (!fuxi_torch_caller_allowed(kauth_cred_issuser(kauth_cred_get()), platform, name)) return EPERM;
+++    }
 ++    lck_mtx_lock(&fp_torch_lock);
 ++    int value = (int)fuxi_torch_requested(&fp_torch_state, fp_torch_now());
 ++    int failed = fp_torch_state.failed;
@@ -10483,8 +10522,8 @@ index 0000000..c19047a
 ++    return error;
 ++}
 ++
-++SYSCTL_PROC(_kern, OID_AUTO, fuxitorch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-++    0, 0, fp_torch_sysctl, "I", "Fuxi torch level 0..4, root writes, two second lease");
+++SYSCTL_PROC(_kern, OID_AUTO, fuxitorch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+++    0, 0, fp_torch_sysctl, "I", "Fuxi torch level 0..4, platform SpringBoard or root, two second lease");
 ++
 ++static void fp_torch_wait(void *context, unsigned microseconds)
 ++{
@@ -10535,7 +10574,7 @@ index 0000000..c19047a
 ++    }
 ++    thread_deallocate(thread);
 ++    __atomic_store_n(&fp_torch_ready, 1u, __ATOMIC_RELEASE);
-++    printf("FUXI PMIC: torch runtime ready; root sysctl kern.fuxitorch, 20..80mA, output off\n");
+++    printf("FUXI PMIC: torch runtime ready; admitted sysctl kern.fuxitorch, 20..80mA, output off\n");
 ++}
 ++
 ++void fuxi_pmic_init(void)
@@ -13735,7 +13774,7 @@ index 0000000..c19047a
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_torch_runtime.h
-+@@ -0,0 +1,25 @@
++@@ -0,0 +1,37 @@
 ++#ifndef FUXI_TORCH_RUNTIME_H
 ++#define FUXI_TORCH_RUNTIME_H
 ++#include <stdint.h>
@@ -13746,6 +13785,18 @@ index 0000000..c19047a
 ++    uint64_t pulses;
 ++    uint64_t deadline;
 ++} FuxiTorchRuntime;
+++
+++static inline int fuxi_torch_caller_allowed(unsigned root, unsigned platform, const char *name)
+++{
+++    if (root) return 1;
+++    if (!platform || !name) return 0;
+++    const char expected[] = "SpringBoard";
+++    unsigned index = 0;
+++    for (; expected[index]; index++) {
+++        if (name[index] != expected[index]) return 0;
+++    }
+++    return name[index] == 0;
+++}
 ++
 ++static inline int fuxi_torch_request(FuxiTorchRuntime *state, unsigned level, uint64_t now)
 ++{
