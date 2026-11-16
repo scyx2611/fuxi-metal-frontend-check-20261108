@@ -90,6 +90,7 @@ shape_for_screen_type(id self, SEL selector, long type)
 	SEL init_sel = sel_registerName("initWithRect:");
 	Class cls = objc_getClass(SHAPE_CLASS);
 	fx_rect r, n;
+	double unit_scale = 1.0;
 	id made;
 
 	if (shape == NULL || cls == NULL || class_getInstanceMethod(object_getClass(shape), rect_sel) == NULL ||
@@ -97,17 +98,22 @@ shape_for_screen_type(id self, SEL selector, long type)
 		return shape;
 	}
 	r = ((fx_rect (*)(id, SEL))objc_msgSend)(shape, rect_sel);
-	if (!fx_near(r.x, x_notch.x) || !fx_near(r.y, x_notch.y) || !fx_near(r.w, x_notch.w) || !fx_near(r.h, x_notch.h)) {
+	if (fx_near(r.x, x_notch.x / 3.0) && fx_near(r.y, x_notch.y / 3.0) &&
+	    fx_near(r.w, x_notch.w / 3.0) && fx_near(r.h, x_notch.h / 3.0)) {
+		unit_scale = 1.0 / 3.0;
+	}
+	if (!fx_near(r.x, x_notch.x * unit_scale) || !fx_near(r.y, x_notch.y * unit_scale) ||
+	    !fx_near(r.w, x_notch.w * unit_scale) || !fx_near(r.h, x_notch.h * unit_scale)) {
 		if (__atomic_fetch_add(&shape_said, 1, __ATOMIC_RELAXED) < SHAPE_SAID) {
 			say("fuxi: SpringBoard: screen type %ld shape (%.0f, %.0f, %.0f, %.0f) is not the X notch; unchanged\n",
 			    type, r.x, r.y, r.w, r.h);
 		}
 		return shape;
 	}
-	n.x = r.x + (r.w - shape_w) / 2.0;
+	n.x = r.x + (r.w - shape_w * unit_scale) / 2.0;
 	n.y = r.y;
-	n.w = shape_w;
-	n.h = shape_h;
+	n.w = shape_w * unit_scale;
+	n.h = shape_h * unit_scale;
 	made = ((id (*)(id, SEL))objc_msgSend)((id)cls, sel_registerName("alloc"));
 	made = ((id (*)(id, SEL, fx_rect))objc_msgSend)(made, init_sel, n);
 	if (made == NULL) {
