@@ -9,6 +9,9 @@ on:
       artifact_name:
         type: string
         default: fuxi-kernel-adsp-battery
+      runner_label:
+        type: string
+        default: macos-15
   # A workflow that is not on the default branch cannot be dispatched by hand, so the branch push starts it.
   push:
     branches:
@@ -43,7 +46,7 @@ permissions:
   contents: read
 jobs:
   kernel:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner_label || 'macos-15' }}
     timeout-minutes: 180
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer

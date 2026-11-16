@@ -1,0 +1,17 @@
+name: Build isolated Fuxi 9 GiB kernel on Intel
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/adsp-battery
+    paths:
+      - .github/workflows/kernel-adsp-ram9g-intel.yml
+permissions:
+  contents: read
+jobs:
+  kernel:
+    uses: ./.github/workflows/kernel-adsp-battery.yml
+    with:
+      ram_layout: 9g
+      artifact_name: fuxi-kernel-adsp-ram9g-intel
+      runner_label: macos-15-intel
