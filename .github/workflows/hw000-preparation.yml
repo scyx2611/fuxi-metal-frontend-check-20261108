@@ -22,6 +22,11 @@ jobs:
         with:
           path: harness
           persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned inspection dependency
+        run: python3 -m pip install capstone==5.0.7
       - name: Prepare pinned public source
         shell: bash
         run: |
