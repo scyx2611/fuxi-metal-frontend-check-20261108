@@ -17177,10 +17177,10 @@ index 0000000..cea2fab
 +}
 diff --git a/tools/test-fuxi-wlan-ios.py b/tools/test-fuxi-wlan-ios.py
 new file mode 100644
-index 0000000..d9108a4
+index 0000000..19bb669
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ios.py
-@@ -0,0 +1,634 @@
+@@ -0,0 +1,637 @@
 +import hashlib
 +import hmac
 +import os
@@ -17691,10 +17691,13 @@ index 0000000..d9108a4
 +    step(); expect_request(2); assert(captured[44]==4 && !memcmp(captured+45,"gone",4));
 +    scan_accept(true); serve_bss(6,0);
 +    assert(!pthread_join(thread,NULL) && caller_result==ENOENT && wli_state.last_error==ENOENT);
-+    /* heard too long ago: scanned again, then joined */
++    /* heard too long ago: its own channel listened to first; not there now, so every channel; then joined */
 +    fake_now+=WLI_FRESH_MS+1;
 +    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=start_caller(3,false); wait_busy(2);
-+    step(); expect_request(2); scan_accept(false); serve_bss(6,0);
++    step(); expect_request(2); assert(captured_length==88 && request_u32(20)==5200);
++    scan_accept(false); serve_bss(0,0);
++    wait_busy(2); step(); expect_request(2); assert(captured_length==80 && !request_attribute(20,&(size_t){0}));
++    scan_accept(false); serve_bss(6,0);
 +    wait_busy(3); step(); expect_request(4); respond(4,8); step(); expect_request(6); respond(6,0); step();
 +    assert(failed_join(thread)==ENOENT);
 +    /* joined, then the radio is switched off: the join is forgotten */
@@ -33177,10 +33180,10 @@ index 0000000..e0b7465
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ios.inc b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
 new file mode 100644
-index 0000000..d85c8ce
+index 0000000..b028004
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-@@ -0,0 +1,1271 @@
+@@ -0,0 +1,1284 @@
 +#include <sys/fuxi_wifi_ios.h>
 +#include <sys/fuxi_wifi_wpa.h>
 +#include <sys/errno.h>
@@ -33451,7 +33454,8 @@ index 0000000..d85c8ce
 +		if (best < 0 || bss->rssi > wli_bss[best].rssi) { best = (int)index; }
 +	}
 +	int error = best < 0 ? ENOENT : age + wli_bss[best].age_ms > WLI_FRESH_MS ? ESTALE : 0;
-+	if (!error) { target->bss = wli_bss[best]; }
++	/* (a stale one is kept too, for its channel: the rescan listens there first) */
++	if (best >= 0) { target->bss = wli_bss[best]; }
 +	lck_mtx_unlock(&wli_lock);
 +	return error;
 +}
@@ -33509,9 +33513,21 @@ index 0000000..d85c8ce
 +		memset(&scan, 0, sizeof(scan));
 +		memcpy(scan.ssid, join->ssid, join->ssid_length);
 +		scan.ssid_length = join->ssid_length;
-+		printf("FUXI WIFI IOS: join needs a fresh scan (%s)\n", error == ENOENT ? "not heard" : "too old");
++		/* heard before but too long ago: its own channel first, a moment rather than every channel's seconds */
++		if (error == ESTALE && target->bss.frequency) {
++			scan.frequencies[0] = target->bss.frequency;
++			scan.frequency_count = 1;
++		}
++		printf("FUXI WIFI IOS: join needs a fresh scan (%s%s)\n", error == ENOENT ? "not heard" : "too old",
++		    scan.frequency_count ? ", its channel first" : "");
 +		error = wli_submit(WLI_SCAN, false, &scan, NULL);
 +		if (!error) { error = wli_pick(join, target); }
++		if (scan.frequency_count && (error == ENOENT || error == ESTALE)) {
++			scan.frequency_count = 0;
++			printf("FUXI WIFI IOS: not on its channel; every channel\n");
++			error = wli_submit(WLI_SCAN, false, &scan, NULL);
++			if (!error) { error = wli_pick(join, target); }
++		}
 +	}
 +	if (!error) { error = wli_security(&target->bss, join->security, &target->group); }
 +	if (!error) {
@@ -34615,7 +34631,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..f4e7593 100644
+index d21bf85..dab2b7c 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -35086,7 +35102,7 @@ index d21bf85..f4e7593 100644
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,2125 @@
+@@ -5899,3 +6092,2138 @@
  + }
  + r[3] = 0;
  +}
@@ -35940,7 +35956,7 @@ index d21bf85..f4e7593 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ios.inc
-+@@ -0,0 +1,1271 @@
++@@ -0,0 +1,1284 @@
 ++#include <sys/fuxi_wifi_ios.h>
 ++#include <sys/fuxi_wifi_wpa.h>
 ++#include <sys/errno.h>
@@ -36211,7 +36227,8 @@ index d21bf85..f4e7593 100644
 ++		if (best < 0 || bss->rssi > wli_bss[best].rssi) { best = (int)index; }
 ++	}
 ++	int error = best < 0 ? ENOENT : age + wli_bss[best].age_ms > WLI_FRESH_MS ? ESTALE : 0;
-++	if (!error) { target->bss = wli_bss[best]; }
+++	/* (a stale one is kept too, for its channel: the rescan listens there first) */
+++	if (best >= 0) { target->bss = wli_bss[best]; }
 ++	lck_mtx_unlock(&wli_lock);
 ++	return error;
 ++}
@@ -36269,9 +36286,21 @@ index d21bf85..f4e7593 100644
 ++		memset(&scan, 0, sizeof(scan));
 ++		memcpy(scan.ssid, join->ssid, join->ssid_length);
 ++		scan.ssid_length = join->ssid_length;
-++		printf("FUXI WIFI IOS: join needs a fresh scan (%s)\n", error == ENOENT ? "not heard" : "too old");
+++		/* heard before but too long ago: its own channel first, a moment rather than every channel's seconds */
+++		if (error == ESTALE && target->bss.frequency) {
+++			scan.frequencies[0] = target->bss.frequency;
+++			scan.frequency_count = 1;
+++		}
+++		printf("FUXI WIFI IOS: join needs a fresh scan (%s%s)\n", error == ENOENT ? "not heard" : "too old",
+++		    scan.frequency_count ? ", its channel first" : "");
 ++		error = wli_submit(WLI_SCAN, false, &scan, NULL);
 ++		if (!error) { error = wli_pick(join, target); }
+++		if (scan.frequency_count && (error == ENOENT || error == ESTALE)) {
+++			scan.frequency_count = 0;
+++			printf("FUXI WIFI IOS: not on its channel; every channel\n");
+++			error = wli_submit(WLI_SCAN, false, &scan, NULL);
+++			if (!error) { error = wli_pick(join, target); }
+++		}
 ++	}
 ++	if (!error) { error = wli_security(&target->bss, join->security, &target->group); }
 ++	if (!error) {
