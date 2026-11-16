@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include "FuxiTorchLevels.h"
 
 static unsigned torch_hooked;
 static unsigned torch_metadata_hooked;
@@ -59,12 +60,11 @@ static void torch_error(id *error, int code)
 static bool torch_set(id self, SEL selector, float level, id *error)
 {
     (void)selector;
-    if (!(level >= 0.0f && level <= 1.0f)) {
+    unsigned requested;
+    if (!fuxi_torch_ui_decode(level, &requested)) {
         torch_error(error, EINVAL);
         return false;
     }
-    unsigned requested = (unsigned)(level * 4.0f);
-    if ((float)requested / 4.0f < level) requested++;
     unsigned previous = __atomic_load_n(&torch_level, __ATOMIC_ACQUIRE);
     if (previous != requested)
         ((void (*)(id, SEL, id))objc_msgSend)(self, sel_registerName("willChangeValueForKey:"),
@@ -119,7 +119,7 @@ static float torch_get(id self, SEL selector)
     size_t size = sizeof(level);
     if (sysctlbyname("kern.fuxitorch", &level, &size, NULL, 0) ||
         size != sizeof(level) || level < 0 || level > 4) return 0.0f;
-    return (float)level / 4.0f;
+    return fuxi_torch_ui_encode((unsigned)level);
 }
 
 static bool torch_power_on(id self, SEL selector, id *error)

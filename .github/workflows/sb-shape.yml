@@ -7,6 +7,7 @@ on:
       - codex/adsp-battery
     paths:
       - userland/fuxi-shape/**
+      - tools/test-flashlight-levels.c
       - .github/workflows/sb-shape.yml
 permissions:
   contents: read
@@ -20,6 +21,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Check flashlight level mapping
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+              -Iuserland/fuxi-shape tools/test-flashlight-levels.c -o /tmp/fuxi-flashlight-levels
+          /tmp/fuxi-flashlight-levels
       - name: Build, sign ad hoc, check
         shell: bash
         run: |
