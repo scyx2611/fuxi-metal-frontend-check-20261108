@@ -110,6 +110,10 @@ jobs:
           (cd source && python3 tools/sync-fuxi-adsp.py --check && python3 tools/sync-fuxi-unixnu.py --check && python3 tools/sync-fuxi-backlight.py --check)
           (cd source && python3 tools/test-fuxi-prof.py)
           (cd source && python3 tools/test-fuxi-ram9g.py)
+          (cd source && python3 tools/sync-fuxi-wlan.py --check)
+          (cd source && python3 tools/test-fuxi-rpmh-shared.py)
+          (cd source && python3 tools/test-fuxi-wlan-m6i.py)
+          (cd source && python3 tools/test-fuxi-wlan-rails.py)
       - name: Build and audit kernel
         shell: bash
         run: |

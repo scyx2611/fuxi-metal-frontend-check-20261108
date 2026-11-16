@@ -1,9 +1,9 @@
 diff --git a/docs-lanes/adsp.md b/docs-lanes/adsp.md
 new file mode 100644
-index 0000000..b11da62
+index 0000000..1831310
 --- /dev/null
 +++ b/docs-lanes/adsp.md
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,98 @@
 +# Audio DSP and battery manager (`fuxiadsp`)
 +
 +Patch 0117 (`tools/sync-fuxi-adsp.py`, canonical sources `xnu/fuxi-adsp/`) starts the audio DSP (ADSP, LPASS) from XNU
@@ -21,8 +21,11 @@ index 0000000..b11da62
 +| 2 | also starts the DSP and brings up SMP2P, GLINK, the IPC router's service locator and the battery manager client (log only) |
 +| 3 | as 2, and SweetBattery publishes the battery manager's readings to powerd (phase 2) |
 +
-+`fuxiadsp=2` is refused (survey only) when `fuxiwlan` is set: both drive the apps RSC (`fuxi_rpmh_arb.h` is not wired
-+into `fuxi_wlan.c` yet, see audio.md "RPMh serialization").
++`fuxiadsp=2` is refused (survey only) when `fuxiwlan` is set until combined hardware validation is complete.
++Both drivers now hold the same blocking mutex in `fuxi_rpmh_shared.c` for the entire RSC transaction.
++An uncertain request or failed cleanup quarantines the shared RSC for the remainder of the boot.
++ADSP restores its IRQ-enable bit and clears its wait mask after completion; a timeout returns an error.
++The portable `fuxi_rpmh_arb.h` model remains separate from this production mutex.
 +
 +## Bring-up (mode 2)
 +
@@ -297,7 +300,7 @@ index c7d2b39..22b499a 100644
          if args.root_extents:
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..9c9b30b
+index 0000000..f0593b4
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
 @@ -0,0 +1,142 @@
@@ -321,10 +324,10 @@ index 0000000..9c9b30b
 +ROOT = Path(__file__).resolve().parents[1]
 +SRC = ROOT / 'xnu/fuxi-adsp'
 +PATCH = ROOT / 'xnu/patches/0117-fuxi-adsp.patch'
-+SOURCES = ('fuxi_adsp.c', 'fuxi_adsp_fw.c', 'fuxi_adsp_battery.c', 'fuxi_amp.c', 'fuxi_pmic.c', 'QcomSmem.c', 'QcomSmp2p.c', 'QcomGlink.c',
++SOURCES = ('fuxi_adsp.c', 'fuxi_adsp_fw.c', 'fuxi_adsp_battery.c', 'fuxi_amp.c', 'fuxi_pmic.c', 'fuxi_rpmh_shared.c', 'QcomSmem.c', 'QcomSmp2p.c', 'QcomGlink.c',
 +           'QcomMdt.c', 'QcomQmp.c', 'QcomRpmh.c', 'QcomQrtr.c', 'FatVolume.c', 'ShengBattmgr.c', 'ShengQrtr.c', 'GeniI2c.c')
 +HEADERS = ('QcomSmem.h', 'QcomSmp2p.h', 'QcomGlink.h', 'QcomMdt.h', 'QcomQmp.h', 'QcomRpmh.h', 'QcomScm.h', 'QcomQrtr.h',
-+           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h', 'fuxi_adsp_battery.h', 'GeniI2c.h')
++           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h', 'fuxi_adsp_battery.h', 'fuxi_rpmh_shared.h', 'GeniI2c.h')
 +MODIFIED = {'iokit/Kernel/arm/SweetBattery.cpp': ('0062-sweet-touch-power-battery.patch', 'SweetBattery.cpp')}
 +# bsd/dev/LICENSE.UniXNU-sheng already comes with 0098 (the GPU fence interrupt is adapted from sheng too); --check
 +# verifies that the local copy is the same text.
@@ -443,6 +446,44 @@ index 0000000..9c9b30b
 +
 +if __name__ == '__main__':
 +    main()
+diff --git a/tools/sync-fuxi-wlan.py b/tools/sync-fuxi-wlan.py
+new file mode 100644
+index 0000000..fdda29b
+--- /dev/null
++++ b/tools/sync-fuxi-wlan.py
+@@ -0,0 +1,32 @@
++import argparse
++import difflib
++from pathlib import Path
++import re
++
++root = Path(__file__).resolve().parents[1]
++source = root / 'xnu/fuxi-wlan/fuxi_wlan.c'
++patch = root / 'xnu/patches/0099-fuxi-wlan.patch'
++parser = argparse.ArgumentParser()
++parser.add_argument('--check', action='store_true')
++args = parser.parse_args()
++pattern = re.compile(r'^--- (?:a/bsd/dev/fuxi_wlan\.c|/dev/null)\n\+\+\+ b/bsd/dev/fuxi_wlan\.c\n@@ -0,0 \+1,\d+ @@\n', re.M)
++text = patch.read_text()
++matches = list(pattern.finditer(text))
++assert len(matches) == 1
++start = matches[0].start()
++end = text.find('\n--- ', matches[0].end())
++if end < 0:
++    end = len(text)
++else:
++    end += 1
++body = source.read_text()
++assert body.endswith('\n')
++original_path = matches[0].group(0).splitlines()[0][4:]
++replacement = ''.join(difflib.unified_diff([], body.splitlines(True), fromfile=original_path,
++                                            tofile='b/bsd/dev/fuxi_wlan.c'))
++expected = text[:start] + replacement + text[end:]
++if args.check:
++    assert text == expected, 'fuxi-wlan canonical source differs from 0099'
++else:
++    patch.write_text(expected, newline='\n')
++print('PASS: fuxi-wlan canonical source matches 0099')
 diff --git a/tools/test-fuxi-ram9g.py b/tools/test-fuxi-ram9g.py
 new file mode 100644
 index 0000000..a4f5a47
@@ -498,6 +539,204 @@ index 0000000..a4f5a47
 +else:
 +    raise AssertionError('unsupported geometry accepted')
 +print('PASS: adjacent banks, gaps, overflow, 5g/9g scratch separation and preserved root mapping')
+diff --git a/tools/test-fuxi-rpmh-shared.py b/tools/test-fuxi-rpmh-shared.py
+new file mode 100644
+index 0000000..e360b63
+--- /dev/null
++++ b/tools/test-fuxi-rpmh-shared.py
+@@ -0,0 +1,128 @@
++import os
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[1]
++sources = root / 'xnu/fuxi-adsp'
++shared = re.sub(r'^#include .*\n', '', (sources / 'fuxi_rpmh_shared.c').read_text(), flags=re.M)
++adsp = (sources / 'fuxi_adsp.c').read_text()
++vote = 'static int vote(' + adsp.split('static int vote(', 1)[1].split('/* ---- secure world calls ---- */', 1)[0]
++preamble = r'''
++#define FUXI 1
++#include <assert.h>
++#include <errno.h>
++#include <pthread.h>
++#include <sched.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "QcomRpmh.h"
++#include "fuxi_rpmh_shared.h"
++#define LCK_GRP_DECLARE(name,label) int name __attribute__((unused))
++#define LCK_MTX_DECLARE(name,group) pthread_mutex_t name=PTHREAD_MUTEX_INITIALIZER
++#define lck_mtx_lock pthread_mutex_lock
++#define lck_mtx_unlock pthread_mutex_unlock
++'''
++model = r'''
++#define FA_RSC_TCS 0xd00u
++struct fa_window {unsigned unused;};
++static struct fa_window gRsc;
++static int gTcs=-1;
++static unsigned gRscBits, gVoteLcx, gVoteLmx, gVoteDone;
++static QcomRscLayout gLayout;
++static QcomRpmhResource gLcx, gLmx;
++static uint32_t registers[0x4000/4];
++static unsigned writes, delays, triggers, stall, bad_cleanup;
++static uint32_t rd(struct fa_window *window, uint32_t offset) {
++    assert(window==&gRsc && !(offset&3) && offset<sizeof(registers));
++    return registers[offset/4];
++}
++static void wr(struct fa_window *window, uint32_t offset, uint32_t value) {
++    assert(window==&gRsc && !(offset&3) && offset<sizeof(registers));
++    assert(pthread_mutex_trylock(&fuxi_rpmh_mutex)==EBUSY);
++    writes++;
++    if(offset==FA_RSC_TCS+8) {registers[(FA_RSC_TCS+4)/4]&=~value; return;}
++    if(offset==FA_RSC_TCS+0x2a0+0x24 && !value && bad_cleanup && triggers) return;
++    registers[offset/4]=value;
++    if(offset==FA_RSC_TCS+0x2a0+0x24 && value==0x1010000) {
++        triggers++;
++        if(!stall) registers[(FA_RSC_TCS+4)/4]|=2;
++    }
++}
++static void delay(unsigned microseconds) {delays+=microseconds;}
++'''
++tests = r'''
++static unsigned active, sequences;
++static void *worker(void *context) {
++    const unsigned owner=(unsigned)(uintptr_t)context;
++    for(unsigned round=0;round<2000;round++) {
++        assert(!fuxi_rpmh_acquire());
++        assert(!__atomic_fetch_add(&active,1,__ATOMIC_RELAXED));
++        static unsigned command;
++        command=owner;
++        sched_yield();
++        assert(command==owner);
++        sequences++;
++        assert(__atomic_fetch_sub(&active,1,__ATOMIC_RELAXED)==1);
++        fuxi_rpmh_release(1);
++    }
++    return NULL;
++}
++static void fixture(void) {
++    fuxi_rpmh_failed=0;
++    memset(registers,0,sizeof(registers));
++    gLayout=qcom_rsc_layout(3u<<16);
++    gLcx.address=0x123400; gLmx.address=0x567800;
++    gTcs=-1; gRscBits=gVoteLcx=gVoteLmx=gVoteDone=0;
++    writes=delays=triggers=stall=bad_cleanup=0;
++    registers[FA_RSC_TCS/4]=0xa5;
++    registers[(FA_RSC_TCS+0x2a0+0x28)/4]=1;
++    registers[(FA_RSC_TCS+0x2c)/4]=0xdead;
++}
++int main(void) {
++    pthread_t workers[4];
++    for(uintptr_t index=0;index<4;index++) assert(!pthread_create(&workers[index],NULL,worker,(void *)(index+1)));
++    for(unsigned index=0;index<4;index++) assert(!pthread_join(workers[index],NULL));
++    assert(!active && sequences==8000 && !fuxi_rpmh_failed);
++    fixture(); assert(!vote(9,8));
++    assert(triggers==1 && gVoteDone && gVoteLcx==9 && gVoteLmx==8);
++    assert(registers[(FA_RSC_TCS+0x2a0+0x38)/4]==0x123400);
++    assert(registers[(FA_RSC_TCS+0x2a0+0x3c)/4]==9);
++    assert(registers[(FA_RSC_TCS+0x2a0+24+0x38)/4]==0x567800);
++    assert(registers[(FA_RSC_TCS+0x2a0+24+0x3c)/4]==8);
++    assert(registers[FA_RSC_TCS/4]==0xa5 && registers[(FA_RSC_TCS+0x2c)/4]==0xdead);
++    assert(!registers[(FA_RSC_TCS+0x2a0+0x20)/4] && !fuxi_rpmh_failed);
++    assert(!vote(0,0) && triggers==2 && !gVoteLcx && !gVoteLmx);
++    const unsigned offsets[]={0x24,0x2c,0x20};
++    for(unsigned index=0;index<3;index++) {
++        fixture(); registers[(FA_RSC_TCS+0x2a0+offsets[index])/4]=1;
++        assert(vote(1,1)==-EBUSY && !writes && !fuxi_rpmh_failed);
++    }
++    fixture(); registers[(FA_RSC_TCS+0x2a0+0x28)/4]=0;
++    assert(vote(1,1)==-EBUSY && !writes && !fuxi_rpmh_failed);
++    fixture(); registers[(FA_RSC_TCS+4)/4]=2;
++    assert(vote(1,1)==-EBUSY && !writes && !fuxi_rpmh_failed);
++    fixture(); registers[FA_RSC_TCS/4]=0xa7;
++    assert(!vote(1,1) && registers[FA_RSC_TCS/4]==0xa7);
++    fixture(); stall=1;
++    assert(vote(1,1)==-ETIMEDOUT && delays==100000 && fuxi_rpmh_failed && !gVoteDone);
++    unsigned old_writes=writes;
++    assert(vote(2,2)==-EIO && writes==old_writes);
++    fixture(); bad_cleanup=1;
++    assert(vote(1,1)==-EIO && fuxi_rpmh_failed && !gVoteDone);
++    assert(fuxi_rpmh_acquire()==-1);
++    puts("PASS: shared RSC mutex, concurrent owners, real ADSP transaction, cleanup, timeout and quarantine");
++    return 0;
++}
++'''
++with tempfile.TemporaryDirectory(prefix='fuxi-rpmh-shared-') as temporary:
++    directory = Path(temporary)
++    cfile = directory / 'shared.c'
++    binary = directory / 'shared'
++    cfile.write_text(preamble + shared + model + vote + tests)
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-g', '-Wall', '-Wextra', '-Werror',
++                    '-pthread', '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
++                    '-I' + str(sources), str(cfile), str(sources / 'QcomRpmh.c'), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
+diff --git a/tools/test-fuxi-wlan-m6i.py b/tools/test-fuxi-wlan-m6i.py
+index 12293f1..dbd7876 100755
+--- a/tools/test-fuxi-wlan-m6i.py
++++ b/tools/test-fuxi-wlan-m6i.py
+@@ -44,6 +44,16 @@ static bool enabled_present, bw_present;
+ static int enabled_arg, bw_arg;
+ static char logs[32768];
+ static size_t loglen;
++static unsigned rpmh_locked, rpmh_failed, rpmh_acquires, rpmh_releases;
++static int fuxi_rpmh_acquire(void) {
++    assert(!rpmh_locked);
++    if(rpmh_failed) return -1;
++    rpmh_locked=1; rpmh_acquires++; return 0;
++}
++static void fuxi_rpmh_release(int healthy) {
++    assert(rpmh_locked); rpmh_locked=0; rpmh_releases++;
++    if(!healthy) rpmh_failed=1;
++}
+ static void test_printf(const char *fmt, ...) {
+     va_list ap; va_start(ap,fmt);
+     int n=vsnprintf(logs+loglen,sizeof(logs)-loglen,fmt,ap);
+@@ -60,8 +70,9 @@ static uint32_t usb_rd(uintptr_t base, uint32_t off) {
+         assert(!(off&3) && off<=WL_CMDDB_BYTES-4);
+         return db[off] | (uint32_t)db[off+1]<<8 | (uint32_t)db[off+2]<<16 | (uint32_t)db[off+3]<<24;
+     }
+-    if(base==RH_DRV_PA) { assert(off==0 || off==12); return off ? cfg : revision; }
++    if(base==RH_DRV_PA) { assert(rpmh_locked && (off==0 || off==12)); return off ? cfg : revision; }
+     if(base==RH_TCS_PA) {
++        assert(rpmh_locked);
+         assert(!(off&3) && off/4<1024);
+         if(off>=0x40 && off<=0x40+15*24 && (off-0x40)%24==0) status_reads++;
+         return rsc[off/4];
+@@ -70,6 +81,7 @@ static uint32_t usb_rd(uintptr_t base, uint32_t off) {
+     assert(base==WL_GCC); return 0;
+ }
+ static void ts_wr(uintptr_t base, uint32_t off, uint32_t v) {
++    assert(rpmh_locked);
+     assert(base==RH_TCS_PA && off/4<1024 && !(off&3));
+     if(fw_faults) return;
+     if(base+off==fault_write) { fw_faults++; return; }
+@@ -130,6 +142,8 @@ static void put16(unsigned at, uint16_t v) {
+ }
+ static void put32(unsigned at, uint32_t v) { put16(at,v); put16(at+2,v>>16); }
+ static void fixture(void) {
++    assert(!rpmh_locked);
++    rpmh_failed=rpmh_acquires=rpmh_releases=0;
+     memset(db,0,sizeof(db)); memset(rsc,0,sizeof(rsc));
+     memset(wl3_report,0,sizeof(wl3_report)); memset(wl5_report,0,sizeof(wl5_report));
+     fw_faults=wl3_faults=writes=triggers=delays=nstages=bhi=aborts=nsent=0;
+@@ -342,7 +356,13 @@ int main(void) {
+     }
+     fixture(); enabled_present=true; enabled_arg=0; wl_icc_test_expect_votes=false;
+     fw_run(22); assert(bhi==1 && !triggers && !wl_icc_acks);
+-    puts("M6i/M6j production cmd-db/encoding/VCD/TCS/ordering/failure tests passed");
++    fixture(); rpmh_failed=1;
++    assert(rh_send(0,0x40000,1000)==1 && !writes && !triggers && !rpmh_locked);
++    fixture(); cmd_status=0x100;
++    assert(rh_send(0,0x40000,1000)==2 && rpmh_failed && rpmh_acquires==rpmh_releases);
++    unsigned before_poison=writes;
++    assert(rh_send(1,0x40000,1000)==1 && writes==before_poison && !rpmh_locked);
++    puts("M6i/M6j production cmd-db/encoding/VCD/TCS/ordering/failure/shared-lock tests passed");
+     return 0;
+ }
+ '''
 diff --git a/xnu/fuxi-adreno/fuxi_gpu_scanout.inc b/xnu/fuxi-adreno/fuxi_gpu_scanout.inc
 index 5d17fe5..6c37436 100644
 --- a/xnu/fuxi-adreno/fuxi_gpu_scanout.inc
@@ -4275,10 +4514,10 @@ index 0000000..4be20a9
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp.c b/xnu/fuxi-adsp/fuxi_adsp.c
 new file mode 100644
-index 0000000..07be418
+index 0000000..5d7916f
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp.c
-@@ -0,0 +1,861 @@
+@@ -0,0 +1,896 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 + *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -4301,7 +4540,7 @@ index 0000000..07be418
 + * IPCC (SPI 229) and RSC (SPI 5) lines are masked in the distributor first: a level line left enabled by the boot stages would
 + * otherwise storm sleh's ownerless EOI path. MMIO and the carveouts are mapped with kernel_map VA and pmap entries (never
 + * ml_io_map: its 8 MiB submap is KMA_NOFAIL). The firmware comes from modem_a in place (fuxi_adsp_fw.c). Refused when fuxiwlan is
-+ * set: the WLAN driver drives the same RSC without a shared lock (docs-lanes/audio.md, RPMh serialization).
++ * set until combined ADSP/WLAN hardware validation is complete; both now use fuxi_rpmh_shared's mutex.
 + *
 + * One kernel thread owns every step and all protocol state; clients (ShengAdsp.h) register channels and queue sends from any
 + * thread, and their callbacks run on this thread (they must not block or call sheng_adsp_send). */
@@ -4329,6 +4568,7 @@ index 0000000..07be418
 +#include "QcomSmem.h"
 +#include "QcomSmp2p.h"
 +#include "ShengAdsp.h"
++#include "fuxi_rpmh_shared.h"
 +
 +extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 +extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
@@ -4631,23 +4871,57 @@ index 0000000..07be418
 +}
 +static int vote(uint32_t lcx, uint32_t lmx)
 +{
++    if (fuxi_rpmh_acquire()) return -EIO;
 +    if (gTcs < 0) {
 +        gTcs = 1;
 +        gRscBits = 1u << gTcs;
-+        wr(&gRsc, FA_RSC_TCS + 0, rd(&gRsc, FA_RSC_TCS + 0) | gRscBits); /* IRQ_ENABLE for our TCS: the status bit latches */
++    }
++    const uint32_t base = (unsigned)gTcs * gLayout.tcs_stride;
++    if (!rd(&gRsc, FA_RSC_TCS + base + gLayout.status) ||
++        rd(&gRsc, FA_RSC_TCS + base + gLayout.control) ||
++        rd(&gRsc, FA_RSC_TCS + base + gLayout.cmd_enable) ||
++        rd(&gRsc, FA_RSC_TCS + base + gLayout.wait_for_cmpl) ||
++        (rd(&gRsc, FA_RSC_TCS + gLayout.irq_status) & gRscBits)) {
++        fuxi_rpmh_release(1);
++        return -EBUSY;
 +    }
 +    const uint32_t addresses[2] = {gLcx.address, gLmx.address}, values[2] = {lcx, lmx};
 +    QcomRpmhWrite writes[16];
 +    const unsigned n = qcom_rpmh_active_request(&gLayout, (unsigned)gTcs, addresses, values, 2, writes, 16);
-+    if (!n) return -22;
++    if (!n) {
++        fuxi_rpmh_release(1);
++        return -EINVAL;
++    }
++    const uint32_t irq_enable = rd(&gRsc, FA_RSC_TCS);
++    wr(&gRsc, FA_RSC_TCS, irq_enable | gRscBits);
 +    for (unsigned i = 0; i < n; ++i) wr(&gRsc, FA_RSC_TCS + writes[i].offset, writes[i].value);
 +    int done = 0;
 +    for (unsigned t = 0; t < 1000 && !done; ++t) { /* up to ~100 ms */
 +        done = (rd(&gRsc, FA_RSC_TCS + gLayout.irq_status) & gRscBits) != 0;
 +        if (!done) delay(100);
 +    }
++    if (!done) {
++        gVoteDone = 0;
++        printf("FUXI ADSP: rpmh vote timed out; shared RSC quarantined\n");
++        fuxi_rpmh_release(0);
++        return -ETIMEDOUT;
++    }
 +    const unsigned m = qcom_rpmh_finish(&gLayout, (unsigned)gTcs, writes, 16);
 +    for (unsigned i = 0; i < m; ++i) wr(&gRsc, FA_RSC_TCS + writes[i].offset, writes[i].value);
++    wr(&gRsc, FA_RSC_TCS + base + gLayout.wait_for_cmpl, 0);
++    wr(&gRsc, FA_RSC_TCS, (rd(&gRsc, FA_RSC_TCS) & ~gRscBits) | (irq_enable & gRscBits));
++    const int healthy = !rd(&gRsc, FA_RSC_TCS + base + gLayout.control) &&
++        !rd(&gRsc, FA_RSC_TCS + base + gLayout.cmd_enable) &&
++        !rd(&gRsc, FA_RSC_TCS + base + gLayout.wait_for_cmpl) &&
++        !(rd(&gRsc, FA_RSC_TCS + gLayout.irq_status) & gRscBits) &&
++        rd(&gRsc, FA_RSC_TCS + base + gLayout.status) &&
++        (rd(&gRsc, FA_RSC_TCS) & gRscBits) == (irq_enable & gRscBits);
++    fuxi_rpmh_release(healthy);
++    if (!healthy) {
++        gVoteDone = 0;
++        printf("FUXI ADSP: rpmh cleanup failed; shared RSC quarantined\n");
++        return -EIO;
++    }
 +    gVoteLcx = lcx; gVoteLmx = lmx; gVoteDone = (uint32_t)done;
 +    printf("FUXI ADSP: rpmh vote lcx=%u lmx=%u done=%d\n", lcx, lmx, done);
 +    return 0;
@@ -5096,7 +5370,7 @@ index 0000000..07be418
 +}
 +
 +/* The mode that runs: 0 off, 1 survey, 2 start the DSP and log the battery manager, 3 also feed SweetBattery. 2 and 3 fall back to
-+ * 1 with fuxiwlan (both drive the apps RSC without a shared lock). Read again on every call, so SweetBattery can ask before or
++ * 1 with fuxiwlan until combined hardware validation. Read again on every call, so SweetBattery can ask before or
 + * after fuxi_adsp_init ran. */
 +unsigned fuxi_adsp_mode(void);
 +unsigned fuxi_adsp_mode(void)
@@ -5125,7 +5399,7 @@ index 0000000..07be418
 +    fuxi_amp_init(); /* the speaker amplifiers' own switch (fuxi_amp.c, fuxiamp / ADT fuxi,amp), independent of fuxiadsp */
 +    if (!run || gStarted) return;
 +    if (asked >= 2 && run < 2) {
-+        printf("FUXI ADSP: fuxiadsp=%u refused with fuxiwlan (both drive the apps RSC without a shared lock); surveying only\n", asked);
++        printf("FUXI ADSP: fuxiadsp=%u refused with fuxiwlan (combined hardware validation pending); surveying only\n", asked);
 +    }
 +    gStarted = 1;
 +    if (run >= 2) {
@@ -6127,6 +6401,50 @@ index 0000000..b70b9b0
 +    fp_survey(7, 0xf200, "haptic-boost");
 +}
 +#endif
+diff --git a/xnu/fuxi-adsp/fuxi_rpmh_shared.c b/xnu/fuxi-adsp/fuxi_rpmh_shared.c
+new file mode 100644
+index 0000000..8043a79
+--- /dev/null
++++ b/xnu/fuxi-adsp/fuxi_rpmh_shared.c
+@@ -0,0 +1,25 @@
++#include <pexpert/arm64/board_config.h>
++#if defined(FUXI)
++#include <kern/locks.h>
++#include "fuxi_rpmh_shared.h"
++
++static LCK_GRP_DECLARE(fuxi_rpmh_group, "fuxi-rpmh");
++static LCK_MTX_DECLARE(fuxi_rpmh_mutex, &fuxi_rpmh_group);
++static int fuxi_rpmh_failed;
++
++int fuxi_rpmh_acquire(void)
++{
++    lck_mtx_lock(&fuxi_rpmh_mutex);
++    if (fuxi_rpmh_failed) {
++        lck_mtx_unlock(&fuxi_rpmh_mutex);
++        return -1;
++    }
++    return 0;
++}
++
++void fuxi_rpmh_release(int healthy)
++{
++    if (!healthy) fuxi_rpmh_failed = 1;
++    lck_mtx_unlock(&fuxi_rpmh_mutex);
++}
++#endif
+diff --git a/xnu/fuxi-adsp/fuxi_rpmh_shared.h b/xnu/fuxi-adsp/fuxi_rpmh_shared.h
+new file mode 100644
+index 0000000..fd499b2
+--- /dev/null
++++ b/xnu/fuxi-adsp/fuxi_rpmh_shared.h
+@@ -0,0 +1,7 @@
++#ifndef FUXI_RPMH_SHARED_H
++#define FUXI_RPMH_SHARED_H
++
++int fuxi_rpmh_acquire(void);
++void fuxi_rpmh_release(int healthy);
++
++#endif
 diff --git a/xnu/fuxi-h1/fuxi_keys.c b/xnu/fuxi-h1/fuxi_keys.c
 index 8f1d60f..e71e7c2 100644
 --- a/xnu/fuxi-h1/fuxi_keys.c
@@ -6613,6 +6931,53 @@ index c8376e4..d363e22 100644
  /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
  int sweet_ufs_rootdev(dev_t *dev);
  
+diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
+index 1b46ea1..d700472 100644
+--- a/xnu/fuxi-wlan/fuxi_wlan.c
++++ b/xnu/fuxi-wlan/fuxi_wlan.c
+@@ -78,6 +78,7 @@
+ #include <vm/pmap.h>
+ #include <arm/caches_internal.h>
+ #include "sweet_spmi_bus.h"
++#include "fuxi_rpmh_shared.h"
+ /* osfmk/vm/pmap.h declares these under MACH_KERNEL_PRIVATE only; bsd/ cannot
+  * see them, but they are in the same kernel image (M6k fuxiwlanprobe=nc). */
+ /* pexpert exposes the string-only parser under XNU_KERNEL_PRIVATE. */
+@@ -258,8 +259,8 @@ ts_gpio(unsigned n, unsigned func, unsigned pull, unsigned ma, int out)
+ }
+ 
+ /* ACTIVE TCS transport shared by the existing WLAN regulator votes and M6i.
+- * RSC v3: TCS stride 672, command stride 24 (rpmh-rsc.c). No other XNU
+- * code drives the fuxi apps RSC. Never touch inherited busy TCS state; an
++ * RSC v3: TCS stride 672, command stride 24 (rpmh-rsc.c). The ADSP uses the
++ * same shared mutex. Never touch inherited busy TCS state; an
+  * uncertain transaction is quarantined for the session. */
+ #define RH_STRIDE 0x2a0u
+ #define RH_WAIT   0x20u
+@@ -280,7 +281,7 @@ rh_wr(uint32_t off, uint32_t v)
+ struct wl_rh_cmd { uint32_t addr, data, wait; };
+ static bool rh_poisoned;
+ static uint32_t
+-rh_send_request(unsigned t, const struct wl_rh_cmd *cmd, unsigned n, bool regulator)
++rh_send_request_locked(unsigned t, const struct wl_rh_cmd *cmd, unsigned n, bool regulator)
+ {
+ 	/* DRV2 has three ACTIVE TCSs; preserve all sleep/wake/other slots. */
+ 	if (t >= 3 || !n || n > 16 || rh_poisoned || fw_faults) { return 1; }
+@@ -352,6 +353,14 @@ rh_send_request(unsigned t, const struct wl_rh_cmd *cmd, unsigned n, bool regula
+ 	return 0;
+ }
+ static uint32_t
++rh_send_request(unsigned t, const struct wl_rh_cmd *cmd, unsigned n, bool regulator)
++{
++	if (fuxi_rpmh_acquire()) { return 1; }
++	uint32_t result = rh_send_request_locked(t, cmd, n, regulator);
++	fuxi_rpmh_release(!rh_poisoned);
++	return result;
++}
++static uint32_t
+ rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
+ {
+ 	/* BCM requests wait for the TCS IRQ and request responses on all cmds. */
 diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
 index 0ca2838..0d215ed 100644
 --- a/xnu/patches/0098-fuxi-native-adreno-abi.patch
@@ -6775,6 +7140,62 @@ index 0ca2838..0d215ed 100644
  + /* Sent: clear the request unless a newer level arrived meanwhile (it stays pending for the next window). */
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
+diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
+index d21bf85..624ed26 100644
+--- a/xnu/patches/0099-fuxi-wlan.patch
++++ b/xnu/patches/0099-fuxi-wlan.patch
+@@ -29,7 +29,7 @@
+  	sweet_sample_start();
+ --- a/bsd/dev/fuxi_wlan.c
+ +++ b/bsd/dev/fuxi_wlan.c
+-@@ -0,0 +1,5315 @@
++@@ -0,0 +1,5324 @@
+ +/*
+ + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
+ + * assignment and a read-only MHI/BHI register dump from XNU.
+@@ -110,6 +110,7 @@
+ +#include <vm/pmap.h>
+ +#include <arm/caches_internal.h>
+ +#include "sweet_spmi_bus.h"
+++#include "fuxi_rpmh_shared.h"
+ +/* osfmk/vm/pmap.h declares these under MACH_KERNEL_PRIVATE only; bsd/ cannot
+ + * see them, but they are in the same kernel image (M6k fuxiwlanprobe=nc). */
+ +/* pexpert exposes the string-only parser under XNU_KERNEL_PRIVATE. */
+@@ -290,8 +291,8 @@
+ +}
+ +
+ +/* ACTIVE TCS transport shared by the existing WLAN regulator votes and M6i.
+-+ * RSC v3: TCS stride 672, command stride 24 (rpmh-rsc.c). No other XNU
+-+ * code drives the fuxi apps RSC. Never touch inherited busy TCS state; an
+++ * RSC v3: TCS stride 672, command stride 24 (rpmh-rsc.c). The ADSP uses the
+++ * same shared mutex. Never touch inherited busy TCS state; an
+ + * uncertain transaction is quarantined for the session. */
+ +#define RH_STRIDE 0x2a0u
+ +#define RH_WAIT   0x20u
+@@ -312,7 +313,7 @@
+ +struct wl_rh_cmd { uint32_t addr, data, wait; };
+ +static bool rh_poisoned;
+ +static uint32_t
+-+rh_send_request(unsigned t, const struct wl_rh_cmd *cmd, unsigned n, bool regulator)
+++rh_send_request_locked(unsigned t, const struct wl_rh_cmd *cmd, unsigned n, bool regulator)
+ +{
+ +	/* DRV2 has three ACTIVE TCSs; preserve all sleep/wake/other slots. */
+ +	if (t >= 3 || !n || n > 16 || rh_poisoned || fw_faults) { return 1; }
+@@ -384,6 +385,14 @@
+ +	return 0;
+ +}
+ +static uint32_t
+++rh_send_request(unsigned t, const struct wl_rh_cmd *cmd, unsigned n, bool regulator)
+++{
+++	if (fuxi_rpmh_acquire()) { return 1; }
+++	uint32_t result = rh_send_request_locked(t, cmd, n, regulator);
+++	fuxi_rpmh_release(!rh_poisoned);
+++	return result;
+++}
+++static uint32_t
+ +rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
+ +{
+ +	/* BCM requests wait for the TCS IRQ and request responses on all cmds. */
 diff --git a/xnu/patches/0103-fuxi-kernel-h1.patch b/xnu/patches/0103-fuxi-kernel-h1.patch
 index 39be642..fac61cc 100644
 --- a/xnu/patches/0103-fuxi-kernel-h1.patch
@@ -7340,13 +7761,13 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..2476eae
+index 0000000..cfaaaf6
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,5134 @@
+@@ -0,0 +1,5208 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
-+@@ -121,6 +121,22 @@
++@@ -121,6 +121,23 @@
 + bsd/dev/sweet_rpmh.c			standard
 + bsd/dev/sweet_spmi.c			standard
 + bsd/dev/sweet_usb.c			standard
@@ -7355,6 +7776,7 @@ index 0000000..2476eae
 ++bsd/dev/fuxi_adsp_battery.c		standard
 ++bsd/dev/fuxi_amp.c			standard
 ++bsd/dev/fuxi_pmic.c			standard
+++bsd/dev/fuxi_rpmh_shared.c		standard
 ++bsd/dev/QcomSmem.c			standard
 ++bsd/dev/QcomSmp2p.c			standard
 ++bsd/dev/QcomGlink.c			standard
@@ -7371,7 +7793,7 @@ index 0000000..2476eae
 + bsd/dev/unix_startup.c			standard
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp.c
-+@@ -0,0 +1,861 @@
++@@ -0,0 +1,896 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 ++ *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -7394,7 +7816,7 @@ index 0000000..2476eae
 ++ * IPCC (SPI 229) and RSC (SPI 5) lines are masked in the distributor first: a level line left enabled by the boot stages would
 ++ * otherwise storm sleh's ownerless EOI path. MMIO and the carveouts are mapped with kernel_map VA and pmap entries (never
 ++ * ml_io_map: its 8 MiB submap is KMA_NOFAIL). The firmware comes from modem_a in place (fuxi_adsp_fw.c). Refused when fuxiwlan is
-++ * set: the WLAN driver drives the same RSC without a shared lock (docs-lanes/audio.md, RPMh serialization).
+++ * set until combined ADSP/WLAN hardware validation is complete; both now use fuxi_rpmh_shared's mutex.
 ++ *
 ++ * One kernel thread owns every step and all protocol state; clients (ShengAdsp.h) register channels and queue sends from any
 ++ * thread, and their callbacks run on this thread (they must not block or call sheng_adsp_send). */
@@ -7422,6 +7844,7 @@ index 0000000..2476eae
 ++#include "QcomSmem.h"
 ++#include "QcomSmp2p.h"
 ++#include "ShengAdsp.h"
+++#include "fuxi_rpmh_shared.h"
 ++
 ++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 ++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
@@ -7724,23 +8147,57 @@ index 0000000..2476eae
 ++}
 ++static int vote(uint32_t lcx, uint32_t lmx)
 ++{
+++    if (fuxi_rpmh_acquire()) return -EIO;
 ++    if (gTcs < 0) {
 ++        gTcs = 1;
 ++        gRscBits = 1u << gTcs;
-++        wr(&gRsc, FA_RSC_TCS + 0, rd(&gRsc, FA_RSC_TCS + 0) | gRscBits); /* IRQ_ENABLE for our TCS: the status bit latches */
+++    }
+++    const uint32_t base = (unsigned)gTcs * gLayout.tcs_stride;
+++    if (!rd(&gRsc, FA_RSC_TCS + base + gLayout.status) ||
+++        rd(&gRsc, FA_RSC_TCS + base + gLayout.control) ||
+++        rd(&gRsc, FA_RSC_TCS + base + gLayout.cmd_enable) ||
+++        rd(&gRsc, FA_RSC_TCS + base + gLayout.wait_for_cmpl) ||
+++        (rd(&gRsc, FA_RSC_TCS + gLayout.irq_status) & gRscBits)) {
+++        fuxi_rpmh_release(1);
+++        return -EBUSY;
 ++    }
 ++    const uint32_t addresses[2] = {gLcx.address, gLmx.address}, values[2] = {lcx, lmx};
 ++    QcomRpmhWrite writes[16];
 ++    const unsigned n = qcom_rpmh_active_request(&gLayout, (unsigned)gTcs, addresses, values, 2, writes, 16);
-++    if (!n) return -22;
+++    if (!n) {
+++        fuxi_rpmh_release(1);
+++        return -EINVAL;
+++    }
+++    const uint32_t irq_enable = rd(&gRsc, FA_RSC_TCS);
+++    wr(&gRsc, FA_RSC_TCS, irq_enable | gRscBits);
 ++    for (unsigned i = 0; i < n; ++i) wr(&gRsc, FA_RSC_TCS + writes[i].offset, writes[i].value);
 ++    int done = 0;
 ++    for (unsigned t = 0; t < 1000 && !done; ++t) { /* up to ~100 ms */
 ++        done = (rd(&gRsc, FA_RSC_TCS + gLayout.irq_status) & gRscBits) != 0;
 ++        if (!done) delay(100);
 ++    }
+++    if (!done) {
+++        gVoteDone = 0;
+++        printf("FUXI ADSP: rpmh vote timed out; shared RSC quarantined\n");
+++        fuxi_rpmh_release(0);
+++        return -ETIMEDOUT;
+++    }
 ++    const unsigned m = qcom_rpmh_finish(&gLayout, (unsigned)gTcs, writes, 16);
 ++    for (unsigned i = 0; i < m; ++i) wr(&gRsc, FA_RSC_TCS + writes[i].offset, writes[i].value);
+++    wr(&gRsc, FA_RSC_TCS + base + gLayout.wait_for_cmpl, 0);
+++    wr(&gRsc, FA_RSC_TCS, (rd(&gRsc, FA_RSC_TCS) & ~gRscBits) | (irq_enable & gRscBits));
+++    const int healthy = !rd(&gRsc, FA_RSC_TCS + base + gLayout.control) &&
+++        !rd(&gRsc, FA_RSC_TCS + base + gLayout.cmd_enable) &&
+++        !rd(&gRsc, FA_RSC_TCS + base + gLayout.wait_for_cmpl) &&
+++        !(rd(&gRsc, FA_RSC_TCS + gLayout.irq_status) & gRscBits) &&
+++        rd(&gRsc, FA_RSC_TCS + base + gLayout.status) &&
+++        (rd(&gRsc, FA_RSC_TCS) & gRscBits) == (irq_enable & gRscBits);
+++    fuxi_rpmh_release(healthy);
+++    if (!healthy) {
+++        gVoteDone = 0;
+++        printf("FUXI ADSP: rpmh cleanup failed; shared RSC quarantined\n");
+++        return -EIO;
+++    }
 ++    gVoteLcx = lcx; gVoteLmx = lmx; gVoteDone = (uint32_t)done;
 ++    printf("FUXI ADSP: rpmh vote lcx=%u lmx=%u done=%d\n", lcx, lmx, done);
 ++    return 0;
@@ -8189,7 +8646,7 @@ index 0000000..2476eae
 ++}
 ++
 ++/* The mode that runs: 0 off, 1 survey, 2 start the DSP and log the battery manager, 3 also feed SweetBattery. 2 and 3 fall back to
-++ * 1 with fuxiwlan (both drive the apps RSC without a shared lock). Read again on every call, so SweetBattery can ask before or
+++ * 1 with fuxiwlan until combined hardware validation. Read again on every call, so SweetBattery can ask before or
 ++ * after fuxi_adsp_init ran. */
 ++unsigned fuxi_adsp_mode(void);
 ++unsigned fuxi_adsp_mode(void)
@@ -8218,7 +8675,7 @@ index 0000000..2476eae
 ++    fuxi_amp_init(); /* the speaker amplifiers' own switch (fuxi_amp.c, fuxiamp / ADT fuxi,amp), independent of fuxiadsp */
 ++    if (!run || gStarted) return;
 ++    if (asked >= 2 && run < 2) {
-++        printf("FUXI ADSP: fuxiadsp=%u refused with fuxiwlan (both drive the apps RSC without a shared lock); surveying only\n", asked);
+++        printf("FUXI ADSP: fuxiadsp=%u refused with fuxiwlan (combined hardware validation pending); surveying only\n", asked);
 ++    }
 ++    gStarted = 1;
 ++    if (run >= 2) {
@@ -9169,6 +9626,34 @@ index 0000000..2476eae
 ++    fp_survey(7, 0xf000, "haptic-config");
 ++    fp_survey(7, 0xf100, "haptic-pattern");
 ++    fp_survey(7, 0xf200, "haptic-boost");
+++}
+++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_rpmh_shared.c
++@@ -0,0 +1,25 @@
+++#include <pexpert/arm64/board_config.h>
+++#if defined(FUXI)
+++#include <kern/locks.h>
+++#include "fuxi_rpmh_shared.h"
+++
+++static LCK_GRP_DECLARE(fuxi_rpmh_group, "fuxi-rpmh");
+++static LCK_MTX_DECLARE(fuxi_rpmh_mutex, &fuxi_rpmh_group);
+++static int fuxi_rpmh_failed;
+++
+++int fuxi_rpmh_acquire(void)
+++{
+++    lck_mtx_lock(&fuxi_rpmh_mutex);
+++    if (fuxi_rpmh_failed) {
+++        lck_mtx_unlock(&fuxi_rpmh_mutex);
+++        return -1;
+++    }
+++    return 0;
+++}
+++
+++void fuxi_rpmh_release(int healthy)
+++{
+++    if (!healthy) fuxi_rpmh_failed = 1;
+++    lck_mtx_unlock(&fuxi_rpmh_mutex);
 ++}
 ++#endif
 +--- /dev/null
@@ -12093,6 +12578,16 @@ index 0000000..2476eae
 ++#ifdef __cplusplus
 ++}
 ++#endif
+++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_rpmh_shared.h
++@@ -0,0 +1,7 @@
+++#ifndef FUXI_RPMH_SHARED_H
+++#define FUXI_RPMH_SHARED_H
+++
+++int fuxi_rpmh_acquire(void);
+++void fuxi_rpmh_release(int healthy);
+++
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/GeniI2c.h
