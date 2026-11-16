@@ -209,21 +209,29 @@ static bool fa_append(char *line, size_t size, size_t *used, const char *format,
 
 static bool fa_log(const struct fa_snapshot *snapshot, unsigned sample, uint64_t begin_ms, uint64_t now_ms)
 {
+    enum { FA_LOG_BYTES = 200 };
+    _Static_assert(sizeof(fa_fields) / sizeof(fa_fields[0]) == 32, "battery audit snapshot requires 32 fields");
     static const char *const results[] = {"match-error", "service-missing", "read-error", "dictionary-error", "ok"};
     static const char *const unknown[] = {"unknown", "", "unknown(type)", "unknown(non-integer)",
         "unknown(number-conversion)", "unknown(parent-type)"};
-    char line[4096];
+    char line[FA_LOG_BYTES + 1];
     size_t used = 0;
+    if (!sample || sample > FA_SAMPLE_LIMIT) return false;
     if (!fa_append(line, sizeof(line), &used,
-        "fuxi: SpringBoard: battery-audit sample=%u begin_ms=%" PRIu64 " now_ms=%" PRIu64
-        " clock=mach_absolute_time_ms result=%s coherence=unestablished publication_sequence=unknown rc=",
-        sample, begin_ms, now_ms, results[snapshot->result])) return false;
+        "fuxi: SpringBoard: battery-audit sample=%u now_ms=%" PRIu64 " begin_ms=%" PRIu64 " result=%s rc=",
+        sample, now_ms, begin_ms, results[snapshot->result])) return false;
     if (snapshot->read_attempted) {
         if (!fa_append(line, sizeof(line), &used, "%d", snapshot->read_result)) return false;
     } else if (!fa_append(line, sizeof(line), &used, "unknown")) return false;
+    if (!fa_append(line, sizeof(line), &used,
+        " clock=mach_absolute_time_ms coherence=unestablished fmt=2\n")) return false;
+    if (write(2, line, used) != (ssize_t)used) return false;
     for (size_t index = 0; index < sizeof(fa_fields) / sizeof(fa_fields[0]); index++) {
         const struct fa_value *value = &snapshot->values[index];
-        if (!fa_append(line, sizeof(line), &used, " %s=", fa_fields[index].label)) return false;
+        used = 0;
+        if (!fa_append(line, sizeof(line), &used,
+            "fuxi: SpringBoard: battery-audit sample=%u now_ms=%" PRIu64 " field=%s value=",
+            sample, now_ms, fa_fields[index].label)) return false;
         if (value->state != FA_VALID) {
             if (!fa_append(line, sizeof(line), &used, "%s", unknown[value->state])) return false;
         } else if (fa_fields[index].kind == FA_BOOLEAN) {
@@ -231,9 +239,9 @@ static bool fa_log(const struct fa_snapshot *snapshot, unsigned sample, uint64_t
         } else if (fa_fields[index].kind == FA_DICTIONARY) {
             if (!fa_append(line, sizeof(line), &used, "dictionary(%" PRId64 ")", value->number)) return false;
         } else if (!fa_append(line, sizeof(line), &used, "%" PRId64, value->number)) return false;
+        if (!fa_append(line, sizeof(line), &used, "\n")) return false;
+        if (write(2, line, used) != (ssize_t)used) return false;
     }
-    if (!fa_append(line, sizeof(line), &used, "\n")) return false;
-    (void)write(2, line, used);
     return true;
 }
 
@@ -243,8 +251,8 @@ static void *fa_worker(void *context)
     struct fa_snapshot previous = {0};
     unsigned samples = 0, changes = 0, lines = 0;
     const char *reason = "sample-limit";
-    fa_say("fuxi: SpringBoard: battery-audit enabled samples<=120 interval_ms=2000 change_lines<=32"
-        " clock=mach_absolute_time_ms publication_sequence=unknown coherence=unestablished\n");
+    fa_say("fuxi: SpringBoard: battery-audit enabled samples<=120 interval_ms=2000 snapshots<=32"
+        " rows_per_snapshot=33 data_lines<=1056 line_bytes<=200 publication_sequence=unknown coherence=unestablished\n");
     while (samples < FA_SAMPLE_LIMIT) {
         uint64_t begin_ms, now_ms;
         if (!fa_now_ms(&begin_ms)) { reason = "clock-error"; break; }
@@ -254,7 +262,7 @@ static void *fa_worker(void *context)
         if (samples == 1 || fa_changed(&previous, &current)) {
             changes++;
             if (lines < FA_CHANGE_LIMIT) {
-                if (!fa_log(&current, samples, begin_ms, now_ms)) { reason = "log-size-error"; break; }
+                if (!fa_log(&current, samples, begin_ms, now_ms)) { reason = "log-error"; break; }
                 lines++;
             }
         }
@@ -263,7 +271,7 @@ static void *fa_worker(void *context)
         const struct timespec delay = {2, 0};
         if (nanosleep(&delay, NULL) != 0) { reason = "sleep-error"; break; }
     }
-    fa_say("fuxi: SpringBoard: battery-audit done samples=%u changes=%u change_lines=%u reason=%s"
+    fa_say("fuxi: SpringBoard: battery-audit done samples=%u changes=%u change_snapshots=%u reason=%s"
         " coherence=unestablished\n", samples, changes, lines, reason);
     return NULL;
 }
