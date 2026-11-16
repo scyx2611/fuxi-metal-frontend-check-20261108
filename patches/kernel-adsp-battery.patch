@@ -1125,10 +1125,10 @@ index 0000000..6d32645
 +本輪交付涵蓋 boot 診斷與可抽出的預備序列，iOS UI 觸覺 hook 待後續整合。
 diff --git a/docs-lanes/pmic-torch.md b/docs-lanes/pmic-torch.md
 new file mode 100644
-index 0000000..1dee5fc
+index 0000000..a985607
 --- /dev/null
 +++ b/docs-lanes/pmic-torch.md
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,58 @@
 +# PM8550 torch control
 +
 +`fuxi,pmic=1` surveys the PMIC. Mode 2 runs one 40 mA, 80 ms pulse with a
@@ -1168,6 +1168,25 @@ index 0000000..1dee5fc
 +The survey also reads haptic boost offset 0x41 and additional haptic
 +configuration offsets. The boost channel is owner 3. No haptic writes are
 +introduced by this change.
++
++## 2026-11-16 shutdown readback checkpoint
++
++The iter3 device audit ended after nine completed pulses. The failing pulse
++returned `-6`: both disable writes returned success, but the first channel
++readback was `1` while the module readback was `0`. The later stopped survey
++read both as zero. Its 80 ms sleep measured 81.020 ms. This establishes a
++shutdown readback mismatch, not a proven thermal fault or a fully identified
++SPMI/hardware cause.
++
++The next experiment retains the original enable sequence, 80 ms pulse,
++`0x8a` timer, current limits and reboot-only failure latch. Shutdown now
++requires two consecutive channel/module off observations, with at most four
++pairs and 1 ms waits between pairs. A read failure aborts confirmation. Fault
++status is checked again after confirmation, before saved configuration is
++restored. Exhaustion retains the timer and waits for its deadline as before;
++there is no re-enable or failure-latch reset. Host models exercise delayed
++readback, persistent mismatches and injected read/write errors. This remains
++an experiment until an actual device run demonstrates the result.
 diff --git a/docs-lanes/ram-multirange-preparation.md b/docs-lanes/ram-multirange-preparation.md
 new file mode 100644
 index 0000000..d77cedf
@@ -5002,7 +5021,7 @@ index 0000000..1d7b73c
 +    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-torch-audit.py b/tools/test-fuxi-torch-audit.py
 new file mode 100644
-index 0000000..64f17b4
+index 0000000..77b8d90
 --- /dev/null
 +++ b/tools/test-fuxi-torch-audit.py
 @@ -0,0 +1,138 @@
@@ -5078,17 +5097,17 @@ index 0000000..64f17b4
 +    assert(!memcmp(original, model.registers, sizeof(original)));
 +    assert(model.audit.count < FUXI_TORCH_AUDIT_CAPACITY && !model.audit.dropped);
 +    assert(model.audit.events[0].operation == 'R' && model.audit.events[0].offset == 4);
-+    assert(model.audit.events[model.audit.count - 1].elapsed_us == 80000);
++    assert(model.audit.events[model.audit.count - 1].elapsed_us == 81000);
 +    unsigned wait_events = 0;
 +    for (unsigned index = 0; index < model.audit.count; index++) {
 +        const FuxiTorchAuditEvent *event = &model.audit.events[index];
 +        assert(!event->result);
 +        if (event->operation == 'S' || event->operation == 'E') {
-+            assert(event->offset == 80000);
++            assert(event->offset == 80000 || event->offset == 1000);
 +            wait_events++;
 +        }
 +    }
-+    assert(wait_events == 2);
++    assert(wait_events == 4);
 +    unsigned read_count = model.reads;
 +    for (unsigned failure = 1; failure <= read_count; failure++) {
 +        fixture(&model);
@@ -5120,7 +5139,7 @@ index 0000000..64f17b4
 +    assert(!model.audit.count && !model.audit.dropped && !model.audit.started);
 +    fuxi_torch_audit_begin(NULL, 0);
 +    fuxi_torch_audit_record(NULL, 'R', 0, 0, 0, 0);
-+    puts("PASS production torch audit: unchanged pulse, every read failure, sleep timing, 64-event bound, reset, clock rollback and overflow");
++    puts("PASS production torch audit: bounded disable confirmation, every read failure, sleep timing, 64-event bound, reset, clock rollback and overflow");
 +    return 0;
 +}
 +'''
@@ -5146,10 +5165,11 @@ index 0000000..64f17b4
 +    subprocess.run([str(binary)], cwd=directory, env=environment, check=True, timeout=60)
 diff --git a/tools/test-fuxi-torch-pulse.py b/tools/test-fuxi-torch-pulse.py
 new file mode 100644
-index 0000000..3c6b447
+index 0000000..66d295b
 --- /dev/null
 +++ b/tools/test-fuxi-torch-pulse.py
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,147 @@
++import importlib.util
 +import os
 +from pathlib import Path
 +import subprocess
@@ -5165,6 +5185,7 @@ index 0000000..3c6b447
 +    uint8_t registers[256], original[256];
 +    unsigned reads, writes, fail_read, fail_write, drop_write, quarantine, dead, fault;
 +    unsigned now, start, pulses, peak_current, expired, level;
++    unsigned off_delay_reads, pending_off_reads, timer_fault;
 +    uint64_t drop_mask;
 +};
 +static int active(struct model *state) {
@@ -5175,7 +5196,10 @@ index 0000000..3c6b447
 +    assert(offset<256);
 +    if(++state->reads==state->fail_read) return -1;
 +    if(state->fault && state->pulses && offset==6) {*value=1; return 0;}
++    if(state->timer_fault && state->expired && offset==9) {*value=1; return 0;}
 +    *value=state->registers[offset];
++    if(offset==0x4e && state->pending_off_reads && !--state->pending_off_reads)
++        state->registers[offset]=0;
 +    return 0;
 +}
 +static int write_register(void *context, unsigned offset, uint8_t value) {
@@ -5192,7 +5216,9 @@ index 0000000..3c6b447
 +            assert(state->registers[0x46]&0x80);
 +            state->start=state->now; state->pulses++; state->expired=0; state->peak_current=state->level*20;
 +        }
-+        state->registers[offset]=value;
++        if(offset==0x4e && !value && state->registers[offset] && state->off_delay_reads)
++            state->pending_off_reads=state->off_delay_reads;
++        else state->registers[offset]=value;
 +    }
 +    if(state->writes==state->fail_write) {state->dead=1; return -1;}
 +    return 0;
@@ -5220,7 +5246,7 @@ index 0000000..3c6b447
 +int main(void) {
 +    struct model state;
 +    fixture(&state); assert(!run(&state));
-+    assert(state.pulses==1 && state.now==80000 && state.writes==12);
++    assert(state.pulses==1 && state.now==81000 && state.writes==12);
 +    assert(!memcmp(state.registers,state.original,256));
 +    unsigned reads=state.reads;
 +    fixture(&state); state.registers[4]=0; assert(run(&state)<0 && !state.writes);
@@ -5241,8 +5267,22 @@ index 0000000..3c6b447
 +        fixture(&state); state.fail_write=index; state.quarantine=1; assert(run(&state)<0);
 +    }
 +    fixture(&state); state.drop_mask=(1ull<<7)|(1ull<<8);
-+    assert(run(&state)==-6 && state.expired && state.now==190000);
++    assert(run(&state)==-6 && state.expired && state.now==193000);
 +    assert(state.registers[0x3e]==0x8a && state.writes==8);
++    for(unsigned delayed_reads=1;delayed_reads<=2;delayed_reads++) {
++        fixture(&state); state.off_delay_reads=delayed_reads;
++        assert(!run(&state) && state.now==81000+delayed_reads*1000);
++        assert(!memcmp(state.registers,state.original,256));
++        unsigned delayed_read_count=state.reads;
++        for(unsigned failure=1;failure<=delayed_read_count;failure++) {
++            fixture(&state); state.off_delay_reads=delayed_reads; state.fail_read=failure;
++            assert(run(&state)<0);
++        }
++    }
++    fixture(&state); state.off_delay_reads=3;
++    assert(run(&state)==-6 && state.registers[0x3e]==0x8a && state.writes==8);
++    fixture(&state); state.drop_mask=(1ull<<7)|(1ull<<8); state.timer_fault=1;
++    assert(run(&state)==-6 && state.expired && state.registers[0x3e]==0x8a);
 +    fixture(&state); state.fault=1; assert(run(&state)==-5);
 +    assert(!memcmp(state.registers,state.original,256));
 +    for(unsigned level=0;level<=5;level++) {
@@ -5253,18 +5293,29 @@ index 0000000..3c6b447
 +            assert(!memcmp(state.registers,state.original,256));
 +        }
 +    }
-+    puts("PASS: real torch pulse, four 20..80mA levels, 80ms duration, timer-before-enable, busy/fault checks, failure cleanup and register restore");
++    puts("PASS: production torch pulse, four 20..80mA levels, 80ms duration, timer-before-enable, bounded two-sample disable, delayed readback, every read/write failure and retained-timer cleanup");
 +    return 0;
 +}
 +'''
++specification = importlib.util.spec_from_file_location('audio_compiler', root / 'tools/test-fuxi-audio-prep.py')
++module = importlib.util.module_from_spec(specification)
++specification.loader.exec_module(module)
++compiler, environment = module.compiler_environment()
++microsoft = Path(compiler[0]).name.lower() in ('cl', 'cl.exe')
 +with tempfile.TemporaryDirectory(prefix='fuxi-torch-pulse-') as temporary:
 +    directory = Path(temporary)
-+    cfile, binary = directory / 'pulse.c', directory / 'pulse'
-+    cfile.write_text(source)
-+    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-g', '-Wall', '-Wextra', '-Werror',
-+                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
-+                    '-I' + str(root / 'xnu/fuxi-adsp'), str(cfile), '-o', str(binary)], check=True)
-+    subprocess.run([str(binary)], check=True)
++    cfile = directory / 'pulse.c'
++    binary = directory / ('pulse.exe' if os.name == 'nt' else 'pulse')
++    cfile.write_text(source, encoding='utf-8', newline='\n')
++    if microsoft:
++        command = compiler + ['/nologo', '/std:c11', '/W4', '/WX', '/Zi', '/Od', '/fsanitize=address',
++                   '/I' + str(root / 'xnu/fuxi-adsp'), str(cfile), '/Fe' + str(binary)]
++    else:
++        command = compiler + ['-std=c11', '-g', '-Wall', '-Wextra', '-Werror',
++                   '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
++                   '-I' + str(root / 'xnu/fuxi-adsp'), str(cfile), '-o', str(binary)]
++    subprocess.run(command, cwd=directory, env=environment, check=True)
++    subprocess.run([str(binary)], cwd=directory, env=environment, check=True, timeout=60)
 diff --git a/tools/test-fuxi-torch-runtime.py b/tools/test-fuxi-torch-runtime.py
 new file mode 100644
 index 0000000..f23f150
@@ -12287,10 +12338,10 @@ index 0000000..7558fa9
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_torch_pulse.h b/xnu/fuxi-adsp/fuxi_torch_pulse.h
 new file mode 100644
-index 0000000..df93326
+index 0000000..49e0d14
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_torch_pulse.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,93 @@
 +#ifndef FUXI_TORCH_PULSE_H
 +#define FUXI_TORCH_PULSE_H
 +#include <stdint.h>
@@ -12306,7 +12357,7 @@ index 0000000..df93326
 +{
 +    static const unsigned registers[] = {0x3e, 0x42, 0x49, 0x4a, 0x46, 0x4e};
 +    uint8_t saved[6], value = 0, type = 0, subtype = 0;
-+    int result = -1, enabled = 0, restored = 1, disabled = 1;
++    int result = -1, enabled = 0, restored = 1, disabled = 0;
 +    if (!io || !io->read || !io->write || !io->wait_us || level < 1 || level > 4) return -1;
 +    if (io->read(io->context, 4, &type) || io->read(io->context, 5, &subtype) ||
 +        type != 0x18 || subtype != 7) return -1;
@@ -12347,11 +12398,28 @@ index 0000000..df93326
 +cleanup:
 +    if (io->write(io->context, 0x4e, 0)) restored = 0;
 +    if (io->write(io->context, 0x46, saved[4])) restored = 0;
-+    if (io->read(io->context, 0x4e, &value) || value) disabled = 0;
-+    if (io->read(io->context, 0x46, &value) || value != saved[4]) disabled = 0;
++    unsigned consecutive_off = 0;
++    for (unsigned attempt = 0; attempt < 4; attempt++) {
++        uint8_t channels = 0, module = 0;
++        int channel_error = io->read(io->context, 0x4e, &channels);
++        int module_error = io->read(io->context, 0x46, &module);
++        if (channel_error || module_error) break;
++        consecutive_off = !channels && module == saved[4] ? consecutive_off + 1 : 0;
++        if (consecutive_off == 2) {
++            disabled = 1;
++            break;
++        }
++        if (attempt < 3) io->wait_us(io->context, 1000);
++    }
 +    if (!disabled) {
 +        if (enabled) io->wait_us(io->context, 110000);
 +        return -6;
++    }
++    for (unsigned index = 0; index < 3; index++) {
++        const unsigned status[] = {6, 7, 9};
++        if (io->read(io->context, status[index], &value) || value) {
++            if (!result) result = -5;
++        }
 +    }
 +    for (unsigned index = 0; index < 4; index++) {
 +        if (io->write(io->context, registers[index], saved[index])) restored = 0;
@@ -16023,10 +16091,10 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..4ee316e
+index 0000000..f1782fd
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,7209 @@
+@@ -0,0 +1,7226 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,27 @@
@@ -22500,7 +22568,7 @@ index 0000000..4ee316e
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_torch_pulse.h
-+@@ -0,0 +1,76 @@
++@@ -0,0 +1,93 @@
 ++#ifndef FUXI_TORCH_PULSE_H
 ++#define FUXI_TORCH_PULSE_H
 ++#include <stdint.h>
@@ -22516,7 +22584,7 @@ index 0000000..4ee316e
 ++{
 ++    static const unsigned registers[] = {0x3e, 0x42, 0x49, 0x4a, 0x46, 0x4e};
 ++    uint8_t saved[6], value = 0, type = 0, subtype = 0;
-++    int result = -1, enabled = 0, restored = 1, disabled = 1;
+++    int result = -1, enabled = 0, restored = 1, disabled = 0;
 ++    if (!io || !io->read || !io->write || !io->wait_us || level < 1 || level > 4) return -1;
 ++    if (io->read(io->context, 4, &type) || io->read(io->context, 5, &subtype) ||
 ++        type != 0x18 || subtype != 7) return -1;
@@ -22557,11 +22625,28 @@ index 0000000..4ee316e
 ++cleanup:
 ++    if (io->write(io->context, 0x4e, 0)) restored = 0;
 ++    if (io->write(io->context, 0x46, saved[4])) restored = 0;
-++    if (io->read(io->context, 0x4e, &value) || value) disabled = 0;
-++    if (io->read(io->context, 0x46, &value) || value != saved[4]) disabled = 0;
+++    unsigned consecutive_off = 0;
+++    for (unsigned attempt = 0; attempt < 4; attempt++) {
+++        uint8_t channels = 0, module = 0;
+++        int channel_error = io->read(io->context, 0x4e, &channels);
+++        int module_error = io->read(io->context, 0x46, &module);
+++        if (channel_error || module_error) break;
+++        consecutive_off = !channels && module == saved[4] ? consecutive_off + 1 : 0;
+++        if (consecutive_off == 2) {
+++            disabled = 1;
+++            break;
+++        }
+++        if (attempt < 3) io->wait_us(io->context, 1000);
+++    }
 ++    if (!disabled) {
 ++        if (enabled) io->wait_us(io->context, 110000);
 ++        return -6;
+++    }
+++    for (unsigned index = 0; index < 3; index++) {
+++        const unsigned status[] = {6, 7, 9};
+++        if (io->read(io->context, status[index], &value) || value) {
+++            if (!result) result = -5;
+++        }
 ++    }
 ++    for (unsigned index = 0; index < 4; index++) {
 ++        if (io->write(io->context, registers[index], saved[index])) restored = 0;
