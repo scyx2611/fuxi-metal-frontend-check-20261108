@@ -2728,6 +2728,142 @@ index 0000000..574aaa7
 +**最小下一安全步驟：** 主代理完成入口的 SKU/runtime FDT 拒絕 gate，並對這一個 12GB／30MiB bank 補齊 iOS handoff phase 的 original/relocated FDT extent、persistent monitor／DMA coverage、dynamic-window placement/lifetime；Android 當前 owner evidence 不代替此 clearance。未齊就保持 defer，不產可 boot new-bank profile。owner 清查後，才依上述五個耦合點做完整 applied-tree 的 metadata／physmap／explicit-PFN／counter host proof，再決定獨立實機驗證；不可只改 scalar base/size 或直接 late release。
 +
 +本輪沒有 VM release、production pmap/PTE/PTOV/GPU alias 實測、完整 kernel build 或任何 hardware writes；新 bank admitted＝false、final allocatable bytes＝null。8GB 正式驗收仍需 8GB 實機；12GB 縮小 available memory regression 不冒充該驗收，也不把 9184MiB／9GiB 階段窗口當成 12GB 的終點。925MiB 候選、772MiB size requests/CMA 均未轉成可用量。
+diff --git a/docs-lanes/ram-handoff-owner-contract.md b/docs-lanes/ram-handoff-owner-contract.md
+new file mode 100644
+index 0000000..99b1b82
+--- /dev/null
++++ b/docs-lanes/ram-handoff-owner-contract.md
+@@ -0,0 +1,130 @@
++# Fuxi handoff owner contract：linker 邊界與 runtime 缺證
++
++2026-11-16，初讀 `17:20 +08:00`，主代理更新 source 後於 `17:32` 複核；ksrc 初始 baseline `a066a05d5be74dacac0d597b2ee71dd199e79bf4`，複核 HEAD `06c7b643af1cf6b3c28a9cb3ae9fcb2e86215606`。只新增本文件；不改 shim／VM／canonical／既有 RAM 工具，不 build、不操作手機／鎖、不 commit。不發布 raw DTB、private capture 或 ELF／payload。這是 ownership observation contract，不是新 RAM admission 或已實作的 report ABI。
++
++此 snapshot 只綁定已確認的 **12GB SKU／usable9g**；9184MiB 是階段窗口而非 12GB 終點。8GB 缺獨立 topology／owner／boot 證據，保持 unsupported，不生成 profile；12GB 限縮 memory regression 不代替 8GB 實機驗收。
++
++## Owning source 與 binary 綁定
++
++[current chain builder](D:/xiaomi13/fuxi_ios/work/boot-chain/build-chain.py:29) 使用 `D:/xiaomi13/fuxi_ios/ios-fuxi/shim`，其 [object/link list](D:/xiaomi13/fuxi_ios/work/boot-chain/build-chain.py:74) 是 `fuxi-loader/start.S`＋`loader.o`＋`probe.o`＋`chain.o` 等，**不是** `fuxi-probe/start.S` 或 generic `shim/start.S`。9g loader objects 重用 payload 目錄；本輪沒有執行 builder。
++
++目前 ksrc 的 `loader.ld` 與 canonical bytes 相同；`start.S`、`loader.c`、`probe.c` 不同，ksrc 沒有同名 chain linker/source。不可用 development source 的行號冒充日常 chain 的 source。[既有 owner checkpoint](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/docs-lanes/ram-android-owner-20261116.md:61) 已記錄來源差異。
++
++| 本輪只讀來源 | SHA-256 |
++| --- | --- |
++| canonical `fuxi-loader/loader.ld` | `424648dc476c1fab7a0f0015bec34732423697d423e1a5a2a475b9663443534e` |
++| canonical `fuxi-loader/loader-chain.ld` | `4898d27caebe33890919bcc0b8a39f8adb1e7e7766073e57689aae854ede1e94` |
++| canonical `fuxi-loader/start.S` | `7e2d0a6c8b1442e7e881480151ce1886cd37b1c46cca1ed45b950933b87db2ed` |
++| canonical `fuxi-loader/loader.c` | `0685ad0c913fb10a2c5c4e0127a297e85c30d08fe4272b3c855e30c037c55a25` |
++| canonical `fuxi-loader/chain.c` | `c9ee5735aa747a924cd628310dd0983172b77843164a5cb14590149d162bb5d9` |
++| canonical `fuxi-loader/fuxi-ram-profile.h` | `088c04267e025f6c4a93b9f3008ce58be4cf877dbd9786447c0a9b5e0c8bb3d5` |
++| canonical `fuxi-probe/probe.c` | `4a5c1c8e2321a9a22dec85ad08794c69c6d46ff9de87a2a7b1a17b6d1bfd7365` |
++| canonical `fuxi-probe/monitor.h` | `035f0d0eff76308ba8a7a43e9bc7362b00d16cfd4044749a35bbd13b7316a825` |
++| canonical `fuxi-probe/gpu-handoff.h` | `37005b98cc2615c9bc36a8cda1707a926ce0256875e22af41cdff7724588752a` |
++| current `work/boot-chain/build-chain.py` | `1a71ba479f5c723f7896d04cd6476d94ee9bcb89b8f276fe72639aa0b5fa2d75` |
++
++只讀 ELF 是 `D:/xiaomi13/fuxi_ios/work/boot-chain/chain-v6-ram9g-batfresh/loader.elf`，SHA-256 `b5ce327c9301c98889ba9f2ab130fc93d3682b849b29c4e0f264551b768c4c45`；對照 normal loader 是 `D:/xiaomi13/fuxi_ios/work/Codex-Xiaomi13-GPU-20261109/native-dly-ram9g-batfresh-sb127-loader/loader.elf`，SHA-256 `009af2c5638c589b13941d496828e0fdc3a793dbb684ebd96257433576bc8357`。source hashes 是本輪讀取的 view，**不宣稱 archived ELF 有完整 source-to-binary provenance**；直接 ELF symbols／entry disassembly 是另一路 binary 證據。
++
++複核的 [current loader guard](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader.c:16) 已使用 `fuxi-ram-profile.h`，在 `probe_main` 前做 FDT readability/profile 檢查；它讀至 `roundup4(total)`，拒絕該 read-window 與整個 loader image 或 `[FG_RAM_BASE,FG_RAM_BASE+FG_BANK_SIZE)` 相交。[caller](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader.c:250) 只在 StaticOk12G 時繼續。這是 current source 證據，不把兩個舊 ELF 當成 guard 已建置／部署證明；helper 的 [local arrays](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/fuxi-ram-profile.h:152) 也要求未來新 ELF 重新核對 primary-stack 使用量。
++
++主代理最新交接：**第20趟 12GB incoming FDT guard 通過並進 SpringBoard**。這是主代理提供的另一個實機 checkpoint，不是本 worker 的手機操作或兩個 archived ELF 的驗收；更不表示 lower30MiB／925MiB、persistent owners 或全12GB 已 cleared，`pending=69/release=0/allocatable=null` 不因此改變。
++
++## 已收斂的 image／stack 範圍
++
++兩 linker 都從 VMA 0 開始。[normal layout](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader.ld:8)／[chain layout](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader-chain.ld:13) 在 BSS 後各留 `0x8000` 給 primary、secondary stack；stack 向下成長，`_secondary_stack_top == _payload_start` 不表示與 payload 重疊。
++
++`llvm-nm -n -S --defined-only` 在兩既有 ELF 得到以下相同 RVAs。下表 PA **只**使用 [stored chain report](D:/xiaomi13/fuxi_ios/work/Codex-Xiaomi13-GPU-20261109/native-hw000chainv6-ram9g-batfresh-boot-1/before.json:11) 的 `MON_IMAGE=0xa8000000` 換算：`PA=MON_IMAGE+(symbol-_head)`；normal ELF 沒有在本輪另配 runtime load base。
++
++| Owner envelope `[start,end)` | ELF RVA | 此 stored chain 的 PA | Lifetime／限制 |
++| --- | --- | --- | --- |
++| code、rodata、firmware、data 與前置 padding | `[0,0x44000)` | `[0xa8000000,0xa8044000)` | monitor 有 caller／vectors 時保留 |
++| 全部 BSS，含 reports／fault state／DMA statics | `[0x44000,0x74000)` | `[0xa8044000,0xa8074000)` | 192KiB；不能只保留 USB array 而忘記其餘 BSS |
++| primary stack | `[0x74000,0x7c000)` | `[0xa8074000,0xa807c000)` | 32KiB assigned envelope；不是 runtime stack high-water 證明 |
++| secondary stack | `[0x7c000,0x84000)` | `[0xa807c000,0xa8084000)` | 32KiB；persistent CPU 仍使用，不因 primary 進 XNU 就 free |
++| embedded payload | `[0x84000,0x114cff0)` | `[0xa8084000,0xa914cff0)` | copy source；本 contract 不提出 reclaim |
++| chain Linux footprint，含 serialized end 之後的尾部 | `[0x1200000,0x3fe0000)` | `[0xa9200000,0xabfe0000)` | `LINUX_IMAGE_SIZE`，不是 ELF file bytes |
++| 保守 parent image，包括 stacks、alignment gaps、Linux footprint | `[0,0x3fe0000)` | `[0xa8000000,0xabfe0000)` | 66977792 bytes；與上述子項 union 去重，不相加 |
++
++Normal `_image_end=_payload_end=0x114cff0`；chain `_linux_end=0x3f3ea00`，但 `_image_end=_end=0x3fe0000`。[chain linker](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader-chain.ld:24) 明列 Linux footprint；僅依 PT_LOAD/file end 會漏 `0xa1600` bytes 尾部及 BSS 後的兩個 stack gaps。`start.S` [Image header](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/start.S:4) 使用 `_image_end`。
++
++直接 disassembly 的 primary `adr` 在 RVA `0x818` 解析至 `0x7c000`；secondary 在 RVA `0x18ac` 解析至 `0x84000`，與 linker 相符。[primary entry](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/start.S:14) 清 BSS 後使用 primary stack；[secondary entry](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/start.S:137) 自設 SP、VBAR，沒有重新清 BSS。
++
++## 不只 USB：static DMA 最小表
++
++| Object | ELF RVA／bytes | 此 stored chain 的 raw PA extent |
++| --- | --- | --- |
++| `dma_area` | `0x70000`／16384 | `[0xa8070000,0xa8074000)` |
++| `gpi_ring`，兩個 channel rings | `0x4b400`／2048 | `[0xa804b400,0xa804bc00)` |
++| `gpi_evr`，event ring | `0x4c000`／4096 | `[0xa804c000,0xa804d000)` |
++| `gpi_txb` | `0x4b100`／64 | `[0xa804b100,0xa804b140)` |
++| `gpi_rxb` | `0x4afc0`／265 | `[0xa804afc0,0xa804b0c9)` |
++
++[USB layout](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:863) 的 event buffer／TRBs／setup／data 都以 `dma_area` 為 base；[programming](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:1063) 使用 `ud.dma_pa+offset`，[initialization](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:1423) 設 `ud.dma_pa=ud.dma`。這依賴 CPU MMU/cache entry ABI，不證明 handoff 後 SMMU/IOVA epoch 未變。
++
++[GPI declarations](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:527)／[ring programming](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:587)／[TX/RX submission](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:665) 是額外 DMA owners，不在 `dma_area` 內。四個 GPI arrays raw sum 6473 bytes，16KiB outward-rounded union 為 `[0xa8048000,0xa8050000)`＝32KiB，已包含於 BSS parent；不是另一個可加減的容量。`lo32` 與 ring high-word=0 的假設也須保留，不搬這些 buffers。
++
++ELF 中 `ud` 已被 compiler scalar-replace 成 `ud.0..ud.9`；不存在一個可藉 `sizeof(ud)`／單一 symbol 自動認定的 runtime DMA ledger。symbol 只證明已配置 object envelope；要封閉 bus targets，仍需 phase-matched 的 event/TRB address、length、resource ownership 與 SMMU 狀態，不把宣告 array 範圍冒充 hardware quiescence。
++
++## Handoff owner 最小 contract
++
++所有 row 都要帶 `owner_id`、`epoch/phase`、source/ELF hash、address space、已驗證 `[start,end)`、coverage、lifetime；unknown 欄位為 null/pending，不填 0。版本標籤可用 `fuxi-handoff-owners-v1`，**目前沒有實作此 producer／consumer**。
++
++| 必須覆蓋的 owner | Link map／既有 runtime report 可提供 | 尚缺／本輪保留政策 |
++| --- | --- | --- |
++| monitor image＋BSS＋兩 stacks | 上表 RVAs；`MON_IMAGE/MON_END`、branch、ELF hash；SP initializer 的 binary proof | 保守 hold parent image；須綁同 boot。assigned stack 不冒充 high-water／未越界證據 |
++| USB DMA／controller resources | `dma_area` symbol、初始化公式；runtime event/TRB pointer/length、CPU/SMMU epoch | 本輪沒有 post-handoff register snapshot；RUN_STOP／未完成 TRB 不能當已停機 |
++| touch GPI DMA | 四個 symbols；source 的 `touch_report[37/38]` 是 ring/event pointer，硬體 context 設定來源明確 | 即使沒有後續 CPU polling，DMA engine 不一定已 halt；沒有 stop/drain proof 就 hold |
++| entry FDT，可能已被 ABL relocation | `probe_info.fdt_address/fdt_size`；實際 pointer、total、`roundup4(total)` read-window、validated hash；producer allocation capacity 若有 | 原 FDT extent 仍 null；非零 pointer 搭配 size0 是 invalid/unresolved，不是空 owner；total 不等於 allocation capacity |
++| 任何另一次 relocated FDT／alias | 必須有 actual producer、source/destination extents、copy bound/hash、final reader pointers、phase | reviewed Fuxi path 沒有另建完整、持久的 relocated-FDT producer；USB response 的暫存 chunk 不替代原 owner。不據此宣稱 ABL/其他 component 沒有 copy，不生成零保留記錄 |
++| 外部 initrd／bootconfig | valid FDT 的 `linux,initrd-start/end`、selected XNU/Linux branch 與 allocation/lifetime | chain 會讀這些 bytes；64MiB 是 mode fallback threshold，不是固定保留量。缺 producer coverage 仍 pending |
++| kernel segments／Apple ADT／boot_args destinations | bounded payload header 的 affine formula；`MON_BOOT_ARGS`＋實際 `topOfKernelData`／segment extents | 不以整段 scalar memSize 冒充 staging owner；不是 free-list clearance；Apple ADT 與 raw FDT 分開 |
++
++已知 parent image 與其 stack/static DMA 均不交於 lower 925／30MiB，但這只消去「已知 image envelope 可能放在那裡」的幾何疑問；**不解除其他 live-owner、dynamic DT、inherited ABL/EL3 owners，不降低 frozen trace 的 69 pending**。
++
++## FDT 與 persistent monitor 生命周期
++
++1. [entry 保存 x0 到 x19](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/start.S:16)。[chain_select](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/chain.c:133) 讀 FDT/外部 initrd，Linux branch 仍以 x19 作 x0 跳入 embedded Image；不把未選 Linux 當成 initrd allocation 已回收。
++2. XNU branch 的 [probe_main](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:1547) 保存同一 entry pointer；只記 pointer/total，沒有複製 raw FDT。`probe_fdt` 的 symbol PA `0xa8048000` 是 **8-byte pointer storage**，不是被指向 FDT 的 extent。
++3. [USB request 0x41](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:1162) 從 `probe_fdt` 讀資料，沒有 `MON_LAUNCH` 禁止 gate。[secondary forever loop](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:780) 在 delegate2 時繼續 `usb_poll()`；[primary return](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:1567) 不停 controller、不做 CPU_OFF、不清 FDT pointer。**進 XNU 不是原 FDT／monitor／DMA 的 lifetime end。** `MON_ACTIVE` 或 CPU_ON return code 本身也不是 release token。
++4. [loader ADT copy](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader.c:210) 從 embedded payload 到 kernel 後方；[boot_args.deviceTreeP](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader.c:229) 是 Apple ADT 的 VA／length，不是原 Linux FDT 的 relocation 記錄。current source 的 [FDT overlap preflight](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader.c:28) 拒絕 image 與完整 9g bank（current＋scratch），[staging 前](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader.c:175) 再驗 profile；仍允許 FDT 位於該 bank 之外，因此沒有回答其是否踩 lower925/30MiB，也不清除任何 persistent owner。StaticOk12G 不是全 owner coverage/admission token。
++5. 若後續別的 owning component 實際 relocation，contract 要同時 hold source/destination，直到 last-reader retargeting、copy/hash 與 DMA/CPU lifetime 都有證據；`memcpy` 完成／`dsb`／primary return 均不能單獨解除 source。此條只定義缺證，不修改 relocation 或 release code。
++
++## 可用的最小 report 與下一輪缺口
++
++[probe_info](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:42) 是 19×u64＝152 bytes 的 native little-endian report：FDT address 在 offset72、size 在 offset80。已有 request `0xc0/0x40` 的 producer，不需要為「取 pointer/total」發明新的 shim allocation；下一輪若取得**同 boot／同 phase** 的既有 report，就能把已知 FDT read-window 從 null 收斂為實際 extent，再另核 producer capacity/coverage。不得發布 raw 0x41 DTB。
++
++[monitor ABI](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/monitor.h:3) 是 11×u64；已有 image/end、delegate/active、USB MPIDR、stage、boot_args/entry，沒有 FDT pointer、relocated extent、SP high-water、DMA-drained、source hash 或 boot epoch。host 必須做 provenance 綁定及 coherent phase sampling，不能把不同 boot 的 reports 拼成 clearance。
++
++目前 stored `before.json`（SHA-256 `44ae548d5adcac33b0843a1b08c4ad1452bff5cb016127ef3740d984a49a7da2`）有 delegate2／active1 與 image/end，但 boot_args=0、沒有 FDT address/size；本輪沒有新 runtime capture。**最少仍缺兩組資料：entry-FDT/外部 staging 的實際 ranges＋producer coverage，以及 handoff 後 persistent readers／DMA targets 的同 epoch 證據。** 後者若仍 active，政策是保留已知 owner，不要求本 worker 停 monitor，也不把 quiescence 假造為 true。
++
++不要把所有 USB「report」呼叫都叫唯讀：[0x45](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:1181) 可呼叫 CPU_ON；0x46/value1 可 delegate；0x49 可 launch；0x54 會改 deadline。此文件只讀 host artifacts/source，沒有執行任何 USB request。
++
++## Hole exclusion 與 fail-closed
++
++- 固定 context holes：`[0x8b9d00000,0x8b9f00000)`＝2MiB、`[0x8bbd00000,0x8c0000000)`＝67MiB；永不因 image owners 不相交就變成 memory。
++- 此 12GB/9g 的 GPU reservation `[0xafe000000,0xb00000000)`＝32MiB 持續排除，[FG owning constants](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/gpu-handoff.h:7) 不改、不搬 scratch。
++- 所有 owner extent 先 checked uint64 addition，再 16KiB outward rounding；overflow、0-size invalid FDT、missing pointer/capacity/coverage 保持 reject/defer。union 去重 parent/child、相鄰與重疊，保留 reason/owner IDs；不用 owner raw sums 或 772MiB size requests/CMA 作容量相減。
++- lower `[0x880000000,0x8b9d00000)`／`[0x8b9f00000,0x8bbd00000)` 在本輪均**不 admitted**；30MiB／1920PFNs 不做 VM release。`pending=69`、`release=0`、`allocatable_bytes=null`、`all_live_owner_coverage=false`。
++
++## 實際唯讀檢查
++
++NDK 已有 LLVM 17.0.2；`llvm-nm`、`llvm-readelf --program-headers --wide`、`llvm-objdump` 直接讀兩個 archived ELF。65 項 host assertions 實際通過：兩 ELF 的 RVA/size、static DMA 全在 BSS、兩 stacks 各32KiB、normal/chain ends、Linux serialized/footprint 差、stored MON_IMAGE/end 綁定、GPI page union、已知 image 與兩 lower banks 不相交。不是 kernel build、native admission helper 或硬體測試。
++
++可重跑的純讀取命令（需要本機既有 ELF，沒有缺檔 skip 或生成映像）：
++
++```powershell
++$ErrorActionPreference = 'Stop'
++$bin = 'C:\Users\yx\AppData\Local\Android\Sdk\ndk\26.1.10909125\toolchains\llvm\prebuilt\windows-x86_64\bin'
++$elf = 'D:\xiaomi13\fuxi_ios\work\boot-chain\chain-v6-ram9g-batfresh\loader.elf'
++if (-not (Test-Path -LiteralPath $elf)) { throw 'Required existing ELF missing' }
++& "$bin\llvm-nm.exe" --numeric-sort --print-size --defined-only $elf |
++    Select-String ' (_head|_bss_start|_bss_end|_stack_top|_secondary_stack_top|_payload_start|_payload_end|_linux_start|_linux_end|_image_end|_end|dma_area|gpi_ring|gpi_evr|gpi_txb|gpi_rxb|probe_fdt|probe_fdt_size)$' |
++    ForEach-Object { $_.Line }
++if ($LASTEXITCODE -ne 0) { throw 'llvm-nm failed' }
++& "$bin\llvm-readelf.exe" --program-headers --wide $elf
++if ($LASTEXITCODE -ne 0) { throw 'llvm-readelf failed' }
++& "$bin\llvm-objdump.exe" --disassemble --no-show-raw-insn --disassemble-symbols=_start,probe_secondary_entry $elf
++if ($LASTEXITCODE -ne 0) { throw 'llvm-objdump failed' }
++```
++
++本輪縮小的是 **linker-backed owner geometry** 與可取得 FDT pointer 的既有 report 路徑；持續保留 lifetime、inherited/dynamic owners 及 source-to-runtime 綁定缺口，沒有放行 30MiB 或其餘 lower banks。
 diff --git a/docs-lanes/ram-multirange-preparation.md b/docs-lanes/ram-multirange-preparation.md
 new file mode 100644
 index 0000000..d77cedf
@@ -2864,6 +3000,174 @@ index 0000000..d77cedf
 +## Host validation
 +
 +`python -B tools/test-fuxi-ram-inventory.py -v` 通過 **20 tests**。測試涵蓋 overlap/adjacency/duplicates union、subtract/intersection、holes、empty/zero-size、64-bit overflow 和 full-address-space union、fragmented banks、current9g/GPU exclusion、current-window holes/conflicts、reserve-map/static reg 去重、dynamic/missing/zero reservations、cell mismatch/default widths、malformed tuples/size、address translation 未解析、reservations outside advertised banks，以及 DTB hash/parser reuse。另以 200 組固定 seed 小位址集合驗證 subtract 與逐 byte set difference 相符。Python syntax 與 trailing whitespace 檢查通過。[range host tests](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/tools/test-fuxi-ram-inventory.py:65) [synthetic FDT tests](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/tools/test-fuxi-ram-inventory.py:124)
+diff --git a/docs-lanes/rtc-time-handoff.md b/docs-lanes/rtc-time-handoff.md
+new file mode 100644
+index 0000000..d020518
+--- /dev/null
++++ b/docs-lanes/rtc-time-handoff.md
+@@ -0,0 +1,162 @@
++# RTC → UTC boot-time handoff：唯讀準備 checkpoint
++
++## 範圍與可交接結論
++
++本輪只新增本文件；不修改 C、loader、ADT、測試、sync、kernel 或持久化格式，
++不操作手機、不執行裝置工具、不取鎖、不 commit。目標是本機 iOS 16.7.16
++20H392 / XNU 8796.141.3，不沿用 iPadOS 27 的 boot_args 長度。
++
++最小入口已存在：主代理在既有 payload command line 放入唯一一組
++`fuxirtcoffset=<非負十進位秒數>`，確認沒有 `fuxirtc=0`；重製 payload / boot artifact，
++不必修改 kernel 或新增 ADT property。只有 Android UTC 與「同一個、仍持續
++計數的 PMIC raw RTC」有可核對的配對樣本，才可以計算及沿用 offset。
++研究開始時尚無 Android 配對結果；後續主代理已完成下列單次短測，數值不供其他裝置或未核對的日常開機沿用。
++
++主代理後續 checkpoint（2026-11-16）：`rtc-calibration.py` 同期讀取 Android
++UTC 及同台 rtc0，得到 raw=39432、offset=1794782947、UTC=1794822379。
++host 採樣區間為200ms，前後 UTC／RTC counter 穩定；建置及開機前再次讀取
++live counter／UTC，要求 offset 差不超過2秒、counter 不倒退。
++第21趟暫時開機在 `native-hw000rtc-calibrated-boot-1/boot.log:203–204`
++記錄 raw=39569、epoch=1794822516、calendar readback=1794822516.000002。
++這支持本台本次 sysfs→raw→calendar 換算；尚未證 UI／時區、長時間走時、
++sleep/wake 或冷啟動 retention。舊 MKB 持久化1970 timestamp 沒有改寫。
++本機 helper 最大接受一小時校準紀錄，且每次暫時開機前重新核對 Android
++live UTC／counter；這是已實作的監督式短測政策，不是 kernel expiry 或
++已部署的日常校時方案。
++
++這是受監督、單次短測的準備方案，不是具備 reset / expiry 防護的完成實作。
++現有 kernel 只檢 epoch 範圍，不能驗證樣本年齡、RTC 身分或 continuity。
++任何資料缺失或不一致，現有 helper 拒絕建置或開機；若另做無校時診斷，
++才使用明確的 `fuxirtc=0`，不把它加入成功校時候選。
++既有程式的 enable 預設其實是 1，本輪沒有把 production 改成 default-off。
++
++## 已有實際證據
++
++`work/Codex-Xiaomi13-GPU-20261109/native-hw000batpause-hap-boot-1/boot.log`
++第 197–198 行：`apid=53/ee4 raw 68 94 00 00 counter=37992 offset=0 epoch=37992`，
++被 sanity window 拒絕，沒有設 calendar。第 630、640、662、672 行 MKB
++session create/login timestamp 仍為 `1970-01-01 00:00:48 +0000`。
++這是該趟 kernel calendar 未校正的證據，不是 RTC 永久保持或 MKB 根因證明。
++不能把這個舊 `37992` 直接與稍後 Android `date +%s` 相減；兩者不是同期樣本。
++
++## 本機 owning source 與 primary source
++
++以下本機位置相對 `ksrc`；遠端固定到 source tag / commit，不引用移動分支。
++
++| 原碼／精確位置 | 已核對的行為 |
++| --- | --- |
++| `xnu/fuxi-h1/fuxi_keys.c:66`、`:242` | SID 0 / PPID `0x0061`，讀 `0x6148..0x614b` 四個 little-endian bytes；最多兩輪 carry 檢查。沒有 RTC data/control 寫入。 |
++| `xnu/fuxi-h1/fuxi_keys.c:272`、`:292`、`:299`、`:304` | unsigned offset；64-bit 加總；只接受 inclusive `[1700000000,2200000000]`；以 `clock_set_calendar_microtime(epoch,0)` 設 calendar，再讀回。 |
++| `shim/fuxi-loader/loader.c:12`、`:45`、`:128`、`:178`、`:200` | payload v1 command line 608 bytes；`boot_args.CommandLine` offset 108；驗最後一 byte 是 NUL；ADT 與 command line 分開複製。 |
++| `tools/mkpayload.py:64`、`:326` | 8796 使用 608-byte command line；v1 會靜默截到 607 bytes，不能依賴它拒絕過長輸入。 |
++| `tools/mkadt-fuxi.py:159` | 既有 `/chosen` firmware / identity / root props；本輪查無現成 RTC UTC offset 消費入口。新增未知 ADT property 不會取代既有 bootarg。 |
++| `../ram-source-reference/xnu-8796.141.3/pexpert/pexpert/arm64/boot.h:26`、`:69` | actual 8796 header 的 `BOOT_LINE_LENGTH=608` 與 `CommandLine[608]`。 |
++| [Apple clock.h:49–58、161–163](https://github.com/apple-oss-distributions/xnu/blob/xnu-8796.141.3/osfmk/kern/clock.h#L49) | LP64 `clock_sec_t` 是 unsigned long；setter 的 microseconds 類型是 unsigned int。 |
++| [Apple bootargs.c:191–196、362–383、410–482](https://github.com/apple-oss-distributions/xnu/blob/xnu-8796.141.3/pexpert/gen/bootargs.c#L362) | `PE_parse_boot_argn` 讀 `PE_boot_args()`；4-byte 結果經 int32 cast 寫回，支援負號／其他 radix／suffix，並非 unsigned decimal validator。 |
++| [matched OEM rtc-pm8xxx.c:70–105、234–246、523–551](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/rtc/rtc-pm8xxx.c#L523) | `qcom,pmk8350-rtc` 對應 ctrl `0x6146` / write `0x6140` / read `0x6148`；read_time 將 raw secs 轉成 calendar，該 driver 路徑未加 nvmem UTC offset。這不證明目前 Android binary 正是此 build。 |
++| [同 commit RTC sysfs.c:32–75](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/rtc/sysfs.c#L32) | date/time/since_epoch 都是獨立 `rtc_read_time()`；since_epoch 轉成 epoch 秒，不是「系統目前 UTC」別名。 |
++| [同 commit RTC interface.c:23–43、84–103](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/rtc/interface.c#L23) | class 層有 `rtc_add_offset()`，在 driver read_time 後可能加入 `rtc->offset_secs`。所以只看 pm8xxx driver 或 sysfs 名稱不能認定 since_epoch 等於 raw counter。 |
++
++已讀 source 的 SHA256（遠端為回應文字 UTF-8、保留其原始換行）：
++
++| source | SHA256 |
++| --- | --- |
++| 本機 `fuxi_keys.c` | `081bbbf41718e0949f366875fb6a24a21bf9e93d21e24ed5df93e1d25750c794` |
++| 本機 `shim/fuxi-loader/loader.c` | `1cfff775f0507013de14d6a69d348ae66f42cafb78d52e5994dc71c2a3b6254e` |
++| 本機 `tools/mkpayload.py` | `0e0fd0f0e8aace130165fa80736531457fff3706d658de2394d9e3522026cece` |
++| 本機 actual `arm64/boot.h` | `efdfec46319cb147297682a8faebbe02873f845261b57f7511ab8e15c13ef3439` |
++| matched OEM `rtc-pm8xxx.c` | `08e429b1fdded506f8e76b231f3b5ecfe1fc5e60f7326daf0f05a1fc9f6bcc8f` |
++| matched OEM `drivers/rtc/sysfs.c` | `3f6d2bad461759e3c09ac047c74ff3eef15c114485d257439f51e6ea3d88fae9` |
++| matched OEM `drivers/rtc/interface.c` | `90381150e8b0b9cfafa9f77d243f132bd71642f20603c9de63b70f5f22dcfe68` |
++| Apple `osfmk/kern/clock.h` | `a2657effae6e918f73f815d9c53e73054cd0a716a38a3ccd77b71050e957afe6` |
++| Apple `osfmk/kern/clock.c` | `001630fcf2089f7f8df7c39ee79f8ba9279b84aa06ec5d8883b016eb15fdc5b1` |
++| Apple `pexpert/gen/bootargs.c` | `1431f1f8aacae240b87bd29cd91905784c968f8014784201b3ed862bdb1b4ed9` |
++| Apple `iokit/Kernel/IOPlatformExpert.cpp` | `94a5bd0e0ae79f0deb504fb84cc186dec00bd6dd483bfce6c7c5ce20284533e3` |
++
++## 主代理唯讀取樣與 offset 計算
++
++1. 由主代理在 Android 原本授權的唯讀流程取得 rtc0 的 `name`、device/driver
++   路徑與 compatible／實際 kernel provenance，以及
++   `/sys/class/rtc/rtc0/{since_epoch,time,date}`、`date +%s`、`/proc/uptime`。
++   可記 `/proc/sys/kernel/random/boot_id` 識別 Android session；它不證明 PMIC
++   continuity。這些值由主代理擷取，本 worker 沒有執行任何手機命令。
++2. RTC 秒數 R 的讀取前後各取 system UTC 整秒 U0/U1 與 uptime P0/P1；
++   留存原始輸出／讀取順序／host UTC／artifact lineage。再取第二組。
++   建議每組 bracket ≤1 秒、兩組隔 2–5 秒；這是採樣政策，不是硬體保證。
++   若 UTC 跳變、RTC 不增、增量不符 uptime 或輸出失敗，拒用。
++3. 必須先證明 R 就是 SID0 `0x6148` raw secs，或有已核對且適用該 Android
++   build 的 class/driver offset 逆轉。若 since_epoch 已是現代 epoch，但 XNU
++   raw 仍很小，列為 mapping blocker，不能用 `U-R≈0` 或猜 nvmem 修正。
++   `/proc/uptime` 是 AP boot elapsed，不是 RTC 原點，也不能代替 raw counter。
++4. 算式是 `O = AndroidUTC_at_R_sample - raw_secs_at_same_sample`，不是 timezone
++   差；`date +%s` 是 Unix epoch，不能另加 UTC+8 或 DST。整秒 read 量化與
++   順序誤差需保留：保守單組 candidate interval 可取
++   `[U0-R-1, U1-R+1]`，兩組應有交集；沒有交集就不給 O。
++   這只能界定取樣誤差，不能證明 Android UTC 已可信同步。
++5. host 用寬整數檢 `0≤O≤4294967295`、預期下一次 raw+O 在既有 sanity window，
++   然後輸出純非負十進位，不帶正負號、hex、suffix 或小數。負 offset 或
++   不可表示 offset 不支援，不能利用 parser cast wrap 繞過。
++6. offset 與 source/sample metadata 留在 host 的該次 boot artifact 旁；整條
++   command line UTF-8 長度 ≤607 bytes、兩個 RTC token 各唯一、未遭截斷。
++   payload 是持續攜帶 O 的既有入口；不需要把每次 UTC 秒數硬編 kernel。
++
++若 RTC 在 reboot 期間仍以一秒／秒增加，`raw_new + O` 會自動包含 reboot
++耗時，不再另加 `/proc/uptime` 或 host elapsed。若只有前趟 raw，沒有同期
++Android raw/mapping，最小入口雖存在，數值校正仍 defer。
++
++## Continuity、reset、過期與持久化界限
++
++- 「PMIC keeps this across reboots and power loss」是 `fuxi_keys.c:270` 現有
++  註解，不能升格為本台已驗證 retention。RTC disable、PMIC reset、失電、
++  Android／firmware 寫時鐘、32-bit wrap、換裝置或不同 RTC driver 都使 O 失效。
++- AP reboot 不等於 RTC reset，也不證明沒有 reset。每次 Android 接續取樣
++  都重新核對身分與 counter 增量；冷啟動、電池斷接或 UTC 被校時後取消舊 O。
++  RTC 停走／漂移會讓時間逐漸錯誤；offset 不修復振盪器或 retention。
++- 研究初始建議第一趟 artifact 在10分鐘內單次使用；後續實作政策為最多
++  一小時，且每次開機前重新核對 live UTC／counter，如前述 checkpoint。
++  不作無期限／日常 artifact；此期限是 host verifier 政策，不是 kernel TTL。
++- reset 後 `raw_new+O` 仍可能落在 2023–2039 sanity window，kernel 仍會接受；
++  只帶 O 的現成入口做不到 boot 前自動 fail-closed continuity 檢查。若要求
++  無人值守、多次 reboot 或冷啟動可靠，需另行分配帶 raw reference、expiry、
++  provenance 與拒絕規則的 consuming code；本轮只列 gap，不新增抽象驅動。
++- 不借用 mtd 當 UTC mailbox：`xnu/fuxi-unixnu/sweet_ufs.c:1257` 的
++  `fx_log_header` 是 SWEETLOG v2，沒有 UTC/raw/expiry 欄位；`:1332` 每次 flush
++  `bzero` 整個 header block，再寫 header 與 byte 2048 stamp。旁邊空白 bytes
++  不是穩定保留区。`:231`、`:240` 限制 stamped 2049-block log area；既有 log
++  授權不代表 RTC mailbox ownership。禁止新 mtd/nvmem/MMIO data 寫入。
++
++## Calendar setter 不是單純記憶體寫入的假設
++
++[Apple clock.c:718–727、826、843–844](https://github.com/apple-oss-distributions/xnu/blob/xnu-8796.141.3/osfmk/kern/clock.c#L718)
++明確呼叫 `PESetUTCTimeOfDay()`，並發 calendar change/set notification。
++[IOPlatformExpert.cpp:1375–1380、501–503、400–402](https://github.com/apple-oss-distributions/xnu/blob/xnu-8796.141.3/iokit/Kernel/IOPlatformExpert.cpp#L1375)
++會 dispatch 到 `gIOPlatform->setUTCTimeOfDay()`；base class 最終
++`setGMTTimeOfDay()` 是空函式。本機
++`xnu/patches/0016-sweet-device-tree-platform-expert.patch:46` 的
++SweetPlatformExpert 沒有覆寫這些 setter，本輪 scoped source scan 亦未找到
++新的覆寫。這支持現有 base path 不寫 PMIC，但不能代替 actual linked class /
++override 核對；主代理須確認沒有另個 platform clock service 寫硬體。
++本文件不建議 Android RTC set_time、alarm/control enable 或任何 PMIC 寫回。
++
++此外 `clock.c:1297` 的 wake 路徑可能再讀 platform UTC；boot-time 單次設
++calendar 不等於 suspend/resume 或 cold boot 已橋接，另列未驗證。
++
++## 下一趟成功判準與 PowerLog 邊界
++
++- 主代理保留 fresh Android 配對資料、唯一 O、完整 bootarg 與實際 artifact
++  SHA。下一個 XNU log 必須有同 RTC 身分的 raw_new、offset=O、epoch=raw_new+O
++  與 `clock set, now=...`，而非 sanity rejection；counter 增量須與可信 host
++  elapsed 符合，差值依取樣／oscillator 誤差預算判定，不只看年份變現代。
++- 再驗 userland UTC、後續短時間前進、launchd/MKB 新 session timestamp
++  與 host UTC 一致；timezone 顯示另驗。舊持久化 MKB timestamp 不會因 setter
++  自動改写；看新 session，不以舊值單獨判失敗或重寫既有資料。
++- 正確 calendar 是 epoch-based log／跨 boot 時序分析的必要輸入之一，不
++  證明 PowerLog 已可用，也未找到 actual 20H392 PowerLog 的 primary caller
++  證據可宣稱「1970 是其唯一 blocker」。需另驗 PowerLog service、資料庫、
++  power source／IOReport、clock-change handling 與事件落盤。
++- Apple `IOPlatformExpert.cpp:517–519` 的 kernel `PMLog` 使用
++  `clock_get_system_microtime()`，不是 calendar。不能把所有 PM logging 都
++  當 UTC 依賴；也不能用 RTC 校正冒充電池／PowerLog owner 功能完成。
++
++本 checkpoint 的驗證是 source／document consistency，不是 host emulator、
++kernel build、RTC 自主 retention、手機寫時或 PowerLog 實測。
 diff --git a/docs-lanes/tap-command.md b/docs-lanes/tap-command.md
 new file mode 100644
 index 0000000..1dfcd16
@@ -2887,6 +3191,288 @@ index 0000000..1dfcd16
 +with independent boot-argument and device-tree stubs. It checks argument
 +priority, missing properties, lookup failures, length limits and string
 +termination under ASan/UBSan.
+diff --git a/docs-lanes/torch-timeout-status-research.md b/docs-lanes/torch-timeout-status-research.md
+new file mode 100644
+index 0000000..90c5aa6
+--- /dev/null
++++ b/docs-lanes/torch-timeout-status-research.md
+@@ -0,0 +1,276 @@
++# Torch timeout/status 與 continuous 路徑研究
++
++## 本輪界限與結論
++
++本輪只新增本文件，讀取既有 host log 與 primary source。沒有修改 canonical
++C、測試、sync 或 `0117`，沒有手機操作、commit 或新硬體交易。
++
++- matched OEM source 沒有定義 `0x09`，也沒有給出該 status 的 read-to-clear、
++  write-one-to-clear、timer/module disable 清除或 clear deadline 語意。
++- Linux v6.12 四通道 decoder 把 `0x09 bit4` 報為 channel index 2 的 timeout。
++  這是 driver 的軟體分類，不是本台 PM8550 該 revision 的 exact decoder 證明。
++- 已找到明確的 IRQ latch acknowledgement，但它操作 peripheral `0x14` 與
++  arbiter IRQ clear，不能推導它能清 `0x09`，更不是本輪可移植的 clear 寫入。
++- OEM/mainline 都有不保留 flash safety timer 的 torch 路徑；這不能直接滿足
++  Fuxi 現在的 fail-closed deadline。真正 continuous 跨越該 deadline 的安全
++  路徑仍 defer，不能停用 timer、猜測 re-arm、忽略 bit4 或重試 failed worker。
++
++## 實際 trace 與 provenance
++
++主代理稱此情況為「第18趟 first attempt」。本機能逐筆核對此失敗型態的 raw 是：
++
++`D:\xiaomi13\fuxi_ios\work\Codex-Xiaomi13-GPU-20261109\native-hw000torchraw-120s-boot-1\boot.log`
++
++SHA256 `0175941f15cd14ae850c1ac8cde4d7cc285a47e4dec4e565bdbc3db0b8b96918`。
++這份 trace 的 audit 11/12 明確寫入並讀回舊 byte `0x8a`，不能把它當成新的
++`0x89` device result；使用者的趟次標籤也不被拿來推算其他 boot/CI provenance。
++
++| 階段 | raw line / audit | 實際證據 |
++| --- | --- | --- |
++| pre-enable | 3697–3699 / 8–10 | `0x06/07/09=0/0/0`，全部 `rc=0` |
++| enable | 3708–3711 / 19–22 | module `0x80`、channel `1`，write/readback 全 `rc=0` |
++| 80 ms wait 後、disable 前 | 3714–3716 / 25–27 | `0x06/07/09=0/0/0`，全部 `rc=0` |
++| off pair 1 | 3719–3720 / 30–31 | channel/module `0/0`，兩筆 `rc=0` |
++| off pair 2 | 3723–3724 / 34–35 | channel/module `0/0`，兩筆 `rc=0` |
++| post-disable status | 3725–3727 / 36–38 | `0x06/07/09=0/0/0x10`，全部 `rc=0` |
++| restore | 3728–3737 / 39–48 | 四個 saved config writes、六個 saved reads 全 `rc=0` 且匹配 |
++| 最後摘要 | 3686–3688、3738 | helper `-5`；後來 stopped survey `0/0/0`；49 events、dropped 0 |
++
++這次 trace 有一次 channel-enable write，沒有失敗後 re-enable。`pulses=0`
++是沒有成功完成的 pulse 計數，不能推論沒有嘗試點燈或沒有光輸出。
++
++Audit wait 實際為 80.022 ms；channel-enable write 完成到 disable write 完成
++87.327 ms，到 post-disable `0x09` read 完成 100.182 ms。timestamp 是 callback
++完成時間，不是 PMIC 內部 timer start、光輸出截止或 rail transition 的時間。
++軟體早已 disable，因此時間接近 100 ms 不是自主截止或 timer fault 根因證據。
++兩次 off register readback 也不是光學/電流輸出或 boost 完全關閉的證明。
++
++後來摘要的 `0x09=0` 不能證明 read-to-clear：其間已經過時間、restore writes
++及其他 reads。不能區分自然狀態變化、配置/disable 關聯清除與讀取副作用。
++目前 worker 保留 `-5` 並 latch off 是現行保守政策；不得因後來 status 零而解除。
++
++## 第20趟 HAP525：獨立的唯讀證據，不能推導 torch 能力
++
++本輪另核對主代理已取得的
++`D:\xiaomi13\fuxi_ios\work\Codex-Xiaomi13-GPU-20261109\native-hw000batpause-hap-boot-1\boot.log`，
++SHA256 `7a09d39036572652f5e1db96c4a9b9c71b101b54260714de4b0d4a6eaaf84134`。
++Lines 380/410 的兩輪摘要都是 selector-stable、identity-valid、TLRA-valid，
++TLRA 為 5710 us；但 `FIFO-status=unavailable`、`writes=0`、
++`cutoff-verified=0`。Line 411 總結 58 attempts、active-gate 0、
++start-attempted 0、route-verified 0。沒有主動啟動或截止驗證。
++
++`fill=0 empty=0 capacity=0` 是 unavailable 摘要的數值，不能解讀成 FIFO
++已 empty、有已知 capacity 或沒有尚待排空的資料。5710 us 是 TLRA 設定的
++有效唯讀解碼，不是 finite completion/cutoff bound。HAP525 是另一個
++peripheral；`0xf063=0x89` 也不是 flash SID1 `ee3e` 的 timer byte。
++本趟不構成新的 `0x89` torch pulse 或 PM8550 自主截止證據。
++
++## Primary source 鎖定與 match 程度
++
++以下原始檔在本輪直接讀取並做 UTF-8 bytes SHA256，沒有引用二手 register 表。
++MiCode kernel pin 為 `7fad87dc178d09489b74a714e4a525d56f546855`；DT pin 為
++`5647c799a064dfec73332a4fe2ef7aa3fb2f4887`；mainline 固定為 Linux `v6.12`。
++
++| ID | Primary source | SHA256 |
++| --- | --- | --- |
++| O1 | [MiCode leds-qti-flash.c](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/leds/leds-qti-flash.c) | `56e96975b820e8f88b4ae6fcf7acedfb53f577424e9f7d9b16637c86652f514d` |
++| O2 | [MiCode pm8550.dtsi](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/pm8550.dtsi) | `71eba0d97e9f00543f23d01d8c3338eedd5ab167b6350ea9337d094d3b08cfc2` |
++| O3 | [MiCode spmi-pmic-arb.c](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/spmi/spmi-pmic-arb.c) | `6c7c31ed1b96093b5c6780640710bb5f30a992471b2b12d3390757cf4f662a6d` |
++| O4 | [MiCode qcom-spmi-pmic.c](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/mfd/qcom-spmi-pmic.c) | `78c31447ff9b7dcf7847a9fd76bd4eb3d54a16ed919736f11eae7613e8ae3d98` |
++| L1 | [Linux v6.12 leds-qcom-flash.c](https://github.com/torvalds/linux/blob/v6.12/drivers/leds/flash/leds-qcom-flash.c) | `41575a93352acf5598563bcb943fbdf07931a443fd5ad649dc1d4bd836a0916f` |
++| L2 | [Linux v6.12 spmi-pmic-arb.c](https://github.com/torvalds/linux/blob/v6.12/drivers/spmi/spmi-pmic-arb.c) | `37913bfb3d7678bbb87f4f4ab6445d1910bd6d1259c7f6a45ce3970a62c7c0f2` |
++| L3 | [Linux v6.12 regmap.c](https://github.com/torvalds/linux/blob/v6.12/drivers/base/regmap/regmap.c) | `405be7c9fd3f91fa82be98e35c1c6129d45e7e9eb4089572d38829fa277ab8a4` |
++
++本機 `D:\xiaomi13\fuxi_ios\dtb\fuxi-live.dtb` 的 SHA256 是
++`0f4f5e4fbc64619b2753062b8a9785e76261dc1ab434cc79d8f7f82046289f31`。
++先前已純 host 解析 node
++`/soc/qcom,spmi@c42d000/qcom,pm8550@1/qcom,flash_led@ee00`：compatible 是
++`qcom,pm8350c-flash-led`、base `0xee00`、status `ok`，IRQ sources 0/3/4。
++O2 lines 120–128 使用同一 PM8550 flash compatible/base/IRQ layout；O1
++lines 1921–1923 的 match table 對它配置四通道，lines 107–109 定義 subtype 7。
++
++這足以鎖定要研究的 OEM driver family。它不是對本機 Android loaded module
++binary、silicon revision、每個 status bit 或 PMIC analog 時序的驗證。Raw 只
++有 flash type `0x18` / subtype `0x07`；沒有這個 peripheral 的 revision read。
++L1 lines 838–862 依 type/subtype 選通用四通道 map，而不是依本台 PM8550
++revision 選一份已實測 decoder。不能把「同 compatible/subtype」升格為
++「本台 PM8550 exact status decoder」。
++
++## Status / latch-clear 能證明什麼
++
++### OEM flash driver
++
++O1 lines 30–40 定義 status1 `0x06`、status2 `0x07` 和 IRQ RT status `0x10`。
++`qti_flash_led_read()` 在 lines 264–277 呼叫 `regmap_bulk_read()`。
++`qti_flash_led_irq_handler()` 在 lines 1385–1424 讀 `0x10`、`0x06`、`0x07`
++並記錄 IRQ/channel/VPH 訊息；該函式沒有 status clear、reset 或 re-enable。
++lines 1333–1339 的 `flash_ops` 也沒有 `fault_get`。
++
++O1 沒有定義或讀取 status3 `0x09`，因此不能由此取出 `0x09 b4` 的確切名稱、
++清除條件或容許值。它不讀該 register 並不代表 byte 可忽略、必為正常或不存在。
++
++O1 對 IRQ RT status `0x10` 的 bit4 命名為 all-ramp-up-done，bit3 為
++all-ramp-down-done，bit0 為 open/short/vreg-not-ready aggregate。它們是
++peripheral `ee10` 的 bits，不是 `ee09` 讀到的 value `0x10`。尤其不能把
++「`0x10 bit4` 是完成事件」套到「`0x09 bit4` 是正常完成事件」。
++
++### Mainline flash decoder
++
++L1 lines 135–144 的四通道 map 指定 `0x06` status1、`0x07` status2、
++`0x09` status3。`qcom_flash_fault_get()` lines 488–561 只讀這些 fields 並
++輸出 `LED_FAULT_*`；四通道 timeout 使用 `BIT(chan_id * 2)`。
++因此該 decoder 對 channel index 2 會把 `0x09 bit4` 報為 timeout；channel0
++timeout mask 則是 bit0。它沒有依 pre-enable/post-disable 階段改變分類。
++
++這不證明本台的 bit4 真由第三通道 timer 觸發，也不證明因 channel0 是此次
++caller 的唯一輸出而可以遮掉其他 bits。不能添加 `status & 1` 之類的豁免。
++原始 register byte 和 decoded hypothesis 必須分開記錄。
++
++L1 沒有對 `REG_STATUS1/2/3` 發出 clear write。L3 lines 3056–3068 的
++`regmap_field_read()` 是 read、mask、shift，沒有額外 clear write。
++這只證明所看軟體沒有顯式清除，不能排除 silicon 本身的 read-to-clear。
++O4 lines 122–145 是一般 16-bit address / 8-bit value SPMI regmap 配置與
++建立；沒有 flash-specific status-clear hook 或 bit4 lifetime 定義。
++
++### 明確存在的是 IRQ latch ack，不是 `0x09` clear protocol
++
++O3 lines 481–490、L2 lines 580–589 都定義 peripheral IRQ RT status `0x10`、
++LATCHED_CLR `0x14`、EN_SET `0x15`、EN_CLR `0x16`、LATCHED_STS `0x18`。
++O3 `qpnpint_irq_ack()` lines 626–637、L2 lines 752–764，清 arbiter IRQ
++並把該 IRQ 的 `BIT(irq)` 寫到 peripheral `0x14`。Unmask 路徑也在 enable
++IRQ 前處理 pending latch。O2 的 flash IRQ sources 是 0/3/4，屬同一 IRQ
++namespace；不是 `0x09` decoder 的 channel-index masks。
++
++這是 Linux IRQ owner 的 ack 工作。上述來源沒有指定「ack 某 IRQ 後清掉
++`0x09 b4`」的關係。Fuxi 目前只有受限 flash write allowlist，沒有在此
++移植 Linux IRQ ownership；不能新增 `0x14/15/16` 寫入，更不能嘗試往
++`0x09` 寫 0、`0x10` 或 `0xff`。列出 IRQ registers 僅作 source 區別，
++不是硬體 clear 操作指示。
++
++### 尚缺的語意
++
++| 問題 | 本輪能否確立 |
++| --- | --- |
++| PM8550 該 revision 的 `0x09 b4` 名稱/來源 | 不能；只有 L1 通用 decoder 假說 |
++| `0x06/07/09` 是 live、latched、read-to-clear 或混合 | 未被上述 matched sources 逐 bit 指定 |
++| IRQ ack `0x14` 是否影響 `0x09` | 沒有關聯證據 |
++| channel/module off 或 timer restore 是否清 b4 | log 時間序不能區分，source 沒有保證 |
++| clear、ramp-down、timer cancel 的有限最長時間 | 沒有 hardware-backed bound |
++| 自主 cutoff、光輸出 off、boost/vreg root cause | 未實測/未捕捉；不能猜 thermal 或 boost fault |
++
++所以本輪沒有 status-clear patch 提案。全部非零 status 拒絕和 failed latch
++必須維持，即使將來觀察到 byte 再次歸零也不能因此 retry。
++
++## Continuous torch 的 primary 路徑與安全缺口
++
++### OEM 路徑：configure 與 switch 是兩階段
++
++O1 `qti_flash_led_enable()` lines 425–463 設 IRESOLUTION/ITARGET；只有
++`FLASH_LED_TYPE_FLASH` 會在這裡寫入 safety timer enable。對已 enabled 的
++TORCH/INDICATOR，函式在 current 配置後直接返回，不重啟 channel。
++Setup lines 1358–1364 先清各 configured fnode 的 timer-enable bit。
++因此不能假設 OEM torch 自帶 Fuxi 的 100 ms fail-closed timer。
++
++一般 torch brightness configure 不等於 channel 已 on：lines 571–576
++只有 INDICATOR 直接 strobe；switch enable lines 692–745 按已配置 fnode、
++switch mask、channel map 再 enable。`qti_flash_led_strobe()` lines 367–417
++先確保共享 module enable，再做 masked channel enable；disable 時先關
++channels，在沒有剩餘 caller/channel 時關 module。
++
++O1 lines 385–391 的 switch off hrtimer 只在 caller 配了非零 `off_time_ms`
++時啟動；初始值在 line 1502 為零。`off_timer_function()` lines 846–859
++仍需 CPU 執行、拿共享狀態並經 SPMI 關 switch。它不是 PMIC 自主 deadline，
++不能代替對 stalled worker、IRQ 或 NoC/SPMI failure 的獨立硬體關斷證據。
++Brightness zero lines 529–539 與 switch disable lines 748–790 會關 channel，
++再由 `qti_flash_led_disable()` 清 current/timer；這不是 `0x09` clear 語意。
++
++### Mainline 路徑：明確停用 flash timeout
++
++L1 `qcom_flash_led_brightness_set()` lines 564–599 的順序是：
++
++1. 對該 LED 的 channels destrobe，釋放該 LED 的 module reference。
++2. 計算 shared current budget，設定 `TORCH_MODE` current/IRESOLUTION。
++3. 呼叫 `set_flash_timeout(led, 0)`，明確停用 flash safety timer。
++4. 取得該 LED 的 module reference，再 SW strobe 該 LED 的 channels。
++
++Module references 在 lines 175–196 使用所有 caller 的 `chan_en_bits`；
++channel writes 在 lines 394–428 使用該 LED mask，不是覆蓋其他 caller。
++`TORCH_MODE` 的 current 配置在 lines 320–365 使用 5 mA resolution；這
++不是證明存在另一個可猜測的「continuous mode」寄存器。
++
++完整 mainline 流程亦不能只挑最後幾個 writes 套入：
++`update_allowed_flash_current()` lines 199–317 管 shared current，且暫時
++寫 thermal threshold fields、讀 status，再 restore thresholds。這些不是
++Fuxi 現有 pulse allowlist；本輪不移植、不修改 thresholds 或 rail/boost votes。
++OEM current/switch ownership 也不能用 Fuxi 一個 worker mutex 取代。
++
++### Fuxi 可保留的路徑，以及目前不能通過的 gate
++
++目前可保留的是已授權的 default-off、明確 opt-in bounded pulse 路徑：
++`0x89`、80 ms wait、20–80 mA、兩秒 lease、全 byte status 拒絕、bounded
++off confirmation、restore 及 failed latch。它不是跨越 timer deadline 的
++真正 continuous torch，也不是本輪授權增加的測試或 worker 重試。
++
++Source-derived timer table 的精確入口：
++
++- [O1 `timeout_to_code()` lines 221–226](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/leds/leds-qti-flash.c#L221)
++  使用 `round(timeout_ms / 10) - 1`；lines 42–47 定義 channel timer base、
++  bit7 enable 與 10 ms step。
++- [L1 `set_flash_timeout()` lines 368–386](https://github.com/torvalds/linux/blob/v6.12/drivers/leds/flash/leds-qcom-flash.c#L368)
++  使用 `timeout_ms / 10`；lines 45–47 定義 bit7 enable、低7 bits 與 10 ms
++  step，line 139 的四通道 map 指定 timer base `0x3e`。
++
++以下是整數 10 ms multiples 的 source programming formula 反解，不是實際
++PMIC 的計時、公差或 autonomous cutoff measurement：
++
++| Byte | OEM model | Mainline model |
++| --- | --- | --- |
++| `0x8a` | 110 ms | 100 ms |
++| `0x89` | 100 ms | 90 ms |
++
++兩套都不構成實際 PMIC 自主截止證明。`0x89` 不能被當作可無限維持的 timer。
++不允許為了消除 timeout status 而清 timer enable，也不允許假設寫回同一
++byte 會安全 re-arm。失敗後把 continuous 路徑當作「另一模式」重試同樣禁止。
++
++將來若另行分配 continuous 實作，最低 acceptance gates 是：
++
++- 新 opt-in 預設 off；failed worker 絕不透過模式切換或 status 清零恢復。
++- 先有四通道、所有 caller 和共享 module/current/boost/rails 的明確 ownership；
++  保留 external refs，不靠整字 restore 覆蓋其他 caller。
++- 先有實際 revision 與 raw status/clear 生命週期證據，不能以 L1 decoder
++  或軟體模擬解除任何 bit4 fault 拒絕。
++- 若未來另行申請無 flash timer 的 continuous 路徑，必須先有另行批准、
++  已證明有限 deadline 的獨立 fail-closed 輸出關斷機制，能涵蓋 lease/client
++  消失與 CPU/worker/SPMI 停滯。本輪不授權取消 timer；僅移動 IOSleep、
++  加 hrtimer 或續租不能滿足這項。
++- 保持電流/lease 上界，不改變 thermal thresholds、boost ownership 或未分配
++  register allowlist。驗證任何中途失敗都關斷或明確保留 unresolved ownership，
++  不 restore 可導致重啟輸出的 active external state。
++
++這些是 future gates，不是本台已有能力。沒有獨立 cutoff 證明前，安全結論是
++**defer true continuous，維持現有 bounded 路徑與 failure containment**。
++
++## 留給主代理下一輪只讀診斷的證據清單
++
++這只是已命名 register 的讀候選，不增加本輪 read/write，也不授權再次啟用
++已 failed 的 worker。主代理須自行保持現有 opt-in、time/audit budget 與 owner
++檢查；每筆記錄完整 raw byte、transport rc、階段與完成 timestamp。
++
++- Identity：peripheral revision `0x00`、type `0x04`、subtype `0x05`。
++- 四通道配置：timers `0x3e..0x41`、ITARGET `0x42..0x45`、IRESOLUTION
++  `0x49`、strobe controls `0x4a..0x4d`、module `0x46`、channel bits `0x4e`。
++- 分階段保留 `0x06/07/09` 原始值；可在既有固定只讀 budget 內觀察 subsequent
++  samples，但不得把重複讀當作無副作用 clear 或 fault retry。
++- OEM 真正使用的 peripheral IRQ RT status `0x10` 可作為 ownership 核對後
++  的候選；IRQ latched status `0x18` 只有 generic irqchip 定義，不將其提升為
++  已驗證 flash 讀取或把 IRQ pending 消失當作 `0x09` 清除證明。
++- 不在同一「只讀」診斷中 ack IRQ、clear status、寫 peer channel、改 timer
++  或再次 enable。診斷容量不足時明確標 dropped/缺樣，而非無限補讀。
++
++新增 snapshot 會增加實際 transactions/time；沿用 80 ms sleep 不代表額外
++讀取仍落在原來的輸出時間內。應由主代理預先安排 admission/off 後的額外
++reads，保留最遲 disable 時間，不能在 active window 內無界加入全通道 dump。
++
++本文件驗證是 host log 逐筆核對、七份 primary source hash 與呼叫路徑檢查；
++沒有新增或執行硬體/host transport 測試。尚無 b4 exact decoder、可靠 clear
++protocol 或 continuous fail-closed route，不能把研究文件當作這些能力的驗收。
 diff --git a/docs-lanes/torch-timer-source-checkpoint.md b/docs-lanes/torch-timer-source-checkpoint.md
 new file mode 100644
 index 0000000..e44384b
@@ -3457,10 +4043,10 @@ index 0000000..8966843
 +該 case 的 symlink 部分未驗證。AST、CLI help 與三個新檔 whitespace checks 通過。
 diff --git a/docs-lanes/wlan-hostcap-secondary-checkpoint.md b/docs-lanes/wlan-hostcap-secondary-checkpoint.md
 new file mode 100644
-index 0000000..a4b5b2c
+index 0000000..91bf2a4
 --- /dev/null
 +++ b/docs-lanes/wlan-hostcap-secondary-checkpoint.md
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,217 @@
 +# W18 HOST_CAP SECONDARY 單變量 checkpoint
 +
 +日期：2026-11-16。這是可測的 opt-in host-contract 差分，不是已證 native FW_READY 修正；沒有重建或聲稱復現缺少 raw／參數的 try16。
@@ -3589,6 +4175,95 @@ index 0000000..a4b5b2c
 +因此 no-MLO 變量有實際送出差分，但未解除 pre-FW_READY blocker；不是 root fix，也不是已到 WLAN_MODE 的結果。它與本文件的單 `0x20` profile 是兩個分開的實驗。
 +
 +六條外部 rails 已有投票，不把這個 timeout 說成未上電。BDF reply 的 `host_bdf_data` 不是 rail vote；原廠 M3 log 的 `0xa2a00000` 是 DMA handle，不是已證 CPU PA，也不移植到 XNU。
++
++## 8. 第22趟 SECONDARY 實機結果
++
++2026-11-16 18:04:50 暫時開機，18:09:41 已確認 Android 完成開機、
++mapping 解除及自有鎖釋放。未改日常 boot_b。主機監看最高50.5°C。
++loader 為 `native-wlan-w18-oem-secondary-ram9g-sb127-loader`，boot SHA256
++`4a6b111a2cd855d9411d9f934b605f907090d62c0920ddb5312dfa8cb46c1631`，
++kernel SHA256
++`aabeb78f6589b5cef2eafa31c8b353aacb857c64c7894884979c40269d8d4338`。
++600-byte 命令列僅相對原 OEM baseline 增加 `fuxiwlancap=1`；
++MLO 仍為缺省 policy，ADSP／amp／PMIC／haptic 關閉。
++
++原始 log 為
++`work/Codex-Xiaomi13-GPU-20261109/native-hw000w18-oem-secondary-boot-1/boot.log`，
++SHA256 `72c168f66ce8f43da9656c6b9f1b2a6a6416d0f84569885bc96b9b9a4eb8d4fb`。
++
++- 第182行 selector 1 valid；第974行明列 TLV `0x20`、SECONDARY=2、len=4。
++- 第977行 HOST_CAP reply `txn 2 msg 0x34 result 0 error 0`。
++- 第1198／1369／1378行分別確認原廠 REGDB、全部15段 `bd_m3.elf`、
++  M3_INFO 成功；已越過舊照片中的 BDF 首片卡關。
++- 第2639–2644行仍為 `FW_READY indication (10000 ms)` timeout、
++  step28 code `0x1c01`，未進 INI／CFG／MODE。
++- 第2680–2687行記錄 bus master off、PERST asserted、MSI／SMMU undo、
++  buffers freed 與 thread stop，沒有在該 boot 重試。
++
++18:11:00 在下一趟 iOS 前另保存持久化 console：
++`work/adsp-battery/fuxilog/20261116-181100/console.txt`，boot#24、
++flush#20、294799 bytes。這與上列 USB log 是不同收集路徑，不能互換 hash。
++
++本趟證明 SECONDARY 已送出且被接受，仍未解除 FW_READY blocker。
++核心及 RAM runtime guard 與舊 OEM baseline 不同，因此沒有把跨核心比較
++當成嚴格 A/B 或根因證明。未驗掃描、連線、TX/RX 或 IP。
++
++## 9. 下一步的同台 Android 實證
++
++18:22:37 已在 Android 唯讀擷取啟動日誌，主機路徑
++`work/adsp-battery/android-wlan-init-20261116-1823/cnss_init_events.txt`；
++manifest 記錄實際命令、bytes及hash。僅讀 dmesg 與固定 firmware/config
++目錄名稱，未啟用debugfs、改參數或觸發firmware dump。
++
++兩輪 CNSS 啟動在同份 log 均記錄：
++
++- HOST_CAP 的 WAKE MSI=13、DDR IOVA start=`0xa0000000`、
++  size=`0x10010000`、feature list=`0x6`。
++- `wlan-connection-roaming.ini` 取得失敗，仍繼續送BDF與M3。
++- M3之後下載 `kiwi/qdss_trace_config_v2.cfg`，4911 bytes；
++  其後收到 FW initialization done／FW_READY event。
++
++這排除了「原廠成功必定先取得 connection-roaming INI」的推論；
++其他 HOST_CAP 欄位及 QDSS 時序是有實證的差異候選，尚非根因。
++不直接移植 Android IOVA／MSI，不宣告 QDSS 是必要條件，也沒有啟用
++未實作的 host feature。原廠事件名與 XNU message ID 的對應仍以
++各自 primary schema 為準。
++
++此外，第22趟 CB6 的 FSR=`0x400`、FAR、
++FSYNR及CBFRSYNRA/SID=`0x139f`，從step20首次CB檢查到step28均相同；
++`wl_smmu_fault()` 的既有 `0xc00001fe` fault mask結果為0。
++因此 timeout後的tuple不能當作本趟新生DMA fault證據，
++更不授權新增stream mapping或清除未知狀態。
++
++## 10. 下一輪 nm_modem 單 TLV 省略候選
++
++2026-11-16 18:35，本輪加入 `fuxiwlancap=2`：沿用 selector1 的
++SECONDARY=2，只省略 TLV `0x13 nm_modem=0x0e`。缺省、精確0及1保留原
++wire；新 selector2 不改 `0x1c`、feature list、MLO、MSI、DDR IOVA、
++BDF／M3或 FW_READY `0x38`／10000ms。其餘字串仍在 WLAN power writes
++前拒絕，每次 configure 重設 omission 狀態。前述章節中「2屬非法」是
++selector2加入前的歷史結果。
++
++原廠 primary `cnss-qmi.c` 的 HOST_CAP request 未設定 nm_modem。
++同台已保存 CNSS disk disassembly 也未觀察到對應 request offset
++`0x98/0x99` 的 stores；此靜態觀察不是 live wire capture，也未證明
++nm_modem 是目前 blocker。原 ath12k 的0x0e宣告不作為此台原廠已用值。
++
++Loader 必須同時明示 `--host-cap-secondary --omit-nm-modem`，並檢查
++新 kernel omission marker。相對 selector1 只改單一 selector字元，
++600-byte command line長度相同，拒絕 inherited selector／MLO override。
++若 selector2 取得 FW_READY，需再以同 kernel selector1 對照；仍須
++另驗 INI／CFG／MODE、掃描、關聯及 TX/RX，不能把 ready 當作上網完成。
++
++本機 production C W18 suite 已以 Unity Emscripten＋Node執行，
++ASan／UBSan flags保留：182組 selector/lane、16組 encoder policy
++差分及8組完整對話通過。獨立 TLV walker 補回被省略的 literal0x13，
++剝除0x20後逐 byte 比對原 baseline。Loader helper自測、45項SKU
++preflight（正常與Python `-O`）通過。這是 wasm32 host結果，native
++64-bit CI及本輪實機驗證仍待完成。M6i／rails相關 invalid-cap log
++expectation已更新以符合新 selector範圍，兩套 production peers亦已
++以相同 wasm32 ASan／UBSan工具鏈重跑通過，包含全部W16 variants、
++供電順序、共用鎖、fault與quarantine路徑。
 diff --git a/docs-lanes/wlan-w18-profile.md b/docs-lanes/wlan-w18-profile.md
 new file mode 100644
 index 0000000..c461d80
@@ -13482,6 +14157,150 @@ index 0000000..e360b63
 +                    '-pthread', '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
 +                    '-I' + str(sources), str(cfile), str(sources / 'QcomRpmh.c'), '-o', str(binary)], check=True)
 +    subprocess.run([str(binary)], check=True)
+diff --git a/tools/test-fuxi-rtc-read.py b/tools/test-fuxi-rtc-read.py
+new file mode 100644
+index 0000000..31ffe57
+--- /dev/null
++++ b/tools/test-fuxi-rtc-read.py
+@@ -0,0 +1,138 @@
++"""Extract production RTC reads for host fault tests; no ARM, SPMI or MMIO access."""
++
++import hashlib
++import os
++from pathlib import Path
++import re
++import runpy
++import subprocess
++import tempfile
++
++
++ROOT = Path(__file__).resolve().parents[1]
++SOURCE = ROOT / 'xnu/fuxi-h1/fuxi_keys.c'
++
++HARNESS = r'''
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#define FK_RTC_READ @READ_OFFSET@
++static unsigned assertions;
++#define CHECK(condition) do { assertions++; if (!(condition)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #condition); exit(1); } } while (0)
++struct rtc_case {
++    const char *name;
++    uint8_t values[10];
++    unsigned samples, fault_read, expected_reads;
++    bool expected_ok;
++    uint32_t seconds;
++};
++@CASES@
++static const struct rtc_case *active_case;
++static unsigned read_count;
++static bool fk_read(uint16_t apid, uint8_t reg, uint8_t *out)
++{
++    const unsigned ordinal = read_count++;
++    CHECK(apid == UINT16_C(0x1234));
++    CHECK(ordinal < active_case->samples);
++    const unsigned byte = ordinal % 5;
++    CHECK(reg == (uint8_t)(FK_RTC_READ + (byte == 4 ? 0 : byte)));
++    if (read_count == active_case->fault_read) {
++        *out = 0xe7;
++        return false;
++    }
++    *out = active_case->values[ordinal];
++    return true;
++}
++@FUNCTION@
++int main(void)
++{
++    const uint8_t sentinel_raw[4] = {0xa1, 0xb2, 0xc3, 0xd4};
++    const unsigned count = (unsigned)(sizeof(cases) / sizeof(cases[0]));
++    for (unsigned index = 0; index < count; index++) {
++        active_case = &cases[index];
++        read_count = 0;
++        uint32_t seconds = UINT32_C(0xc0dec0de);
++        uint8_t raw[4];
++        memcpy(raw, sentinel_raw, sizeof(raw));
++        const bool result = fk_rtc_read_raw(UINT16_C(0x1234), &seconds, raw);
++        if (result != active_case->expected_ok) {
++            fprintf(stderr, "FAIL %s: expected success=%u, got=%u\n", active_case->name,
++                (unsigned)active_case->expected_ok, (unsigned)result);
++            return 1;
++        }
++        CHECK(result == active_case->expected_ok);
++        CHECK(read_count == active_case->expected_reads);
++        if (result) {
++            CHECK(seconds == active_case->seconds);
++            for (unsigned byte_index = 0; byte_index < 4; byte_index++)
++                CHECK(raw[byte_index] == (uint8_t)(active_case->seconds >> (byte_index * 8)));
++        } else {
++            CHECK(seconds == UINT32_C(0xc0dec0de));
++            CHECK(memcmp(raw, sentinel_raw, sizeof(raw)) == 0);
++        }
++    }
++    printf("PASS fk_rtc_read_raw host: %u cases, %u assertions; ARM/MMIO untested\n", count, assertions);
++    return 0;
++}
++'''
++
++
++def main():
++    original = SOURCE.read_bytes()
++    source = original.decode('utf-8')
++    function = re.search(r'^static bool\s+fk_rtc_read_raw\([^)]*\)\s*\{.*?^\}',
++                         source, re.MULTILINE | re.DOTALL)
++    register = re.search(r'^#define\s+FK_RTC_READ\s+(\S+)', source, re.MULTILINE)
++    if function is None or register is None:
++        raise SystemExit('Production RTC function/register extraction refused.')
++    stable = [0x78, 0x56, 0x34, 0x12, 0x78]
++    rollover = [0xfe, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00]
++    cases = [('stable', stable, 0, 5, True, 0x12345678),
++             ('lsb-advances', stable[:4] + [0x79], 0, 5, True, 0x12345678),
++             ('zero', [0] * 5, 0, 5, True, 0),
++             ('maximum', [0xff] * 5, 0, 5, True, 0xffffffff)]
++    cases += [('initial-byte-fault-' + str(read), stable, read, read, False, 0) for read in range(1, 5)]
++    cases.append(('final-lsb-fault', stable, 5, 5, False, 0))
++    cases.append(('rollover-retry-stable', rollover, 0, 10, True, 0x01000000))
++    cases += [('rollover-retry-byte-fault-' + str(read), rollover, read, read, False, 0)
++              for read in range(6, 10)]
++    cases.append(('rollover-retry-final-lsb-fault', rollover, 10, 10, False, 0))
++    cases.append(('rollover-twice-rejects', rollover[:5] + [0xfe, 0x00, 0x00, 0x01, 0x00], 0, 10, False, 0))
++    rows = []
++    for name, values, fault_read, expected_reads, expected_ok, seconds in cases:
++        samples = '{' + ','.join(str(value) for value in values) + '}'
++        rows.append('{' + f'"{name}", {samples}, {len(values)}, {fault_read}, {expected_reads}, '
++                    f'{str(expected_ok).lower()}, UINT32_C({seconds})' + '}')
++    table = 'static const struct rtc_case cases[] = {' + ',\n'.join(rows) + '};'
++    harness = HARNESS.replace('@FUNCTION@', function.group()).replace('@READ_OFFSET@', register.group(1))
++    harness = harness.replace('@CASES@', table)
++    tools = runpy.run_path(str(ROOT / 'tools/test-fuxi-audio-prep.py'))
++    compiler, environment = tools['compiler_environment']()
++    msvc = Path(compiler[0].strip('"')).name.lower() in ('cl', 'cl.exe')
++    with tempfile.TemporaryDirectory(prefix='fuxi-rtc-read-host-') as directory:
++        temporary = Path(directory)
++        test_source = temporary / 'rtc_read_host.c'
++        test_source.write_text(harness, encoding='utf-8', newline='\n')
++        executable = temporary / ('rtc-read.exe' if os.name == 'nt' else 'rtc-read')
++        if msvc:
++            command = compiler + ['/nologo', '/TC', '/std:c11', '/W4', '/WX', '/Od', '/MD',
++                                  str(test_source), '/Fe:' + str(executable)]
++        else:
++            command = compiler + ['-std=c11', '-Wall', '-Wextra', '-Werror', '-O1',
++                                  str(test_source), '-o', str(executable)]
++        subprocess.run(command, cwd=directory, env=environment, check=True, timeout=60)
++        result = subprocess.run([str(executable)], cwd=directory, env=environment,
++                                capture_output=True, text=True, timeout=30)
++        if result.returncode:
++            raise SystemExit(result.stdout + result.stderr)
++        print(result.stdout.strip())
++    if SOURCE.read_bytes() != original:
++        raise SystemExit('Production source changed during host tests.')
++    print('sha256 ' + hashlib.sha256(original).hexdigest() + '  ' + str(SOURCE))
++    print('Only extracted read logic executes; set_clock, bootargs, drivers and device entry do not run.')
++
++
++if __name__ == '__main__':
++    main()
 diff --git a/tools/test-fuxi-tap-command.py b/tools/test-fuxi-tap-command.py
 new file mode 100644
 index 0000000..1d7b73c
@@ -14626,7 +15445,7 @@ index 41003b6..1fd2a95 100755
          if(probe_arg) { strncpy(out,probe_arg,size); return true; }
          return false;
 diff --git a/tools/test-fuxi-wlan-m6i.py b/tools/test-fuxi-wlan-m6i.py
-index 12293f1..0a2435c 100755
+index 12293f1..0e13d38 100755
 --- a/tools/test-fuxi-wlan-m6i.py
 +++ b/tools/test-fuxi-wlan-m6i.py
 @@ -44,6 +44,16 @@ static bool enabled_present, bw_present;
@@ -14698,7 +15517,7 @@ index 12293f1..0a2435c 100755
 +    assert(!writes && !triggers && !delays && !bhi && !nstages && !aborts && !nsent);
 +    assert(!rpmh_locked && !rpmh_acquires && !rpmh_releases);
 +    assert(!wl3_report[0] && !wl4_report[0] && !wl5_report[0]);
-+    assert(strstr(logs,"invalid fuxiwlancap (expected exact 0 or 1); refused before WLAN power writes"));
++    assert(strstr(logs,"invalid fuxiwlancap (expected exact 0, 1 or 2); refused before WLAN power writes"));
      fixture(); pdc_error=6; fw_run(22);
      assert(!triggers && !bhi && !nstages); /* policy failure precedes all power writes */
      pdc_error=0;
@@ -14729,7 +15548,7 @@ index 12293f1..0a2435c 100755
      with tempfile.TemporaryDirectory(prefix='fuxi-wlan-m6i-') as tmp:
          cfile, binary = Path(tmp) / 'm6i.c', Path(tmp) / 'm6i'
 diff --git a/tools/test-fuxi-wlan-rails.py b/tools/test-fuxi-wlan-rails.py
-index 4edc566..98e8b07 100755
+index 4edc566..d55e598 100755
 --- a/tools/test-fuxi-wlan-rails.py
 +++ b/tools/test-fuxi-wlan-rails.py
 @@ -48,6 +48,7 @@ static void ts_gpio(unsigned n,unsigned func,unsigned pull,unsigned ma,int out)
@@ -14748,7 +15567,7 @@ index 4edc566..98e8b07 100755
 +    assert(!gpio_high && !writes && !nsent && !triggers && !nstages && !delays && !bhi && !aborts);
 +    assert(!rpmh_acquires && !rpmh_releases && !rpmh_locked);
 +    assert(!wl3_report[0] && !wl4_report[0] && !wl5_report[0]);
-+    assert(strstr(logs,"invalid fuxiwlancap (expected exact 0 or 1); refused before WLAN power writes"));
++    assert(strstr(logs,"invalid fuxiwlancap (expected exact 0, 1 or 2); refused before WLAN power writes"));
      for(unsigned v=0;v<=2;v++) {
          boot(v); fw_run(3); assert(!wl5_report[3] && gpio_high==1);
          assert(nsent==(v==1?30:12));
@@ -14763,10 +15582,10 @@ index 4edc566..98e8b07 100755
          cfile, binary = Path(tmp) / 'rails.c', Path(tmp) / 'rails'
 diff --git a/tools/test-fuxi-wlan-w18.py b/tools/test-fuxi-wlan-w18.py
 new file mode 100644
-index 0000000..87ad158
+index 0000000..dde4495
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-w18.py
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,297 @@
 +#!/usr/bin/env python3
 +"""Compile the production WLAN timeline with the existing independent W16 peer.
 +
@@ -14789,14 +15608,22 @@ index 0000000..87ad158
 +spec.loader.exec_module(w16)
 +
 +CAP_PEER = r'''
-+static unsigned cap_strip(const uint8_t *body,unsigned length,uint8_t *baseline,bool enabled) {
-+    unsigned cursor=0,output=0,found=0;
++static unsigned cap_strip(const uint8_t *body,unsigned length,uint8_t *baseline,bool enabled,bool omit_nm_modem) {
++    unsigned cursor=0,output=0,found=0,nm_found=0;
 +    assert(length<=512);
 +    while(cursor<length) {
 +        assert(length-cursor>=3);
 +        unsigned size=body[cursor+1]|((unsigned)body[cursor+2]<<8);
 +        assert(size<=length-cursor-3);
 +        assert(body[cursor]!=0x11 && body[cursor]!=0x1f);
++        if(body[cursor]==0x13) {
++            assert(!omit_nm_modem && ++nm_found==1 && size==1 && body[cursor+3]==0x0e);
++        }
++        if(body[cursor]==0x14 && omit_nm_modem) {
++            const uint8_t omitted[]={0x13,1,0,0x0e};
++            assert(++nm_found==1);
++            memcpy(baseline+output,omitted,sizeof(omitted));output+=sizeof(omitted);
++        }
 +        if(body[cursor]==0x20) {
 +            const uint8_t expected[]={2,0,0,0};
 +            assert(enabled && ++found==1 && size==sizeof(expected));
@@ -14806,7 +15633,7 @@ index 0000000..87ad158
 +        }
 +        cursor+=size+3;
 +    }
-+    assert(found==(unsigned)enabled);
++    assert(found==(unsigned)enabled && nm_found==1);
 +    return output;
 +}
 +'''
@@ -14817,7 +15644,9 @@ index 0000000..87ad158
 +        uint8_t baseline[519];
 +        assert(len>=7);
 +        memcpy(baseline,q,7);
-+        unsigned size=cap_strip(q+7,len-7,baseline+7,cap_arg && !strcmp(cap_arg,"1"));
++        bool enabled=cap_arg && (!strcmp(cap_arg,"1") || !strcmp(cap_arg,"2"));
++        bool omit_nm_modem=cap_arg && !strcmp(cap_arg,"2");
++        unsigned size=cap_strip(q+7,len-7,baseline+7,enabled,omit_nm_modem);
 +        baseline[5]=(uint8_t)size;baseline[6]=(uint8_t)(size>>8);
 +        q=baseline;len=size+7;
 +''')
@@ -14866,23 +15695,24 @@ index 0000000..87ad158
 +    assert(!memcmp(ipcr,(void *)wl_ipcr.va,wl_ipcr.size));free(ipcr);
 +}
 +static void host_cap_selectors(void) {
-+    const char *values[]={NULL,"0","1","-1","2","01","+1","0x1","1junk","","2147483648","1000000000000000000000000000000"};
++    const char *values[]={NULL,"0","1","2","-1","3","01","+1","0x1","1junk","","2147483648","1000000000000000000000000000000"};
 +    for(int qrtr=0;qrtr<=6;qrtr++)for(int variant=0;variant<=1;variant++) {
 +        for(unsigned index=0;index<sizeof(values)/sizeof(values[0]);index++) {
 +            cap_arg=values[index];qrtr_arg=qrtr;w18_arg=variant;w16_arg=0;
 +            unsigned before=ne;
 +            wl_probe_configure();
 +            bool selected=qrtr==5 && variant==1;
-+            bool invalid=selected && index>=3;
++            bool invalid=selected && index>=4;
 +            assert(wl_variant_invalid==invalid && ne==before);
 +            assert(wl18_cap_invalid==invalid);
-+            assert(wl18_host_cap==(selected && index==2));
++            assert(wl18_host_cap==(selected && (index==2 || index==3)));
++            assert(wl18_omit_nm_modem==(selected && index==3));
 +            assert(wl18_cap_refused()==invalid && ne==before);
 +            if(invalid)assert(wl5_step(17)==0x6c && ne==before);
 +        }
 +    }
 +    cap_arg=NULL;qrtr_arg=5;w18_arg=1;wl_probe_configure();
-+    assert(!wl18_host_cap && !wl_variant_invalid);
++    assert(!wl18_host_cap && !wl18_omit_nm_modem && !wl_variant_invalid);
 +}
 +static void host_cap_wire(void) {
 +    const unsigned policies[]={0,WL17_HOSTMEM,WL17_MLOALL};
@@ -14891,17 +15721,21 @@ index 0000000..87ad158
 +            if(variant==2 && policies[policy]==WL17_MLOALL)continue;
 +            struct wl12_encoder baseline={0},selected={0};uint8_t stripped[512];
 +            wl12_mlo_variant=variant;wl17_bits=policies[policy];
-+            wl12_mlo_enabled=true;wl12_num_phy=2;wl18_host_cap=false;
++            wl12_mlo_enabled=true;wl12_num_phy=2;wl18_host_cap=false;wl18_omit_nm_modem=false;
 +            assert(!wl12_host_cap(&baseline));
-+            unsigned size=cap_strip(baseline.data,baseline.len,stripped,false);
++            unsigned size=cap_strip(baseline.data,baseline.len,stripped,false,false);
 +            assert(size==baseline.len && !memcmp(stripped,baseline.data,size));
-+            wl18_host_cap=true;assert(!wl12_host_cap(&selected));
-+            size=cap_strip(selected.data,selected.len,stripped,true);
-+            assert(selected.len==baseline.len+7 && size==baseline.len);
-+            assert(!memcmp(stripped,baseline.data,size));
++            for(unsigned selector=1;selector<=2;selector++) {
++                selected=(struct wl12_encoder){0};
++                wl18_host_cap=true;wl18_omit_nm_modem=selector==2;
++                assert(!wl12_host_cap(&selected));
++                size=cap_strip(selected.data,selected.len,stripped,true,selector==2);
++                assert(selected.len==baseline.len+7-(selector==2 ? 4u : 0u) && size==baseline.len);
++                assert(!memcmp(stripped,baseline.data,size));
++            }
 +        }
 +    }
-+    wl12_mlo_variant=wl17_bits=0;wl18_host_cap=false;
++    wl12_mlo_variant=wl17_bits=0;wl18_host_cap=wl18_omit_nm_modem=false;
 +}
 +int main(void) {
 +    host_cap_selectors();host_cap_wire();
@@ -14974,19 +15808,21 @@ index 0000000..87ad158
 +    fail_bm=fail_perst=true;wl5_abort(28);
 +    assert(!frees && wl_ipcr.va && wl14_m3.va);
 +    fail_bm=fail_perst=false;contain();
-+    const char *profiles[]={NULL,"0","1"};
++    const char *profiles[]={NULL,"0","1","2"};
 +    for(unsigned profile=0;profile<sizeof(profiles)/sizeof(profiles[0]);profile++) {
 +        for(unsigned failure=0;failure<=22;failure+=22) {
 +            cap_arg=profiles[profile];boot18(3,failure,0);
-+            assert(wl18_host_cap==(profile==2));
++            assert(wl18_host_cap==(profile>=2));
++            assert(wl18_omit_nm_modem==(profile==3));
 +            assert((finish_step()!=0)==(failure!=0) && seen15==3);
-+            assert(!!strstr(logbuf,"HOST_CAP TLV 0x20")== (profile==2));
++            assert(!!strstr(logbuf,"HOST_CAP TLV 0x20")== (profile>=2));
++            assert(!!strstr(logbuf,"HOST_CAP TLV 0x13 nm_modem omitted")== (profile==3));
 +            if(failure)sample_line("phase MODE timeout","elapsed 10000 ms");
 +            check_no_ce();contain();
 +        }
 +    }
 +    cap_arg=NULL;
-+    puts("W18 selectors, exact QMI, single-TLV HOST_CAP A/B, phase transitions, exact MODE EOT, bounded silence, six read-only accesses, faults, RDDM and quarantine passed");
++    puts("W18 selectors, exact QMI, SECONDARY and single-TLV omission, phase transitions, exact MODE EOT, bounded silence, six read-only accesses, faults, RDDM and quarantine passed");
 +    return 0;
 +}
 +'''
@@ -25214,7 +26050,7 @@ index 0000000..8491c6b
 +
 +#endif
 diff --git a/xnu/fuxi-h1/fuxi_keys.c b/xnu/fuxi-h1/fuxi_keys.c
-index 8f1d60f..3bdff20 100644
+index 8f1d60f..2fff4c5 100644
 --- a/xnu/fuxi-h1/fuxi_keys.c
 +++ b/xnu/fuxi-h1/fuxi_keys.c
 @@ -39,6 +39,7 @@
@@ -25225,7 +26061,19 @@ index 8f1d60f..3bdff20 100644
  #include "sweet_spmi_bus.h"
  #include "fuxi_key_state.h"
  
-@@ -575,6 +576,26 @@ fk_taps_nums(const char *p, long *out, int max, int *count)
+@@ -250,7 +251,10 @@ fk_rtc_read_raw(uint16_t apid, uint32_t *secs, uint8_t raw[4])
+ 		}
+ 		/* A carry can land mid-read: the LSB must not go backwards. */
+ 		uint8_t lsb = 0;
+-		if (!fk_read(apid, FK_RTC_READ, &lsb) || lsb >= v[0]) {
++		if (!fk_read(apid, FK_RTC_READ, &lsb)) {
++			return false;
++		}
++		if (lsb >= v[0]) {
+ 			break;
+ 		}
+ 		if (i == 1) {
+@@ -575,6 +579,26 @@ fk_taps_nums(const char *p, long *out, int max, int *count)
  	return p;
  }
  
@@ -25252,7 +26100,7 @@ index 8f1d60f..3bdff20 100644
  static void
  fk_taps(void *arg, wait_result_t wr)
  {
-@@ -584,7 +605,7 @@ fk_taps(void *arg, wait_result_t wr)
+@@ -584,7 +608,7 @@ fk_taps(void *arg, wait_result_t wr)
  	char cmds[400]; /* fuxitapcmd=@1: page 2, open Settings (row 1 col 1 there), scroll it, go home, back to page 1 (a user's session); @2: the slow home drag; @3: open Settings from home page 1 (row 2 col 1, the default layout) */ static const char *const fk_taps_presets[] = {"s540,2390,540,999,99;s900,1200,180,1200,300;t148,285;w800;s540,1900,540,700,300;s540,1900,540,700,300;s540,700,540,1900,300;s540,1900,540,700,300;s540,2390,540,999,99;s180,1200,900,1200,300", "s540,2390,540,999,99;s900,999,180,999,8000;s180,999,900,999,8000", "s540,2390,540,999,99;t148,570;w800;s540,1900,540,700,300;s540,1900,540,700,300;s540,700,540,1900,300;s540,1900,540,700,300;s540,2390,540,999,99;s900,1200,180,1200,300;s180,1200,900,1200,300"};
  
  	(void)wr;
@@ -25261,7 +26109,7 @@ index 8f1d60f..3bdff20 100644
  		printf("FUXI TAPS: fuxitapcmd missing\n");
  		(void)thread_terminate(current_thread());
  		thread_block(THREAD_CONTINUE_NULL);
-@@ -668,6 +689,8 @@ fk_taps(void *arg, wait_result_t wr)
+@@ -668,6 +692,8 @@ fk_taps(void *arg, wait_result_t wr)
   * the General and About rows in Settings. Device tests only (synthetic touch).
   */
  static unsigned fk_tour_hold = 45, fk_tour_general = 2100, fk_tour_about = 400;
@@ -25270,7 +26118,7 @@ index 8f1d60f..3bdff20 100644
  
  static void
  fk_tap(int x, int y)
-@@ -739,6 +762,34 @@ fk_tour(void *arg, wait_result_t wr)
+@@ -739,6 +765,34 @@ fk_tour(void *arg, wait_result_t wr)
  	fk_swipe(1000, 10, 1000, 1100, 250);    /* Control Center */
  	fk_script_sleep(2000);
  	fk_tour_shot(&shot, "control-center");
@@ -25305,7 +26153,7 @@ index 8f1d60f..3bdff20 100644
  	/* A home gesture on another page only returns to page 1 the second time. */
  	fk_tour_home();
  	fk_tour_home();
-@@ -759,6 +810,16 @@ fk_tour(void *arg, wait_result_t wr)
+@@ -759,6 +813,16 @@ fk_tour(void *arg, wait_result_t wr)
  	fk_tour_home();
  	fk_tour_app(&shot, 670, 860, "photos");
  	fk_tour_home();
@@ -27895,7 +28743,7 @@ index c8376e4..d363e22 100644
  int sweet_ufs_rootdev(dev_t *dev);
  
 diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
-index 1b46ea1..6705050 100644
+index 1b46ea1..f27b4ab 100644
 --- a/xnu/fuxi-wlan/fuxi_wlan.c
 +++ b/xnu/fuxi-wlan/fuxi_wlan.c
 @@ -78,6 +78,7 @@
@@ -27941,23 +28789,25 @@ index 1b46ea1..6705050 100644
  rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
  {
  	/* BCM requests wait for the TCS IRQ and request responses on all cmds. */
-@@ -728,6 +737,7 @@ static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
+@@ -728,6 +737,8 @@ static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
  static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
  static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
  static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
 +static bool wl18_enabled, wl18_host_cap, wl18_cap_invalid;
++static bool wl18_omit_nm_modem;
  static unsigned wl_rails_variant;
  static bool wl_rails_requested;
  static bool wl16_large, wl16_redrive;
-@@ -1025,6 +1035,7 @@ wl_probe_configure(void)
+@@ -1025,6 +1036,8 @@ wl_probe_configure(void)
  	}
  	wl15_variant = 0;
  	wl16_variant = 0; wl16_large = wl16_redrive = false;
 +	wl18_enabled = wl18_host_cap = wl18_cap_invalid = false;
++	wl18_omit_nm_modem = false;
  	if (wl_w15) {
  		int variant = 0;
  		(void)PE_parse_boot_argn("fuxiwlanw15", &variant, sizeof(variant));
-@@ -1041,6 +1052,23 @@ wl_probe_configure(void)
+@@ -1041,6 +1054,26 @@ wl_probe_configure(void)
  			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
  			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
  		}
@@ -27972,16 +28822,19 @@ index 1b46ea1..6705050 100644
 +	if (wl18_enabled) {
 +		char capability[16] = {0};
 +		if (PE_parse_boot_arg_str("fuxiwlancap", capability, sizeof(capability))) {
-+			if ((capability[0] != '0' && capability[0] != '1') || capability[1]) {
++			if ((capability[0] < '0' || capability[0] > '2') || capability[1]) {
 +				wl_variant_invalid = wl18_cap_invalid = true;
-+			} else { wl18_host_cap = capability[0] == '1'; }
-+			printf("FUXI WLAN: W18 host cap selector %u valid %u (1 adds SECONDARY=2 only)\n",
-+			    wl18_host_cap, !wl_variant_invalid);
++			} else {
++				wl18_host_cap = capability[0] != '0';
++				wl18_omit_nm_modem = capability[0] == '2';
++			}
++			printf("FUXI WLAN: W18 host cap selector %u valid %u (1 SECONDARY=2, 2 also omits nm_modem)\n",
++			    wl18_omit_nm_modem ? 2u : (unsigned)wl18_host_cap, !wl_variant_invalid);
 +		}
  	}
  	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
  	if (wl_w14) {
-@@ -1085,6 +1113,14 @@ wl_probe_configure(void)
+@@ -1085,6 +1118,14 @@ wl_probe_configure(void)
  	printf("FUXI WLAN: M6n cnss=%s valid=%u (PDC before step 1)\n",
  	    wl_cnss_names[wl_cnss], !wl_variant_invalid);
  }
@@ -27990,13 +28843,13 @@ index 1b46ea1..6705050 100644
 +wl18_cap_refused(void)
 +{
 +	if (!wl18_cap_invalid) { return false; }
-+	printf("FUXI WLAN: invalid fuxiwlancap (expected exact 0 or 1); refused before WLAN power writes\n");
++	printf("FUXI WLAN: invalid fuxiwlancap (expected exact 0, 1 or 2); refused before WLAN power writes\n");
 +	return true;
 +}
  #define WL_CNSS_IOVA 0xa0000000ull
  #define WL_CNSS_IOVA_END 0xb0000000ull
  #define WL_LEGACY_IOVA 0x10000000ull
-@@ -3176,6 +3212,10 @@ static unsigned wl12_num_phy;
+@@ -3176,6 +3217,10 @@ static unsigned wl12_num_phy;
  static bool wl13_delayed, wl13_negotiated;
  static bool wl14_ready, wl14_init_done, wl14_board_valid;
  static uint64_t wl15_ready_time;
@@ -28007,7 +28860,7 @@ index 1b46ea1..6705050 100644
  static uint32_t wl14_board;
  static int wl_w12_run(void);
  static int wl_qmi_w12(const uint8_t *, unsigned);
-@@ -3206,6 +3246,40 @@ static struct wl_context *wl_channel(unsigned ch) { return (void *)(wl_contexts.
+@@ -3206,6 +3251,40 @@ static struct wl_context *wl_channel(unsigned ch) { return (void *)(wl_contexts.
  static struct wl_tre *wl_ipcr_ring(unsigned off) { return (void *)(wl_ipcr.va + off); }
  static void wl_w11_barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
  
@@ -28048,7 +28901,7 @@ index 1b46ea1..6705050 100644
  /* RAM-only snapshot: channel RP is diagnostic, never used to reclaim TREs.
   * Completion events remain authoritative. Do not repair a live device-owned
   * RP even when it resembles type/ER words (as in try15c/try15d). */
-@@ -3567,7 +3641,15 @@ wl_w11_events(void)
+@@ -3567,7 +3646,15 @@ wl_w11_events(void)
  					if (ev.ptr != wl_ipcr.iova+roff+ri*16 || (ch == 20 && ri == wl_tx_write)) { return wl_w11_fail("transfer completion pointer/order"); }
  					struct wl_tre tre = wl_ipcr_ring(roff)[ri];
  					if (bytes > (ch == 20 ? WL_IPCR_TXMTU : WL_IPCR_MTU) || bytes > (tre.d0 & 0xffff)) { return wl_w11_fail("transfer completion length"); }
@@ -28065,7 +28918,7 @@ index 1b46ea1..6705050 100644
  					else {
  						uint64_t lo = wl_ipcr.iova + WL_IPCR_RXBUF;
  						if (tre.ptr < lo || tre.ptr >= lo+WL_IPCR_N*WL_IPCR_MTU ||
-@@ -3669,6 +3751,7 @@ wl_w11_run(void)
+@@ -3669,6 +3756,7 @@ wl_w11_run(void)
  	wl12_reply = wl12_requested = wl12_ready = false;
  	wl13_delayed = wl13_negotiated = false;
  	wl14_ready = wl14_init_done = wl14_board_valid = false; wl14_board = 0;
@@ -28073,7 +28926,7 @@ index 1b46ea1..6705050 100644
  	wl_chdb = wl_mrd(0x18); wl_erdb = wl_mrd(0x20);
  	if (!wl_qrtr || !wl_amss_reached || !wl_contexts_published || wl_w11_guard() ||
  	    (wl_chdb & 7) || wl_chdb < 0x100 || wl_chdb > 0x3c00 ||
-@@ -3779,6 +3862,10 @@ wl12_send(struct wl12_encoder *e, unsigned msg, unsigned stage)
+@@ -3779,6 +3867,10 @@ wl12_send(struct wl12_encoder *e, unsigned msg, unsigned stage)
  	e->data[0] = 0; wl_put16(e->data+1, wl12_txn);
  	wl_put16(e->data+3, msg); wl_put16(e->data+5, e->len-7);
  	printf("FUXI WLAN: %s send txn %u msg %#x stage %u\n", wl_w15 && stage >= WL15_INI ? "W15" : "W12", wl12_txn, msg, stage);
@@ -28084,8 +28937,18 @@ index 1b46ea1..6705050 100644
  	int error = wl_qrtr_send(1, wl_server_node, wl_server_port, e->data, e->len);
  	if (!error && stage == WL15_MODE) { wl16_snapshot("MODE queued"); }
  	return error;
-@@ -3844,6 +3931,10 @@ wl12_host_cap(struct wl12_encoder *e)
- 	    wl12_tlv(e, 0x14, 1, 1) || wl12_tlv(e, 0x16, 1, 1) ||
+@@ -3840,10 +3932,18 @@ wl12_host_cap(struct wl12_encoder *e)
+ {
+ 	/* ath12k_qmi_host_cap_send: fresh boot cal_done=0, memory mode=0,
+ 	 * internal clock bits 1/2/3, hw_params CNSS feature bits 3/4. */
+-	if (wl12_tlv(e, 0x10, 1, 4) || wl12_tlv(e, 0x13, 0x0e, 1) ||
+-	    wl12_tlv(e, 0x14, 1, 1) || wl12_tlv(e, 0x16, 1, 1) ||
++	if (wl12_tlv(e, 0x10, 1, 4)) { return 1; }
++	if (!wl18_omit_nm_modem && wl12_tlv(e, 0x13, 0x0e, 1)) { return 1; }
++	if (wl18_omit_nm_modem) {
++		printf("FUXI WLAN: W18 HOST_CAP TLV 0x13 nm_modem omitted\n");
++	}
++	if (wl12_tlv(e, 0x14, 1, 1) || wl12_tlv(e, 0x16, 1, 1) ||
  	    wl12_tlv(e, 0x17, 1, 1) || wl12_tlv(e, 0x1a, 0, 1) ||
  	    wl12_tlv(e, 0x1c, 0, 1)) { return 1; }
 +	if (wl18_host_cap) {
@@ -28095,7 +28958,7 @@ index 1b46ea1..6705050 100644
  	int links = wl17_mlo_links(wl12_mlo_variant, wl17_bits, wl12_mlo_enabled, wl12_num_phy);
  	bool mlo = links != 0;
  	if (mlo) {
-@@ -4281,6 +4372,7 @@ static void
+@@ -4281,6 +4381,7 @@ static void
  wl15_timeout_snapshot(void)
  {
  	if (!wl_w15 || wl12_stage != WL15_MODE) { return; }
@@ -28103,7 +28966,7 @@ index 1b46ea1..6705050 100644
  	wl16_snapshot("MODE timeout");
  	wl15_elapsed("MODE timeout");
  	wl_wlfw_diagnostics("W15 MODE timeout");
-@@ -4345,11 +4437,15 @@ wl12_wait(unsigned what, const char *stage)
+@@ -4345,11 +4446,15 @@ wl12_wait(unsigned what, const char *stage)
  	/* Match ath12k's ten-second WLFW timeout, with bounded transport passes. */
  	for (unsigned ms = 0; ms <= 10000; ms += 10) {
  		if (wl_w11_events()) {
@@ -28119,7 +28982,7 @@ index 1b46ea1..6705050 100644
  		if (ms < 10000) { wl_sleep(10); }
  	}
  	if (wl12_mlo_variant == 1 && wl12_msg == 0x57) {
-@@ -4494,6 +4590,7 @@ static int
+@@ -4494,6 +4599,7 @@ static int
  wl_w15_run(void)
  {
  	static struct wl12_encoder e;
@@ -28127,7 +28990,7 @@ index 1b46ea1..6705050 100644
  	bzero(&e, sizeof(e)); e.len = 7;
  	/* qmi_wlanfw_wlan_ini_req_msg_v01 / *_ei: optional 0x10 u8.
  	 * Explicit lane policy: disable fw log (0). Upstream v6.12 sends 1. */
-@@ -4501,11 +4598,13 @@ wl_w15_run(void)
+@@ -4501,11 +4607,13 @@ wl_w15_run(void)
  	if (wl12_tlv(&e, 0x10, 0, 1) || wl12_send(&e, 0x2f, WL15_INI) ||
  	    wl12_wait(0, "WLAN_INI reply") || wl_w11_wait(3, "W15 INI TX drain")) { return 1; }
  	printf("FUXI WLAN: W15 wlan ini ok\n");
@@ -28141,7 +29004,7 @@ index 1b46ea1..6705050 100644
  	wl16_snapshot("CFG reply/before MODE");
  	if (wl16_redrive) {
  		printf("FUXI WLAN: W16 before MODE re-ring posted RX; no CE init before MODE (ath12k v6.12 order)\n");
-@@ -4520,6 +4619,7 @@ wl_w15_run(void)
+@@ -4520,6 +4628,7 @@ wl_w15_run(void)
  	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
  	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
  	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
@@ -28149,7 +29012,7 @@ index 1b46ea1..6705050 100644
  	wl16_snapshot("MODE reply");
  	wl12_stage = WL15_OBSERVE;
  	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
-@@ -5190,6 +5290,7 @@ wl17_clk_step(void)
+@@ -5190,6 +5299,7 @@ wl17_clk_step(void)
  static void
  fw_run(unsigned limit)
  {
@@ -28320,7 +29183,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..a5d62ac 100644
+index d21bf85..11e31bd 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -28328,7 +29191,7 @@ index d21bf85..a5d62ac 100644
  --- a/bsd/dev/fuxi_wlan.c
  +++ b/bsd/dev/fuxi_wlan.c
 -@@ -0,0 +1,5315 @@
-+@@ -0,0 +1,5416 @@
++@@ -0,0 +1,5425 @@
  +/*
  + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
  + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -28375,23 +29238,25 @@ index d21bf85..a5d62ac 100644
  +rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
  +{
  +	/* BCM requests wait for the TCS IRQ and request responses on all cmds. */
-@@ -760,6 +769,7 @@
+@@ -760,6 +769,8 @@
  +static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
  +static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
  +static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
 ++static bool wl18_enabled, wl18_host_cap, wl18_cap_invalid;
+++static bool wl18_omit_nm_modem;
  +static unsigned wl_rails_variant;
  +static bool wl_rails_requested;
  +static bool wl16_large, wl16_redrive;
-@@ -1057,6 +1067,7 @@
+@@ -1057,6 +1068,8 @@
  +	}
  +	wl15_variant = 0;
  +	wl16_variant = 0; wl16_large = wl16_redrive = false;
 ++	wl18_enabled = wl18_host_cap = wl18_cap_invalid = false;
+++	wl18_omit_nm_modem = false;
  +	if (wl_w15) {
  +		int variant = 0;
  +		(void)PE_parse_boot_argn("fuxiwlanw15", &variant, sizeof(variant));
-@@ -1073,6 +1084,23 @@
+@@ -1073,6 +1086,26 @@
  +			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
  +			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
  +		}
@@ -28406,16 +29271,19 @@ index d21bf85..a5d62ac 100644
 ++	if (wl18_enabled) {
 ++		char capability[16] = {0};
 ++		if (PE_parse_boot_arg_str("fuxiwlancap", capability, sizeof(capability))) {
-++			if ((capability[0] != '0' && capability[0] != '1') || capability[1]) {
+++			if ((capability[0] < '0' || capability[0] > '2') || capability[1]) {
 ++				wl_variant_invalid = wl18_cap_invalid = true;
-++			} else { wl18_host_cap = capability[0] == '1'; }
-++			printf("FUXI WLAN: W18 host cap selector %u valid %u (1 adds SECONDARY=2 only)\n",
-++			    wl18_host_cap, !wl_variant_invalid);
+++			} else {
+++				wl18_host_cap = capability[0] != '0';
+++				wl18_omit_nm_modem = capability[0] == '2';
+++			}
+++			printf("FUXI WLAN: W18 host cap selector %u valid %u (1 SECONDARY=2, 2 also omits nm_modem)\n",
+++			    wl18_omit_nm_modem ? 2u : (unsigned)wl18_host_cap, !wl_variant_invalid);
 ++		}
  +	}
  +	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
  +	if (wl_w14) {
-@@ -1117,6 +1145,14 @@
+@@ -1117,6 +1150,14 @@
  +	printf("FUXI WLAN: M6n cnss=%s valid=%u (PDC before step 1)\n",
  +	    wl_cnss_names[wl_cnss], !wl_variant_invalid);
  +}
@@ -28424,13 +29292,13 @@ index d21bf85..a5d62ac 100644
 ++wl18_cap_refused(void)
 ++{
 ++	if (!wl18_cap_invalid) { return false; }
-++	printf("FUXI WLAN: invalid fuxiwlancap (expected exact 0 or 1); refused before WLAN power writes\n");
+++	printf("FUXI WLAN: invalid fuxiwlancap (expected exact 0, 1 or 2); refused before WLAN power writes\n");
 ++	return true;
 ++}
  +#define WL_CNSS_IOVA 0xa0000000ull
  +#define WL_CNSS_IOVA_END 0xb0000000ull
  +#define WL_LEGACY_IOVA 0x10000000ull
-@@ -3208,6 +3244,10 @@
+@@ -3208,6 +3249,10 @@
  +static bool wl13_delayed, wl13_negotiated;
  +static bool wl14_ready, wl14_init_done, wl14_board_valid;
  +static uint64_t wl15_ready_time;
@@ -28441,7 +29309,7 @@ index d21bf85..a5d62ac 100644
  +static uint32_t wl14_board;
  +static int wl_w12_run(void);
  +static int wl_qmi_w12(const uint8_t *, unsigned);
-@@ -3238,6 +3278,40 @@
+@@ -3238,6 +3283,40 @@
  +static struct wl_tre *wl_ipcr_ring(unsigned off) { return (void *)(wl_ipcr.va + off); }
  +static void wl_w11_barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
  +
@@ -28482,7 +29350,7 @@ index d21bf85..a5d62ac 100644
  +/* RAM-only snapshot: channel RP is diagnostic, never used to reclaim TREs.
  + * Completion events remain authoritative. Do not repair a live device-owned
  + * RP even when it resembles type/ER words (as in try15c/try15d). */
-@@ -3599,7 +3673,15 @@
+@@ -3599,7 +3678,15 @@
  +					if (ev.ptr != wl_ipcr.iova+roff+ri*16 || (ch == 20 && ri == wl_tx_write)) { return wl_w11_fail("transfer completion pointer/order"); }
  +					struct wl_tre tre = wl_ipcr_ring(roff)[ri];
  +					if (bytes > (ch == 20 ? WL_IPCR_TXMTU : WL_IPCR_MTU) || bytes > (tre.d0 & 0xffff)) { return wl_w11_fail("transfer completion length"); }
@@ -28499,7 +29367,7 @@ index d21bf85..a5d62ac 100644
  +					else {
  +						uint64_t lo = wl_ipcr.iova + WL_IPCR_RXBUF;
  +						if (tre.ptr < lo || tre.ptr >= lo+WL_IPCR_N*WL_IPCR_MTU ||
-@@ -3701,6 +3783,7 @@
+@@ -3701,6 +3788,7 @@
  +	wl12_reply = wl12_requested = wl12_ready = false;
  +	wl13_delayed = wl13_negotiated = false;
  +	wl14_ready = wl14_init_done = wl14_board_valid = false; wl14_board = 0;
@@ -28507,7 +29375,7 @@ index d21bf85..a5d62ac 100644
  +	wl_chdb = wl_mrd(0x18); wl_erdb = wl_mrd(0x20);
  +	if (!wl_qrtr || !wl_amss_reached || !wl_contexts_published || wl_w11_guard() ||
  +	    (wl_chdb & 7) || wl_chdb < 0x100 || wl_chdb > 0x3c00 ||
-@@ -3811,6 +3894,10 @@
+@@ -3811,6 +3899,10 @@
  +	e->data[0] = 0; wl_put16(e->data+1, wl12_txn);
  +	wl_put16(e->data+3, msg); wl_put16(e->data+5, e->len-7);
  +	printf("FUXI WLAN: %s send txn %u msg %#x stage %u\n", wl_w15 && stage >= WL15_INI ? "W15" : "W12", wl12_txn, msg, stage);
@@ -28518,8 +29386,18 @@ index d21bf85..a5d62ac 100644
  +	int error = wl_qrtr_send(1, wl_server_node, wl_server_port, e->data, e->len);
  +	if (!error && stage == WL15_MODE) { wl16_snapshot("MODE queued"); }
  +	return error;
-@@ -3876,6 +3963,10 @@
- +	    wl12_tlv(e, 0x14, 1, 1) || wl12_tlv(e, 0x16, 1, 1) ||
+@@ -3872,10 +3964,18 @@
+ +{
+ +	/* ath12k_qmi_host_cap_send: fresh boot cal_done=0, memory mode=0,
+ +	 * internal clock bits 1/2/3, hw_params CNSS feature bits 3/4. */
+-+	if (wl12_tlv(e, 0x10, 1, 4) || wl12_tlv(e, 0x13, 0x0e, 1) ||
+-+	    wl12_tlv(e, 0x14, 1, 1) || wl12_tlv(e, 0x16, 1, 1) ||
+++	if (wl12_tlv(e, 0x10, 1, 4)) { return 1; }
+++	if (!wl18_omit_nm_modem && wl12_tlv(e, 0x13, 0x0e, 1)) { return 1; }
+++	if (wl18_omit_nm_modem) {
+++		printf("FUXI WLAN: W18 HOST_CAP TLV 0x13 nm_modem omitted\n");
+++	}
+++	if (wl12_tlv(e, 0x14, 1, 1) || wl12_tlv(e, 0x16, 1, 1) ||
  +	    wl12_tlv(e, 0x17, 1, 1) || wl12_tlv(e, 0x1a, 0, 1) ||
  +	    wl12_tlv(e, 0x1c, 0, 1)) { return 1; }
 ++	if (wl18_host_cap) {
@@ -28529,7 +29407,7 @@ index d21bf85..a5d62ac 100644
  +	int links = wl17_mlo_links(wl12_mlo_variant, wl17_bits, wl12_mlo_enabled, wl12_num_phy);
  +	bool mlo = links != 0;
  +	if (mlo) {
-@@ -4313,6 +4404,7 @@
+@@ -4313,6 +4413,7 @@
  +wl15_timeout_snapshot(void)
  +{
  +	if (!wl_w15 || wl12_stage != WL15_MODE) { return; }
@@ -28537,7 +29415,7 @@ index d21bf85..a5d62ac 100644
  +	wl16_snapshot("MODE timeout");
  +	wl15_elapsed("MODE timeout");
  +	wl_wlfw_diagnostics("W15 MODE timeout");
-@@ -4377,11 +4469,15 @@
+@@ -4377,11 +4478,15 @@
  +	/* Match ath12k's ten-second WLFW timeout, with bounded transport passes. */
  +	for (unsigned ms = 0; ms <= 10000; ms += 10) {
  +		if (wl_w11_events()) {
@@ -28553,7 +29431,7 @@ index d21bf85..a5d62ac 100644
  +		if (ms < 10000) { wl_sleep(10); }
  +	}
  +	if (wl12_mlo_variant == 1 && wl12_msg == 0x57) {
-@@ -4526,6 +4622,7 @@
+@@ -4526,6 +4631,7 @@
  +wl_w15_run(void)
  +{
  +	static struct wl12_encoder e;
@@ -28561,7 +29439,7 @@ index d21bf85..a5d62ac 100644
  +	bzero(&e, sizeof(e)); e.len = 7;
  +	/* qmi_wlanfw_wlan_ini_req_msg_v01 / *_ei: optional 0x10 u8.
  +	 * Explicit lane policy: disable fw log (0). Upstream v6.12 sends 1. */
-@@ -4533,11 +4630,13 @@
+@@ -4533,11 +4639,13 @@
  +	if (wl12_tlv(&e, 0x10, 0, 1) || wl12_send(&e, 0x2f, WL15_INI) ||
  +	    wl12_wait(0, "WLAN_INI reply") || wl_w11_wait(3, "W15 INI TX drain")) { return 1; }
  +	printf("FUXI WLAN: W15 wlan ini ok\n");
@@ -28575,7 +29453,7 @@ index d21bf85..a5d62ac 100644
  +	wl16_snapshot("CFG reply/before MODE");
  +	if (wl16_redrive) {
  +		printf("FUXI WLAN: W16 before MODE re-ring posted RX; no CE init before MODE (ath12k v6.12 order)\n");
-@@ -4552,6 +4651,7 @@
+@@ -4552,6 +4660,7 @@
  +	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
  +	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
  +	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
@@ -28583,7 +29461,7 @@ index d21bf85..a5d62ac 100644
  +	wl16_snapshot("MODE reply");
  +	wl12_stage = WL15_OBSERVE;
  +	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
-@@ -5222,6 +5322,7 @@
+@@ -5222,6 +5331,7 @@
  +static void
  +fw_run(unsigned limit)
  +{

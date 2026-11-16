@@ -65,6 +65,7 @@ jobs:
           python3 tools/test-fuxi-wlan-bdf-inventory.py
           python3 tools/test-fuxi-battery-pause.py --sanitize
           python3 tools/test-fuxi-battery-publication.py --sanitize
+          python3 tools/test-fuxi-rtc-read.py
           python3 tools/test-fuxi-torch-pulse.py --sanitize
           python3 tools/test-fuxi-torch-audit.py --sanitize
           python3 tools/test-fuxi-wlan-m6i.py

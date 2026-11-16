@@ -123,6 +123,7 @@ jobs:
           (cd source && python3 tools/test-fuxi-audio-prep.py --sanitize)
           (cd source && python3 tools/test-fuxi-battery-prep.py --sanitize)
           (cd source && python3 tools/test-fuxi-battery-publication.py --sanitize)
+          (cd source && python3 tools/test-fuxi-rtc-read.py)
           (cd source && python3 tools/test-fuxi-ram-inventory.py)
           (cd source && python3 tools/test-fuxi-bluetooth.py --sanitize)
           (cd source && python3 tools/test-fuxi-bluetooth-xnu.py --sanitize)
