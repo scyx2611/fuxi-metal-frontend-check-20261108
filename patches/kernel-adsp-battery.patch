@@ -297,7 +297,7 @@ index c7d2b39..22b499a 100644
          if args.root_extents:
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..043a11f
+index 0000000..073f6d4
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
 @@ -0,0 +1,142 @@
@@ -321,7 +321,7 @@ index 0000000..043a11f
 +ROOT = Path(__file__).resolve().parents[1]
 +SRC = ROOT / 'xnu/fuxi-adsp'
 +PATCH = ROOT / 'xnu/patches/0117-fuxi-adsp.patch'
-+SOURCES = ('fuxi_adsp.c', 'fuxi_adsp_fw.c', 'fuxi_adsp_battery.c', 'fuxi_amp.c', 'QcomSmem.c', 'QcomSmp2p.c', 'QcomGlink.c',
++SOURCES = ('fuxi_adsp.c', 'fuxi_adsp_fw.c', 'fuxi_adsp_battery.c', 'fuxi_amp.c', 'fuxi_pmic.c', 'QcomSmem.c', 'QcomSmp2p.c', 'QcomGlink.c',
 +           'QcomMdt.c', 'QcomQmp.c', 'QcomRpmh.c', 'QcomQrtr.c', 'FatVolume.c', 'ShengBattmgr.c', 'ShengQrtr.c', 'GeniI2c.c')
 +HEADERS = ('QcomSmem.h', 'QcomSmp2p.h', 'QcomGlink.h', 'QcomMdt.h', 'QcomQmp.h', 'QcomRpmh.h', 'QcomScm.h', 'QcomQrtr.h',
 +           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h', 'fuxi_adsp_battery.h', 'GeniI2c.h')
@@ -4252,10 +4252,10 @@ index 0000000..32e5255
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp.c b/xnu/fuxi-adsp/fuxi_adsp.c
 new file mode 100644
-index 0000000..a899f5a
+index 0000000..07be418
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp.c
-@@ -0,0 +1,859 @@
+@@ -0,0 +1,861 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 + *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -4324,6 +4324,7 @@ index 0000000..a899f5a
 +extern void sheng_qrtr_start(void);
 +extern void fuxi_adsp_battery_start(int publish);
 +extern void fuxi_amp_init(void);
++extern void fuxi_pmic_init(void);
 +extern volatile int32_t native_qrtr_stats[16];
 +extern char native_qrtr_text[96];
 +void fuxi_adsp_init(void);
@@ -5097,6 +5098,7 @@ index 0000000..a899f5a
 +{
 +    const unsigned asked = fa_mode(), run = fuxi_adsp_mode();
 +    thread_t thread = NULL;
++    fuxi_pmic_init();
 +    fuxi_amp_init(); /* the speaker amplifiers' own switch (fuxi_amp.c, fuxiamp / ADT fuxi,amp), independent of fuxiadsp */
 +    if (!run || gStarted) return;
 +    if (asked >= 2 && run < 2) {
@@ -5937,6 +5939,165 @@ index 0000000..09ce08d
 +    printf("FUXI AMP: started mode %u\n", mode > 2 ? 2 : mode);
 +}
 +#endif /* FUXI */
+diff --git a/xnu/fuxi-adsp/fuxi_pmic.c b/xnu/fuxi-adsp/fuxi_pmic.c
+new file mode 100644
+index 0000000..b70b9b0
+--- /dev/null
++++ b/xnu/fuxi-adsp/fuxi_pmic.c
+@@ -0,0 +1,153 @@
++#include <pexpert/arm64/board_config.h>
++#if defined(FUXI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++
++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
++    unsigned, void *);
++void fuxi_pmic_init(void);
++
++struct fp_window {
++    uint64_t physical;
++    vm_size_t size;
++    vm_offset_t address;
++};
++
++static struct fp_window fp_core = {0x0c400000ull, 0x4000, 0};
++static struct fp_window fp_config = {0x0c42c000ull, 0x8000, 0};
++static struct fp_window fp_observer = {0x0c440000ull, 0x8000, 0};
++static LCK_GRP_DECLARE(fp_group, "fuxi-pmic");
++static LCK_MTX_DECLARE(fp_lock, &fp_group);
++static unsigned fp_apids;
++static uint8_t fp_poisoned[1024];
++static unsigned fp_started;
++
++static kern_return_t fp_map(struct fp_window *window)
++{
++    vm_offset_t address = 0;
++    kern_return_t result = kmem_alloc(kernel_map, &address, window->size,
++        KMA_VAONLY | KMA_KOBJECT | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
++    if (result != KERN_SUCCESS) return result;
++    for (vm_size_t offset = 0; offset < window->size; offset += PAGE_SIZE) {
++        result = pmap_enter_options_addr(kernel_pmap, address + offset, window->physical + offset,
++            VM_PROT_READ | VM_PROT_WRITE, VM_PROT_NONE, VM_WIMG_IO, TRUE, PMAP_OPTIONS_NOWAIT, NULL);
++        if (result != KERN_SUCCESS) {
++            pmap_remove(kernel_pmap, address, address + window->size);
++            return result;
++        }
++    }
++    window->address = address;
++    return KERN_SUCCESS;
++}
++
++static uint32_t fp_read32(const struct fp_window *window, unsigned offset)
++{
++    uint32_t value = *(volatile uint32_t *)(window->address + offset);
++    __asm__ volatile("dmb oshld" ::: "memory");
++    return value;
++}
++
++static void fp_write32(const struct fp_window *window, unsigned offset, uint32_t value)
++{
++    *(volatile uint32_t *)(window->address + offset) = value;
++    __asm__ volatile("dsb osh" ::: "memory");
++}
++
++static int fp_find(unsigned sid, unsigned peripheral, unsigned *owner)
++{
++    int selected = -1;
++    const unsigned ppid = sid << 8 | peripheral;
++    for (unsigned apid = 0; apid < fp_apids; apid++) {
++        uint32_t map = fp_read32(&fp_core, 0x2000 + 4 * apid);
++        if (!map || ((map >> 8) & 0xfff) != ppid) continue;
++        unsigned candidate_owner = fp_read32(&fp_config, 0x1000 + 4 * apid) & 7u;
++        if (selected < 0 || candidate_owner == 0) {
++            selected = (int)apid;
++            *owner = candidate_owner;
++        }
++    }
++    return selected;
++}
++
++static int fp_read(unsigned sid, unsigned address, uint8_t *value)
++{
++    unsigned owner = 0;
++    int result = -1;
++    lck_mtx_lock(&fp_lock);
++    int apid = fp_find(sid, address >> 8, &owner);
++    if (apid < 0 || fp_poisoned[apid]) goto done;
++    unsigned channel = (unsigned)apid * 0x20;
++    fp_write32(&fp_observer, channel, 1u << 27 | (address & 0xffu) << 4);
++    for (unsigned poll = 0; poll < 1000; poll++) {
++        uint32_t status = fp_read32(&fp_observer, channel + 8);
++        if (status & 1u) {
++            if (!(status & 0x0eu)) {
++                *value = (uint8_t)fp_read32(&fp_observer, channel + 0x18);
++                result = 0;
++            }
++            goto done;
++        }
++        delay(1);
++    }
++    fp_poisoned[apid] = 1;
++    printf("FUXI PMIC: timeout sid=%u addr=%#x APID=%d; channel disabled\n", sid, address, apid);
++done:
++    lck_mtx_unlock(&fp_lock);
++    return result;
++}
++
++static void fp_survey(unsigned sid, unsigned base, const char *name)
++{
++    static const uint8_t offsets[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
++        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x10, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b,
++        0x4c, 0x4d, 0x4e, 0x50, 0x5c, 0x5d, 0x63, 0x66};
++    unsigned owner = 7;
++    int apid = fp_find(sid, base >> 8, &owner);
++    printf("FUXI PMIC: %s sid=%u base=%#x APID=%d owner=%u survey-only\n", name, sid, base, apid, owner);
++    if (apid < 0) return;
++    for (unsigned index = 0; index < sizeof(offsets); index++) {
++        uint8_t value = 0;
++        int result = fp_read(sid, base + offsets[index], &value);
++        printf("FUXI PMIC: %s +%02x=%02x rc=%d\n", name, offsets[index], value, result);
++        if (fp_poisoned[apid]) break;
++    }
++}
++
++void fuxi_pmic_init(void)
++{
++    uint32_t mode = 0;
++    DTEntry chosen;
++    void *property = NULL;
++    unsigned bytes = 0;
++    if (!PE_parse_boot_argn("fuxipmic", &mode, sizeof(mode)) &&
++        SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++        SecureDTGetProperty(chosen, "fuxi,pmic", &property, &bytes) == kSuccess && bytes == sizeof(mode)) {
++        memcpy(&mode, property, sizeof(mode));
++    }
++    if (!mode || __atomic_exchange_n(&fp_started, 1u, __ATOMIC_ACQ_REL)) return;
++    if (mode != 1) {
++        printf("FUXI PMIC: unsupported mode=%u; hardware untouched\n", mode);
++        return;
++    }
++    if (fp_map(&fp_core) != KERN_SUCCESS || fp_map(&fp_config) != KERN_SUCCESS ||
++        fp_map(&fp_observer) != KERN_SUCCESS) {
++        printf("FUXI PMIC: mapping failed\n");
++        return;
++    }
++    uint32_t version = fp_read32(&fp_core, 0);
++    fp_apids = fp_read32(&fp_core, 4) & 0x7ffu;
++    printf("FUXI PMIC: arbiter=%#x APIDs=%u mode=1\n", version, fp_apids);
++    if (version < 0x70000000u || version >= 0x80000000u || !fp_apids || fp_apids > 1024) return;
++    fp_survey(1, 0xee00, "flash");
++    fp_survey(7, 0xf000, "haptic-config");
++    fp_survey(7, 0xf100, "haptic-pattern");
++    fp_survey(7, 0xf200, "haptic-boost");
++}
++#endif
 diff --git a/xnu/fuxi-h1/fuxi_keys.c b/xnu/fuxi-h1/fuxi_keys.c
 index 8f1d60f..e71e7c2 100644
 --- a/xnu/fuxi-h1/fuxi_keys.c
@@ -7150,13 +7311,13 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..031c394
+index 0000000..71a06c2
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,4941 @@
+@@ -0,0 +1,5100 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
-+@@ -121,6 +121,21 @@
++@@ -121,6 +121,22 @@
 + bsd/dev/sweet_rpmh.c			standard
 + bsd/dev/sweet_spmi.c			standard
 + bsd/dev/sweet_usb.c			standard
@@ -7164,6 +7325,7 @@ index 0000000..031c394
 ++bsd/dev/fuxi_adsp_fw.c			standard
 ++bsd/dev/fuxi_adsp_battery.c		standard
 ++bsd/dev/fuxi_amp.c			standard
+++bsd/dev/fuxi_pmic.c			standard
 ++bsd/dev/QcomSmem.c			standard
 ++bsd/dev/QcomSmp2p.c			standard
 ++bsd/dev/QcomGlink.c			standard
@@ -7180,7 +7342,7 @@ index 0000000..031c394
 + bsd/dev/unix_startup.c			standard
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp.c
-+@@ -0,0 +1,859 @@
++@@ -0,0 +1,861 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 ++ *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -7249,6 +7411,7 @@ index 0000000..031c394
 ++extern void sheng_qrtr_start(void);
 ++extern void fuxi_adsp_battery_start(int publish);
 ++extern void fuxi_amp_init(void);
+++extern void fuxi_pmic_init(void);
 ++extern volatile int32_t native_qrtr_stats[16];
 ++extern char native_qrtr_text[96];
 ++void fuxi_adsp_init(void);
@@ -8022,6 +8185,7 @@ index 0000000..031c394
 ++{
 ++    const unsigned asked = fa_mode(), run = fuxi_adsp_mode();
 ++    thread_t thread = NULL;
+++    fuxi_pmic_init();
 ++    fuxi_amp_init(); /* the speaker amplifiers' own switch (fuxi_amp.c, fuxiamp / ADT fuxi,amp), independent of fuxiadsp */
 ++    if (!run || gStarted) return;
 ++    if (asked >= 2 && run < 2) {
@@ -8818,6 +8982,162 @@ index 0000000..031c394
 ++    printf("FUXI AMP: started mode %u\n", mode > 2 ? 2 : mode);
 ++}
 ++#endif /* FUXI */
++--- /dev/null
+++++ b/bsd/dev/fuxi_pmic.c
++@@ -0,0 +1,153 @@
+++#include <pexpert/arm64/board_config.h>
+++#if defined(FUXI)
+++#include <sys/param.h>
+++#include <sys/systm.h>
+++#include <kern/clock.h>
+++#include <kern/locks.h>
+++#include <machine/machine_routines.h>
+++#include <pexpert/pexpert.h>
+++#include <pexpert/device_tree.h>
+++#include <vm/vm_kern.h>
+++#include <vm/pmap.h>
+++
+++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
+++    unsigned, void *);
+++void fuxi_pmic_init(void);
+++
+++struct fp_window {
+++    uint64_t physical;
+++    vm_size_t size;
+++    vm_offset_t address;
+++};
+++
+++static struct fp_window fp_core = {0x0c400000ull, 0x4000, 0};
+++static struct fp_window fp_config = {0x0c42c000ull, 0x8000, 0};
+++static struct fp_window fp_observer = {0x0c440000ull, 0x8000, 0};
+++static LCK_GRP_DECLARE(fp_group, "fuxi-pmic");
+++static LCK_MTX_DECLARE(fp_lock, &fp_group);
+++static unsigned fp_apids;
+++static uint8_t fp_poisoned[1024];
+++static unsigned fp_started;
+++
+++static kern_return_t fp_map(struct fp_window *window)
+++{
+++    vm_offset_t address = 0;
+++    kern_return_t result = kmem_alloc(kernel_map, &address, window->size,
+++        KMA_VAONLY | KMA_KOBJECT | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
+++    if (result != KERN_SUCCESS) return result;
+++    for (vm_size_t offset = 0; offset < window->size; offset += PAGE_SIZE) {
+++        result = pmap_enter_options_addr(kernel_pmap, address + offset, window->physical + offset,
+++            VM_PROT_READ | VM_PROT_WRITE, VM_PROT_NONE, VM_WIMG_IO, TRUE, PMAP_OPTIONS_NOWAIT, NULL);
+++        if (result != KERN_SUCCESS) {
+++            pmap_remove(kernel_pmap, address, address + window->size);
+++            return result;
+++        }
+++    }
+++    window->address = address;
+++    return KERN_SUCCESS;
+++}
+++
+++static uint32_t fp_read32(const struct fp_window *window, unsigned offset)
+++{
+++    uint32_t value = *(volatile uint32_t *)(window->address + offset);
+++    __asm__ volatile("dmb oshld" ::: "memory");
+++    return value;
+++}
+++
+++static void fp_write32(const struct fp_window *window, unsigned offset, uint32_t value)
+++{
+++    *(volatile uint32_t *)(window->address + offset) = value;
+++    __asm__ volatile("dsb osh" ::: "memory");
+++}
+++
+++static int fp_find(unsigned sid, unsigned peripheral, unsigned *owner)
+++{
+++    int selected = -1;
+++    const unsigned ppid = sid << 8 | peripheral;
+++    for (unsigned apid = 0; apid < fp_apids; apid++) {
+++        uint32_t map = fp_read32(&fp_core, 0x2000 + 4 * apid);
+++        if (!map || ((map >> 8) & 0xfff) != ppid) continue;
+++        unsigned candidate_owner = fp_read32(&fp_config, 0x1000 + 4 * apid) & 7u;
+++        if (selected < 0 || candidate_owner == 0) {
+++            selected = (int)apid;
+++            *owner = candidate_owner;
+++        }
+++    }
+++    return selected;
+++}
+++
+++static int fp_read(unsigned sid, unsigned address, uint8_t *value)
+++{
+++    unsigned owner = 0;
+++    int result = -1;
+++    lck_mtx_lock(&fp_lock);
+++    int apid = fp_find(sid, address >> 8, &owner);
+++    if (apid < 0 || fp_poisoned[apid]) goto done;
+++    unsigned channel = (unsigned)apid * 0x20;
+++    fp_write32(&fp_observer, channel, 1u << 27 | (address & 0xffu) << 4);
+++    for (unsigned poll = 0; poll < 1000; poll++) {
+++        uint32_t status = fp_read32(&fp_observer, channel + 8);
+++        if (status & 1u) {
+++            if (!(status & 0x0eu)) {
+++                *value = (uint8_t)fp_read32(&fp_observer, channel + 0x18);
+++                result = 0;
+++            }
+++            goto done;
+++        }
+++        delay(1);
+++    }
+++    fp_poisoned[apid] = 1;
+++    printf("FUXI PMIC: timeout sid=%u addr=%#x APID=%d; channel disabled\n", sid, address, apid);
+++done:
+++    lck_mtx_unlock(&fp_lock);
+++    return result;
+++}
+++
+++static void fp_survey(unsigned sid, unsigned base, const char *name)
+++{
+++    static const uint8_t offsets[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+++        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x10, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b,
+++        0x4c, 0x4d, 0x4e, 0x50, 0x5c, 0x5d, 0x63, 0x66};
+++    unsigned owner = 7;
+++    int apid = fp_find(sid, base >> 8, &owner);
+++    printf("FUXI PMIC: %s sid=%u base=%#x APID=%d owner=%u survey-only\n", name, sid, base, apid, owner);
+++    if (apid < 0) return;
+++    for (unsigned index = 0; index < sizeof(offsets); index++) {
+++        uint8_t value = 0;
+++        int result = fp_read(sid, base + offsets[index], &value);
+++        printf("FUXI PMIC: %s +%02x=%02x rc=%d\n", name, offsets[index], value, result);
+++        if (fp_poisoned[apid]) break;
+++    }
+++}
+++
+++void fuxi_pmic_init(void)
+++{
+++    uint32_t mode = 0;
+++    DTEntry chosen;
+++    void *property = NULL;
+++    unsigned bytes = 0;
+++    if (!PE_parse_boot_argn("fuxipmic", &mode, sizeof(mode)) &&
+++        SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+++        SecureDTGetProperty(chosen, "fuxi,pmic", &property, &bytes) == kSuccess && bytes == sizeof(mode)) {
+++        memcpy(&mode, property, sizeof(mode));
+++    }
+++    if (!mode || __atomic_exchange_n(&fp_started, 1u, __ATOMIC_ACQ_REL)) return;
+++    if (mode != 1) {
+++        printf("FUXI PMIC: unsupported mode=%u; hardware untouched\n", mode);
+++        return;
+++    }
+++    if (fp_map(&fp_core) != KERN_SUCCESS || fp_map(&fp_config) != KERN_SUCCESS ||
+++        fp_map(&fp_observer) != KERN_SUCCESS) {
+++        printf("FUXI PMIC: mapping failed\n");
+++        return;
+++    }
+++    uint32_t version = fp_read32(&fp_core, 0);
+++    fp_apids = fp_read32(&fp_core, 4) & 0x7ffu;
+++    printf("FUXI PMIC: arbiter=%#x APIDs=%u mode=1\n", version, fp_apids);
+++    if (version < 0x70000000u || version >= 0x80000000u || !fp_apids || fp_apids > 1024) return;
+++    fp_survey(1, 0xee00, "flash");
+++    fp_survey(7, 0xf000, "haptic-config");
+++    fp_survey(7, 0xf100, "haptic-pattern");
+++    fp_survey(7, 0xf200, "haptic-boost");
+++}
+++#endif
 +--- /dev/null
 ++++ b/bsd/dev/QcomSmem.c
 +@@ -0,0 +1,112 @@
