@@ -17115,10 +17115,10 @@ index 0000000..cea2fab
 +}
 diff --git a/tools/test-fuxi-wlan-ios.py b/tools/test-fuxi-wlan-ios.py
 new file mode 100644
-index 0000000..40c96da
+index 0000000..d9108a4
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ios.py
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,634 @@
 +import hashlib
 +import hmac
 +import os
@@ -17280,6 +17280,10 @@ index 0000000..40c96da
 +}
 +static size_t put32(uint8_t *bytes,size_t offset,unsigned attribute,uint32_t value) {
 +    uint8_t encoded[4]; fwc_write(encoded,value,4); return wli_put(bytes,offset,attribute,encoded,4);
++}
++static int last_heard_rssi;
++static void count_heard(const struct fuxi_wifi_sta_bss *bss,void *context) {
++    ++*(unsigned *)context; last_heard_rssi=bss->rssi;
 +}
 +static void bootstrap(void) {
 +    uint8_t bytes[MESSAGE], power[4]={1};
@@ -17680,6 +17684,16 @@ index 0000000..40c96da
 +    test_mode=2; memcpy(test_ssid,"fcb",4); unsigned started=threads_started; bootstrap();
 +    assert(threads_started==started+1 && wli_test_join.ssid_length==3 && !memcmp(wli_test_join.ssid,"fcb",3));
 +    test_ssid[0]=0; bootstrap(); assert(threads_started==started+1); test_mode=0;
++    /* fuxiwifitest=3: wifid hears only the named network; no test thread, nothing else changes. */
++    test_mode=3; memcpy(test_ssid,"fcb",4); started=threads_started; bootstrap();
++    assert(threads_started==started && wli_ui_only_length==3 && !memcmp(wli_ui_only,"fcb",3));
++    memset(wli_bss,0,3*sizeof(wli_bss[0])); wli_bss_count=3;
++    wli_bss[0].ssid_length=4; memcpy(wli_bss[0].ssid,"fcbx",4);
++    wli_bss[1].ssid_length=3; memcpy(wli_bss[1].ssid,"fcb",3); wli_bss[1].rssi=-40;
++    wli_bss[2].ssid_length=2; memcpy(wli_bss[2].ssid,"fc",2);
++    unsigned heard_seen=0; wli_heard(count_heard,&heard_seen); assert(heard_seen==1 && last_heard_rssi==-40);
++    wli_ui_only_length=0; heard_seen=0; wli_heard(count_heard,&heard_seen); assert(heard_seen==3);
++    test_ssid[0]=0; bootstrap(); assert(wli_ui_only_length==0); test_mode=0; wli_bss_count=0;
 +    puts("PASS native bridge: power acknowledgements, generations, directed scans with every element "
 +         "(trimmed whole), module-record fallback, WPA2-PSK and open joins with the four-way and group "
 +         "handshakes, keys, port, frames both ways, refusals, timeouts, loss, leave and stale rejection");
@@ -32914,10 +32928,10 @@ index 0000000..e0b7465
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ios.inc b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
 new file mode 100644
-index 0000000..26779a7
+index 0000000..08fc7e2
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-@@ -0,0 +1,1237 @@
+@@ -0,0 +1,1260 @@
 +#include <sys/fuxi_wifi_ios.h>
 +#include <sys/fuxi_wifi_wpa.h>
 +#include <sys/errno.h>
@@ -33100,6 +33114,14 @@ index 0000000..26779a7
 +	return wli_submit(WLI_SCAN, false, scan, NULL);
 +}
 +
++/*
++ * fuxiwifitest=3 (UI tests only): what wifid hears is cut down to the network named by
++ * fuxiwifitestssid, so a scripted tap on the first row of the list lands on it whatever else is
++ * on the air. Off (empty) by default; the radio still scans everything.
++ */
++static uint8_t wli_ui_only[32];
++static uint8_t wli_ui_only_length;
++
 +static void
 +wli_heard(void (*each)(const struct fuxi_wifi_sta_bss *, void *), void *context)
 +{
@@ -33110,6 +33132,10 @@ index 0000000..26779a7
 +		if (present) { bss = wli_bss[index]; }
 +		lck_mtx_unlock(&wli_lock);
 +		if (!present) { break; }
++		if (wli_ui_only_length && (bss.ssid_length != wli_ui_only_length ||
++		    memcmp(bss.ssid, wli_ui_only, wli_ui_only_length) != 0)) {
++			continue;
++		}
 +		each(&bss, context);
 +	}
 +}
@@ -34050,6 +34076,17 @@ index 0000000..26779a7
 +		if (kernel_thread_start(wli_test_join_thread, NULL, &thread) == KERN_SUCCESS) {
 +			thread_deallocate(thread);
 +		}
++	} else if (test == 3) {
++		char name[33];
++		memset(name, 0, sizeof(name));
++		if (!PE_parse_boot_argn("fuxiwifitestssid", name, sizeof(name) - 1) || !name[0]) {
++			printf("FUXI WIFI IOS: UI list filter needs fuxiwifitestssid\n");
++			return;
++		}
++		wli_ui_only_length = (uint8_t)strlen(name);
++		memcpy(wli_ui_only, name, wli_ui_only_length);
++		printf("FUXI WIFI IOS: UI test: wifid hears only the network named by fuxiwifitestssid (%u bytes)\n",
++		    wli_ui_only_length);
 +	}
 +}
 +
@@ -34318,7 +34355,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..3fdff64 100644
+index d21bf85..ad58ed3 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -34789,7 +34826,7 @@ index d21bf85..3fdff64 100644
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,2091 @@
+@@ -5899,3 +6092,2114 @@
  + }
  + r[3] = 0;
  +}
@@ -35643,7 +35680,7 @@ index d21bf85..3fdff64 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ios.inc
-+@@ -0,0 +1,1237 @@
++@@ -0,0 +1,1260 @@
 ++#include <sys/fuxi_wifi_ios.h>
 ++#include <sys/fuxi_wifi_wpa.h>
 ++#include <sys/errno.h>
@@ -35826,6 +35863,14 @@ index d21bf85..3fdff64 100644
 ++	return wli_submit(WLI_SCAN, false, scan, NULL);
 ++}
 ++
+++/*
+++ * fuxiwifitest=3 (UI tests only): what wifid hears is cut down to the network named by
+++ * fuxiwifitestssid, so a scripted tap on the first row of the list lands on it whatever else is
+++ * on the air. Off (empty) by default; the radio still scans everything.
+++ */
+++static uint8_t wli_ui_only[32];
+++static uint8_t wli_ui_only_length;
+++
 ++static void
 ++wli_heard(void (*each)(const struct fuxi_wifi_sta_bss *, void *), void *context)
 ++{
@@ -35836,6 +35881,10 @@ index d21bf85..3fdff64 100644
 ++		if (present) { bss = wli_bss[index]; }
 ++		lck_mtx_unlock(&wli_lock);
 ++		if (!present) { break; }
+++		if (wli_ui_only_length && (bss.ssid_length != wli_ui_only_length ||
+++		    memcmp(bss.ssid, wli_ui_only, wli_ui_only_length) != 0)) {
+++			continue;
+++		}
 ++		each(&bss, context);
 ++	}
 ++}
@@ -36776,6 +36825,17 @@ index d21bf85..3fdff64 100644
 ++		if (kernel_thread_start(wli_test_join_thread, NULL, &thread) == KERN_SUCCESS) {
 ++			thread_deallocate(thread);
 ++		}
+++	} else if (test == 3) {
+++		char name[33];
+++		memset(name, 0, sizeof(name));
+++		if (!PE_parse_boot_argn("fuxiwifitestssid", name, sizeof(name) - 1) || !name[0]) {
+++			printf("FUXI WIFI IOS: UI list filter needs fuxiwifitestssid\n");
+++			return;
+++		}
+++		wli_ui_only_length = (uint8_t)strlen(name);
+++		memcpy(wli_ui_only, name, wli_ui_only_length);
+++		printf("FUXI WIFI IOS: UI test: wifid hears only the network named by fuxiwifitestssid (%u bytes)\n",
+++		    wli_ui_only_length);
 ++	}
 ++}
 ++
