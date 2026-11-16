@@ -53,6 +53,7 @@ jobs:
           python3 tools/test-fuxi-wlan-m6i.py
           python3 tools/test-fuxi-wlan-rails.py
           python3 tools/test-fuxi-wlan-w18.py
+          python3 tools/test-fuxi-wlan-ath12k.py --sanitize
           python3 tools/test-fuxi-rtc-read.py
           python3 tools/test-fuxi-torch-steady.py --sanitize
   host:

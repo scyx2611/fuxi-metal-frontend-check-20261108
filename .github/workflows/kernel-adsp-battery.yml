@@ -12,6 +12,9 @@ on:
       runner_label:
         type: string
         default: macos-15
+      ath12k:
+        type: boolean
+        default: false
   # A workflow that is not on the default branch cannot be dispatched by hand, so the branch push starts it.
   push:
     branches:
@@ -44,6 +47,7 @@ on:
       - .github/workflows/kernel-adsp-battery.yml
 permissions:
   contents: read
+  actions: read
 jobs:
   kernel:
     runs-on: ${{ inputs.runner_label || 'macos-15' }}
@@ -136,6 +140,22 @@ jobs:
           (cd source && python3 tools/test-fuxi-wlan-m6i.py)
           (cd source && python3 tools/test-fuxi-wlan-rails.py)
           (cd source && python3 tools/test-fuxi-wlan-w18.py)
+      - name: Download the pinned public ath12k link input
+        if: ${{ inputs.ath12k }}
+        uses: actions/download-artifact@v4
+        with:
+          name: fuxi-ath12k-objects
+          path: ath12k-out
+          run-id: 43879548709
+          github-token: ${{ github.token }}
+      - name: Verify the optional ath12k link input
+        if: ${{ inputs.ath12k }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 source/tools/ci/ath12k-link.py ath12k-out
+          (cd source && python3 tools/test-fuxi-wlan-ath12k.py --sanitize)
+          echo "FUXI_ATH12K_OBJECT=$PWD/ath12k-out/fuxi_ath12k.o" >> "$GITHUB_ENV"
       - name: Build and audit kernel
         shell: bash
         run: |

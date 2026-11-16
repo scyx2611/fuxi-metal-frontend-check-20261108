@@ -9,6 +9,7 @@ on:
       - .github/workflows/kernel-adsp-ram9g.yml
 permissions:
   contents: read
+  actions: read
 jobs:
   kernel:
     uses: ./.github/workflows/kernel-adsp-battery.yml

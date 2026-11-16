@@ -1,6 +1,6 @@
 diff --git a/docs-lanes/adsp.md b/docs-lanes/adsp.md
 new file mode 100644
-index 0000000..7349474
+index 0000000000000000000000000000000000000000..73494740f1d37578a0694aa8198333d298ed4850
 --- /dev/null
 +++ b/docs-lanes/adsp.md
 @@ -0,0 +1,134 @@
@@ -140,7 +140,7 @@ index 0000000..7349474
 +results are recorded separately.
 diff --git a/docs-lanes/audio-preparation.md b/docs-lanes/audio-preparation.md
 new file mode 100644
-index 0000000..359d1dd
+index 0000000000000000000000000000000000000000..359d1dd8f084a36e6960daf6da9235af1249d0cf
 --- /dev/null
 +++ b/docs-lanes/audio-preparation.md
 @@ -0,0 +1,187 @@
@@ -333,7 +333,7 @@ index 0000000..359d1dd
 +尚待下一階段驗證的部分為 kernel build 接線、GPR 在 fuxi firmware 的 40-byte query 接受情況、hardware audio、iOS HAL load 與實際 app 路由。
 diff --git a/docs-lanes/battery-freshness.md b/docs-lanes/battery-freshness.md
 new file mode 100644
-index 0000000..e6cee9f
+index 0000000000000000000000000000000000000000..e6cee9f10fa432999a467ee46f602c763d1c50a1
 --- /dev/null
 +++ b/docs-lanes/battery-freshness.md
 @@ -0,0 +1,108 @@
@@ -447,7 +447,7 @@ index 0000000..e6cee9f
 +此 checkpoint 支持立即規劃 producer/consumer 的一組小修正。Host helper 的資格判斷已驗證，下一階段由主線整合既有 production 接點並驗收真拔線、停流、失效、重連與 UI。
 diff --git a/docs-lanes/battery-poll-pause-checkpoint.md b/docs-lanes/battery-poll-pause-checkpoint.md
 new file mode 100644
-index 0000000..aad0ba5
+index 0000000000000000000000000000000000000000..aad0ba55683fc397d402147d1e64262c6ec89e41
 --- /dev/null
 +++ b/docs-lanes/battery-poll-pause-checkpoint.md
 @@ -0,0 +1,67 @@
@@ -520,7 +520,7 @@ index 0000000..aad0ba5
 +依賴 pause header未變，SHA256=`393a0f7b7db7bd1f1ab1b955a37ecc62b30e49a616e9a18110480c4da6dcc368`。以上 hashes 由完成 normal／ASan與sync check之後的本機檔案重算；0117另含前述並行PMIC內容。
 diff --git a/docs-lanes/battery-publication-checkpoint.md b/docs-lanes/battery-publication-checkpoint.md
 new file mode 100644
-index 0000000..bf5b88c
+index 0000000000000000000000000000000000000000..bf5b88ceb66a0b167eb7be1ff8e6d21f20472bc0
 --- /dev/null
 +++ b/docs-lanes/battery-publication-checkpoint.md
 @@ -0,0 +1,93 @@
@@ -619,7 +619,7 @@ index 0000000..bf5b88c
 +本輪不調快充限流或功放、不操作硬體，不把 ADSP / 功放 ID 已通視為音訊完成。
 diff --git a/docs-lanes/bluetooth-checkpoint-01.md b/docs-lanes/bluetooth-checkpoint-01.md
 new file mode 100644
-index 0000000..d7d7e57
+index 0000000000000000000000000000000000000000..d7d7e57d91fb5d437d85566ba205e8116d8aa83f
 --- /dev/null
 +++ b/docs-lanes/bluetooth-checkpoint-01.md
 @@ -0,0 +1,162 @@
@@ -787,7 +787,7 @@ index 0000000..d7d7e57
 +第一輪實機 UART version 成功後，基本掃描 / 配對的順序工作粗估為 3–7 週。若第一個 UART milestone 需要額外 DMA/SMMU/IRQ bring-up，整體範圍約 3–8 週。A2DP、HFP/SCO、deep sleep / wake 和 Apple vendor-specific 功能各需獨立驗證與估時。主代理可先合入本 checkpoint，在 RAM/haptic 同批 CI 取得編譯結果後安排 BT snapshot。
 diff --git a/docs-lanes/bluetooth-fifo-preparation.md b/docs-lanes/bluetooth-fifo-preparation.md
 new file mode 100644
-index 0000000..0344119
+index 0000000000000000000000000000000000000000..034411911da7c709d760592df3a95ea2fa9bac5f
 --- /dev/null
 +++ b/docs-lanes/bluetooth-fifo-preparation.md
 @@ -0,0 +1,206 @@
@@ -999,7 +999,7 @@ index 0000000..0344119
 +板級 pins / supplies 來自本地 Fuxi live DT `work/hw-survey/fuxi-live-20261116.dtb`，本輪重新核對 SHA-256 `2d7e97ea52bf67a79ef7b99487131a41bd87fc0ab774983ce62bfb9fa79fb9fa` 並解析 SE14、GPIO81、regulator phandles。其供應鏈不同於 sheng board reference；沒有從 sheng DT 推導 Fuxi rail / GPIO。
 diff --git a/docs-lanes/bluetooth-ios16-abi.md b/docs-lanes/bluetooth-ios16-abi.md
 new file mode 100644
-index 0000000..dbd079b
+index 0000000000000000000000000000000000000000..dbd079b145ac4c16a5956f54dd21a0122c949559
 --- /dev/null
 +++ b/docs-lanes/bluetooth-ios16-abi.md
 @@ -0,0 +1,203 @@
@@ -1208,7 +1208,7 @@ index 0000000..dbd079b
 +- [XNU8796 event.h](https://github.com/apple-oss-distributions/xnu/blob/xnu-8796.141.3/bsd/sys/event.h)：EVFILT_READ/WRITE/USER、NOTE_TRIGGER；SHA-256 `3d5bafa95e84a1528dd16ec18c2c4f2d7d8eda198a2591115f7c992ee69f5f9b`。
 diff --git a/docs-lanes/charging-acceptance.md b/docs-lanes/charging-acceptance.md
 new file mode 100644
-index 0000000..e524bb4
+index 0000000000000000000000000000000000000000..e524bb4faa6d7ee9a878792da74df11438d461d9
 --- /dev/null
 +++ b/docs-lanes/charging-acceptance.md
 @@ -0,0 +1,190 @@
@@ -1404,7 +1404,7 @@ index 0000000..e524bb4
 +尚未完成的物理拔線、快充／電表、coherent runtime freshness 與跨 alias／UI 验收維持前述判準。沒有重新跑 producer/consumer host tests、沒有新 native build，也沒有手機操作或 source commit。
 diff --git a/docs-lanes/haptic-fifo-preparation.md b/docs-lanes/haptic-fifo-preparation.md
 new file mode 100644
-index 0000000..af948f3
+index 0000000000000000000000000000000000000000..af948f3aed2cfa8622d95c02f61580e636023dd6
 --- /dev/null
 +++ b/docs-lanes/haptic-fifo-preparation.md
 @@ -0,0 +1,211 @@
@@ -1621,7 +1621,7 @@ index 0000000..af948f3
 +retrigger 定義及適用條件；不以 HAP530、尾零、容量或 software stop 代入。
 diff --git a/docs-lanes/haptic-finite-research.md b/docs-lanes/haptic-finite-research.md
 new file mode 100644
-index 0000000..e975d26
+index 0000000000000000000000000000000000000000..e975d26504b33e43b95e07789d80aef509d85646
 --- /dev/null
 +++ b/docs-lanes/haptic-finite-research.md
 @@ -0,0 +1,290 @@
@@ -1917,7 +1917,7 @@ index 0000000..e975d26
 +本文件的實機狀態依據為使用者提供的既有 survey。
 diff --git a/docs-lanes/pmic-haptics.md b/docs-lanes/pmic-haptics.md
 new file mode 100644
-index 0000000..ad99370
+index 0000000000000000000000000000000000000000..ad99370f8f5007bb39e994d952c10778178aae3d
 --- /dev/null
 +++ b/docs-lanes/pmic-haptics.md
 @@ -0,0 +1,176 @@
@@ -2099,7 +2099,7 @@ index 0000000..ad99370
 +不新增 HEADERS 或 build-list 項目；`fuxi_pmic.c` 已在既有 SOURCES 中。
 diff --git a/docs-lanes/pmic-torch.md b/docs-lanes/pmic-torch.md
 new file mode 100644
-index 0000000..f261e09
+index 0000000000000000000000000000000000000000..f261e09693ac3a9684303e1fc82db10c5b112d93
 --- /dev/null
 +++ b/docs-lanes/pmic-torch.md
 @@ -0,0 +1,93 @@
@@ -2198,7 +2198,7 @@ index 0000000..f261e09
 +bits. It does not retry, change the control sequence or clear the latch.
 diff --git a/docs-lanes/ram-admission-checkpoint.md b/docs-lanes/ram-admission-checkpoint.md
 new file mode 100644
-index 0000000..dce5f73
+index 0000000000000000000000000000000000000000..dce5f73a97d6e9a1b92f4f38dc6d923cc9f85a5e
 --- /dev/null
 +++ b/docs-lanes/ram-admission-checkpoint.md
 @@ -0,0 +1,165 @@
@@ -2369,7 +2369,7 @@ index 0000000..dce5f73
 +**仍待證：**當次 board-patched compiled configuration（ARM_LARGE_MEMORY／XNU_MONITOR／KASAN／page-table granules）、actual boot_args／ADT named owners、PTOV／PTE／cache state、topOfKernelData／first_avail／free-page counts、所有 dynamic activation／placement／lifetime、live-owner 完整 PA extents、late-add accounting 與 DMA／security access，以及新 bank 和新 layout 的實機存取／穩定性。沒有 hardware writes，沒有重做主線 RAM512 測試，沒有日常部署或全 12GB 可用保證。
 diff --git a/docs-lanes/ram-android-owner-20261116.md b/docs-lanes/ram-android-owner-20261116.md
 new file mode 100644
-index 0000000..574aaa7
+index 0000000000000000000000000000000000000000..574aaa7f6264acd4011c4dc788df61d05b3783b6
 --- /dev/null
 +++ b/docs-lanes/ram-android-owner-20261116.md
 @@ -0,0 +1,382 @@
@@ -2757,7 +2757,7 @@ index 0000000..574aaa7
 +本輪沒有 VM release、production pmap/PTE/PTOV/GPU alias 實測、完整 kernel build 或任何 hardware writes；新 bank admitted＝false、final allocatable bytes＝null。8GB 正式驗收仍需 8GB 實機；12GB 縮小 available memory regression 不冒充該驗收，也不把 9184MiB／9GiB 階段窗口當成 12GB 的終點。925MiB 候選、772MiB size requests/CMA 均未轉成可用量。
 diff --git a/docs-lanes/ram-handoff-owner-contract.md b/docs-lanes/ram-handoff-owner-contract.md
 new file mode 100644
-index 0000000..99b1b82
+index 0000000000000000000000000000000000000000..99b1b8246ac4b6eabd2423a43448681b0ffbdefc
 --- /dev/null
 +++ b/docs-lanes/ram-handoff-owner-contract.md
 @@ -0,0 +1,130 @@
@@ -2893,7 +2893,7 @@ index 0000000..99b1b82
 +本輪縮小的是 **linker-backed owner geometry** 與可取得 FDT pointer 的既有 report 路徑；持續保留 lifetime、inherited/dynamic owners 及 source-to-runtime 綁定缺口，沒有放行 30MiB 或其餘 lower banks。
 diff --git a/docs-lanes/ram-multirange-preparation.md b/docs-lanes/ram-multirange-preparation.md
 new file mode 100644
-index 0000000..d77cedf
+index 0000000000000000000000000000000000000000..d77cedf4ef783c5aae3e1ff988b8886947d18d3e
 --- /dev/null
 +++ b/docs-lanes/ram-multirange-preparation.md
 @@ -0,0 +1,130 @@
@@ -3029,7 +3029,7 @@ index 0000000..d77cedf
 +`python -B tools/test-fuxi-ram-inventory.py -v` 通過 **20 tests**。測試涵蓋 overlap/adjacency/duplicates union、subtract/intersection、holes、empty/zero-size、64-bit overflow 和 full-address-space union、fragmented banks、current9g/GPU exclusion、current-window holes/conflicts、reserve-map/static reg 去重、dynamic/missing/zero reservations、cell mismatch/default widths、malformed tuples/size、address translation 未解析、reservations outside advertised banks，以及 DTB hash/parser reuse。另以 200 組固定 seed 小位址集合驗證 subtract 與逐 byte set difference 相符。Python syntax 與 trailing whitespace 檢查通過。[range host tests](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/tools/test-fuxi-ram-inventory.py:65) [synthetic FDT tests](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/tools/test-fuxi-ram-inventory.py:124)
 diff --git a/docs-lanes/rtc-time-handoff.md b/docs-lanes/rtc-time-handoff.md
 new file mode 100644
-index 0000000..d020518
+index 0000000000000000000000000000000000000000..d02051844fed609d154d8478276f1d95d8215688
 --- /dev/null
 +++ b/docs-lanes/rtc-time-handoff.md
 @@ -0,0 +1,162 @@
@@ -3197,7 +3197,7 @@ index 0000000..d020518
 +kernel build、RTC 自主 retention、手機寫時或 PowerLog 實測。
 diff --git a/docs-lanes/tap-command.md b/docs-lanes/tap-command.md
 new file mode 100644
-index 0000000..1dfcd16
+index 0000000000000000000000000000000000000000..1dfcd1687194854cf65337738e3b6196bf7af631
 --- /dev/null
 +++ b/docs-lanes/tap-command.md
 @@ -0,0 +1,17 @@
@@ -3220,7 +3220,7 @@ index 0000000..1dfcd16
 +termination under ASan/UBSan.
 diff --git a/docs-lanes/torch-timeout-status-research.md b/docs-lanes/torch-timeout-status-research.md
 new file mode 100644
-index 0000000..90c5aa6
+index 0000000000000000000000000000000000000000..90c5aa6193277cdfc2cb4427b3f4c4430dd21970
 --- /dev/null
 +++ b/docs-lanes/torch-timeout-status-research.md
 @@ -0,0 +1,276 @@
@@ -3502,7 +3502,7 @@ index 0000000..90c5aa6
 +protocol 或 continuous fail-closed route，不能把研究文件當作這些能力的驗收。
 diff --git a/docs-lanes/torch-timer-source-checkpoint.md b/docs-lanes/torch-timer-source-checkpoint.md
 new file mode 100644
-index 0000000..21fe2c5
+index 0000000000000000000000000000000000000000..21fe2c599e823e075c5e37cb2094a725ee11c0d3
 --- /dev/null
 +++ b/docs-lanes/torch-timer-source-checkpoint.md
 @@ -0,0 +1,185 @@
@@ -3691,9 +3691,73 @@ index 0000000..21fe2c5
 +The fix has only been built and host-tested. Whether the 120-second tap
 +script now completes without a DROPPED read has to be observed on the
 +device; until then the torch remains unverified.
+diff --git a/docs-lanes/wlan-ath12k.md b/docs-lanes/wlan-ath12k.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b0b133a7d286811985de13d3e889a59f3619113
+--- /dev/null
++++ b/docs-lanes/wlan-ath12k.md
+@@ -0,0 +1,58 @@
++# Fuxi ath12k board adapter
++
++The existing WLAN diagnostic reached FW_READY, INI, CFG and a successful
++WLAN_MODE response with upstream WCN7850 firmware and the PMK8550 GPIO3 sleep
++clock enabled. Its legacy path intentionally stops before CE/HTC/WMI.
++
++The new board adapter is disabled by default. Its diagnostic opt-in requires
++`fuxiwlan=1 fuxiwlanath=1 fuxiwlanmlo=192`, the native module entry points,
++the CNSS IOVA pool, and no legacy QRTR, probe, sequence, keep or partial-stop
++selectors. Invalid combinations are rejected before WLAN power writes. ADSP
++must remain disabled for this experiment.
++
++The legacy board code owns power, PCIe and SMMU setup through step 18.
++The native module then exclusively owns MHI, QMI, CE, HTC and WMI from PBL;
++legacy steps 19 through 28 are skipped. The adapter supplies the complete
++2 MiB BAR, a 128 MiB Normal-NC DMA arena, bounded allocations, narrow PCI
++configuration accesses and polling callbacks. The first 4 KiB of the arena
++is reserved for an MSI sink and cannot be allocated to module buffers.
++
++DMA map and free operations require owned allocations and matching pointer,
++bus address and length. Invalid operations latch the adapter failed.
++Containment stops DMA and detaches the owned SMMU mapping before releasing
++the arena. Metadata and cached firmware are released only after the arena
++has been released; failed containment retains the allocations.
++
++Firmware is read from `/usr/local/share/fuxi/wlan/`: `amss20.bin`, `m3.bin`,
++`board-2.bin` and `regdb_xiaomi.bin`. Only these names are admitted. The root
++currently needs `board-2.bin` staged before the experiment can start.
++Firmware, phone device trees and Apple binaries are not CI inputs.
++
++After module stage 4, the adapter requests one scan. It polls for at most
++90 seconds, prints at most 64 BSS records, stops the module and enters common
++containment. It does not provide an iOS Wi-Fi settings interface, connection,
++IP traffic or persistent networking yet.
++
++Host validation includes 236471 native MSVC ASan checks and 30000 allocator
++transitions, PCI write-one-to-clear preservation, release ordering and
++idempotence. A separate comparison against the pinned module ABI checks four
++structure sizes and alignments, every field offset and platform callbacks.
++The M6, M6i, M6o, Rails and W18 production extraction regressions also pass
++with wasm32 ASan/UBSan after the adapter changes.
++
++The module object has been built separately from pinned public sources.
++`FUXI_ATH12K_OBJECT` optionally adds that exact verified object to the plain
++arm64 kernel link. `tools/ci/ath12k-link.py` checks its SHA256, Mach-O header,
++iOS 16 kernel ABI flags, source lock, imports and entry points before staging.
++The variant patch adds the object as a link dependency and retains all nine
++board entry points. After linking, the build requires those entry points to
++be defined in the unstripped kernel and records the object and kernel hashes
++in `ath12k-link.json`. Other kernel targets reject the object input.
++
++Fourteen host checks exercised the actual bundle, altered object and report
++rejections, unsafe path rejection, patch application and rejection of a
++previous kernel that has no native module.
++
++The board adapter has not yet completed a full XNU build or a device scan.
++Host models and an independently built object do not establish hardware
++acceptance.
 diff --git a/docs-lanes/wlan-bdf-provenance.md b/docs-lanes/wlan-bdf-provenance.md
 new file mode 100644
-index 0000000..8966843
+index 0000000000000000000000000000000000000000..8966843a83976916bf29e741711126125ba217ee
 --- /dev/null
 +++ b/docs-lanes/wlan-bdf-provenance.md
 @@ -0,0 +1,446 @@
@@ -4145,7 +4209,7 @@ index 0000000..8966843
 +該 case 的 symlink 部分未驗證。AST、CLI help 與三個新檔 whitespace checks 通過。
 diff --git a/docs-lanes/wlan-hostcap-secondary-checkpoint.md b/docs-lanes/wlan-hostcap-secondary-checkpoint.md
 new file mode 100644
-index 0000000..161400a
+index 0000000000000000000000000000000000000000..161400a3036b552f786125c73f45e69659ca2546
 --- /dev/null
 +++ b/docs-lanes/wlan-hostcap-secondary-checkpoint.md
 @@ -0,0 +1,270 @@
@@ -4420,7 +4484,7 @@ index 0000000..161400a
 +不直接照搬Android DMA／MSI，也不以0x21取代0x38。掃描、關聯、
 +CE／HTC資料路徑與IP傳輸均未驗收。
 diff --git a/docs-lanes/wlan-p17.md b/docs-lanes/wlan-p17.md
-index 8e33183..8213d0b 100644
+index 8e331838ad3e172d18a1063565128d66d70c531c..8213d0b3a934e12f3a6fc1eb84c46e99c9f2a0d2 100644
 --- a/docs-lanes/wlan-p17.md
 +++ b/docs-lanes/wlan-p17.md
 @@ -1,6 +1,8 @@
@@ -4499,7 +4563,7 @@ index 8e33183..8213d0b 100644
 +and stopped somewhere", and pick up any text it left there.
 diff --git a/docs-lanes/wlan-w18-profile.md b/docs-lanes/wlan-w18-profile.md
 new file mode 100644
-index 0000000..c461d80
+index 0000000000000000000000000000000000000000..c461d806fdcd8b581ec785601964e28e6841fd4f
 --- /dev/null
 +++ b/docs-lanes/wlan-w18-profile.md
 @@ -0,0 +1,231 @@
@@ -4736,7 +4800,7 @@ index 0000000..c461d80
 +核心已通過主機檢查；此次仍待有來源的 BDF/WLAN staging、完整 loader 建置與裝置驗證。
 diff --git a/docs-lanes/wlan-w18.md b/docs-lanes/wlan-w18.md
 new file mode 100644
-index 0000000..baf98d5
+index 0000000000000000000000000000000000000000..baf98d5bc6c0f860f4caf871495e470c78b7a83f
 --- /dev/null
 +++ b/docs-lanes/wlan-w18.md
 @@ -0,0 +1,188 @@
@@ -4929,7 +4993,7 @@ index 0000000..baf98d5
 +canonical patch reconstruction, endpoint timing and the new boot result
 +belong to the main agent's integration/device run.
 diff --git a/shim/fuxi-probe/probe.c b/shim/fuxi-probe/probe.c
-index efb83f1..745d165 100644
+index efb83f1a7b85c06880b62dbcc349a5c960dc90ee..745d165560fa6e569237487e84f4926184305300 100644
 --- a/shim/fuxi-probe/probe.c
 +++ b/shim/fuxi-probe/probe.c
 @@ -8,6 +8,7 @@
@@ -4956,8 +5020,137 @@ index efb83f1..745d165 100644
          else memcpy(data, (const void *)(uintptr_t)(0x8c0000000ULL+off), n);
      } else if (type == 0xc0 && req == 0x4e) {
          uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
+diff --git a/tools/ci/ath12k-link.py b/tools/ci/ath12k-link.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..02c96f0103b5054e603ddf7291f1f61d7e36d16c
+--- /dev/null
++++ b/tools/ci/ath12k-link.py
+@@ -0,0 +1,97 @@
++import argparse
++import hashlib
++import json
++from pathlib import Path
++import struct
++import subprocess
++
++OBJECT_SHA256 = '9eeb3f50624e2622223d5d39774a2fb87776e0875a8e1257af3637ba816f94e0'
++LOCK_SHA256 = 'f23882695f1c136c27b3f9cb36673bebad9ae1fc2af3fa787a98bd4add76c3c9'
++ENTRY_POINTS = (
++    '_nw_wifi_start', '_nw_wifi_step', '_nw_wifi_stop', '_nw_wifi_poll',
++    '_nw_wifi_irq_mode', '_nw_wifi_scan', '_nw_wifi_bss_count',
++    '_nw_wifi_bss_get', '_nw_wifi_stats',
++)
++IMPORTS = {
++    '_bzero', '_memcmp', '_memcpy', '_memmove', '_memset', '_snprintf',
++    '_sscanf', '_strchr', '_strcmp', '_strlen', '_strncpy', '_strtoul',
++    '_vsnprintf',
++}
++
++
++def require(condition, message):
++    if not condition:
++        raise ValueError(message)
++
++
++def digest(path):
++    with path.open('rb') as stream:
++        return hashlib.file_digest(stream, 'sha256').hexdigest()
++
++
++def validate_bundle(directory):
++    directory = Path(directory).resolve()
++    object_path = directory / 'fuxi_ath12k.o'
++    require(object_path.is_file() and not object_path.is_symlink(),
++            'Pinned ath12k object is missing or is a symlink')
++    require(digest(object_path) == OBJECT_SHA256, 'Pinned ath12k object hash differs')
++    with object_path.open('rb') as stream:
++        header = stream.read(32)
++    require(len(header) == 32 and struct.unpack_from('<4I', header) ==
++            (0xfeedfacf, 0x0100000c, 0, 1), 'ath12k input must be an arm64 Mach-O object')
++    report_path = directory / 'fuxi_ath12k.build-report.json'
++    report = json.loads(report_path.read_text(encoding='utf-8'))
++    require(report.get('runtime') == 'mainline' and
++            report.get('legacy_station_linked') is False and
++            report.get('hardware_verified') is False, 'ath12k build report differs')
++    identity = report.get('source_identity', {})
++    require(identity.get('source_lock_sha256') == LOCK_SHA256,
++            'ath12k source lock differs')
++    flags = report.get('flags', [])
++    require(flags.count('-target') == 1 and
++            flags[flags.index('-target') + 1:flags.index('-target') + 2] ==
++            ['arm64-apple-ios16.0'] and '-mkernel' in flags and
++            '-mgeneral-regs-only' in flags, 'ath12k kernel ABI flags differ')
++    undefined = set((directory / 'fuxi_ath12k.undefined.txt').read_text().split())
++    exports = set((directory / 'fuxi_ath12k.exports.txt').read_text().split())
++    require(undefined == IMPORTS, 'ath12k kernel imports differ')
++    require(set(ENTRY_POINTS) <= exports, 'ath12k module entry points are missing')
++    return {
++        'schema': 'fuxi-ath12k-link-v1',
++        'object_sha256': OBJECT_SHA256,
++        'build_report_sha256': digest(report_path),
++        'source_lock_sha256': LOCK_SHA256,
++        'source_identity': identity,
++        'entry_points': list(ENTRY_POINTS),
++        'imports': sorted(IMPORTS),
++        'source_run': 43879548709,
++        'source_commit': '41a932d5edce22e935320b419fc35fce5ec113d3',
++        'hardware_verified': False,
++    }
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('directory', type=Path)
++    parser.add_argument('--output', type=Path)
++    parser.add_argument('--kernel', type=Path)
++    parser.add_argument('--nm', type=Path)
++    arguments = parser.parse_args()
++    record = validate_bundle(arguments.directory)
++    if arguments.kernel:
++        command = [str(arguments.nm)] if arguments.nm else ['xcrun', 'nm']
++        result = subprocess.run(command + ['--defined-only', str(arguments.kernel)],
++                                check=True, capture_output=True, text=True, timeout=90)
++        symbols = {line.split()[-1] for line in result.stdout.splitlines() if line.split()}
++        require(set(ENTRY_POINTS) <= symbols, 'Linked kernel lacks ath12k entry points')
++        record['linked_kernel_sha256'] = digest(arguments.kernel)
++        record['entry_points_defined'] = True
++    if arguments.output:
++        with arguments.output.open('x', encoding='utf-8', newline='\n') as stream:
++            stream.write(json.dumps(record, indent=2) + '\n')
++    print('PASS pinned ath12k object, ABI, source lock and imports' +
++          ('; kernel entry points defined' if arguments.kernel else ''))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/ci/build.sh b/tools/ci/build.sh
+index cfe79d79b4218d1fa863f05227924ee5b5282189..df93faa02988d6b5c038680d1a9a364129b378c9 100755
+--- a/tools/ci/build.sh
++++ b/tools/ci/build.sh
+@@ -242,6 +242,10 @@ setup() {
+ kernel() {
+     local dxb=$work/dxb variant=${target#kernel-} arm64e=0
+     [[ $target == kernel-metal4e ]] && arm64e=1
++    if [[ -n ${FUXI_ATH12K_OBJECT:-} ]]; then
++        [[ $target == kernel-metal4 ]] || die 'ath12k object is supported only for the plain arm64 metal4 kernel'
++        python3 tools/ci/ath12k-link.py "$(dirname "$FUXI_ATH12K_OBJECT")"
++    fi
+     python3 tools/test-fuxi-iig-cache.py
+     python3 tools/test-fuxi-backlight.py
+     python3 tools/test-fuxi-prof.py
+@@ -291,6 +295,10 @@ kernel() {
+     # MakeInc.kernel installs the raw linked kernel into SYMROOT *without* an
+     # .unstripped suffix; give it the local packer's conventional output name.
+     cp "$dxb/build/xnu.sym/kernel.development.fuxi" "$out/kernel.development.fuxi.unstripped"
++    if [[ -n ${FUXI_ATH12K_OBJECT:-} ]]; then
++        python3 tools/ci/ath12k-link.py "$(dirname "$FUXI_ATH12K_OBJECT")" \
++            --kernel "$out/kernel.development.fuxi.unstripped" --output "$out/ath12k-link.json"
++    fi
+     if [[ $iig_mode != xcode ]]; then
+         # XNU-derived (APSL) generated source only: what every build directory
+         # compiled, deduplicated and checked against this build's .iig inputs.
 diff --git a/tools/ci/kernel-inputs.py b/tools/ci/kernel-inputs.py
-index 57161ea..4c1fee8 100755
+index 57161ea0882cabc7c517a09e4be75372440b304f..4c1fee87ad09e7ddef6d5d3e96963b9ca9472d0f 100755
 --- a/tools/ci/kernel-inputs.py
 +++ b/tools/ci/kernel-inputs.py
 @@ -61,6 +61,10 @@ def main():
@@ -4972,28 +5165,38 @@ index 57161ea..4c1fee8 100755
          if args.local_adt:
              ap.error("--local-adt carries an xnu-8796 ADT; ios27 uses mkadt-fuxi27.py")
 diff --git a/tools/ci/prepare-kernel.py b/tools/ci/prepare-kernel.py
-index 069fc18..ae5ae74 100755
+index 069fc18e428770d2b8a0cdafa7fb163321a5306c..545d250a773f5d2fef462f558e2863221ce6297f 100755
 --- a/tools/ci/prepare-kernel.py
 +++ b/tools/ci/prepare-kernel.py
-@@ -1,6 +1,7 @@
+@@ -1,7 +1,10 @@
  #!/usr/bin/env python3
  """Adapt the pinned blacktop builder without changing the local build scripts."""
  import argparse
 +import os
  from pathlib import Path
++import re
++import runpy
  import shutil
  
-@@ -9,6 +10,9 @@ ap.add_argument("builder", type=Path)
+ ap = argparse.ArgumentParser(description=__doc__)
+@@ -9,6 +12,16 @@ ap.add_argument("builder", type=Path)
  args = ap.parse_args()
  root = Path(__file__).resolve().parents[2]
  builder = args.builder
 +ram_layout = os.environ.get('FUXI_RAM_LAYOUT', 'full')
 +if ram_layout not in ('full', '9g'):
 +    ap.error('FUXI_RAM_LAYOUT must be full or 9g')
++ath12k_object = os.environ.get('FUXI_ATH12K_OBJECT')
++if ath12k_object:
++    object_path = Path(ath12k_object)
++    if not object_path.is_absolute() or object_path.name != 'fuxi_ath12k.o' or not re.fullmatch(
++            r'/[A-Za-z0-9_./+-]+', ath12k_object):
++        ap.error('FUXI_ATH12K_OBJECT must be an absolute POSIX path without Make or shell metacharacters')
++    runpy.run_path(str(root / 'tools/ci/ath12k-link.py'))['validate_bundle'](object_path.parent)
  for source in sorted((root / "xnu/patches").iterdir()):
      if source.suffix not in (".sh", ".patch"):
          continue
-@@ -23,6 +27,12 @@ for source in sorted((root / "xnu/patches").iterdir()):
+@@ -23,6 +36,18 @@ for source in sorted((root / "xnu/patches").iterdir()):
          shutil.copyfile(source, dest)
          Path(str(dest) + ".fuxi-required").touch()
  
@@ -5003,12 +5206,18 @@ index 069fc18..ae5ae74 100755
 +    shutil.copyfile(source, dest)
 +    Path(str(dest) + '.fuxi-required').touch()
 +
++if ath12k_object:
++    source = root / 'xnu/variants/ath12k-link.patch'
++    dest = builder / 'patches/0120-fuxi-ath12k-link.patch'
++    shutil.copyfile(source, dest)
++    Path(str(dest) + '.fuxi-required').touch()
++
  p = builder / "build.sh"
  text = p.read_text()
  
 diff --git a/tools/fuxi-charge-evidence.py b/tools/fuxi-charge-evidence.py
 new file mode 100644
-index 0000000..919ce07
+index 0000000000000000000000000000000000000000..919ce075c3fef9dcb40278087dd6ec666225aff7
 --- /dev/null
 +++ b/tools/fuxi-charge-evidence.py
 @@ -0,0 +1,484 @@
@@ -5498,7 +5707,7 @@ index 0000000..919ce07
 +    main()
 diff --git a/tools/fuxi-ram-admission.py b/tools/fuxi-ram-admission.py
 new file mode 100644
-index 0000000..4e8fc73
+index 0000000000000000000000000000000000000000..4e8fc734d2993119c487ff79fd6fad60e6950e9c
 --- /dev/null
 +++ b/tools/fuxi-ram-admission.py
 @@ -0,0 +1,421 @@
@@ -5925,7 +6134,7 @@ index 0000000..4e8fc73
 +    main()
 diff --git a/tools/fuxi-ram-inventory.py b/tools/fuxi-ram-inventory.py
 new file mode 100644
-index 0000000..c2e1752
+index 0000000000000000000000000000000000000000..c2e1752a3a2a82c2c9cb16493c30b08607896ee3
 --- /dev/null
 +++ b/tools/fuxi-ram-inventory.py
 @@ -0,0 +1,343 @@
@@ -6274,7 +6483,7 @@ index 0000000..c2e1752
 +    main()
 diff --git a/tools/fuxi-wlan-bdf-inventory.py b/tools/fuxi-wlan-bdf-inventory.py
 new file mode 100644
-index 0000000..964172b
+index 0000000000000000000000000000000000000000..964172bee2b35969a7604e49464d783f6056debd
 --- /dev/null
 +++ b/tools/fuxi-wlan-bdf-inventory.py
 @@ -0,0 +1,549 @@
@@ -6828,7 +7037,7 @@ index 0000000..964172b
 +if __name__ == '__main__':
 +    main()
 diff --git a/tools/fuxi-xnu-monitor.py b/tools/fuxi-xnu-monitor.py
-index 5264d7c..f22e223 100644
+index 5264d7ceba61453845fb216eddb009bd2d49dd9e..f22e2234d083b9d2d81cdafa68c5b4d960c12d5a 100644
 --- a/tools/fuxi-xnu-monitor.py
 +++ b/tools/fuxi-xnu-monitor.py
 @@ -181,7 +181,7 @@ def main():
@@ -6852,7 +7061,7 @@ index 5264d7c..f22e223 100644
      report = request(0x40, 152)
 diff --git a/tools/inspect-fuxi-bluetooth-abi.py b/tools/inspect-fuxi-bluetooth-abi.py
 new file mode 100644
-index 0000000..2eeeca7
+index 0000000000000000000000000000000000000000..2eeeca71e1de0d3fe12a9916dbb3133f66546be4
 --- /dev/null
 +++ b/tools/inspect-fuxi-bluetooth-abi.py
 @@ -0,0 +1,712 @@
@@ -7569,7 +7778,7 @@ index 0000000..2eeeca7
 +if __name__ == "__main__":
 +    main()
 diff --git a/tools/mkadt-fuxi.py b/tools/mkadt-fuxi.py
-index c7d2b39..d27f1d3 100644
+index c7d2b391c3a00bebaa2cae559fbf2221af8fdb39..d27f1d35fb43de74ec71620496b0bb353685e2d1 100644
 --- a/tools/mkadt-fuxi.py
 +++ b/tools/mkadt-fuxi.py
 @@ -31,13 +31,58 @@ MEM_SIZE = BANK_SIZE - GPU_SIZE
@@ -7735,7 +7944,7 @@ index c7d2b39..d27f1d3 100644
          ap.exit(1, str(error) + '\n')
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..41f6b5b
+index 0000000000000000000000000000000000000000..41f6b5b5da8c28db8dc1ec4eb8d0f35c12563388
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
 @@ -0,0 +1,158 @@
@@ -7898,7 +8107,7 @@ index 0000000..41f6b5b
 +if __name__ == '__main__':
 +    main()
 diff --git a/tools/sync-fuxi-h1.py b/tools/sync-fuxi-h1.py
-index 07edd64..b83b489 100755
+index 07edd64102c4f63750fbea49c41cb02001b5cb48..b83b489188f20ba83f5f537854af093d3c34dd5e 100755
 --- a/tools/sync-fuxi-h1.py
 +++ b/tools/sync-fuxi-h1.py
 @@ -52,7 +52,7 @@ def main():
@@ -7912,10 +8121,10 @@ index 07edd64..b83b489 100755
          for name, text in before.items():
 diff --git a/tools/sync-fuxi-wlan.py b/tools/sync-fuxi-wlan.py
 new file mode 100644
-index 0000000..ab26b3a
+index 0000000000000000000000000000000000000000..53e3ad22c4918e33879001f179b9b40cb19158cd
 --- /dev/null
 +++ b/tools/sync-fuxi-wlan.py
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,45 @@
 +import argparse
 +import difflib
 +from pathlib import Path
@@ -7943,6 +8152,19 @@ index 0000000..ab26b3a
 +replacement = ''.join(difflib.unified_diff([], body.splitlines(True), fromfile=original_path,
 +                                            tofile='b/bsd/dev/fuxi_wlan.c'))
 +expected = text[:start] + replacement + text[end:]
++for name in ('fuxi_wlan_arena.h', 'fuxi_wlan_ath12k.h', 'fuxi_wlan_ath12k.inc'):
++    body = (source.parent / name).read_text(encoding='utf-8')
++    assert body.endswith('\n') and '\r' not in body
++    marker = '--- /dev/null\n+++ b/bsd/dev/' + name + '\n'
++    block = ''.join(difflib.unified_diff([], body.splitlines(True), fromfile='/dev/null',
++                                        tofile='b/bsd/dev/' + name))
++    start = expected.find(marker)
++    if start < 0:
++        expected += block
++    else:
++        end = expected.find('\n--- ', start + len(marker))
++        end = len(expected) if end < 0 else end + 1
++        expected = expected[:start] + block + expected[end:]
 +if args.check:
 +    assert text == expected, 'fuxi-wlan canonical source differs from 0099'
 +else:
@@ -7950,7 +8172,7 @@ index 0000000..ab26b3a
 +print('PASS: fuxi-wlan canonical source matches 0099')
 diff --git a/tools/test-fuxi-audio-prep.py b/tools/test-fuxi-audio-prep.py
 new file mode 100644
-index 0000000..d74473c
+index 0000000000000000000000000000000000000000..d74473c30bfaf27abaaa81d5c51aa2973db239df
 --- /dev/null
 +++ b/tools/test-fuxi-audio-prep.py
 @@ -0,0 +1,73 @@
@@ -8029,7 +8251,7 @@ index 0000000..d74473c
 +    main()
 diff --git a/tools/test-fuxi-battery-pause.py b/tools/test-fuxi-battery-pause.py
 new file mode 100644
-index 0000000..0acead1
+index 0000000000000000000000000000000000000000..0acead1072762cce7fe2240ea103ad580238af33
 --- /dev/null
 +++ b/tools/test-fuxi-battery-pause.py
 @@ -0,0 +1,521 @@
@@ -8556,7 +8778,7 @@ index 0000000..0acead1
 +    main()
 diff --git a/tools/test-fuxi-battery-prep.py b/tools/test-fuxi-battery-prep.py
 new file mode 100644
-index 0000000..5d4e218
+index 0000000000000000000000000000000000000000..5d4e2188065a85590ba6107fd6dd393ab683f673
 --- /dev/null
 +++ b/tools/test-fuxi-battery-prep.py
 @@ -0,0 +1,43 @@
@@ -8605,7 +8827,7 @@ index 0000000..5d4e218
 +    main()
 diff --git a/tools/test-fuxi-battery-publication.py b/tools/test-fuxi-battery-publication.py
 new file mode 100644
-index 0000000..922f6a1
+index 0000000000000000000000000000000000000000..922f6a171375a1c2d66ad8dfdc0fafc8ac5a7fac
 --- /dev/null
 +++ b/tools/test-fuxi-battery-publication.py
 @@ -0,0 +1,865 @@
@@ -9476,7 +9698,7 @@ index 0000000..922f6a1
 +    main()
 diff --git a/tools/test-fuxi-bluetooth-xnu.py b/tools/test-fuxi-bluetooth-xnu.py
 new file mode 100644
-index 0000000..13326f2
+index 0000000000000000000000000000000000000000..13326f20d79dbb3449250eae81a19656b350f67e
 --- /dev/null
 +++ b/tools/test-fuxi-bluetooth-xnu.py
 @@ -0,0 +1,382 @@
@@ -9864,7 +10086,7 @@ index 0000000..13326f2
 +    main()
 diff --git a/tools/test-fuxi-bluetooth.py b/tools/test-fuxi-bluetooth.py
 new file mode 100644
-index 0000000..48a43f2
+index 0000000000000000000000000000000000000000..48a43f22bd780a0c1eea66103ba9a2ee81442bf2
 --- /dev/null
 +++ b/tools/test-fuxi-bluetooth.py
 @@ -0,0 +1,567 @@
@@ -10437,7 +10659,7 @@ index 0000000..48a43f2
 +    main()
 diff --git a/tools/test-fuxi-bt-clock.py b/tools/test-fuxi-bt-clock.py
 new file mode 100644
-index 0000000..6976408
+index 0000000000000000000000000000000000000000..6976408b7975a8c17549b763136de96810c882d0
 --- /dev/null
 +++ b/tools/test-fuxi-bt-clock.py
 @@ -0,0 +1,351 @@
@@ -10794,7 +11016,7 @@ index 0000000..6976408
 +    main()
 diff --git a/tools/test-fuxi-bt-geni-fifo.py b/tools/test-fuxi-bt-geni-fifo.py
 new file mode 100644
-index 0000000..3ac76d7
+index 0000000000000000000000000000000000000000..3ac76d7fd70247d96f5149604993c4b7c42544e4
 --- /dev/null
 +++ b/tools/test-fuxi-bt-geni-fifo.py
 @@ -0,0 +1,919 @@
@@ -11719,7 +11941,7 @@ index 0000000..3ac76d7
 +    main()
 diff --git a/tools/test-fuxi-charge-evidence.py b/tools/test-fuxi-charge-evidence.py
 new file mode 100644
-index 0000000..172d1eb
+index 0000000000000000000000000000000000000000..172d1ebb2c1fe9df03545ccd071c861f2d23468b
 --- /dev/null
 +++ b/tools/test-fuxi-charge-evidence.py
 @@ -0,0 +1,408 @@
@@ -12133,7 +12355,7 @@ index 0000000..172d1eb
 +    unittest.main(verbosity=2)
 diff --git a/tools/test-fuxi-haptic-fifo.py b/tools/test-fuxi-haptic-fifo.py
 new file mode 100644
-index 0000000..84b78c0
+index 0000000000000000000000000000000000000000..84b78c065f92677a571706d61c2faf8c8628b18c
 --- /dev/null
 +++ b/tools/test-fuxi-haptic-fifo.py
 @@ -0,0 +1,89 @@
@@ -12228,7 +12450,7 @@ index 0000000..84b78c0
 +    main()
 diff --git a/tools/test-fuxi-haptic-pulse.py b/tools/test-fuxi-haptic-pulse.py
 new file mode 100644
-index 0000000..3144cfe
+index 0000000000000000000000000000000000000000..3144cfed70bcf037e3aaa6e48012ce5039ab84b8
 --- /dev/null
 +++ b/tools/test-fuxi-haptic-pulse.py
 @@ -0,0 +1,400 @@
@@ -12634,7 +12856,7 @@ index 0000000..3144cfe
 +    main()
 diff --git a/tools/test-fuxi-haptic-survey.py b/tools/test-fuxi-haptic-survey.py
 new file mode 100644
-index 0000000..b4d70a7
+index 0000000000000000000000000000000000000000..b4d70a7e88ed0d592de29f911e78f90a3902de19
 --- /dev/null
 +++ b/tools/test-fuxi-haptic-survey.py
 @@ -0,0 +1,308 @@
@@ -12948,7 +13170,7 @@ index 0000000..b4d70a7
 +    main()
 diff --git a/tools/test-fuxi-htc-prep.py b/tools/test-fuxi-htc-prep.py
 new file mode 100644
-index 0000000..295f9f5
+index 0000000000000000000000000000000000000000..295f9f513601822618beb462667c41e7bce9884b
 --- /dev/null
 +++ b/tools/test-fuxi-htc-prep.py
 @@ -0,0 +1,381 @@
@@ -13335,7 +13557,7 @@ index 0000000..295f9f5
 +    main()
 diff --git a/tools/test-fuxi-ram-admission.py b/tools/test-fuxi-ram-admission.py
 new file mode 100644
-index 0000000..9de8ecd
+index 0000000000000000000000000000000000000000..9de8ecd58265c48a66d81d1e0be93a71a53ff8dd
 --- /dev/null
 +++ b/tools/test-fuxi-ram-admission.py
 @@ -0,0 +1,321 @@
@@ -13662,7 +13884,7 @@ index 0000000..9de8ecd
 +    unittest.main()
 diff --git a/tools/test-fuxi-ram-bank.py b/tools/test-fuxi-ram-bank.py
 new file mode 100644
-index 0000000..d87dd9b
+index 0000000000000000000000000000000000000000..d87dd9b2214395a6c050158d75eda0a9bd759b74
 --- /dev/null
 +++ b/tools/test-fuxi-ram-bank.py
 @@ -0,0 +1,181 @@
@@ -13849,7 +14071,7 @@ index 0000000..d87dd9b
 +    main()
 diff --git a/tools/test-fuxi-ram-inventory.py b/tools/test-fuxi-ram-inventory.py
 new file mode 100644
-index 0000000..6f6679c
+index 0000000000000000000000000000000000000000..6f6679c5eb7ecd5dc998ad5c55203798f2cb7bad
 --- /dev/null
 +++ b/tools/test-fuxi-ram-inventory.py
 @@ -0,0 +1,257 @@
@@ -14112,7 +14334,7 @@ index 0000000..6f6679c
 +    unittest.main()
 diff --git a/tools/test-fuxi-ram-sku.py b/tools/test-fuxi-ram-sku.py
 new file mode 100644
-index 0000000..e9d4f34
+index 0000000000000000000000000000000000000000..e9d4f34289f304686b411a4f32104dac86788c47
 --- /dev/null
 +++ b/tools/test-fuxi-ram-sku.py
 @@ -0,0 +1,113 @@
@@ -14231,7 +14453,7 @@ index 0000000..e9d4f34
 +    unittest.main()
 diff --git a/tools/test-fuxi-ram9g.py b/tools/test-fuxi-ram9g.py
 new file mode 100644
-index 0000000..a4f5a47
+index 0000000000000000000000000000000000000000..a4f5a474deb3bb996114f58f6c37d4919143f3cb
 --- /dev/null
 +++ b/tools/test-fuxi-ram9g.py
 @@ -0,0 +1,49 @@
@@ -14286,7 +14508,7 @@ index 0000000..a4f5a47
 +print('PASS: adjacent banks, gaps, overflow, 5g/9g scratch separation and preserved root mapping')
 diff --git a/tools/test-fuxi-ramtest.py b/tools/test-fuxi-ramtest.py
 new file mode 100644
-index 0000000..5e7da35
+index 0000000000000000000000000000000000000000..5e7da352ce6064bd54bb3f11f82151b60b6b7279
 --- /dev/null
 +++ b/tools/test-fuxi-ramtest.py
 @@ -0,0 +1,55 @@
@@ -14347,7 +14569,7 @@ index 0000000..5e7da35
 +    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-rpmh-shared.py b/tools/test-fuxi-rpmh-shared.py
 new file mode 100644
-index 0000000..e360b63
+index 0000000000000000000000000000000000000000..e360b6343edeadd4d34b5d670e8ac32df7de69ea
 --- /dev/null
 +++ b/tools/test-fuxi-rpmh-shared.py
 @@ -0,0 +1,128 @@
@@ -14481,7 +14703,7 @@ index 0000000..e360b63
 +    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-rtc-read.py b/tools/test-fuxi-rtc-read.py
 new file mode 100644
-index 0000000..31ffe57
+index 0000000000000000000000000000000000000000..31ffe571426a1c85628f3847c9792220c7cec042
 --- /dev/null
 +++ b/tools/test-fuxi-rtc-read.py
 @@ -0,0 +1,138 @@
@@ -14625,7 +14847,7 @@ index 0000000..31ffe57
 +    main()
 diff --git a/tools/test-fuxi-tap-command.py b/tools/test-fuxi-tap-command.py
 new file mode 100644
-index 0000000..1d7b73c
+index 0000000000000000000000000000000000000000..1d7b73c028d4a2a4a1dce0b9022de80261afbb1e
 --- /dev/null
 +++ b/tools/test-fuxi-tap-command.py
 @@ -0,0 +1,102 @@
@@ -14733,7 +14955,7 @@ index 0000000..1d7b73c
 +    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-torch-audit.py b/tools/test-fuxi-torch-audit.py
 new file mode 100644
-index 0000000..4c40af5
+index 0000000000000000000000000000000000000000..4c40af5179f90f0591202cd2749590895490173c
 --- /dev/null
 +++ b/tools/test-fuxi-torch-audit.py
 @@ -0,0 +1,181 @@
@@ -14920,7 +15142,7 @@ index 0000000..4c40af5
 +    subprocess.run([str(binary)], cwd=directory, env=environment, check=True, timeout=60)
 diff --git a/tools/test-fuxi-torch-pulse.py b/tools/test-fuxi-torch-pulse.py
 new file mode 100644
-index 0000000..6f741f8
+index 0000000000000000000000000000000000000000..6f741f8ff45b31efb38fb884bb89447b34d2d955
 --- /dev/null
 +++ b/tools/test-fuxi-torch-pulse.py
 @@ -0,0 +1,189 @@
@@ -15115,7 +15337,7 @@ index 0000000..6f741f8
 +    subprocess.run([str(binary)], cwd=directory, env=environment, check=True, timeout=60)
 diff --git a/tools/test-fuxi-torch-runtime.py b/tools/test-fuxi-torch-runtime.py
 new file mode 100644
-index 0000000..f23f150
+index 0000000000000000000000000000000000000000..f23f150e4496c835fc4a59db1fa6a44c2d040ba3
 --- /dev/null
 +++ b/tools/test-fuxi-torch-runtime.py
 @@ -0,0 +1,60 @@
@@ -15181,7 +15403,7 @@ index 0000000..f23f150
 +    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-torch-steady.py b/tools/test-fuxi-torch-steady.py
 new file mode 100644
-index 0000000..e04f2e8
+index 0000000000000000000000000000000000000000..e04f2e85edeaf04e1793590dc3d3636922fbd8b6
 --- /dev/null
 +++ b/tools/test-fuxi-torch-steady.py
 @@ -0,0 +1,225 @@
@@ -15410,9 +15632,268 @@ index 0000000..e04f2e8
 +
 +if __name__ == '__main__':
 +    main()
+diff --git a/tools/test-fuxi-wlan-ath12k.py b/tools/test-fuxi-wlan-ath12k.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7933978ec455ace5f885e4c7f3837cda4178a47
+--- /dev/null
++++ b/tools/test-fuxi-wlan-ath12k.py
+@@ -0,0 +1,253 @@
++import argparse
++import json
++import os
++from pathlib import Path
++import runpy
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[1]
++SOURCE = ROOT / 'xnu/fuxi-wlan'
++
++HOST = r'''
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <string.h>
++#include "fuxi_wlan_arena.h"
++#include "fuxi_wlan_ath12k.h"
++static unsigned checks;
++#define CHECK(test) do { checks++; if (!(test)) { fprintf(stderr,"line %d: %s\n",__LINE__,#test); exit(1); } } while (0)
++static uint32_t registers[1024], last_write;
++static unsigned reads, writes, fw_faults, wla_failed, wla_express = 0x70;
++#define WL_EPCFG UINT64_C(0x60100000)
++static uint32_t wl_prd(uint64_t address) {
++    CHECK(address >= WL_EPCFG && address - WL_EPCFG < sizeof(registers) && !(address & 3));
++    reads++; return registers[(address - WL_EPCFG) / 4];
++}
++static void wl_pwr(uint64_t address, uint32_t value) {
++    CHECK(address >= WL_EPCFG && address - WL_EPCFG < sizeof(registers) && !(address & 3));
++    writes++; last_write = value; registers[(address - WL_EPCFG) / 4] = value;
++}
++@CONFIG@
++static struct fwa_arena wla_pool;
++static struct fwa_block *wla_blocks;
++static struct { uintptr_t va; } wl_ath_arena;
++static struct { void *memory; size_t bytes; } wla_firmware[4];
++static unsigned normal_frees;
++static void wla_free(void *memory) {
++    if (memory) { normal_frees++; free(memory); }
++}
++@RELEASE@
++static void verify(const struct fwa_arena *arena) {
++    uint32_t offset = 0;
++    CHECK(arena->count <= arena->capacity);
++    for (uint32_t index = 0; index < arena->count; index++) {
++        const struct fwa_block *block = &arena->blocks[index];
++        CHECK(block->offset == offset && block->size && block->requested <= block->size);
++        CHECK(block->size <= arena->bytes - offset);
++        if (index) CHECK(block->requested || arena->blocks[index - 1].requested);
++        offset += block->size;
++    }
++    CHECK(offset == arena->bytes);
++}
++static void config_tests(void) {
++    unsigned offset = 0;
++    CHECK(!fwa_config_offset(0x80000008u, 2, 0x70, &offset) && offset == 0x78);
++    CHECK(fwa_config_offset(0x80000008u, 2, 0, &offset));
++    CHECK(fwa_config_offset(0x80000fffu, 4, 0x70, &offset));
++    CHECK(fwa_config_offset(0xffffffffu, 4, 0x70, &offset));
++    CHECK(fwa_config_offset(0x1000, 4, 0x70, &offset));
++    CHECK(fwa_config_offset(0xfff, 2, 0x70, &offset));
++    CHECK(fwa_config_offset(0xfff, 3, 0x70, &offset));
++    CHECK(!fwa_config_offset(0xfff, 1, 0x70, &offset) && offset == 0xfff);
++    uint32_t value;
++    registers[1] = 0xffff0406;
++    CHECK(!wla_cfg_write(4, 2, 0x402) && last_write == 0x402);
++    registers[1] = 0xffff0406;
++    CHECK(!wla_cfg_write(5, 1, 0x01) && last_write == 0x106);
++    registers[0x78 / 4] = 0xffffabcd;
++    CHECK(!wla_cfg_write((int)0x80000008u, 2, 0x1234) && last_write == 0x1234);
++    registers[0x80 / 4] = 0xffffabcd;
++    CHECK(!wla_cfg_write((int)0x80000010u, 1, 0x12) && last_write == 0xab12);
++    registers[0x90 / 4] = 0x87654321;
++    CHECK(!wla_cfg_write(0x91, 1, 0xaa) && last_write == 0x8765aa21);
++    CHECK(!wla_cfg_read(0x90, 4, &value) && value == 0x8765aa21);
++    CHECK(!wla_cfg_read(0x91, 1, &value) && value == 0xaa);
++    unsigned before = writes;
++    CHECK(wla_cfg_write(0xfff, 2, 0) && writes == before);
++    fw_faults = 1;
++    CHECK(wla_cfg_write(0x90, 4, 0) && writes == before);
++    fw_faults = 0; wla_failed = 1; before = reads;
++    CHECK(wla_cfg_read(0x90, 4, &value) && reads == before);
++    wla_failed = 0;
++}
++int main(void) {
++    const uint32_t total = 32u << 20;
++    uint8_t *allocation = malloc(total + 64);
++    CHECK(allocation != NULL);
++    uint8_t *memory = (uint8_t *)(((uintptr_t)allocation + 63) & ~(uintptr_t)63);
++    struct fwa_block blocks[4096];
++    struct fwa_arena arena;
++    CHECK(fwa_init(&arena, memory, 0xfffff000, total, blocks, 4096));
++    CHECK(fwa_init(&arena, memory, 0xa0000001, total, blocks, 4096));
++    CHECK(fwa_init(&arena, memory, 0xa0000000, total, blocks, 1));
++    CHECK(!fwa_init(&arena, memory, 0xa0000000, total, blocks, 4096));
++    CHECK(!fwa_map(&arena, memory, 4096));
++    uint64_t bus = 99;
++    CHECK(!fwa_alloc(&arena, 0, &bus) && !bus);
++    CHECK(!fwa_alloc(&arena, (size_t)-1, &bus) && !bus);
++    void *first = fwa_alloc(&arena, 7077888, &bus);
++    CHECK(first && !(bus & 0x7fffff));
++    CHECK(fwa_map(&arena, first, 7077888) == bus);
++    CHECK(!fwa_map(&arena, first, 7077889));
++    CHECK(fwa_free(&arena, 7077887, first, bus));
++    CHECK(fwa_free(&arena, 7077888, (uint8_t *)first + 1, bus));
++    CHECK(fwa_free(&arena, 7077888, first, bus + 1));
++    CHECK(!fwa_free(&arena, 7077888, first, bus));
++    CHECK(fwa_free(&arena, 7077888, first, bus));
++    CHECK(!fwa_map(&arena, first, 1));
++    verify(&arena); CHECK(arena.count == 2);
++    struct slot { void *memory; uint64_t bus; uint32_t bytes; } slots[256] = {0};
++    uint32_t random = 0x19031c4d;
++    for (unsigned round = 0; round < 30000; round++) {
++        random = random * 1664525u + 1013904223u;
++        unsigned index = (random >> 16) & 255;
++        struct slot *slot = &slots[index];
++        if (slot->memory) {
++            CHECK(fwa_map(&arena, slot->memory, slot->bytes) == slot->bus);
++            CHECK(!fwa_free(&arena, slot->bytes, slot->memory, slot->bus));
++            CHECK(!fwa_map(&arena, slot->memory, 1));
++            slot->memory = NULL;
++        } else {
++            uint32_t sizes[] = {1, 63, 64, 65, 4095, 4096, 4097, 65535, 524289, 1048577};
++            slot->bytes = sizes[random % 10];
++            slot->memory = fwa_alloc(&arena, slot->bytes, &slot->bus);
++            if (slot->memory) {
++                CHECK(fwa_map(&arena, slot->memory, slot->bytes) == slot->bus);
++                CHECK(fwa_map(&arena, (uint8_t *)slot->memory + slot->bytes - 1, 1) == slot->bus + slot->bytes - 1);
++                CHECK(!fwa_map(&arena, (uint8_t *)slot->memory + slot->bytes - 1, 2));
++                const uint8_t *bytes = slot->memory;
++                for (unsigned at = 0; at < slot->bytes; at++) {
++                    if (bytes[at]) { CHECK(0); }
++                }
++                memset(slot->memory, 0xa5, slot->bytes);
++            } else CHECK(!slot->bus);
++        }
++        if (!(round % 97)) verify(&arena);
++    }
++    for (unsigned index = 0; index < 256; index++) {
++        if (slots[index].memory) CHECK(!fwa_free(&arena, slots[index].bytes, slots[index].memory, slots[index].bus));
++    }
++    verify(&arena); CHECK(arena.count == 2);
++    CHECK(!fwa_init(&arena, memory, 0xa0000000, 8192, blocks, 2));
++    CHECK(!fwa_alloc(&arena, 64, &bus));
++    CHECK(fwa_alloc(&arena, 4096, &bus) == memory + 4096);
++    CHECK(!fwa_free(&arena, 4096, memory + 4096, bus));
++    config_tests();
++    wla_pool = arena;
++    wla_blocks = malloc(sizeof(*wla_blocks) * 16);
++    CHECK(wla_blocks);
++    for (unsigned index = 0; index < 4; index++) {
++        wla_firmware[index].memory = malloc(17);
++        wla_firmware[index].bytes = 17;
++        CHECK(wla_firmware[index].memory);
++    }
++    wl_ath_arena.va = (uintptr_t)memory;
++    wl_ath_release();
++    CHECK(!normal_frees && wla_blocks && wla_pool.memory == memory);
++    wl_ath_arena.va = 0;
++    wl_ath_release();
++    CHECK(normal_frees == 5 && !wla_blocks && !wla_pool.memory && !wla_pool.count);
++    for (unsigned index = 0; index < 4; index++) {
++        CHECK(!wla_firmware[index].memory && !wla_firmware[index].bytes);
++    }
++    wl_ath_release();
++    CHECK(normal_frees == 5);
++    free(allocation);
++    printf("PASS ath12k board contracts: %u checks, 30000 allocation transitions\n", checks);
++    return 0;
++}
++'''
++
++ABI_FIELDS = {
++    'lx_platform': ('now_ms', 'sleep_ms', 'poll', 'log', 'halt', 'alloc', 'free',
++                    'dma_alloc', 'dma_free', 'dma_map', 'dma_sync', 'fw_get',
++                    'now_ns', 'boottime_ns', 'busy_delay_us', 'preempt_disable', 'preempt_enable'),
++    'nw_board': ('bar', 'bar_len', 'device_id', 'msi_cap', 'irq_base', 'cfg_read',
++                 'cfg_write', 'msi_target', 'map_phys', 'diagnostics'),
++    'nw_wifi_stats': ('stage', 'scans', 'frames', 'beacons', 'bss_seen', 'last_err'),
++    'nw_bss_info': ('bssid', 'ssid_len', 'ssid', 'freq_mhz', 'signal_dbm', 'caps',
++                    'beacon_int', 'age_ms', 'ie_len', 'ie'),
++}
++ABI_SYMBOLS = ('nw_wifi_start', 'nw_wifi_step', 'nw_wifi_stop', 'nw_wifi_poll',
++               'nw_wifi_irq_mode', 'nw_wifi_scan', 'nw_wifi_bss_count', 'nw_wifi_bss_get')
++
++
++def abi_source(reference):
++    symbols = tuple(ABI_FIELDS) + ABI_SYMBOLS
++    lines = ['#include <stddef.h>', '#include <stdio.h>']
++    lines += [f'#define {name} fuxi_{name}' for name in symbols]
++    lines += ['#include "fuxi_wlan_ath12k.h"']
++    lines += [f'#undef {name}' for name in symbols]
++    lines += ['#include ' + json.dumps(reference.resolve().as_posix())]
++    for name, fields in ABI_FIELDS.items():
++        lines += [
++            f'_Static_assert(sizeof(struct {name}) == sizeof(struct fuxi_{name}), "{name} size");',
++            f'_Static_assert(_Alignof(struct {name}) == _Alignof(struct fuxi_{name}), "{name} alignment");',
++        ]
++        for field in fields:
++            lines.append(f'_Static_assert(offsetof(struct {name}, {field}) == '
++                         f'offsetof(struct fuxi_{name}, {field}), "{name}.{field} offset");')
++    for name in ('lx_platform', 'nw_board'):
++        lines += [f'static struct {name} upstream_{name};',
++                  f'static struct fuxi_{name} local_{name};']
++    lines += ['int main(void) {', 'unsigned offset;']
++    for name in ('lx_platform', 'nw_board'):
++        lines += [f'local_{name}.{field} = upstream_{name}.{field};' for field in ABI_FIELDS[name]]
++    lines += ['if (fwa_config_offset(0, 4, 0, &offset)) return 1;',
++              'puts("PASS pinned module ABI: four structure sizes/alignments, all field offsets and platform callbacks");',
++              'return 0;', '}']
++    return '\n'.join(lines) + '\n'
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--sanitize', action='store_true')
++    parser.add_argument('--abi-header', type=Path)
++    arguments = parser.parse_args()
++    tools = runpy.run_path(str(ROOT / 'tools/test-fuxi-audio-prep.py'))
++    compiler, environment = tools['compiler_environment']()
++    msvc = Path(compiler[0].strip('"')).name.lower() in ('cl', 'cl.exe')
++    adapter = (SOURCE / 'fuxi_wlan_ath12k.inc').read_text()
++    config = 'static int\nwla_cfg_read(' + adapter.split('static int\nwla_cfg_read(', 1)[1].split(
++        'static int\nwla_msi_target(', 1)[0]
++    config = config.replace('__asm__ volatile("dsb sy" ::: "memory");', '')
++    release = 'static void\nwl_ath_release(' + adapter.split('static void\nwl_ath_release(', 1)[1].split(
++        'static void *\nwla_dma_alloc(', 1)[0]
++    with tempfile.TemporaryDirectory(prefix='ath12k-contract-') as directory:
++        temporary = Path(directory)
++        source = temporary / 'contracts.c'
++        source.write_text(HOST.replace('@CONFIG@', config).replace('@RELEASE@', release))
++        output = temporary / ('contracts.exe' if os.name == 'nt' else 'contracts')
++        if msvc:
++            flags = ['/nologo', '/TC', '/std:c11', '/W4', '/WX', '/Od', '/Zi', '/MD']
++            if arguments.sanitize:
++                flags.append('/fsanitize=address')
++            command = compiler + flags + [f'/I{SOURCE}', str(source), f'/Fe:{output}']
++        else:
++            flags = ['-std=c11', '-Wall', '-Wextra', '-Werror', '-O1', '-g']
++            if arguments.sanitize:
++                flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
++            command = compiler + flags + ['-I', str(SOURCE), str(source), '-o', str(output)]
++        subprocess.run(command, cwd=directory, env=environment, check=True, timeout=120)
++        subprocess.run([str(output)], cwd=directory, env=environment, check=True, timeout=120)
++        if arguments.abi_header:
++            source.write_text(abi_source(arguments.abi_header), encoding='utf-8', newline='\n')
++            subprocess.run(command, cwd=directory, env=environment, check=True, timeout=120)
++            subprocess.run([str(output)], cwd=directory, env=environment, check=True, timeout=120)
++
++
++if __name__ == '__main__':
++    main()
 diff --git a/tools/test-fuxi-wlan-bdf-inventory.py b/tools/test-fuxi-wlan-bdf-inventory.py
 new file mode 100644
-index 0000000..9cff8f4
+index 0000000000000000000000000000000000000000..9cff8f47c999c7084c5c024d3ff087a440d367a4
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-bdf-inventory.py
 @@ -0,0 +1,569 @@
@@ -15986,10 +16467,18 @@ index 0000000..9cff8f4
 +if __name__ == '__main__':
 +    unittest.main()
 diff --git a/tools/test-fuxi-wlan-m6.py b/tools/test-fuxi-wlan-m6.py
-index 41003b6..1fd2a95 100755
+index 41003b6cc3507ba11e094b8d9f3f091c494a45e9..ebdc9c0d08394aca2e7933280a3d9123d65fe6c6 100755
 --- a/tools/test-fuxi-wlan-m6.py
 +++ b/tools/test-fuxi-wlan-m6.py
-@@ -100,6 +100,7 @@ static bool PE_parse_boot_argn(const char *name, void *out, int size) {
+@@ -77,6 +77,7 @@ static unsigned rh_send(unsigned t, unsigned addr, unsigned data);
+ static unsigned wl_vrm(unsigned addr, unsigned mv) { return rh_send(0,addr,mv) || rh_send(0,addr+4,1); }
+ static unsigned rh_send(unsigned t, unsigned addr, unsigned data) { return 0; }
+ static unsigned wl_icc_acks;
++static void wl_ath_release(void) { }
+ struct reg { uint64_t pa; uint32_t v; };
+ struct ev { char kind; uint64_t pa; uint32_t v; };
+ static struct reg regs[4096];
+@@ -100,6 +101,7 @@ static bool PE_parse_boot_argn(const char *name, void *out, int size) {
      if(!strcmp(name,"fuxiwlanmlo")) { if(mlo_present)memcpy(out,&mlo_arg,size); return mlo_present; }
      if(!strcmp(name,"fuxiwlanw15")) { assert(size==sizeof(int)); return false; }
      if(!strcmp(name,"fuxiwlanw16")) { assert(size==sizeof(int)); return false; }
@@ -15997,8 +16486,25 @@ index 41003b6..1fd2a95 100755
      if(!strcmp(name,"fuxiwlanprobe")) {
          if(probe_arg) { strncpy(out,probe_arg,size); return true; }
          return false;
+@@ -1035,12 +1037,14 @@ int main(void) {
+ def main():
+     driver = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
+     patch = (ROOT / 'xnu/patches/0099-fuxi-wlan.patch').read_text()
+-    added = patch.split('+++ b/bsd/dev/fuxi_wlan.c\n', 1)[1].split('\n--- a/', 1)[0]
++    added = re.split(r'\n--- (?:a/|/dev/null\n)',
++                     patch.split('+++ b/bsd/dev/fuxi_wlan.c\n', 1)[1], maxsplit=1)[0]
+     count = re.match(r'@@ -0,0 \+1,(\d+) @@\n', added)
+     assert count and int(count[1]) == len(driver.splitlines()), 'WLAN new-file hunk count differs'
+     reconstructed = '\n'.join(line[1:] for line in added.splitlines() if line.startswith('+')) + '\n'
+     assert reconstructed == driver, 'integration patch and standalone WLAN C differ'
+-    included = patch.split('+++ b/bsd/dev/wlan.c\n', 1)[1]
++    included = re.split(r'\n--- (?:a/|/dev/null\n)',
++                        patch.split('+++ b/bsd/dev/wlan.c\n', 1)[1], maxsplit=1)[0]
+     reconstructed = '\n'.join(line[1:] for line in included.splitlines() if line.startswith('+')) + '\n'
+     assert reconstructed == (ROOT / 'shim/fuxi-probe/wlan.c').read_text(), 'included M3 source differs'
+     block = driver.split('/* ---- milestone 5:', 1)[1].split('static void\nfw_dump(', 1)[0]
 diff --git a/tools/test-fuxi-wlan-m6i.py b/tools/test-fuxi-wlan-m6i.py
-index 12293f1..0e13d38 100755
+index 12293f1039f7f16b93790d3506f39049cb5e5f13..cf7d492413f1c691c44a6265c3265264314f473f 100755
 --- a/tools/test-fuxi-wlan-m6i.py
 +++ b/tools/test-fuxi-wlan-m6i.py
 @@ -44,6 +44,16 @@ static bool enabled_present, bw_present;
@@ -16037,7 +16543,7 @@ index 12293f1..0e13d38 100755
      assert(base==RH_TCS_PA && off/4<1024 && !(off&3));
      if(fw_faults) return;
      if(base+off==fault_write) { fw_faults++; return; }
-@@ -113,6 +125,7 @@ static unsigned wl_pdc_acks, pdc_error;
+@@ -113,12 +125,15 @@ static unsigned wl_pdc_acks, pdc_error;
  static unsigned wl_seq_flags;
  static bool wl_variant_invalid, wl_seq_requested;
  static bool wl_rails_requested;
@@ -16045,7 +16551,15 @@ index 12293f1..0e13d38 100755
  static int wl_rails_on(unsigned variant, const char *where) { return 0; }
  static int wl_cnss_pdc(void) { return pdc_error; } /* peer exercised by M6n suite */
  static void wl5_status(unsigned s) { }
-@@ -130,6 +143,8 @@ static void put16(unsigned at, uint16_t v) {
+ static bool wl_smmu_fault(unsigned s) { return false; }
+ static void fw_m3_summary(unsigned s) { }
+ static void wl5_abort(unsigned s) { aborts++; }
++static bool wl_ath_enabled;
++static int wl_ath_run(void) { return 0; }
+ static void wl_finish(unsigned limit) { if(limit>=17) wl5_abort(limit); }
+ static void fw_dump(const char *tag, const uint32_t *r, unsigned n) { }
+ '''
+@@ -130,6 +145,8 @@ static void put16(unsigned at, uint16_t v) {
  }
  static void put32(unsigned at, uint32_t v) { put16(at,v); put16(at+2,v>>16); }
  static void fixture(void) {
@@ -16054,7 +16568,7 @@ index 12293f1..0e13d38 100755
      memset(db,0,sizeof(db)); memset(rsc,0,sizeof(rsc));
      memset(wl3_report,0,sizeof(wl3_report)); memset(wl5_report,0,sizeof(wl5_report));
      fw_faults=wl3_faults=writes=triggers=delays=nstages=bhi=aborts=nsent=0;
-@@ -141,6 +156,7 @@ static void fixture(void) {
+@@ -141,6 +158,7 @@ static void fixture(void) {
      enabled_present=bw_present=false; enabled_arg=bw_arg=0;
      wl_icc_enabled=1; wl_icc_bw=0; wl_icc_configured=wl_icc_ready=wl_icc_failed=false;
      wl_icc_acks=0; rh_poisoned=false; wl_icc_test_expect_votes=true;
@@ -16062,7 +16576,7 @@ index 12293f1..0e13d38 100755
      loglen=0; logs[0]=0;
      put32(0,1); put32(4,0x0c0330db);
      put16(8,5); put16(10,0); put16(12,512); put16(14,6); put16(16,0x100);
-@@ -327,6 +343,11 @@ int main(void) {
+@@ -327,6 +345,11 @@ int main(void) {
      }
      /* Actual fw_run hooks: initial vote before step2 and all clocks, link
         update before endpoint setup; either failure prevents the BHI step. */
@@ -16074,7 +16588,7 @@ index 12293f1..0e13d38 100755
      fixture(); pdc_error=6; fw_run(22);
      assert(!triggers && !bhi && !nstages); /* policy failure precedes all power writes */
      pdc_error=0;
-@@ -342,7 +363,13 @@ int main(void) {
+@@ -342,7 +365,13 @@ int main(void) {
      }
      fixture(); enabled_present=true; enabled_arg=0; wl_icc_test_expect_votes=false;
      fw_run(22); assert(bhi==1 && !triggers && !wl_icc_acks);
@@ -16089,7 +16603,7 @@ index 12293f1..0e13d38 100755
      return 0;
  }
  '''
-@@ -357,8 +384,9 @@ def main():
+@@ -357,8 +386,9 @@ def main():
                            if line.startswith(('static uint8_t wl_cdb8(', 'static uint32_t wl_cdb16(')))
      icc = driver.split('/* ---- milestone 6i:', 1)[1].split('/* ---- end milestone 6i ---- */', 1)[0]
      icc = '/* ---- milestone 6i:' + icc
@@ -16100,8 +16614,22 @@ index 12293f1..0e13d38 100755
      source = re.sub(r'__asm__ volatile\([^;]+;', '/* host barrier */;', source)
      with tempfile.TemporaryDirectory(prefix='fuxi-wlan-m6i-') as tmp:
          cfile, binary = Path(tmp) / 'm6i.c', Path(tmp) / 'm6i'
+diff --git a/tools/test-fuxi-wlan-m6o.py b/tools/test-fuxi-wlan-m6o.py
+index 25cc3006e3cc629a76a4c0ca811e6aabaf6dbc64..79bf7d79be97b3f249ce1e6a4827453d94d07f4b 100644
+--- a/tools/test-fuxi-wlan-m6o.py
++++ b/tools/test-fuxi-wlan-m6o.py
+@@ -522,7 +522,8 @@ def main():
+     driver = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
+     patch = (ROOT / 'xnu/patches/0099-fuxi-wlan.patch').read_text()
+     for dest, source in [('fuxi_wlan.c', driver), ('wlan.c', (ROOT / 'shim/fuxi-probe/wlan.c').read_text())]:
+-        added = patch.split(f'+++ b/bsd/dev/{dest}\n', 1)[1].split('\n--- a/', 1)[0]
++        added = re.split(r'\n--- (?:a/|/dev/null\n)',
++                         patch.split(f'+++ b/bsd/dev/{dest}\n', 1)[1], maxsplit=1)[0]
+         assert int(re.match(r'@@ -0,0 \+1,(\d+) @@', added)[1]) == len(source.splitlines())
+         assert ''.join(l[1:] + '\n' for l in added.splitlines() if l.startswith('+')) == source
+     assert 'python3 tools/test-fuxi-wlan-m6o.py' in (ROOT / 'tools/ci/build.sh').read_text()
 diff --git a/tools/test-fuxi-wlan-rails.py b/tools/test-fuxi-wlan-rails.py
-index 4edc566..d55e598 100755
+index 4edc566ca4e3485b27113020265f05c521fb23de..d55e59860405fadc2b6f49d17d0dfa8adff9ecc7 100755
 --- a/tools/test-fuxi-wlan-rails.py
 +++ b/tools/test-fuxi-wlan-rails.py
 @@ -48,6 +48,7 @@ static void ts_gpio(unsigned n,unsigned func,unsigned pull,unsigned ma,int out)
@@ -16134,7 +16662,7 @@ index 4edc566..d55e598 100755
      with tempfile.TemporaryDirectory(prefix='fuxi-wlan-rails-') as tmp:
          cfile, binary = Path(tmp) / 'rails.c', Path(tmp) / 'rails'
 diff --git a/tools/test-fuxi-wlan-w13.py b/tools/test-fuxi-wlan-w13.py
-index a7785c8..778df26 100755
+index a7785c86303aa658fbcc3d9c90fd52ecbe478d61..778df26a15ff9976edf8733eadb90a8e8ec692a1 100755
 --- a/tools/test-fuxi-wlan-w13.py
 +++ b/tools/test-fuxi-wlan-w13.py
 @@ -74,7 +74,7 @@ static void qmi_peer(const uint8_t *q,unsigned len) {
@@ -16189,7 +16717,7 @@ index a7785c8..778df26 100755
      assert(strstr(logbuf,"unsupported target type 2"));wl_finish(28);assert(frees==allocations);dev_on=false;
      const unsigned failures[]={3,4,5,6,7,9,10,11,12,13};
 diff --git a/tools/test-fuxi-wlan-w17.py b/tools/test-fuxi-wlan-w17.py
-index fce26f4..1038e4d 100644
+index fce26f4b9a0fbff9202cf15521031d67c369cfe3..1038e4db395da2437ac434ff2588ca8f4932a5d8 100644
 --- a/tools/test-fuxi-wlan-w17.py
 +++ b/tools/test-fuxi-wlan-w17.py
 @@ -160,7 +160,7 @@ def integration():
@@ -16203,7 +16731,7 @@ index fce26f4..1038e4d 100644
              assert(wl_variant_invalid==(bool)t[i].bad);
 diff --git a/tools/test-fuxi-wlan-w18.py b/tools/test-fuxi-wlan-w18.py
 new file mode 100644
-index 0000000..dde4495
+index 0000000000000000000000000000000000000000..dde4495a4ef110dfc31bab1e980304a96272ffd7
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-w18.py
 @@ -0,0 +1,297 @@
@@ -16505,7 +17033,7 @@ index 0000000..dde4495
 +if __name__ == '__main__':
 +    main()
 diff --git a/xnu/fuxi-adreno/fuxi_gpu_scanout.inc b/xnu/fuxi-adreno/fuxi_gpu_scanout.inc
-index 5d17fe5..6c37436 100644
+index 5d17fe54e183a3f33d3e75ffccf6544a2f671d11..6c3743636d9625b48b6187fdaeb953f44e973449 100644
 --- a/xnu/fuxi-adreno/fuxi_gpu_scanout.inc
 +++ b/xnu/fuxi-adreno/fuxi_gpu_scanout.inc
 @@ -1801,16 +1801,27 @@ uncertain:
@@ -16659,7 +17187,7 @@ index 5d17fe5..6c37436 100644
   if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/fuxi-adsp/FatVolume.c b/xnu/fuxi-adsp/FatVolume.c
 new file mode 100644
-index 0000000..2afa75f
+index 0000000000000000000000000000000000000000..2afa75fc7555f54153458fb76eba472ef4e5084c
 --- /dev/null
 +++ b/xnu/fuxi-adsp/FatVolume.c
 @@ -0,0 +1,225 @@
@@ -16890,7 +17418,7 @@ index 0000000..2afa75f
 +}
 diff --git a/xnu/fuxi-adsp/FatVolume.h b/xnu/fuxi-adsp/FatVolume.h
 new file mode 100644
-index 0000000..4308316
+index 0000000000000000000000000000000000000000..43083169c3adc67dd5e15276cb322268e2f42814
 --- /dev/null
 +++ b/xnu/fuxi-adsp/FatVolume.h
 @@ -0,0 +1,53 @@
@@ -16949,7 +17477,7 @@ index 0000000..4308316
 +#endif
 diff --git a/xnu/fuxi-adsp/GeniI2c.c b/xnu/fuxi-adsp/GeniI2c.c
 new file mode 100644
-index 0000000..cad36d0
+index 0000000000000000000000000000000000000000..cad36d09f3a4f911d5f2661853f204ce8b48c198
 --- /dev/null
 +++ b/xnu/fuxi-adsp/GeniI2c.c
 @@ -0,0 +1,232 @@
@@ -17187,7 +17715,7 @@ index 0000000..cad36d0
 +}
 diff --git a/xnu/fuxi-adsp/GeniI2c.h b/xnu/fuxi-adsp/GeniI2c.h
 new file mode 100644
-index 0000000..118dc7c
+index 0000000000000000000000000000000000000000..118dc7cb1c77ac7931ead96e5557cf9a7dc0a083
 --- /dev/null
 +++ b/xnu/fuxi-adsp/GeniI2c.h
 @@ -0,0 +1,120 @@
@@ -17313,7 +17841,7 @@ index 0000000..118dc7c
 +#endif
 diff --git a/xnu/fuxi-adsp/LICENSE.UniXNU-sheng b/xnu/fuxi-adsp/LICENSE.UniXNU-sheng
 new file mode 100644
-index 0000000..f63d2a6
+index 0000000000000000000000000000000000000000..f63d2a6e4c80c3bf8d44b047458468289927593d
 --- /dev/null
 +++ b/xnu/fuxi-adsp/LICENSE.UniXNU-sheng
 @@ -0,0 +1,51 @@
@@ -17370,7 +17898,7 @@ index 0000000..f63d2a6
 +POSSIBILITY OF SUCH DAMAGE.
 diff --git a/xnu/fuxi-adsp/QcomGlink.c b/xnu/fuxi-adsp/QcomGlink.c
 new file mode 100644
-index 0000000..fee7b1f
+index 0000000000000000000000000000000000000000..fee7b1ff7ee5b4e991509b323cd1185f39057f70
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomGlink.c
 @@ -0,0 +1,453 @@
@@ -17829,7 +18357,7 @@ index 0000000..fee7b1f
 +}
 diff --git a/xnu/fuxi-adsp/QcomGlink.h b/xnu/fuxi-adsp/QcomGlink.h
 new file mode 100644
-index 0000000..1fb845c
+index 0000000000000000000000000000000000000000..1fb845ccac2655e3a53abbf64eadcb1c441cca20
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomGlink.h
 @@ -0,0 +1,100 @@
@@ -17935,7 +18463,7 @@ index 0000000..1fb845c
 +#endif
 diff --git a/xnu/fuxi-adsp/QcomMdt.c b/xnu/fuxi-adsp/QcomMdt.c
 new file mode 100644
-index 0000000..8688b0f
+index 0000000000000000000000000000000000000000..8688b0fe6b73351e37a5bf83920e066837f4fc69
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomMdt.c
 @@ -0,0 +1,157 @@
@@ -18098,7 +18626,7 @@ index 0000000..8688b0f
 +}
 diff --git a/xnu/fuxi-adsp/QcomMdt.h b/xnu/fuxi-adsp/QcomMdt.h
 new file mode 100644
-index 0000000..5728297
+index 0000000000000000000000000000000000000000..57282972e38e9448f927ef73fe0b262ab02614d1
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomMdt.h
 @@ -0,0 +1,87 @@
@@ -18191,7 +18719,7 @@ index 0000000..5728297
 +#endif
 diff --git a/xnu/fuxi-adsp/QcomQmp.c b/xnu/fuxi-adsp/QcomQmp.c
 new file mode 100644
-index 0000000..da04166
+index 0000000000000000000000000000000000000000..da041660a87a3e768ed4b09b2c800ba82ba7c6b8
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomQmp.c
 @@ -0,0 +1,102 @@
@@ -18299,7 +18827,7 @@ index 0000000..da04166
 +}
 diff --git a/xnu/fuxi-adsp/QcomQmp.h b/xnu/fuxi-adsp/QcomQmp.h
 new file mode 100644
-index 0000000..e411345
+index 0000000000000000000000000000000000000000..e4113458d19d5498b3268758bbe592bceb8bfa0b
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomQmp.h
 @@ -0,0 +1,47 @@
@@ -18352,7 +18880,7 @@ index 0000000..e411345
 +#endif
 diff --git a/xnu/fuxi-adsp/QcomQrtr.c b/xnu/fuxi-adsp/QcomQrtr.c
 new file mode 100644
-index 0000000..f0e8021
+index 0000000000000000000000000000000000000000..f0e80217e158013d9083ae32d9ec2d4560a96429
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomQrtr.c
 @@ -0,0 +1,226 @@
@@ -18584,7 +19112,7 @@ index 0000000..f0e8021
 +}
 diff --git a/xnu/fuxi-adsp/QcomQrtr.h b/xnu/fuxi-adsp/QcomQrtr.h
 new file mode 100644
-index 0000000..132ee1e
+index 0000000000000000000000000000000000000000..132ee1ea928824acbf9a68cea7d869840b8514f0
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomQrtr.h
 @@ -0,0 +1,79 @@
@@ -18669,7 +19197,7 @@ index 0000000..132ee1e
 +#endif
 diff --git a/xnu/fuxi-adsp/QcomRpmh.c b/xnu/fuxi-adsp/QcomRpmh.c
 new file mode 100644
-index 0000000..5af655d
+index 0000000000000000000000000000000000000000..5af655ddb2b1dc981e7a9cf59d0d30eb42979259
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomRpmh.c
 @@ -0,0 +1,94 @@
@@ -18769,7 +19297,7 @@ index 0000000..5af655d
 +}
 diff --git a/xnu/fuxi-adsp/QcomRpmh.h b/xnu/fuxi-adsp/QcomRpmh.h
 new file mode 100644
-index 0000000..c5fc59b
+index 0000000000000000000000000000000000000000..c5fc59bd851b60bc81f6307221779a05c83012a1
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomRpmh.h
 @@ -0,0 +1,50 @@
@@ -18825,7 +19353,7 @@ index 0000000..c5fc59b
 +#endif
 diff --git a/xnu/fuxi-adsp/QcomScm.h b/xnu/fuxi-adsp/QcomScm.h
 new file mode 100644
-index 0000000..53f7eff
+index 0000000000000000000000000000000000000000..53f7effd6536e5f2da523dfbc9cdde1bcf4995c4
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomScm.h
 @@ -0,0 +1,44 @@
@@ -18875,7 +19403,7 @@ index 0000000..53f7eff
 +#endif
 diff --git a/xnu/fuxi-adsp/QcomSmem.c b/xnu/fuxi-adsp/QcomSmem.c
 new file mode 100644
-index 0000000..515c63f
+index 0000000000000000000000000000000000000000..515c63fc264a5dbf047f343e1cc7becb944b445b
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomSmem.c
 @@ -0,0 +1,112 @@
@@ -18993,7 +19521,7 @@ index 0000000..515c63f
 +}
 diff --git a/xnu/fuxi-adsp/QcomSmem.h b/xnu/fuxi-adsp/QcomSmem.h
 new file mode 100644
-index 0000000..facab04
+index 0000000000000000000000000000000000000000..facab0415d4166c47a20a7102121a6f6d4a88caa
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomSmem.h
 @@ -0,0 +1,51 @@
@@ -19050,7 +19578,7 @@ index 0000000..facab04
 +#endif
 diff --git a/xnu/fuxi-adsp/QcomSmp2p.c b/xnu/fuxi-adsp/QcomSmp2p.c
 new file mode 100644
-index 0000000..7ba701b
+index 0000000000000000000000000000000000000000..7ba701bde69f7e5919e5ba295d66c3436551ad6c
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomSmp2p.c
 @@ -0,0 +1,125 @@
@@ -19181,7 +19709,7 @@ index 0000000..7ba701b
 +}
 diff --git a/xnu/fuxi-adsp/QcomSmp2p.h b/xnu/fuxi-adsp/QcomSmp2p.h
 new file mode 100644
-index 0000000..947a7d7
+index 0000000000000000000000000000000000000000..947a7d784268566e2053db36b451108cbd28d2e4
 --- /dev/null
 +++ b/xnu/fuxi-adsp/QcomSmp2p.h
 @@ -0,0 +1,51 @@
@@ -19238,7 +19766,7 @@ index 0000000..947a7d7
 +#endif
 diff --git a/xnu/fuxi-adsp/ShengAdsp.h b/xnu/fuxi-adsp/ShengAdsp.h
 new file mode 100644
-index 0000000..87daa37
+index 0000000000000000000000000000000000000000..87daa37dadd04adfb1e6f40ef0a17bc891103afc
 --- /dev/null
 +++ b/xnu/fuxi-adsp/ShengAdsp.h
 @@ -0,0 +1,30 @@
@@ -19274,7 +19802,7 @@ index 0000000..87daa37
 +#endif
 diff --git a/xnu/fuxi-adsp/ShengBattmgr.c b/xnu/fuxi-adsp/ShengBattmgr.c
 new file mode 100644
-index 0000000..676a7a5
+index 0000000000000000000000000000000000000000..676a7a571a18281cd66a42c364c713d59a316bc4
 --- /dev/null
 +++ b/xnu/fuxi-adsp/ShengBattmgr.c
 @@ -0,0 +1,290 @@
@@ -19570,7 +20098,7 @@ index 0000000..676a7a5
 +}
 diff --git a/xnu/fuxi-adsp/ShengBattmgr.h b/xnu/fuxi-adsp/ShengBattmgr.h
 new file mode 100644
-index 0000000..fa9d370
+index 0000000000000000000000000000000000000000..fa9d3702afd1358ec5c54f2d067b30a8f61b47ad
 --- /dev/null
 +++ b/xnu/fuxi-adsp/ShengBattmgr.h
 @@ -0,0 +1,101 @@
@@ -19677,7 +20205,7 @@ index 0000000..fa9d370
 +#endif
 diff --git a/xnu/fuxi-adsp/ShengQrtr.c b/xnu/fuxi-adsp/ShengQrtr.c
 new file mode 100644
-index 0000000..5633228
+index 0000000000000000000000000000000000000000..5633228a5daa21375406768ce5ac66d29bd34967
 --- /dev/null
 +++ b/xnu/fuxi-adsp/ShengQrtr.c
 @@ -0,0 +1,114 @@
@@ -19797,7 +20325,7 @@ index 0000000..5633228
 +}
 diff --git a/xnu/fuxi-adsp/SweetBattery.cpp b/xnu/fuxi-adsp/SweetBattery.cpp
 new file mode 100644
-index 0000000..72eedb5
+index 0000000000000000000000000000000000000000..72eedb5f98671da32a14d633300d5ce11a9d68c6
 --- /dev/null
 +++ b/xnu/fuxi-adsp/SweetBattery.cpp
 @@ -0,0 +1,585 @@
@@ -20388,7 +20916,7 @@ index 0000000..72eedb5
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp.c b/xnu/fuxi-adsp/fuxi_adsp.c
 new file mode 100644
-index 0000000..0e8bfa7
+index 0000000000000000000000000000000000000000..0e8bfa778c0b93c57ec1b6bd2072efbd4caf9ba7
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp.c
 @@ -0,0 +1,900 @@
@@ -21294,7 +21822,7 @@ index 0000000..0e8bfa7
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp_battery.c b/xnu/fuxi-adsp/fuxi_adsp_battery.c
 new file mode 100644
-index 0000000..92fccc5
+index 0000000000000000000000000000000000000000..92fccc532c75cd8a8a8c673988ecada92306502d
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp_battery.c
 @@ -0,0 +1,483 @@
@@ -21783,7 +22311,7 @@ index 0000000..92fccc5
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp_battery.h b/xnu/fuxi-adsp/fuxi_adsp_battery.h
 new file mode 100644
-index 0000000..eec4fbf
+index 0000000000000000000000000000000000000000..eec4fbfb4b0a14cdcffeeacda8cec630cb3a5b9e
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp_battery.h
 @@ -0,0 +1,38 @@
@@ -21827,7 +22355,7 @@ index 0000000..eec4fbf
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_adsp_fw.c b/xnu/fuxi-adsp/fuxi_adsp_fw.c
 new file mode 100644
-index 0000000..7755f92
+index 0000000000000000000000000000000000000000..7755f9276a071000b1b4b99e919ddb2654b25b88
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp_fw.c
 @@ -0,0 +1,142 @@
@@ -21975,7 +22503,7 @@ index 0000000..7755f92
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_amp.c b/xnu/fuxi-adsp/fuxi_amp.c
 new file mode 100644
-index 0000000..09ce08d
+index 0000000000000000000000000000000000000000..09ce08d6a01773a56efb6c1ad17c90bdf6f18c33
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_amp.c
 @@ -0,0 +1,335 @@
@@ -22316,7 +22844,7 @@ index 0000000..09ce08d
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_haptic_pulse.h b/xnu/fuxi-adsp/fuxi_haptic_pulse.h
 new file mode 100644
-index 0000000..442bfbf
+index 0000000000000000000000000000000000000000..442bfbfbc6f99945f312b8ef2251158645f9c267
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_haptic_pulse.h
 @@ -0,0 +1,259 @@
@@ -22581,7 +23109,7 @@ index 0000000..442bfbf
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_pmic.c b/xnu/fuxi-adsp/fuxi_pmic.c
 new file mode 100644
-index 0000000..6f1b89f
+index 0000000000000000000000000000000000000000..6f1b89ff0d9de1bd33a5454183ccae2a5e66f68d
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_pmic.c
 @@ -0,0 +1,603 @@
@@ -23190,7 +23718,7 @@ index 0000000..6f1b89f
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_ramtest.c b/xnu/fuxi-adsp/fuxi_ramtest.c
 new file mode 100644
-index 0000000..7439e53
+index 0000000000000000000000000000000000000000..7439e53d58a798e7bd3ea3a22aa46b829bd2484a
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_ramtest.c
 @@ -0,0 +1,122 @@
@@ -23318,7 +23846,7 @@ index 0000000..7439e53
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_ramtest_pattern.h b/xnu/fuxi-adsp/fuxi_ramtest_pattern.h
 new file mode 100644
-index 0000000..e7eaebe
+index 0000000000000000000000000000000000000000..e7eaebef50c64ef2d625dc5a3e2f0fe3dddc0c01
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_ramtest_pattern.h
 @@ -0,0 +1,42 @@
@@ -23366,7 +23894,7 @@ index 0000000..e7eaebe
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_rpmh_shared.c b/xnu/fuxi-adsp/fuxi_rpmh_shared.c
 new file mode 100644
-index 0000000..8043a79
+index 0000000000000000000000000000000000000000..8043a7929d25cf20029ba0035e3669a14cc47389
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_rpmh_shared.c
 @@ -0,0 +1,25 @@
@@ -23397,7 +23925,7 @@ index 0000000..8043a79
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_rpmh_shared.h b/xnu/fuxi-adsp/fuxi_rpmh_shared.h
 new file mode 100644
-index 0000000..fd499b2
+index 0000000000000000000000000000000000000000..fd499b2ec0524019b9fd7cef2734d44cb1f00a5c
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_rpmh_shared.h
 @@ -0,0 +1,7 @@
@@ -23410,7 +23938,7 @@ index 0000000..fd499b2
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_torch_audit.h b/xnu/fuxi-adsp/fuxi_torch_audit.h
 new file mode 100644
-index 0000000..7558fa9
+index 0000000000000000000000000000000000000000..7558fa9b30316b677c5521411f49dbdadbde8537
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_torch_audit.h
 @@ -0,0 +1,45 @@
@@ -23461,7 +23989,7 @@ index 0000000..7558fa9
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_torch_pulse.h b/xnu/fuxi-adsp/fuxi_torch_pulse.h
 new file mode 100644
-index 0000000..9bdc64d
+index 0000000000000000000000000000000000000000..9bdc64d14599307c6b6eea28efb63e04f0b9ae0f
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_torch_pulse.h
 @@ -0,0 +1,93 @@
@@ -23560,7 +24088,7 @@ index 0000000..9bdc64d
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_torch_runtime.h b/xnu/fuxi-adsp/fuxi_torch_runtime.h
 new file mode 100644
-index 0000000..6bd480a
+index 0000000000000000000000000000000000000000..6bd480ab4dff5b0ba14a51ec1a81341a90cb50b5
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_torch_runtime.h
 @@ -0,0 +1,37 @@
@@ -23603,7 +24131,7 @@ index 0000000..6bd480a
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_torch_steady.h b/xnu/fuxi-adsp/fuxi_torch_steady.h
 new file mode 100644
-index 0000000..f829135
+index 0000000000000000000000000000000000000000..f829135b3d9280446ff6049f072240c1ea3e0808
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_torch_steady.h
 @@ -0,0 +1,130 @@
@@ -23739,7 +24267,7 @@ index 0000000..f829135
 +#endif
 diff --git a/xnu/fuxi-audio-prep/fuxi_audio_prep_gpr.c b/xnu/fuxi-audio-prep/fuxi_audio_prep_gpr.c
 new file mode 100644
-index 0000000..6a6ef61
+index 0000000000000000000000000000000000000000..6a6ef61b44d13724bf30b584b7dbc081597cdbf3
 --- /dev/null
 +++ b/xnu/fuxi-audio-prep/fuxi_audio_prep_gpr.c
 @@ -0,0 +1,151 @@
@@ -23896,7 +24424,7 @@ index 0000000..6a6ef61
 +}
 diff --git a/xnu/fuxi-audio-prep/fuxi_audio_prep_gpr.h b/xnu/fuxi-audio-prep/fuxi_audio_prep_gpr.h
 new file mode 100644
-index 0000000..b92edaf
+index 0000000000000000000000000000000000000000..b92edaf0a84566e1a547dd638cbf54e6d4202f0e
 --- /dev/null
 +++ b/xnu/fuxi-audio-prep/fuxi_audio_prep_gpr.h
 @@ -0,0 +1,79 @@
@@ -23981,7 +24509,7 @@ index 0000000..b92edaf
 +#endif
 diff --git a/xnu/fuxi-audio-prep/test_gpr.c b/xnu/fuxi-audio-prep/test_gpr.c
 new file mode 100644
-index 0000000..3f7cdbd
+index 0000000000000000000000000000000000000000..3f7cdbdf1ea4bd4df80d9b02a972cc8e64766208
 --- /dev/null
 +++ b/xnu/fuxi-audio-prep/test_gpr.c
 @@ -0,0 +1,302 @@
@@ -24289,7 +24817,7 @@ index 0000000..3f7cdbd
 +}
 diff --git a/xnu/fuxi-battery-prep/fuxi_battery_freshness.c b/xnu/fuxi-battery-prep/fuxi_battery_freshness.c
 new file mode 100644
-index 0000000..8628d4c
+index 0000000000000000000000000000000000000000..8628d4cde4fed5a53ca17146255f6bcffe313ec1
 --- /dev/null
 +++ b/xnu/fuxi-battery-prep/fuxi_battery_freshness.c
 @@ -0,0 +1,168 @@
@@ -24463,7 +24991,7 @@ index 0000000..8628d4c
 +}
 diff --git a/xnu/fuxi-battery-prep/fuxi_battery_freshness.h b/xnu/fuxi-battery-prep/fuxi_battery_freshness.h
 new file mode 100644
-index 0000000..e063377
+index 0000000000000000000000000000000000000000..e0633774a624d5017abe321989ecacec1e3a06af
 --- /dev/null
 +++ b/xnu/fuxi-battery-prep/fuxi_battery_freshness.h
 @@ -0,0 +1,46 @@
@@ -24515,7 +25043,7 @@ index 0000000..e063377
 +#endif
 diff --git a/xnu/fuxi-battery-prep/fuxi_battery_poll_pause.h b/xnu/fuxi-battery-prep/fuxi_battery_poll_pause.h
 new file mode 100644
-index 0000000..11d5899
+index 0000000000000000000000000000000000000000..11d58993102fec18254779dc366db8045a179e60
 --- /dev/null
 +++ b/xnu/fuxi-battery-prep/fuxi_battery_poll_pause.h
 @@ -0,0 +1,199 @@
@@ -24720,7 +25248,7 @@ index 0000000..11d5899
 +#endif
 diff --git a/xnu/fuxi-battery-prep/test_freshness.c b/xnu/fuxi-battery-prep/test_freshness.c
 new file mode 100644
-index 0000000..e298226
+index 0000000000000000000000000000000000000000..e298226d7faee32430b883d7199656f0a2b603d5
 --- /dev/null
 +++ b/xnu/fuxi-battery-prep/test_freshness.c
 @@ -0,0 +1,300 @@
@@ -25026,7 +25554,7 @@ index 0000000..e298226
 +}
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt.c b/xnu/fuxi-bluetooth/fuxi_bt.c
 new file mode 100644
-index 0000000..7a549b7
+index 0000000000000000000000000000000000000000..7a549b7455493a6ce6e86f45f67a933bb553b691
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt.c
 @@ -0,0 +1,392 @@
@@ -25424,7 +25952,7 @@ index 0000000..7a549b7
 +}
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt.h b/xnu/fuxi-bluetooth/fuxi_bt.h
 new file mode 100644
-index 0000000..0e23c8a
+index 0000000000000000000000000000000000000000..0e23c8afd6621ff2659eee8686c9df364406e5c5
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt.h
 @@ -0,0 +1,100 @@
@@ -25530,7 +26058,7 @@ index 0000000..0e23c8a
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.c b/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.c
 new file mode 100644
-index 0000000..5c11589
+index 0000000000000000000000000000000000000000..5c115890133d2fc7e9159ee753a037e1ce023311
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.c
 @@ -0,0 +1,610 @@
@@ -26146,7 +26674,7 @@ index 0000000..5c11589
 +}
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.h b/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.h
 new file mode 100644
-index 0000000..35331b3
+index 0000000000000000000000000000000000000000..35331b3a90680a1c74a7b4909ef0441a6d911aab
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.h
 @@ -0,0 +1,146 @@
@@ -26298,7 +26826,7 @@ index 0000000..35331b3
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_xnu.c b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
 new file mode 100644
-index 0000000..d5578d4
+index 0000000000000000000000000000000000000000..d5578d495369301c5533b0ecf74155708a60c080
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
 @@ -0,0 +1,192 @@
@@ -26496,7 +27024,7 @@ index 0000000..d5578d4
 +#endif
 diff --git a/xnu/fuxi-bt-clock-prep/README.md b/xnu/fuxi-bt-clock-prep/README.md
 new file mode 100644
-index 0000000..9174fe5
+index 0000000000000000000000000000000000000000..9174fe5b7089952537edaeeacee2930c2467c28e
 --- /dev/null
 +++ b/xnu/fuxi-bt-clock-prep/README.md
 @@ -0,0 +1,72 @@
@@ -26574,7 +27102,7 @@ index 0000000..9174fe5
 +本機既有BT snapshot、共享RPMh介面及WLAN source只用來查核native接點缺口，不當primary Linux driver的替代品；沒有宣稱本機已具備等價CCF或安全engine access。
 diff --git a/xnu/fuxi-bt-clock-prep/fuxi_bt_clock_ledger.c b/xnu/fuxi-bt-clock-prep/fuxi_bt_clock_ledger.c
 new file mode 100644
-index 0000000..3e16cb2
+index 0000000000000000000000000000000000000000..3e16cb2026dde7e34bc7869b170cb075d80511b5
 --- /dev/null
 +++ b/xnu/fuxi-bt-clock-prep/fuxi_bt_clock_ledger.c
 @@ -0,0 +1,231 @@
@@ -26811,7 +27339,7 @@ index 0000000..3e16cb2
 +}
 diff --git a/xnu/fuxi-bt-clock-prep/fuxi_bt_clock_ledger.h b/xnu/fuxi-bt-clock-prep/fuxi_bt_clock_ledger.h
 new file mode 100644
-index 0000000..8491c6b
+index 0000000000000000000000000000000000000000..8491c6b50458ceb3a95963045716f4472c4449ef
 --- /dev/null
 +++ b/xnu/fuxi-bt-clock-prep/fuxi_bt_clock_ledger.h
 @@ -0,0 +1,100 @@
@@ -26916,7 +27444,7 @@ index 0000000..8491c6b
 +
 +#endif
 diff --git a/xnu/fuxi-h1/fuxi_keys.c b/xnu/fuxi-h1/fuxi_keys.c
-index 8f1d60f..2fff4c5 100644
+index 8f1d60f5f10c49e35458042874fbfab96757ede7..2fff4c58ff638f305ef95be361f49e4c6f588759 100644
 --- a/xnu/fuxi-h1/fuxi_keys.c
 +++ b/xnu/fuxi-h1/fuxi_keys.c
 @@ -39,6 +39,7 @@
@@ -27038,7 +27566,7 @@ index 8f1d60f..2fff4c5 100644
  	thread_block(THREAD_CONTINUE_NULL);
 diff --git a/xnu/fuxi-haptic-prep/fuxi_haptic_fifo.c b/xnu/fuxi-haptic-prep/fuxi_haptic_fifo.c
 new file mode 100644
-index 0000000..f15fc6d
+index 0000000000000000000000000000000000000000..f15fc6d6edd80da07b5ed659a86615c6a867d001
 --- /dev/null
 +++ b/xnu/fuxi-haptic-prep/fuxi_haptic_fifo.c
 @@ -0,0 +1,335 @@
@@ -27379,7 +27907,7 @@ index 0000000..f15fc6d
 +}
 diff --git a/xnu/fuxi-haptic-prep/fuxi_haptic_fifo.h b/xnu/fuxi-haptic-prep/fuxi_haptic_fifo.h
 new file mode 100644
-index 0000000..0d62be7
+index 0000000000000000000000000000000000000000..0d62be79b7208bbf4f0ecc4888ab91d55583f4e0
 --- /dev/null
 +++ b/xnu/fuxi-haptic-prep/fuxi_haptic_fifo.h
 @@ -0,0 +1,137 @@
@@ -27522,7 +28050,7 @@ index 0000000..0d62be7
 +#endif
 diff --git a/xnu/fuxi-haptic-prep/test_fifo.c b/xnu/fuxi-haptic-prep/test_fifo.c
 new file mode 100644
-index 0000000..d69bfaa
+index 0000000000000000000000000000000000000000..d69bfaab0b7f42664204fb1ed741344de60f46ef
 --- /dev/null
 +++ b/xnu/fuxi-haptic-prep/test_fifo.c
 @@ -0,0 +1,550 @@
@@ -28078,7 +28606,7 @@ index 0000000..d69bfaa
 +}
 diff --git a/xnu/fuxi-htc-prep/README.md b/xnu/fuxi-htc-prep/README.md
 new file mode 100644
-index 0000000..f19ea44
+index 0000000000000000000000000000000000000000..f19ea4472ff3d183f2a2d8ce1a3206b515b294a9
 --- /dev/null
 +++ b/xnu/fuxi-htc-prep/README.md
 @@ -0,0 +1,57 @@
@@ -28141,7 +28669,7 @@ index 0000000..f19ea44
 +No source mirror, aggregate patch, build script, firmware or phone is touched.
 diff --git a/xnu/fuxi-htc-prep/fuxi_htc_prep.c b/xnu/fuxi-htc-prep/fuxi_htc_prep.c
 new file mode 100644
-index 0000000..bff7dd2
+index 0000000000000000000000000000000000000000..bff7dd228b10d8621a5d9d61f22a685e5be02fea
 --- /dev/null
 +++ b/xnu/fuxi-htc-prep/fuxi_htc_prep.c
 @@ -0,0 +1,211 @@
@@ -28358,7 +28886,7 @@ index 0000000..bff7dd2
 +}
 diff --git a/xnu/fuxi-htc-prep/fuxi_htc_prep.h b/xnu/fuxi-htc-prep/fuxi_htc_prep.h
 new file mode 100644
-index 0000000..187ad59
+index 0000000000000000000000000000000000000000..187ad595bd40cef4c002a35d00d7535955f96ab9
 --- /dev/null
 +++ b/xnu/fuxi-htc-prep/fuxi_htc_prep.h
 @@ -0,0 +1,81 @@
@@ -28445,7 +28973,7 @@ index 0000000..187ad59
 +#endif
 diff --git a/xnu/fuxi-inject/fuxi_exec_inject.h b/xnu/fuxi-inject/fuxi_exec_inject.h
 new file mode 100644
-index 0000000..a7bc35a
+index 0000000000000000000000000000000000000000..a7bc35a842d4403030cf10a4857debf40df04e33
 --- /dev/null
 +++ b/xnu/fuxi-inject/fuxi_exec_inject.h
 @@ -0,0 +1,67 @@
@@ -28518,7 +29046,7 @@ index 0000000..a7bc35a
 +}
 diff --git a/xnu/fuxi-ram-prep/fuxi_ram_bank.c b/xnu/fuxi-ram-prep/fuxi_ram_bank.c
 new file mode 100644
-index 0000000..4d7c4c3
+index 0000000000000000000000000000000000000000..4d7c4c3bf3cdc1ae5570e869ef01f510eca63121
 --- /dev/null
 +++ b/xnu/fuxi-ram-prep/fuxi_ram_bank.c
 @@ -0,0 +1,208 @@
@@ -28732,7 +29260,7 @@ index 0000000..4d7c4c3
 +}
 diff --git a/xnu/fuxi-ram-prep/fuxi_ram_bank.h b/xnu/fuxi-ram-prep/fuxi_ram_bank.h
 new file mode 100644
-index 0000000..684955b
+index 0000000000000000000000000000000000000000..684955be5dacbca502943e96f3b8c8a6e15bc392
 --- /dev/null
 +++ b/xnu/fuxi-ram-prep/fuxi_ram_bank.h
 @@ -0,0 +1,108 @@
@@ -28846,7 +29374,7 @@ index 0000000..684955b
 +#endif
 diff --git a/xnu/fuxi-ram-prep/test_fuxi_ram_bank.c b/xnu/fuxi-ram-prep/test_fuxi_ram_bank.c
 new file mode 100644
-index 0000000..8a1b9db
+index 0000000000000000000000000000000000000000..8a1b9db4c96c5c5ab33e1e1754c7edf0e235f26b
 --- /dev/null
 +++ b/xnu/fuxi-ram-prep/test_fuxi_ram_bank.c
 @@ -0,0 +1,410 @@
@@ -29261,7 +29789,7 @@ index 0000000..8a1b9db
 +    return 0;
 +}
 diff --git a/xnu/fuxi-unixnu/sweet_ufs.c b/xnu/fuxi-unixnu/sweet_ufs.c
-index c8376e4..d363e22 100644
+index c8376e4dccc460a68c8b1ac6c105c0cd24a193b3..d363e22d1f56aa0b7027b4c1c0ba8ec2037f85bc 100644
 --- a/xnu/fuxi-unixnu/sweet_ufs.c
 +++ b/xnu/fuxi-unixnu/sweet_ufs.c
 @@ -60,7 +60,11 @@ extern void sweet_touch_init(void);
@@ -29609,7 +30137,7 @@ index c8376e4..d363e22 100644
  int sweet_ufs_rootdev(dev_t *dev);
  
 diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
-index 1b46ea1..4b4a4af 100644
+index 1b46ea1b86a3c66d832977a14592f3d1bee16dac..09ba6837bf86a377e5cdcaffb41e0f16dba6f759 100644
 --- a/xnu/fuxi-wlan/fuxi_wlan.c
 +++ b/xnu/fuxi-wlan/fuxi_wlan.c
 @@ -78,6 +78,7 @@
@@ -29655,8 +30183,13 @@ index 1b46ea1..4b4a4af 100644
  rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
  {
  	/* BCM requests wait for the TCS IRQ and request responses on all cmds. */
-@@ -728,6 +737,8 @@ static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
+@@ -726,8 +735,13 @@ static bool wl_mhi_valid;
+ struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa, iova; bool nc; };
+ static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
  static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
++static struct wl_dma wl_ath_arena;
++static bool wl_ath_enabled;
++static void wl_ath_release(void);
  static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
  static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
 +static bool wl18_enabled, wl18_host_cap, wl18_cap_invalid;
@@ -29664,7 +30197,7 @@ index 1b46ea1..4b4a4af 100644
  static unsigned wl_rails_variant;
  static bool wl_rails_requested;
  static bool wl16_large, wl16_redrive;
-@@ -753,7 +764,10 @@ static bool wl16_large, wl16_redrive;
+@@ -753,7 +767,10 @@ static bool wl16_large, wl16_redrive;
  #define WL17_CLKCHECK 0x040u
  #define WL17_CLKON 0x080u
  #define WL17_ERRDEC 0x100u
@@ -29676,7 +30209,7 @@ index 1b46ea1..4b4a4af 100644
  static unsigned wl17_bits;
  static unsigned wl17_phy17_len;
  static uint64_t wl17_phy17_val;
-@@ -1016,15 +1030,17 @@ wl_probe_configure(void)
+@@ -1016,15 +1033,17 @@ wl_probe_configure(void)
  			if (!wl17_bits && !bad) {
  				if (variant) { printf("FUXI WLAN: W12 mlo variant %d (1 PHY_CAP, 2 omit MLO) valid %u\n", variant, !wl_variant_invalid); }
  			} else {
@@ -29696,7 +30229,7 @@ index 1b46ea1..4b4a4af 100644
  	if (wl_w15) {
  		int variant = 0;
  		(void)PE_parse_boot_argn("fuxiwlanw15", &variant, sizeof(variant));
-@@ -1041,6 +1057,26 @@ wl_probe_configure(void)
+@@ -1041,6 +1060,26 @@ wl_probe_configure(void)
  			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
  			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
  		}
@@ -29723,7 +30256,7 @@ index 1b46ea1..4b4a4af 100644
  	}
  	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
  	if (wl_w14) {
-@@ -1085,6 +1121,14 @@ wl_probe_configure(void)
+@@ -1085,6 +1124,14 @@ wl_probe_configure(void)
  	printf("FUXI WLAN: M6n cnss=%s valid=%u (PDC before step 1)\n",
  	    wl_cnss_names[wl_cnss], !wl_variant_invalid);
  }
@@ -29738,7 +30271,25 @@ index 1b46ea1..4b4a4af 100644
  #define WL_CNSS_IOVA 0xa0000000ull
  #define WL_CNSS_IOVA_END 0xb0000000ull
  #define WL_LEGACY_IOVA 0x10000000ull
-@@ -3176,6 +3220,10 @@ static unsigned wl12_num_phy;
+@@ -2110,7 +2157,7 @@ wl_pt_pa(unsigned table)
+ static vm_offset_t
+ wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)
+ {
+-	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3 };
++	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3, &wl_ath_arena };
+ 	unsigned fixed = sizeof(bufs)/sizeof(bufs[0]);
+ 	for (unsigned i = 0; i < (tables_only ? 1u : fixed + WL_TARGET_MAX); i++) {
+ 		struct wl_dma *d = i < fixed ? bufs[i] : &wl_target[i-fixed];
+@@ -2187,7 +2234,7 @@ wl_smmu_populate(void)
+ 	for (unsigned i = 0; i < l3_count; i++) {
+ 		l2[((wl_iova_base >> 21) & 511) + i] = wl_pt_pa(2 + i) | 3;
+ 	}
+-	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr };
++	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl_ath_arena };
+ 	for (unsigned i = 0; i < sizeof(bufs)/sizeof(bufs[0]); i++) {
+ 		struct wl_dma *d = bufs[i];
+ 		if (d == &wl_image && wl_probe == WL_PROBE_UNMAPPED) { continue; }
+@@ -3176,6 +3223,10 @@ static unsigned wl12_num_phy;
  static bool wl13_delayed, wl13_negotiated;
  static bool wl14_ready, wl14_init_done, wl14_board_valid;
  static uint64_t wl15_ready_time;
@@ -29749,7 +30300,7 @@ index 1b46ea1..4b4a4af 100644
  static uint32_t wl14_board;
  static int wl_w12_run(void);
  static int wl_qmi_w12(const uint8_t *, unsigned);
-@@ -3206,6 +3254,40 @@ static struct wl_context *wl_channel(unsigned ch) { return (void *)(wl_contexts.
+@@ -3206,6 +3257,40 @@ static struct wl_context *wl_channel(unsigned ch) { return (void *)(wl_contexts.
  static struct wl_tre *wl_ipcr_ring(unsigned off) { return (void *)(wl_ipcr.va + off); }
  static void wl_w11_barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
  
@@ -29790,7 +30341,7 @@ index 1b46ea1..4b4a4af 100644
  /* RAM-only snapshot: channel RP is diagnostic, never used to reclaim TREs.
   * Completion events remain authoritative. Do not repair a live device-owned
   * RP even when it resembles type/ER words (as in try15c/try15d). */
-@@ -3567,7 +3649,15 @@ wl_w11_events(void)
+@@ -3567,7 +3652,15 @@ wl_w11_events(void)
  					if (ev.ptr != wl_ipcr.iova+roff+ri*16 || (ch == 20 && ri == wl_tx_write)) { return wl_w11_fail("transfer completion pointer/order"); }
  					struct wl_tre tre = wl_ipcr_ring(roff)[ri];
  					if (bytes > (ch == 20 ? WL_IPCR_TXMTU : WL_IPCR_MTU) || bytes > (tre.d0 & 0xffff)) { return wl_w11_fail("transfer completion length"); }
@@ -29807,7 +30358,7 @@ index 1b46ea1..4b4a4af 100644
  					else {
  						uint64_t lo = wl_ipcr.iova + WL_IPCR_RXBUF;
  						if (tre.ptr < lo || tre.ptr >= lo+WL_IPCR_N*WL_IPCR_MTU ||
-@@ -3669,6 +3759,7 @@ wl_w11_run(void)
+@@ -3669,6 +3762,7 @@ wl_w11_run(void)
  	wl12_reply = wl12_requested = wl12_ready = false;
  	wl13_delayed = wl13_negotiated = false;
  	wl14_ready = wl14_init_done = wl14_board_valid = false; wl14_board = 0;
@@ -29815,7 +30366,7 @@ index 1b46ea1..4b4a4af 100644
  	wl_chdb = wl_mrd(0x18); wl_erdb = wl_mrd(0x20);
  	if (!wl_qrtr || !wl_amss_reached || !wl_contexts_published || wl_w11_guard() ||
  	    (wl_chdb & 7) || wl_chdb < 0x100 || wl_chdb > 0x3c00 ||
-@@ -3779,6 +3870,10 @@ wl12_send(struct wl12_encoder *e, unsigned msg, unsigned stage)
+@@ -3779,6 +3873,10 @@ wl12_send(struct wl12_encoder *e, unsigned msg, unsigned stage)
  	e->data[0] = 0; wl_put16(e->data+1, wl12_txn);
  	wl_put16(e->data+3, msg); wl_put16(e->data+5, e->len-7);
  	printf("FUXI WLAN: %s send txn %u msg %#x stage %u\n", wl_w15 && stage >= WL15_INI ? "W15" : "W12", wl12_txn, msg, stage);
@@ -29826,7 +30377,7 @@ index 1b46ea1..4b4a4af 100644
  	int error = wl_qrtr_send(1, wl_server_node, wl_server_port, e->data, e->len);
  	if (!error && stage == WL15_MODE) { wl16_snapshot("MODE queued"); }
  	return error;
-@@ -3840,10 +3935,18 @@ wl12_host_cap(struct wl12_encoder *e)
+@@ -3840,10 +3938,18 @@ wl12_host_cap(struct wl12_encoder *e)
  {
  	/* ath12k_qmi_host_cap_send: fresh boot cal_done=0, memory mode=0,
  	 * internal clock bits 1/2/3, hw_params CNSS feature bits 3/4. */
@@ -29847,7 +30398,7 @@ index 1b46ea1..4b4a4af 100644
  	int links = wl17_mlo_links(wl12_mlo_variant, wl17_bits, wl12_mlo_enabled, wl12_num_phy);
  	bool mlo = links != 0;
  	if (mlo) {
-@@ -4071,7 +4174,8 @@ wl12_request_mem(const uint8_t *v, unsigned n)
+@@ -4071,7 +4177,8 @@ wl12_request_mem(const uint8_t *v, unsigned n)
  	}
  	if (off != n || wl_iova_next < wl_iova_base || wl_iova_next >= wl_iova_end ||
  	    rounded > wl_iova_end-wl_iova_next) { return wl_w11_fail("REQUEST_MEM trailing bytes/IOVA exhaustion"); }
@@ -29857,7 +30408,7 @@ index 1b46ea1..4b4a4af 100644
  		return wl_w11_fail("REQUEST_MEM small-chunk limit/aligned IOVA exhaustion; negotiation exhausted");
  	}
  	wl_target_n = count; wl_target_total = total; wl12_requested = true;
-@@ -4281,6 +4385,7 @@ static void
+@@ -4281,6 +4388,7 @@ static void
  wl15_timeout_snapshot(void)
  {
  	if (!wl_w15 || wl12_stage != WL15_MODE) { return; }
@@ -29865,7 +30416,7 @@ index 1b46ea1..4b4a4af 100644
  	wl16_snapshot("MODE timeout");
  	wl15_elapsed("MODE timeout");
  	wl_wlfw_diagnostics("W15 MODE timeout");
-@@ -4339,17 +4444,66 @@ wl15_timeout_snapshot(void)
+@@ -4339,17 +4447,66 @@ wl15_timeout_snapshot(void)
  	printf("FUXI WLAN: W15 pending RX QMI headers %u (snapshot only)\n", pending);
  }
  
@@ -29932,7 +30483,7 @@ index 1b46ea1..4b4a4af 100644
  		if (ms < 10000) { wl_sleep(10); }
  	}
  	if (wl12_mlo_variant == 1 && wl12_msg == 0x57) {
-@@ -4359,6 +4513,7 @@ wl12_wait(unsigned what, const char *stage)
+@@ -4359,6 +4516,7 @@ wl12_wait(unsigned what, const char *stage)
  	printf("FUXI WLAN: %s timeout %s (10000 ms); contain, no retry\n", wl_w15 && wl12_stage >= WL15_INI ? "W15" : "W12", stage);
  	if (wl_w15 && wl12_stage == WL15_MODE) { wl15_timeout_snapshot(); }
  	if (wl12_stage == WL12_RESPOND) { wl13_respond_diagnostics(); }
@@ -29940,7 +30491,7 @@ index 1b46ea1..4b4a4af 100644
  	return wl_w11_fail(stage);
  }
  
-@@ -4494,6 +4649,7 @@ static int
+@@ -4494,6 +4652,7 @@ static int
  wl_w15_run(void)
  {
  	static struct wl12_encoder e;
@@ -29948,7 +30499,7 @@ index 1b46ea1..4b4a4af 100644
  	bzero(&e, sizeof(e)); e.len = 7;
  	/* qmi_wlanfw_wlan_ini_req_msg_v01 / *_ei: optional 0x10 u8.
  	 * Explicit lane policy: disable fw log (0). Upstream v6.12 sends 1. */
-@@ -4501,11 +4657,13 @@ wl_w15_run(void)
+@@ -4501,11 +4660,13 @@ wl_w15_run(void)
  	if (wl12_tlv(&e, 0x10, 0, 1) || wl12_send(&e, 0x2f, WL15_INI) ||
  	    wl12_wait(0, "WLAN_INI reply") || wl_w11_wait(3, "W15 INI TX drain")) { return 1; }
  	printf("FUXI WLAN: W15 wlan ini ok\n");
@@ -29962,7 +30513,7 @@ index 1b46ea1..4b4a4af 100644
  	wl16_snapshot("CFG reply/before MODE");
  	if (wl16_redrive) {
  		printf("FUXI WLAN: W16 before MODE re-ring posted RX; no CE init before MODE (ath12k v6.12 order)\n");
-@@ -4520,6 +4678,7 @@ wl_w15_run(void)
+@@ -4520,6 +4681,7 @@ wl_w15_run(void)
  	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
  	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
  	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
@@ -29970,7 +30521,7 @@ index 1b46ea1..4b4a4af 100644
  	wl16_snapshot("MODE reply");
  	wl12_stage = WL15_OBSERVE;
  	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
-@@ -4599,7 +4758,10 @@ wl_w12_run(void)
+@@ -4599,7 +4761,10 @@ wl_w12_run(void)
  	if (wl12_wait(1, "REQUEST_MEM indication")) { return 1; }
  	for (unsigned round = 0; round < 2; round++) {
  		wl13_delayed = false;
@@ -29982,7 +30533,21 @@ index 1b46ea1..4b4a4af 100644
  			for (unsigned i = 0; i < wl_target_n; i++) {
  				if (wl13_supported(wl_target_type[i]) && wl_target_size[i] > WL13_CHUNK_LIMIT) {
  					wl13_delayed = true;
-@@ -5190,6 +5352,7 @@ wl17_clk_step(void)
+@@ -5031,6 +5196,8 @@ wl5_abort(unsigned step)
+ 		for (unsigned i = 0; i < WL_TARGET_MAX; i++) { wl_dma_free(&wl_target[i]); }
+ 		wl_dma_free(&wl14_regdb); wl_dma_free(&wl14_bdf); wl_dma_free(&wl14_m3);
+ 		wl_dma_free(&wl_ipcr);
++		wl_dma_free(&wl_ath_arena);
++		wl_ath_release();
+ 		wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_amss); wl_dma_free(&wl_image);
+ 		printf("FUXI WLAN: abort buffers freed\n");
+ 	} else {
+@@ -5187,9 +5354,12 @@ wl17_clk_step(void)
+ 	sweet_spmi_bus_unlock();
+ }
+ 
++#include "fuxi_wlan_ath12k.inc"
++
  static void
  fw_run(unsigned limit)
  {
@@ -29990,8 +30555,582 @@ index 1b46ea1..4b4a4af 100644
  	uint32_t *r4 = wl4_report;
  	r4[0] = WL4_MAGIC;
  	r4[1] = limit;
+@@ -5248,6 +5418,12 @@ fw_run(unsigned limit)
+ 			    s, e, fw_fault_esr, fw_fault_far);
+ 			goto out;
+ 		}
++		if (wl_ath_enabled && s == 18) {
++			int native_error = wl_ath_run();
++			printf("FUXI WLAN: ath12k diagnostic result %d; legacy steps 19..28 skipped\n", native_error);
++			wl5_abort(18);
++			goto out;
++		}
+ 	}
+ 	printf("FUXI WLAN: %u steps done\n", limit);
+ 	/* W10 contains successful full runs as well as partial runs. Only explicit
+@@ -5270,6 +5446,8 @@ fw_thread(void *arg, wait_result_t result)
+ 	unsigned mapped = 0;
+ 	(void)result;
+ 	for (unsigned i = 0; i < FW_NWIN; i++) {
++		if (wl_ath_enabled && fw_windows[i].pa == 0x60480000) { continue; }
++		if (wl_ath_enabled && fw_windows[i].pa == WL_BAR0) { fw_windows[i].size = 0x200000; }
+ 		if ((!wl_cnss || wl_variant_invalid) &&
+ 		    (fw_windows[i].pa == WL_AOSS_QMP || fw_windows[i].pa == WL_AOSS_IPCC)) { continue; }
+ 		kern_return_t kr = fw_map_window(&fw_windows[i]);
+@@ -5304,6 +5482,21 @@ fuxi_wlan_init(void)
+ 	}
+ 	unsigned limit = (arg == 1 || arg > (int)WL5_STEPS) ? WL5_STEPS : (unsigned)arg;
+ 	wl_iova_configure();
++	char native[16] = {0};
++	if (PE_parse_boot_arg_str("fuxiwlanath", native, sizeof(native))) {
++		if (strcmp(native, "0") && strcmp(native, "1")) {
++			printf("FUXI WLAN: invalid fuxiwlanath; refused before WLAN power\n");
++			return;
++		}
++		wl_ath_enabled = !strcmp(native, "1");
++	}
++	if (wl_ath_enabled && (!wla_available() || limit != WL5_STEPS || wl_variant_invalid ||
++	    wl_variant_active() || wl_qrtr || wl_stop22 || wl_keep || wl_probe != WL_PROBE_OFF ||
++	    wl_iova_base != WL_CNSS_IOVA || wl12_mlo_variant ||
++	    wl17_bits != (WL17_CLKCHECK | WL17_CLKON))) {
++		printf("FUXI WLAN: ath12k unavailable or incompatible diagnostic selectors; refused before WLAN power\n");
++		return;
++	}
+ 	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
+ 	    arg, limit);
+ 	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
+diff --git a/xnu/fuxi-wlan/fuxi_wlan_arena.h b/xnu/fuxi-wlan/fuxi_wlan_arena.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..83fb1204b809252e45fc563867f5a909e241eaef
+--- /dev/null
++++ b/xnu/fuxi-wlan/fuxi_wlan_arena.h
+@@ -0,0 +1,118 @@
++#ifndef FUXI_WLAN_ARENA_H
++#define FUXI_WLAN_ARENA_H
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++
++struct fwa_block {
++	uint32_t offset, size, requested;
++};
++struct fwa_arena {
++	uint8_t *memory;
++	uint64_t bus;
++	uint32_t bytes, count, capacity;
++	struct fwa_block *blocks;
++};
++
++static int
++fwa_init(struct fwa_arena *arena, void *memory, uint64_t bus, uint32_t bytes,
++    struct fwa_block *blocks, uint32_t capacity)
++{
++	if (!arena || !memory || !blocks || capacity < 2 || bytes <= 4096 ||
++	    ((uintptr_t)memory & 63) || (bus & 4095) || bytes > 0xffffffffu - 4095 ||
++	    bus > 0xffffffffu || bytes > UINT64_C(0x100000000) - bus) { return 1; }
++	memset(arena, 0, sizeof(*arena));
++	arena->memory = memory;
++	arena->bus = bus;
++	arena->bytes = bytes;
++	arena->blocks = blocks;
++	arena->capacity = capacity;
++	arena->count = 2;
++	blocks[0] = (struct fwa_block){0, 4096, 4096};
++	blocks[1] = (struct fwa_block){4096, bytes - 4096, 0};
++	return 0;
++}
++
++static void *
++fwa_alloc(struct fwa_arena *arena, size_t bytes, uint64_t *bus)
++{
++	if (bus) { *bus = 0; }
++	if (!arena || !arena->memory || !bytes || bytes > 0xffffffffu - 4095) { return NULL; }
++	uint32_t rounded = ((uint32_t)bytes + 63) & ~63u, alignment = 64;
++	if (rounded >= 4096) {
++		rounded = (rounded + 4095) & ~4095u;
++		alignment = 4096;
++		while (alignment < rounded && alignment < 0x80000000u) { alignment <<= 1; }
++		if (alignment < rounded) { return NULL; }
++	}
++	for (uint32_t index = 1; index < arena->count; index++) {
++		struct fwa_block whole = arena->blocks[index];
++		if (whole.requested) { continue; }
++		uint64_t start_bus = arena->bus + whole.offset;
++		uint64_t aligned_bus = (start_bus + alignment - 1) & ~((uint64_t)alignment - 1);
++		uint64_t padding = aligned_bus - start_bus;
++		if (padding > whole.size || rounded > whole.size - padding) { continue; }
++		uint32_t start = whole.offset + (uint32_t)padding;
++		uint32_t tail = whole.size - (uint32_t)padding - rounded;
++		uint32_t extra = (padding ? 1u : 0u) + (tail ? 1u : 0u);
++		if (extra > arena->capacity - arena->count) { continue; }
++		memmove(&arena->blocks[index + extra], &arena->blocks[index],
++		    (arena->count - index) * sizeof(*arena->blocks));
++		arena->count += extra;
++		uint32_t at = index;
++		if (padding) { arena->blocks[at++] = (struct fwa_block){whole.offset, (uint32_t)padding, 0}; }
++		arena->blocks[at] = (struct fwa_block){start, rounded, (uint32_t)bytes};
++		if (tail) { arena->blocks[at + 1] = (struct fwa_block){start + rounded, tail, 0}; }
++		memset(arena->memory + start, 0, rounded);
++		if (bus) { *bus = aligned_bus; }
++		return arena->memory + start;
++	}
++	return NULL;
++}
++
++static uint64_t
++fwa_map(const struct fwa_arena *arena, const void *memory, size_t bytes)
++{
++	if (!arena || !arena->memory || !memory || !bytes) { return 0; }
++	uintptr_t pointer = (uintptr_t)memory, base = (uintptr_t)arena->memory;
++	if (pointer < base || pointer - base >= arena->bytes || bytes > arena->bytes - (pointer - base)) { return 0; }
++	uint32_t offset = (uint32_t)(pointer - base);
++	for (uint32_t index = 1; index < arena->count; index++) {
++		const struct fwa_block *block = &arena->blocks[index];
++		if (block->requested && offset >= block->offset &&
++		    offset - block->offset < block->requested &&
++		    bytes <= block->requested - (offset - block->offset)) {
++			return arena->bus + offset;
++		}
++	}
++	return 0;
++}
++
++static int
++fwa_free(struct fwa_arena *arena, size_t bytes, void *memory, uint64_t bus)
++{
++	if (!arena || !arena->memory || !memory || !bytes ||
++	    bus < arena->bus || bus - arena->bus >= arena->bytes) { return 1; }
++	uint32_t offset = (uint32_t)(bus - arena->bus);
++	if ((uintptr_t)memory != (uintptr_t)arena->memory + offset) { return 1; }
++	for (uint32_t index = 1; index < arena->count; index++) {
++		struct fwa_block *block = &arena->blocks[index];
++		if (block->offset != offset || block->requested != bytes) { continue; }
++		block->requested = 0;
++		if (index + 1 < arena->count && !arena->blocks[index + 1].requested) {
++			block->size += arena->blocks[index + 1].size;
++			memmove(&arena->blocks[index + 1], &arena->blocks[index + 2],
++			    (arena->count - index - 2) * sizeof(*block));
++			arena->count--;
++		}
++		if (index > 1 && !arena->blocks[index - 1].requested) {
++			arena->blocks[index - 1].size += block->size;
++			memmove(&arena->blocks[index], &arena->blocks[index + 1],
++			    (arena->count - index - 1) * sizeof(*block));
++			arena->count--;
++		}
++		return 0;
++	}
++	return 1;
++}
++#endif
+diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.h b/xnu/fuxi-wlan/fuxi_wlan_ath12k.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..16a0938077d749c8584a7c28698eff28e9a5bc2d
+--- /dev/null
++++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.h
+@@ -0,0 +1,74 @@
++#ifndef FUXI_WLAN_ATH12K_H
++#define FUXI_WLAN_ATH12K_H
++#include <stdint.h>
++#include <stddef.h>
++#if defined(__APPLE__)
++#define FWA_WEAK __attribute__((weak_import))
++#else
++#define FWA_WEAK
++#endif
++struct lx_platform {
++	uint64_t (*now_ms)(void);
++	void (*sleep_ms)(unsigned ms);
++	void (*poll)(void);
++	void (*log)(int level, const char *line);
++	void (*halt)(void);
++	void *(*alloc)(size_t bytes);
++	void (*free)(void *memory);
++	void *(*dma_alloc)(size_t bytes, uint64_t *bus);
++	void (*dma_free)(size_t bytes, void *memory, uint64_t bus);
++	uint64_t (*dma_map)(void *memory, size_t bytes, int direction);
++	void (*dma_sync)(uint64_t bus, size_t bytes, int direction);
++	int (*fw_get)(const char *name, const uint8_t **data, size_t *bytes);
++	uint64_t (*now_ns)(void);
++	uint64_t (*boottime_ns)(void);
++	void (*busy_delay_us)(unsigned us);
++	void (*preempt_disable)(void);
++	void (*preempt_enable)(void);
++};
++struct nw_board {
++	void *bar;
++	size_t bar_len;
++	uint16_t device_id, msi_cap;
++	int irq_base;
++	int (*cfg_read)(int offset, int size, uint32_t *value);
++	int (*cfg_write)(int offset, int size, uint32_t value);
++	int (*msi_target)(uint32_t *low, uint32_t *high, uint32_t *data);
++	void *(*map_phys)(uint64_t address, size_t bytes);
++	unsigned diagnostics;
++};
++struct nw_wifi_stats {
++	uint32_t stage, scans, frames, beacons, bss_seen;
++	int last_err;
++};
++struct nw_bss_info {
++	uint8_t bssid[6], ssid_len, ssid[32];
++	uint32_t freq_mhz;
++	int8_t signal_dbm;
++	uint16_t caps, beacon_int;
++	uint32_t age_ms;
++	uint16_t ie_len;
++	uint8_t ie[384];
++};
++extern int nw_wifi_start(const struct lx_platform *, const struct nw_board *) FWA_WEAK;
++extern int nw_wifi_step(void) FWA_WEAK;
++extern void nw_wifi_stop(void) FWA_WEAK;
++extern void nw_wifi_poll(void) FWA_WEAK;
++extern void nw_wifi_irq_mode(int) FWA_WEAK;
++extern int nw_wifi_scan(const uint8_t *, size_t) FWA_WEAK;
++extern int nw_wifi_bss_count(void) FWA_WEAK;
++extern int nw_wifi_bss_get(int, struct nw_bss_info *) FWA_WEAK;
++extern struct nw_wifi_stats nw_wifi_stats FWA_WEAK;
++
++static int
++fwa_config_offset(uint32_t encoded, unsigned size, unsigned express, unsigned *offset)
++{
++	if (!offset || (size != 1 && size != 2 && size != 4)) { return 1; }
++	uint32_t relative = encoded & 0x7fffffffu;
++	if ((encoded & 0x80000000u) && (!express || relative > 0xfffu - express)) { return 1; }
++	uint32_t absolute = relative + ((encoded & 0x80000000u) ? express : 0);
++	if (absolute > 0x1000u - size || (absolute & (size - 1))) { return 1; }
++	*offset = absolute;
++	return 0;
++}
++#endif
+diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
+new file mode 100644
+index 0000000000000000000000000000000000000000..737e97fe2f8387a8ca68e9e3faa9e0ef7b16fa67
+--- /dev/null
++++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
+@@ -0,0 +1,320 @@
++#include "fuxi_wlan_arena.h"
++#include "fuxi_wlan_ath12k.h"
++
++#define WLA_BYTES (128u << 20)
++#define WLA_BLOCKS 16384u
++static struct fwa_arena wla_pool;
++static struct fwa_block *wla_blocks;
++static unsigned wla_express, wla_msi, wla_failed;
++static struct {
++	const char *name, *file;
++	void *memory;
++	size_t bytes;
++} wla_firmware[] = {
++	{"amss.bin", "amss20.bin", NULL, 0},
++	{"m3.bin", "m3.bin", NULL, 0},
++	{"board-2.bin", "board-2.bin", NULL, 0},
++	{"regdb.bin", "regdb_xiaomi.bin", NULL, 0},
++};
++
++static uint64_t
++wla_now_ns(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++static uint64_t
++wla_now_ms(void)
++{
++	return wla_now_ns() / 1000000ull;
++}
++
++static void *
++wla_alloc(size_t bytes)
++{
++	if (!bytes || bytes > (64u << 20)) { return NULL; }
++	vm_size_t allocation = round_page(bytes + 16);
++	vm_offset_t memory = 0;
++	if (kmem_alloc(kernel_map, &memory, allocation,
++	    KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) { return NULL; }
++	*(vm_size_t *)memory = allocation;
++	return (void *)(memory + 16);
++}
++
++static void
++wla_free(void *memory)
++{
++	if (!memory) { return; }
++	vm_offset_t base = (vm_offset_t)memory - 16;
++	kmem_free(kernel_map, base, *(vm_size_t *)base);
++}
++
++static void
++wl_ath_release(void)
++{
++	if (wl_ath_arena.va) { return; }
++	wla_free(wla_blocks);
++	wla_blocks = NULL;
++	memset(&wla_pool, 0, sizeof(wla_pool));
++	for (unsigned index = 0; index < sizeof(wla_firmware) / sizeof(wla_firmware[0]); index++) {
++		wla_free(wla_firmware[index].memory);
++		wla_firmware[index].memory = NULL;
++		wla_firmware[index].bytes = 0;
++	}
++}
++
++static void *
++wla_dma_alloc(size_t bytes, uint64_t *bus)
++{
++	void *memory = wla_failed ? NULL : fwa_alloc(&wla_pool, bytes, bus);
++	if (!memory) {
++		if (bus) { *bus = 0; }
++		printf("FUXI ATH12K: DMA allocation refused bytes %llu blocks %u\n", (uint64_t)bytes, wla_pool.count);
++	}
++	return memory;
++}
++
++static void
++wla_dma_free(size_t bytes, void *memory, uint64_t bus)
++{
++	if (fwa_free(&wla_pool, bytes, memory, bus)) { wla_failed = 1; }
++}
++
++static uint64_t
++wla_dma_map(void *memory, size_t bytes, int direction)
++{
++	if (wla_failed || direction < 0 || direction > 2) { return 0; }
++	return fwa_map(&wla_pool, memory, bytes);
++}
++
++static void
++wla_dma_sync(uint64_t bus, size_t bytes, int direction)
++{
++	if (direction < 0 || direction > 2 || bus < wla_pool.bus ||
++	    bus - wla_pool.bus >= wla_pool.bytes ||
++	    fwa_map(&wla_pool, wla_pool.memory + (bus - wla_pool.bus), bytes) != bus) {
++		wla_failed = 1;
++		return;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int
++wla_fw_get(const char *name, const uint8_t **data, size_t *bytes)
++{
++	if (!name || !data || !bytes) { return -1; }
++	*data = NULL;
++	*bytes = 0;
++	const char *base = name;
++	for (const char *cursor = name; *cursor; cursor++) {
++		if (*cursor == '/') { base = cursor + 1; }
++	}
++	unsigned index;
++	for (index = 0; index < sizeof(wla_firmware) / sizeof(wla_firmware[0]); index++) {
++		if (!strcmp(base, wla_firmware[index].name)) { break; }
++	}
++	if (index == sizeof(wla_firmware) / sizeof(wla_firmware[0])) { return -1; }
++	if (!wla_firmware[index].memory) {
++		char path[128];
++		vnode_t file = NULL;
++		vfs_context_t context = vfs_context_kernel();
++		snprintf(path, sizeof(path), "/usr/local/share/fuxi/wlan/%s", wla_firmware[index].file);
++		int error = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &file, context);
++		if (error) { return -1; }
++		struct vnode_attr attributes;
++		VATTR_INIT(&attributes);
++		VATTR_WANTED(&attributes, va_data_size);
++		error = vnode_getattr(file, &attributes, context);
++		if (error || vnode_vtype(file) != VREG || !VATTR_IS_SUPPORTED(&attributes, va_data_size) ||
++		    !attributes.va_data_size || attributes.va_data_size > WL_FW_MAX) { error = -1; }
++		void *memory = error ? NULL : wla_alloc((size_t)attributes.va_data_size);
++		if (!memory) { error = -1; }
++		if (!error) {
++			int residual = 0;
++			error = vn_rdwr(UIO_READ, file, (caddr_t)memory, (int)attributes.va_data_size, 0,
++			    UIO_SYSSPACE, 0, vfs_context_ucred(context), &residual, vfs_context_proc(context));
++			if (residual) { error = -1; }
++		}
++		if (vnode_close(file, FREAD, context)) { error = -1; }
++		if (error) {
++			wla_free(memory);
++			return -1;
++		}
++		wla_firmware[index].memory = memory;
++		wla_firmware[index].bytes = (size_t)attributes.va_data_size;
++		printf("FUXI ATH12K: firmware %s from %s bytes %llu\n", base,
++		    wla_firmware[index].file, (uint64_t)wla_firmware[index].bytes);
++	}
++	*data = wla_firmware[index].memory;
++	*bytes = wla_firmware[index].bytes;
++	return 0;
++}
++
++static int
++wla_cfg_read(int encoded, int size, uint32_t *value)
++{
++	unsigned offset;
++	if (!value || fwa_config_offset((uint32_t)encoded, (unsigned)size, wla_express, &offset) ||
++	    fw_faults || wla_failed) { return -1; }
++	uint32_t word = wl_prd(WL_EPCFG + (offset & ~3u));
++	if (fw_faults) { return -1; }
++	*value = size == 4 ? word : (word >> (8 * (offset & 3u))) & (size == 2 ? 0xffffu : 0xffu);
++	return 0;
++}
++
++static int
++wla_cfg_write(int encoded, int size, uint32_t value)
++{
++	unsigned offset;
++	if (fwa_config_offset((uint32_t)encoded, (unsigned)size, wla_express, &offset) ||
++	    fw_faults || wla_failed) { return -1; }
++	unsigned aligned = offset & ~3u;
++	if (size != 4) {
++		uint32_t shift = (offset & 3u) * 8;
++		uint32_t mask = (size == 2 ? 0xffffu : 0xffu) << shift;
++		uint32_t old = wl_prd(WL_EPCFG + aligned);
++		if (fw_faults) { return -1; }
++		if (aligned == 4 || aligned == wla_express + 8 || aligned == wla_express + 16) {
++			old &= 0xffffu;
++		}
++		value = (old & ~mask) | ((value << shift) & mask);
++	}
++	wl_pwr(WL_EPCFG + aligned, value);
++	__asm__ volatile("dsb sy" ::: "memory");
++	return fw_faults ? -1 : 0;
++}
++
++static int
++wla_msi_target(uint32_t *low, uint32_t *high, uint32_t *data)
++{
++	if (!low || !high || !data || !wl_enabled || !wla_pool.memory || wla_failed) { return -1; }
++	*low = (uint32_t)wla_pool.bus;
++	*high = (uint32_t)(wla_pool.bus >> 32);
++	*data = 0;
++	return 0;
++}
++
++static void *
++wla_map_phys(uint64_t address, size_t bytes)
++{
++	if (!bytes || address < WL_BAR0 || address - WL_BAR0 >= 0x200000 ||
++	    bytes > 0x200000 - (address - WL_BAR0)) { return NULL; }
++	return (void *)(fw_va(WL_BAR0) + (address - WL_BAR0));
++}
++
++static void
++wla_poll(void)
++{
++	nw_wifi_irq_mode(0);
++	nw_wifi_poll();
++}
++
++static void
++wla_log(int level, const char *line)
++{
++	if (level <= 6 && line) { printf("FUXI ATH12K: %llu %.180s\n", wla_now_ms(), line); }
++}
++
++static void
++wla_halt(void)
++{
++	wla_failed = 1;
++	printf("FUXI ATH12K: module halted; contain once, worker exits\n");
++	wl5_abort(18);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++	for (;;) { wl_sleep(1000); }
++}
++
++extern void _disable_preemption(void);
++extern void _enable_preemption(void);
++
++static bool
++wla_available(void)
++{
++	return nw_wifi_start && nw_wifi_step && nw_wifi_stop && nw_wifi_poll && nw_wifi_irq_mode &&
++	       nw_wifi_scan && nw_wifi_bss_count && nw_wifi_bss_get && &nw_wifi_stats;
++}
++
++static int
++wl_ath_run(void)
++{
++	static const struct lx_platform platform = {
++		wla_now_ms, wl_sleep, wla_poll, wla_log, wla_halt, wla_alloc, wla_free,
++		wla_dma_alloc, wla_dma_free, wla_dma_map, wla_dma_sync, wla_fw_get,
++		wla_now_ns, wla_now_ns, fw_delay, _disable_preemption, _enable_preemption
++	};
++	static struct nw_board board;
++	uint32_t flags = 0;
++	wla_express = wl_diag_cap(WL_EPCFG, 0x10, false, &flags);
++	wla_msi = wl_diag_cap(WL_EPCFG, 5, false, &flags);
++	if (!wla_express || !wla_msi || flags || fw_faults || !wla_available() ||
++	    wl_prd(WL_EPCFG) != 0x110717cb || (wl_prd(WL_EPCFG + 4) & 4) ||
++	    wl_mrd(wl_bhi + 0x28) != 0 || wl_disable_irqs() || wl_download_aspm()) { return 1; }
++	const uint8_t *data;
++	size_t bytes;
++	for (unsigned attempt = 0; attempt < 1200; attempt++) {
++		if (!wla_fw_get("amss.bin", &data, &bytes) &&
++		    !wla_fw_get("m3.bin", &data, &bytes) &&
++		    !wla_fw_get("board-2.bin", &data, &bytes)) { break; }
++		if (attempt == 1199) { return 2; }
++		wl_sleep(100);
++	}
++	uint64_t alignment = WLA_BYTES;
++	wl_iova_next = (wl_iova_next + alignment - 1) & ~(alignment - 1);
++	wla_blocks = wla_alloc(WLA_BLOCKS * sizeof(*wla_blocks));
++	if (!wla_blocks || wl_dma_alloc(&wl_ath_arena, WLA_BYTES) || wl_dma_nc(&wl_ath_arena) ||
++	    fwa_init(&wla_pool, (void *)wl_ath_arena.va, wl_ath_arena.iova, WLA_BYTES, wla_blocks, WLA_BLOCKS) ||
++	    wl_smmu_enable() || wl_smmu_fault(18) || wl_rc_check()) { return 3; }
++	board = (struct nw_board){
++		(void *)fw_va(WL_BAR0), 0x200000, 0x1107, (uint16_t)wla_msi, 1000,
++		wla_cfg_read, wla_cfg_write, wla_msi_target, wla_map_phys, 0
++	};
++	wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x406);
++	if (fw_faults || (wl_prd(WL_EPCFG + 4) & 0x406) != 0x406) { return 4; }
++	printf("FUXI ATH12K: start from PBL, full BAR, owned 128 MiB DMA, IRQ polling; legacy MHI skipped\n");
++	nw_wifi_irq_mode(0);
++	int error = nw_wifi_start(&platform, &board);
++	bool requested = false, completed = false;
++	uint64_t started = wla_now_ms(), report = started;
++	while (!error && !fw_faults && !wla_failed && wla_now_ms() - started < 90000) {
++		(void)nw_wifi_step();
++		uint64_t now = wla_now_ms();
++		if (!requested && nw_wifi_stats.stage >= 4) {
++			error = nw_wifi_scan(NULL, 0);
++			requested = !error;
++			printf("FUXI ATH12K: scan requested result %d\n", error);
++		}
++		if (requested && nw_wifi_stats.scans) { completed = true; break; }
++		if (now >= report) {
++			report = now + 5000;
++			printf("FUXI ATH12K: stage %u scans %u BSS %u error %d\n", nw_wifi_stats.stage,
++			    nw_wifi_stats.scans, nw_wifi_stats.bss_seen, nw_wifi_stats.last_err);
++			if (wl_smmu_fault(0) || wl_rc_check()) { error = -1; break; }
++		}
++		wl_sleep(1);
++	}
++	int count = completed ? nw_wifi_bss_count() : 0;
++	printf("FUXI ATH12K: scan completed %u BSS count %d start error %d DMA error %u faults %u\n",
++	    completed, count, error, wla_failed, fw_faults);
++	for (int index = 0; completed && index < count && index < 64; index++) {
++		struct nw_bss_info info;
++		if (!nw_wifi_bss_get(index, &info)) {
++			char ssid[33];
++			unsigned length = MIN((unsigned)info.ssid_len, 32u);
++			for (unsigned at = 0; at < length; at++) {
++				ssid[at] = info.ssid[at] >= 0x20 && info.ssid[at] < 0x7f ? (char)info.ssid[at] : '?';
++			}
++			ssid[length] = 0;
++			printf("FUXI ATH12K: BSS %d freq %u RSSI %d SSID %s\n", index,
++			    info.freq_mhz, info.signal_dbm, ssid);
++		}
++	}
++	nw_wifi_stop();
++	if (wl_disable_irqs()) { error = -1; }
++	bool success = !error && completed && count > 0 && !wla_failed && !fw_faults;
++	printf("FUXI ATH12K: diagnostic %s; common containment follows\n", success ? "scan observed" : "incomplete");
++	return success ? 0 : 5;
++}
 diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
-index 0ca2838..0d215ed 100644
+index 0ca28384a623fc36e987daa43e85e29b84c11540..0d215ede6b71c5c85a3bca7ccfcac02c1b1dce16 100644
 --- a/xnu/patches/0098-fuxi-native-adreno-abi.patch
 +++ b/xnu/patches/0098-fuxi-native-adreno-abi.patch
 @@ -1628,7 +1628,7 @@
@@ -30153,7 +31292,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..44a99b6 100644
+index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..4b5f0c8c98d19fd2455087d171ed4ce5ff4ac2d3 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -30161,7 +31300,7 @@ index d21bf85..44a99b6 100644
  --- a/bsd/dev/fuxi_wlan.c
  +++ b/bsd/dev/fuxi_wlan.c
 -@@ -0,0 +1,5315 @@
-+@@ -0,0 +1,5478 @@
++@@ -0,0 +1,5508 @@
  +/*
  + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
  + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -30208,8 +31347,13 @@ index d21bf85..44a99b6 100644
  +rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
  +{
  +	/* BCM requests wait for the TCS IRQ and request responses on all cmds. */
-@@ -760,6 +769,8 @@
+@@ -758,8 +767,13 @@
+ +struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa, iova; bool nc; };
+ +static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
  +static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
+++static struct wl_dma wl_ath_arena;
+++static bool wl_ath_enabled;
+++static void wl_ath_release(void);
  +static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
  +static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
 ++static bool wl18_enabled, wl18_host_cap, wl18_cap_invalid;
@@ -30217,7 +31361,7 @@ index d21bf85..44a99b6 100644
  +static unsigned wl_rails_variant;
  +static bool wl_rails_requested;
  +static bool wl16_large, wl16_redrive;
-@@ -785,7 +796,10 @@
+@@ -785,7 +799,10 @@
  +#define WL17_CLKCHECK 0x040u
  +#define WL17_CLKON 0x080u
  +#define WL17_ERRDEC 0x100u
@@ -30229,7 +31373,7 @@ index d21bf85..44a99b6 100644
  +static unsigned wl17_bits;
  +static unsigned wl17_phy17_len;
  +static uint64_t wl17_phy17_val;
-@@ -1048,15 +1062,17 @@
+@@ -1048,15 +1065,17 @@
  +			if (!wl17_bits && !bad) {
  +				if (variant) { printf("FUXI WLAN: W12 mlo variant %d (1 PHY_CAP, 2 omit MLO) valid %u\n", variant, !wl_variant_invalid); }
  +			} else {
@@ -30249,7 +31393,7 @@ index d21bf85..44a99b6 100644
  +	if (wl_w15) {
  +		int variant = 0;
  +		(void)PE_parse_boot_argn("fuxiwlanw15", &variant, sizeof(variant));
-@@ -1073,6 +1089,26 @@
+@@ -1073,6 +1092,26 @@
  +			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
  +			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
  +		}
@@ -30276,7 +31420,7 @@ index d21bf85..44a99b6 100644
  +	}
  +	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
  +	if (wl_w14) {
-@@ -1117,6 +1153,14 @@
+@@ -1117,6 +1156,14 @@
  +	printf("FUXI WLAN: M6n cnss=%s valid=%u (PDC before step 1)\n",
  +	    wl_cnss_names[wl_cnss], !wl_variant_invalid);
  +}
@@ -30291,7 +31435,25 @@ index d21bf85..44a99b6 100644
  +#define WL_CNSS_IOVA 0xa0000000ull
  +#define WL_CNSS_IOVA_END 0xb0000000ull
  +#define WL_LEGACY_IOVA 0x10000000ull
-@@ -3208,6 +3252,10 @@
+@@ -2142,7 +2189,7 @@
+ +static vm_offset_t
+ +wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)
+ +{
+-+	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3 };
+++	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3, &wl_ath_arena };
+ +	unsigned fixed = sizeof(bufs)/sizeof(bufs[0]);
+ +	for (unsigned i = 0; i < (tables_only ? 1u : fixed + WL_TARGET_MAX); i++) {
+ +		struct wl_dma *d = i < fixed ? bufs[i] : &wl_target[i-fixed];
+@@ -2219,7 +2266,7 @@
+ +	for (unsigned i = 0; i < l3_count; i++) {
+ +		l2[((wl_iova_base >> 21) & 511) + i] = wl_pt_pa(2 + i) | 3;
+ +	}
+-+	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr };
+++	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl_ath_arena };
+ +	for (unsigned i = 0; i < sizeof(bufs)/sizeof(bufs[0]); i++) {
+ +		struct wl_dma *d = bufs[i];
+ +		if (d == &wl_image && wl_probe == WL_PROBE_UNMAPPED) { continue; }
+@@ -3208,6 +3255,10 @@
  +static bool wl13_delayed, wl13_negotiated;
  +static bool wl14_ready, wl14_init_done, wl14_board_valid;
  +static uint64_t wl15_ready_time;
@@ -30302,7 +31464,7 @@ index d21bf85..44a99b6 100644
  +static uint32_t wl14_board;
  +static int wl_w12_run(void);
  +static int wl_qmi_w12(const uint8_t *, unsigned);
-@@ -3238,6 +3286,40 @@
+@@ -3238,6 +3289,40 @@
  +static struct wl_tre *wl_ipcr_ring(unsigned off) { return (void *)(wl_ipcr.va + off); }
  +static void wl_w11_barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
  +
@@ -30343,7 +31505,7 @@ index d21bf85..44a99b6 100644
  +/* RAM-only snapshot: channel RP is diagnostic, never used to reclaim TREs.
  + * Completion events remain authoritative. Do not repair a live device-owned
  + * RP even when it resembles type/ER words (as in try15c/try15d). */
-@@ -3599,7 +3681,15 @@
+@@ -3599,7 +3684,15 @@
  +					if (ev.ptr != wl_ipcr.iova+roff+ri*16 || (ch == 20 && ri == wl_tx_write)) { return wl_w11_fail("transfer completion pointer/order"); }
  +					struct wl_tre tre = wl_ipcr_ring(roff)[ri];
  +					if (bytes > (ch == 20 ? WL_IPCR_TXMTU : WL_IPCR_MTU) || bytes > (tre.d0 & 0xffff)) { return wl_w11_fail("transfer completion length"); }
@@ -30360,7 +31522,7 @@ index d21bf85..44a99b6 100644
  +					else {
  +						uint64_t lo = wl_ipcr.iova + WL_IPCR_RXBUF;
  +						if (tre.ptr < lo || tre.ptr >= lo+WL_IPCR_N*WL_IPCR_MTU ||
-@@ -3701,6 +3791,7 @@
+@@ -3701,6 +3794,7 @@
  +	wl12_reply = wl12_requested = wl12_ready = false;
  +	wl13_delayed = wl13_negotiated = false;
  +	wl14_ready = wl14_init_done = wl14_board_valid = false; wl14_board = 0;
@@ -30368,7 +31530,7 @@ index d21bf85..44a99b6 100644
  +	wl_chdb = wl_mrd(0x18); wl_erdb = wl_mrd(0x20);
  +	if (!wl_qrtr || !wl_amss_reached || !wl_contexts_published || wl_w11_guard() ||
  +	    (wl_chdb & 7) || wl_chdb < 0x100 || wl_chdb > 0x3c00 ||
-@@ -3811,6 +3902,10 @@
+@@ -3811,6 +3905,10 @@
  +	e->data[0] = 0; wl_put16(e->data+1, wl12_txn);
  +	wl_put16(e->data+3, msg); wl_put16(e->data+5, e->len-7);
  +	printf("FUXI WLAN: %s send txn %u msg %#x stage %u\n", wl_w15 && stage >= WL15_INI ? "W15" : "W12", wl12_txn, msg, stage);
@@ -30379,7 +31541,7 @@ index d21bf85..44a99b6 100644
  +	int error = wl_qrtr_send(1, wl_server_node, wl_server_port, e->data, e->len);
  +	if (!error && stage == WL15_MODE) { wl16_snapshot("MODE queued"); }
  +	return error;
-@@ -3872,10 +3967,18 @@
+@@ -3872,10 +3970,18 @@
  +{
  +	/* ath12k_qmi_host_cap_send: fresh boot cal_done=0, memory mode=0,
  +	 * internal clock bits 1/2/3, hw_params CNSS feature bits 3/4. */
@@ -30400,7 +31562,7 @@ index d21bf85..44a99b6 100644
  +	int links = wl17_mlo_links(wl12_mlo_variant, wl17_bits, wl12_mlo_enabled, wl12_num_phy);
  +	bool mlo = links != 0;
  +	if (mlo) {
-@@ -4103,7 +4206,8 @@
+@@ -4103,7 +4209,8 @@
  +	}
  +	if (off != n || wl_iova_next < wl_iova_base || wl_iova_next >= wl_iova_end ||
  +	    rounded > wl_iova_end-wl_iova_next) { return wl_w11_fail("REQUEST_MEM trailing bytes/IOVA exhaustion"); }
@@ -30410,7 +31572,7 @@ index d21bf85..44a99b6 100644
  +		return wl_w11_fail("REQUEST_MEM small-chunk limit/aligned IOVA exhaustion; negotiation exhausted");
  +	}
  +	wl_target_n = count; wl_target_total = total; wl12_requested = true;
-@@ -4313,6 +4417,7 @@
+@@ -4313,6 +4420,7 @@
  +wl15_timeout_snapshot(void)
  +{
  +	if (!wl_w15 || wl12_stage != WL15_MODE) { return; }
@@ -30418,7 +31580,7 @@ index d21bf85..44a99b6 100644
  +	wl16_snapshot("MODE timeout");
  +	wl15_elapsed("MODE timeout");
  +	wl_wlfw_diagnostics("W15 MODE timeout");
-@@ -4371,17 +4476,66 @@
+@@ -4371,17 +4479,66 @@
  +	printf("FUXI WLAN: W15 pending RX QMI headers %u (snapshot only)\n", pending);
  +}
  +
@@ -30485,7 +31647,7 @@ index d21bf85..44a99b6 100644
  +		if (ms < 10000) { wl_sleep(10); }
  +	}
  +	if (wl12_mlo_variant == 1 && wl12_msg == 0x57) {
-@@ -4391,6 +4545,7 @@
+@@ -4391,6 +4548,7 @@
  +	printf("FUXI WLAN: %s timeout %s (10000 ms); contain, no retry\n", wl_w15 && wl12_stage >= WL15_INI ? "W15" : "W12", stage);
  +	if (wl_w15 && wl12_stage == WL15_MODE) { wl15_timeout_snapshot(); }
  +	if (wl12_stage == WL12_RESPOND) { wl13_respond_diagnostics(); }
@@ -30493,7 +31655,7 @@ index d21bf85..44a99b6 100644
  +	return wl_w11_fail(stage);
  +}
  +
-@@ -4526,6 +4681,7 @@
+@@ -4526,6 +4684,7 @@
  +wl_w15_run(void)
  +{
  +	static struct wl12_encoder e;
@@ -30501,7 +31663,7 @@ index d21bf85..44a99b6 100644
  +	bzero(&e, sizeof(e)); e.len = 7;
  +	/* qmi_wlanfw_wlan_ini_req_msg_v01 / *_ei: optional 0x10 u8.
  +	 * Explicit lane policy: disable fw log (0). Upstream v6.12 sends 1. */
-@@ -4533,11 +4689,13 @@
+@@ -4533,11 +4692,13 @@
  +	if (wl12_tlv(&e, 0x10, 0, 1) || wl12_send(&e, 0x2f, WL15_INI) ||
  +	    wl12_wait(0, "WLAN_INI reply") || wl_w11_wait(3, "W15 INI TX drain")) { return 1; }
  +	printf("FUXI WLAN: W15 wlan ini ok\n");
@@ -30515,7 +31677,7 @@ index d21bf85..44a99b6 100644
  +	wl16_snapshot("CFG reply/before MODE");
  +	if (wl16_redrive) {
  +		printf("FUXI WLAN: W16 before MODE re-ring posted RX; no CE init before MODE (ath12k v6.12 order)\n");
-@@ -4552,6 +4710,7 @@
+@@ -4552,6 +4713,7 @@
  +	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
  +	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
  +	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
@@ -30523,7 +31685,7 @@ index d21bf85..44a99b6 100644
  +	wl16_snapshot("MODE reply");
  +	wl12_stage = WL15_OBSERVE;
  +	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
-@@ -4631,7 +4790,10 @@
+@@ -4631,7 +4793,10 @@
  +	if (wl12_wait(1, "REQUEST_MEM indication")) { return 1; }
  +	for (unsigned round = 0; round < 2; round++) {
  +		wl13_delayed = false;
@@ -30535,7 +31697,21 @@ index d21bf85..44a99b6 100644
  +			for (unsigned i = 0; i < wl_target_n; i++) {
  +				if (wl13_supported(wl_target_type[i]) && wl_target_size[i] > WL13_CHUNK_LIMIT) {
  +					wl13_delayed = true;
-@@ -5222,6 +5384,7 @@
+@@ -5063,6 +5228,8 @@
+ +		for (unsigned i = 0; i < WL_TARGET_MAX; i++) { wl_dma_free(&wl_target[i]); }
+ +		wl_dma_free(&wl14_regdb); wl_dma_free(&wl14_bdf); wl_dma_free(&wl14_m3);
+ +		wl_dma_free(&wl_ipcr);
+++		wl_dma_free(&wl_ath_arena);
+++		wl_ath_release();
+ +		wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_amss); wl_dma_free(&wl_image);
+ +		printf("FUXI WLAN: abort buffers freed\n");
+ +	} else {
+@@ -5219,9 +5386,12 @@
+ +	sweet_spmi_bus_unlock();
+ +}
+ +
+++#include "fuxi_wlan_ath12k.inc"
+++
  +static void
  +fw_run(unsigned limit)
  +{
@@ -30543,8 +31719,577 @@ index d21bf85..44a99b6 100644
  +	uint32_t *r4 = wl4_report;
  +	r4[0] = WL4_MAGIC;
  +	r4[1] = limit;
+@@ -5280,6 +5450,12 @@
+ +			    s, e, fw_fault_esr, fw_fault_far);
+ +			goto out;
+ +		}
+++		if (wl_ath_enabled && s == 18) {
+++			int native_error = wl_ath_run();
+++			printf("FUXI WLAN: ath12k diagnostic result %d; legacy steps 19..28 skipped\n", native_error);
+++			wl5_abort(18);
+++			goto out;
+++		}
+ +	}
+ +	printf("FUXI WLAN: %u steps done\n", limit);
+ +	/* W10 contains successful full runs as well as partial runs. Only explicit
+@@ -5302,6 +5478,8 @@
+ +	unsigned mapped = 0;
+ +	(void)result;
+ +	for (unsigned i = 0; i < FW_NWIN; i++) {
+++		if (wl_ath_enabled && fw_windows[i].pa == 0x60480000) { continue; }
+++		if (wl_ath_enabled && fw_windows[i].pa == WL_BAR0) { fw_windows[i].size = 0x200000; }
+ +		if ((!wl_cnss || wl_variant_invalid) &&
+ +		    (fw_windows[i].pa == WL_AOSS_QMP || fw_windows[i].pa == WL_AOSS_IPCC)) { continue; }
+ +		kern_return_t kr = fw_map_window(&fw_windows[i]);
+@@ -5336,6 +5514,21 @@
+ +	}
+ +	unsigned limit = (arg == 1 || arg > (int)WL5_STEPS) ? WL5_STEPS : (unsigned)arg;
+ +	wl_iova_configure();
+++	char native[16] = {0};
+++	if (PE_parse_boot_arg_str("fuxiwlanath", native, sizeof(native))) {
+++		if (strcmp(native, "0") && strcmp(native, "1")) {
+++			printf("FUXI WLAN: invalid fuxiwlanath; refused before WLAN power\n");
+++			return;
+++		}
+++		wl_ath_enabled = !strcmp(native, "1");
+++	}
+++	if (wl_ath_enabled && (!wla_available() || limit != WL5_STEPS || wl_variant_invalid ||
+++	    wl_variant_active() || wl_qrtr || wl_stop22 || wl_keep || wl_probe != WL_PROBE_OFF ||
+++	    wl_iova_base != WL_CNSS_IOVA || wl12_mlo_variant ||
+++	    wl17_bits != (WL17_CLKCHECK | WL17_CLKON))) {
+++		printf("FUXI WLAN: ath12k unavailable or incompatible diagnostic selectors; refused before WLAN power\n");
+++		return;
+++	}
+ +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
+ +	    arg, limit);
+ +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
+@@ -5899,3 +6092,524 @@
+ + }
+ + r[3] = 0;
+ +}
++--- /dev/null
+++++ b/bsd/dev/fuxi_wlan_arena.h
++@@ -0,0 +1,118 @@
+++#ifndef FUXI_WLAN_ARENA_H
+++#define FUXI_WLAN_ARENA_H
+++#include <stdint.h>
+++#include <stddef.h>
+++#include <string.h>
+++
+++struct fwa_block {
+++	uint32_t offset, size, requested;
+++};
+++struct fwa_arena {
+++	uint8_t *memory;
+++	uint64_t bus;
+++	uint32_t bytes, count, capacity;
+++	struct fwa_block *blocks;
+++};
+++
+++static int
+++fwa_init(struct fwa_arena *arena, void *memory, uint64_t bus, uint32_t bytes,
+++    struct fwa_block *blocks, uint32_t capacity)
+++{
+++	if (!arena || !memory || !blocks || capacity < 2 || bytes <= 4096 ||
+++	    ((uintptr_t)memory & 63) || (bus & 4095) || bytes > 0xffffffffu - 4095 ||
+++	    bus > 0xffffffffu || bytes > UINT64_C(0x100000000) - bus) { return 1; }
+++	memset(arena, 0, sizeof(*arena));
+++	arena->memory = memory;
+++	arena->bus = bus;
+++	arena->bytes = bytes;
+++	arena->blocks = blocks;
+++	arena->capacity = capacity;
+++	arena->count = 2;
+++	blocks[0] = (struct fwa_block){0, 4096, 4096};
+++	blocks[1] = (struct fwa_block){4096, bytes - 4096, 0};
+++	return 0;
+++}
+++
+++static void *
+++fwa_alloc(struct fwa_arena *arena, size_t bytes, uint64_t *bus)
+++{
+++	if (bus) { *bus = 0; }
+++	if (!arena || !arena->memory || !bytes || bytes > 0xffffffffu - 4095) { return NULL; }
+++	uint32_t rounded = ((uint32_t)bytes + 63) & ~63u, alignment = 64;
+++	if (rounded >= 4096) {
+++		rounded = (rounded + 4095) & ~4095u;
+++		alignment = 4096;
+++		while (alignment < rounded && alignment < 0x80000000u) { alignment <<= 1; }
+++		if (alignment < rounded) { return NULL; }
+++	}
+++	for (uint32_t index = 1; index < arena->count; index++) {
+++		struct fwa_block whole = arena->blocks[index];
+++		if (whole.requested) { continue; }
+++		uint64_t start_bus = arena->bus + whole.offset;
+++		uint64_t aligned_bus = (start_bus + alignment - 1) & ~((uint64_t)alignment - 1);
+++		uint64_t padding = aligned_bus - start_bus;
+++		if (padding > whole.size || rounded > whole.size - padding) { continue; }
+++		uint32_t start = whole.offset + (uint32_t)padding;
+++		uint32_t tail = whole.size - (uint32_t)padding - rounded;
+++		uint32_t extra = (padding ? 1u : 0u) + (tail ? 1u : 0u);
+++		if (extra > arena->capacity - arena->count) { continue; }
+++		memmove(&arena->blocks[index + extra], &arena->blocks[index],
+++		    (arena->count - index) * sizeof(*arena->blocks));
+++		arena->count += extra;
+++		uint32_t at = index;
+++		if (padding) { arena->blocks[at++] = (struct fwa_block){whole.offset, (uint32_t)padding, 0}; }
+++		arena->blocks[at] = (struct fwa_block){start, rounded, (uint32_t)bytes};
+++		if (tail) { arena->blocks[at + 1] = (struct fwa_block){start + rounded, tail, 0}; }
+++		memset(arena->memory + start, 0, rounded);
+++		if (bus) { *bus = aligned_bus; }
+++		return arena->memory + start;
+++	}
+++	return NULL;
+++}
+++
+++static uint64_t
+++fwa_map(const struct fwa_arena *arena, const void *memory, size_t bytes)
+++{
+++	if (!arena || !arena->memory || !memory || !bytes) { return 0; }
+++	uintptr_t pointer = (uintptr_t)memory, base = (uintptr_t)arena->memory;
+++	if (pointer < base || pointer - base >= arena->bytes || bytes > arena->bytes - (pointer - base)) { return 0; }
+++	uint32_t offset = (uint32_t)(pointer - base);
+++	for (uint32_t index = 1; index < arena->count; index++) {
+++		const struct fwa_block *block = &arena->blocks[index];
+++		if (block->requested && offset >= block->offset &&
+++		    offset - block->offset < block->requested &&
+++		    bytes <= block->requested - (offset - block->offset)) {
+++			return arena->bus + offset;
+++		}
+++	}
+++	return 0;
+++}
+++
+++static int
+++fwa_free(struct fwa_arena *arena, size_t bytes, void *memory, uint64_t bus)
+++{
+++	if (!arena || !arena->memory || !memory || !bytes ||
+++	    bus < arena->bus || bus - arena->bus >= arena->bytes) { return 1; }
+++	uint32_t offset = (uint32_t)(bus - arena->bus);
+++	if ((uintptr_t)memory != (uintptr_t)arena->memory + offset) { return 1; }
+++	for (uint32_t index = 1; index < arena->count; index++) {
+++		struct fwa_block *block = &arena->blocks[index];
+++		if (block->offset != offset || block->requested != bytes) { continue; }
+++		block->requested = 0;
+++		if (index + 1 < arena->count && !arena->blocks[index + 1].requested) {
+++			block->size += arena->blocks[index + 1].size;
+++			memmove(&arena->blocks[index + 1], &arena->blocks[index + 2],
+++			    (arena->count - index - 2) * sizeof(*block));
+++			arena->count--;
+++		}
+++		if (index > 1 && !arena->blocks[index - 1].requested) {
+++			arena->blocks[index - 1].size += block->size;
+++			memmove(&arena->blocks[index], &arena->blocks[index + 1],
+++			    (arena->count - index - 1) * sizeof(*block));
+++			arena->count--;
+++		}
+++		return 0;
+++	}
+++	return 1;
+++}
+++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_wlan_ath12k.h
++@@ -0,0 +1,74 @@
+++#ifndef FUXI_WLAN_ATH12K_H
+++#define FUXI_WLAN_ATH12K_H
+++#include <stdint.h>
+++#include <stddef.h>
+++#if defined(__APPLE__)
+++#define FWA_WEAK __attribute__((weak_import))
+++#else
+++#define FWA_WEAK
+++#endif
+++struct lx_platform {
+++	uint64_t (*now_ms)(void);
+++	void (*sleep_ms)(unsigned ms);
+++	void (*poll)(void);
+++	void (*log)(int level, const char *line);
+++	void (*halt)(void);
+++	void *(*alloc)(size_t bytes);
+++	void (*free)(void *memory);
+++	void *(*dma_alloc)(size_t bytes, uint64_t *bus);
+++	void (*dma_free)(size_t bytes, void *memory, uint64_t bus);
+++	uint64_t (*dma_map)(void *memory, size_t bytes, int direction);
+++	void (*dma_sync)(uint64_t bus, size_t bytes, int direction);
+++	int (*fw_get)(const char *name, const uint8_t **data, size_t *bytes);
+++	uint64_t (*now_ns)(void);
+++	uint64_t (*boottime_ns)(void);
+++	void (*busy_delay_us)(unsigned us);
+++	void (*preempt_disable)(void);
+++	void (*preempt_enable)(void);
+++};
+++struct nw_board {
+++	void *bar;
+++	size_t bar_len;
+++	uint16_t device_id, msi_cap;
+++	int irq_base;
+++	int (*cfg_read)(int offset, int size, uint32_t *value);
+++	int (*cfg_write)(int offset, int size, uint32_t value);
+++	int (*msi_target)(uint32_t *low, uint32_t *high, uint32_t *data);
+++	void *(*map_phys)(uint64_t address, size_t bytes);
+++	unsigned diagnostics;
+++};
+++struct nw_wifi_stats {
+++	uint32_t stage, scans, frames, beacons, bss_seen;
+++	int last_err;
+++};
+++struct nw_bss_info {
+++	uint8_t bssid[6], ssid_len, ssid[32];
+++	uint32_t freq_mhz;
+++	int8_t signal_dbm;
+++	uint16_t caps, beacon_int;
+++	uint32_t age_ms;
+++	uint16_t ie_len;
+++	uint8_t ie[384];
+++};
+++extern int nw_wifi_start(const struct lx_platform *, const struct nw_board *) FWA_WEAK;
+++extern int nw_wifi_step(void) FWA_WEAK;
+++extern void nw_wifi_stop(void) FWA_WEAK;
+++extern void nw_wifi_poll(void) FWA_WEAK;
+++extern void nw_wifi_irq_mode(int) FWA_WEAK;
+++extern int nw_wifi_scan(const uint8_t *, size_t) FWA_WEAK;
+++extern int nw_wifi_bss_count(void) FWA_WEAK;
+++extern int nw_wifi_bss_get(int, struct nw_bss_info *) FWA_WEAK;
+++extern struct nw_wifi_stats nw_wifi_stats FWA_WEAK;
+++
+++static int
+++fwa_config_offset(uint32_t encoded, unsigned size, unsigned express, unsigned *offset)
+++{
+++	if (!offset || (size != 1 && size != 2 && size != 4)) { return 1; }
+++	uint32_t relative = encoded & 0x7fffffffu;
+++	if ((encoded & 0x80000000u) && (!express || relative > 0xfffu - express)) { return 1; }
+++	uint32_t absolute = relative + ((encoded & 0x80000000u) ? express : 0);
+++	if (absolute > 0x1000u - size || (absolute & (size - 1))) { return 1; }
+++	*offset = absolute;
+++	return 0;
+++}
+++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_wlan_ath12k.inc
++@@ -0,0 +1,320 @@
+++#include "fuxi_wlan_arena.h"
+++#include "fuxi_wlan_ath12k.h"
+++
+++#define WLA_BYTES (128u << 20)
+++#define WLA_BLOCKS 16384u
+++static struct fwa_arena wla_pool;
+++static struct fwa_block *wla_blocks;
+++static unsigned wla_express, wla_msi, wla_failed;
+++static struct {
+++	const char *name, *file;
+++	void *memory;
+++	size_t bytes;
+++} wla_firmware[] = {
+++	{"amss.bin", "amss20.bin", NULL, 0},
+++	{"m3.bin", "m3.bin", NULL, 0},
+++	{"board-2.bin", "board-2.bin", NULL, 0},
+++	{"regdb.bin", "regdb_xiaomi.bin", NULL, 0},
+++};
+++
+++static uint64_t
+++wla_now_ns(void)
+++{
+++	uint64_t ns = 0;
+++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+++	return ns;
+++}
+++
+++static uint64_t
+++wla_now_ms(void)
+++{
+++	return wla_now_ns() / 1000000ull;
+++}
+++
+++static void *
+++wla_alloc(size_t bytes)
+++{
+++	if (!bytes || bytes > (64u << 20)) { return NULL; }
+++	vm_size_t allocation = round_page(bytes + 16);
+++	vm_offset_t memory = 0;
+++	if (kmem_alloc(kernel_map, &memory, allocation,
+++	    KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) { return NULL; }
+++	*(vm_size_t *)memory = allocation;
+++	return (void *)(memory + 16);
+++}
+++
+++static void
+++wla_free(void *memory)
+++{
+++	if (!memory) { return; }
+++	vm_offset_t base = (vm_offset_t)memory - 16;
+++	kmem_free(kernel_map, base, *(vm_size_t *)base);
+++}
+++
+++static void
+++wl_ath_release(void)
+++{
+++	if (wl_ath_arena.va) { return; }
+++	wla_free(wla_blocks);
+++	wla_blocks = NULL;
+++	memset(&wla_pool, 0, sizeof(wla_pool));
+++	for (unsigned index = 0; index < sizeof(wla_firmware) / sizeof(wla_firmware[0]); index++) {
+++		wla_free(wla_firmware[index].memory);
+++		wla_firmware[index].memory = NULL;
+++		wla_firmware[index].bytes = 0;
+++	}
+++}
+++
+++static void *
+++wla_dma_alloc(size_t bytes, uint64_t *bus)
+++{
+++	void *memory = wla_failed ? NULL : fwa_alloc(&wla_pool, bytes, bus);
+++	if (!memory) {
+++		if (bus) { *bus = 0; }
+++		printf("FUXI ATH12K: DMA allocation refused bytes %llu blocks %u\n", (uint64_t)bytes, wla_pool.count);
+++	}
+++	return memory;
+++}
+++
+++static void
+++wla_dma_free(size_t bytes, void *memory, uint64_t bus)
+++{
+++	if (fwa_free(&wla_pool, bytes, memory, bus)) { wla_failed = 1; }
+++}
+++
+++static uint64_t
+++wla_dma_map(void *memory, size_t bytes, int direction)
+++{
+++	if (wla_failed || direction < 0 || direction > 2) { return 0; }
+++	return fwa_map(&wla_pool, memory, bytes);
+++}
+++
+++static void
+++wla_dma_sync(uint64_t bus, size_t bytes, int direction)
+++{
+++	if (direction < 0 || direction > 2 || bus < wla_pool.bus ||
+++	    bus - wla_pool.bus >= wla_pool.bytes ||
+++	    fwa_map(&wla_pool, wla_pool.memory + (bus - wla_pool.bus), bytes) != bus) {
+++		wla_failed = 1;
+++		return;
+++	}
+++	__asm__ volatile("dsb sy" ::: "memory");
+++}
+++
+++static int
+++wla_fw_get(const char *name, const uint8_t **data, size_t *bytes)
+++{
+++	if (!name || !data || !bytes) { return -1; }
+++	*data = NULL;
+++	*bytes = 0;
+++	const char *base = name;
+++	for (const char *cursor = name; *cursor; cursor++) {
+++		if (*cursor == '/') { base = cursor + 1; }
+++	}
+++	unsigned index;
+++	for (index = 0; index < sizeof(wla_firmware) / sizeof(wla_firmware[0]); index++) {
+++		if (!strcmp(base, wla_firmware[index].name)) { break; }
+++	}
+++	if (index == sizeof(wla_firmware) / sizeof(wla_firmware[0])) { return -1; }
+++	if (!wla_firmware[index].memory) {
+++		char path[128];
+++		vnode_t file = NULL;
+++		vfs_context_t context = vfs_context_kernel();
+++		snprintf(path, sizeof(path), "/usr/local/share/fuxi/wlan/%s", wla_firmware[index].file);
+++		int error = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &file, context);
+++		if (error) { return -1; }
+++		struct vnode_attr attributes;
+++		VATTR_INIT(&attributes);
+++		VATTR_WANTED(&attributes, va_data_size);
+++		error = vnode_getattr(file, &attributes, context);
+++		if (error || vnode_vtype(file) != VREG || !VATTR_IS_SUPPORTED(&attributes, va_data_size) ||
+++		    !attributes.va_data_size || attributes.va_data_size > WL_FW_MAX) { error = -1; }
+++		void *memory = error ? NULL : wla_alloc((size_t)attributes.va_data_size);
+++		if (!memory) { error = -1; }
+++		if (!error) {
+++			int residual = 0;
+++			error = vn_rdwr(UIO_READ, file, (caddr_t)memory, (int)attributes.va_data_size, 0,
+++			    UIO_SYSSPACE, 0, vfs_context_ucred(context), &residual, vfs_context_proc(context));
+++			if (residual) { error = -1; }
+++		}
+++		if (vnode_close(file, FREAD, context)) { error = -1; }
+++		if (error) {
+++			wla_free(memory);
+++			return -1;
+++		}
+++		wla_firmware[index].memory = memory;
+++		wla_firmware[index].bytes = (size_t)attributes.va_data_size;
+++		printf("FUXI ATH12K: firmware %s from %s bytes %llu\n", base,
+++		    wla_firmware[index].file, (uint64_t)wla_firmware[index].bytes);
+++	}
+++	*data = wla_firmware[index].memory;
+++	*bytes = wla_firmware[index].bytes;
+++	return 0;
+++}
+++
+++static int
+++wla_cfg_read(int encoded, int size, uint32_t *value)
+++{
+++	unsigned offset;
+++	if (!value || fwa_config_offset((uint32_t)encoded, (unsigned)size, wla_express, &offset) ||
+++	    fw_faults || wla_failed) { return -1; }
+++	uint32_t word = wl_prd(WL_EPCFG + (offset & ~3u));
+++	if (fw_faults) { return -1; }
+++	*value = size == 4 ? word : (word >> (8 * (offset & 3u))) & (size == 2 ? 0xffffu : 0xffu);
+++	return 0;
+++}
+++
+++static int
+++wla_cfg_write(int encoded, int size, uint32_t value)
+++{
+++	unsigned offset;
+++	if (fwa_config_offset((uint32_t)encoded, (unsigned)size, wla_express, &offset) ||
+++	    fw_faults || wla_failed) { return -1; }
+++	unsigned aligned = offset & ~3u;
+++	if (size != 4) {
+++		uint32_t shift = (offset & 3u) * 8;
+++		uint32_t mask = (size == 2 ? 0xffffu : 0xffu) << shift;
+++		uint32_t old = wl_prd(WL_EPCFG + aligned);
+++		if (fw_faults) { return -1; }
+++		if (aligned == 4 || aligned == wla_express + 8 || aligned == wla_express + 16) {
+++			old &= 0xffffu;
+++		}
+++		value = (old & ~mask) | ((value << shift) & mask);
+++	}
+++	wl_pwr(WL_EPCFG + aligned, value);
+++	__asm__ volatile("dsb sy" ::: "memory");
+++	return fw_faults ? -1 : 0;
+++}
+++
+++static int
+++wla_msi_target(uint32_t *low, uint32_t *high, uint32_t *data)
+++{
+++	if (!low || !high || !data || !wl_enabled || !wla_pool.memory || wla_failed) { return -1; }
+++	*low = (uint32_t)wla_pool.bus;
+++	*high = (uint32_t)(wla_pool.bus >> 32);
+++	*data = 0;
+++	return 0;
+++}
+++
+++static void *
+++wla_map_phys(uint64_t address, size_t bytes)
+++{
+++	if (!bytes || address < WL_BAR0 || address - WL_BAR0 >= 0x200000 ||
+++	    bytes > 0x200000 - (address - WL_BAR0)) { return NULL; }
+++	return (void *)(fw_va(WL_BAR0) + (address - WL_BAR0));
+++}
+++
+++static void
+++wla_poll(void)
+++{
+++	nw_wifi_irq_mode(0);
+++	nw_wifi_poll();
+++}
+++
+++static void
+++wla_log(int level, const char *line)
+++{
+++	if (level <= 6 && line) { printf("FUXI ATH12K: %llu %.180s\n", wla_now_ms(), line); }
+++}
+++
+++static void
+++wla_halt(void)
+++{
+++	wla_failed = 1;
+++	printf("FUXI ATH12K: module halted; contain once, worker exits\n");
+++	wl5_abort(18);
+++	(void)thread_terminate(current_thread());
+++	thread_block(THREAD_CONTINUE_NULL);
+++	for (;;) { wl_sleep(1000); }
+++}
+++
+++extern void _disable_preemption(void);
+++extern void _enable_preemption(void);
+++
+++static bool
+++wla_available(void)
+++{
+++	return nw_wifi_start && nw_wifi_step && nw_wifi_stop && nw_wifi_poll && nw_wifi_irq_mode &&
+++	       nw_wifi_scan && nw_wifi_bss_count && nw_wifi_bss_get && &nw_wifi_stats;
+++}
+++
+++static int
+++wl_ath_run(void)
+++{
+++	static const struct lx_platform platform = {
+++		wla_now_ms, wl_sleep, wla_poll, wla_log, wla_halt, wla_alloc, wla_free,
+++		wla_dma_alloc, wla_dma_free, wla_dma_map, wla_dma_sync, wla_fw_get,
+++		wla_now_ns, wla_now_ns, fw_delay, _disable_preemption, _enable_preemption
+++	};
+++	static struct nw_board board;
+++	uint32_t flags = 0;
+++	wla_express = wl_diag_cap(WL_EPCFG, 0x10, false, &flags);
+++	wla_msi = wl_diag_cap(WL_EPCFG, 5, false, &flags);
+++	if (!wla_express || !wla_msi || flags || fw_faults || !wla_available() ||
+++	    wl_prd(WL_EPCFG) != 0x110717cb || (wl_prd(WL_EPCFG + 4) & 4) ||
+++	    wl_mrd(wl_bhi + 0x28) != 0 || wl_disable_irqs() || wl_download_aspm()) { return 1; }
+++	const uint8_t *data;
+++	size_t bytes;
+++	for (unsigned attempt = 0; attempt < 1200; attempt++) {
+++		if (!wla_fw_get("amss.bin", &data, &bytes) &&
+++		    !wla_fw_get("m3.bin", &data, &bytes) &&
+++		    !wla_fw_get("board-2.bin", &data, &bytes)) { break; }
+++		if (attempt == 1199) { return 2; }
+++		wl_sleep(100);
+++	}
+++	uint64_t alignment = WLA_BYTES;
+++	wl_iova_next = (wl_iova_next + alignment - 1) & ~(alignment - 1);
+++	wla_blocks = wla_alloc(WLA_BLOCKS * sizeof(*wla_blocks));
+++	if (!wla_blocks || wl_dma_alloc(&wl_ath_arena, WLA_BYTES) || wl_dma_nc(&wl_ath_arena) ||
+++	    fwa_init(&wla_pool, (void *)wl_ath_arena.va, wl_ath_arena.iova, WLA_BYTES, wla_blocks, WLA_BLOCKS) ||
+++	    wl_smmu_enable() || wl_smmu_fault(18) || wl_rc_check()) { return 3; }
+++	board = (struct nw_board){
+++		(void *)fw_va(WL_BAR0), 0x200000, 0x1107, (uint16_t)wla_msi, 1000,
+++		wla_cfg_read, wla_cfg_write, wla_msi_target, wla_map_phys, 0
+++	};
+++	wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x406);
+++	if (fw_faults || (wl_prd(WL_EPCFG + 4) & 0x406) != 0x406) { return 4; }
+++	printf("FUXI ATH12K: start from PBL, full BAR, owned 128 MiB DMA, IRQ polling; legacy MHI skipped\n");
+++	nw_wifi_irq_mode(0);
+++	int error = nw_wifi_start(&platform, &board);
+++	bool requested = false, completed = false;
+++	uint64_t started = wla_now_ms(), report = started;
+++	while (!error && !fw_faults && !wla_failed && wla_now_ms() - started < 90000) {
+++		(void)nw_wifi_step();
+++		uint64_t now = wla_now_ms();
+++		if (!requested && nw_wifi_stats.stage >= 4) {
+++			error = nw_wifi_scan(NULL, 0);
+++			requested = !error;
+++			printf("FUXI ATH12K: scan requested result %d\n", error);
+++		}
+++		if (requested && nw_wifi_stats.scans) { completed = true; break; }
+++		if (now >= report) {
+++			report = now + 5000;
+++			printf("FUXI ATH12K: stage %u scans %u BSS %u error %d\n", nw_wifi_stats.stage,
+++			    nw_wifi_stats.scans, nw_wifi_stats.bss_seen, nw_wifi_stats.last_err);
+++			if (wl_smmu_fault(0) || wl_rc_check()) { error = -1; break; }
+++		}
+++		wl_sleep(1);
+++	}
+++	int count = completed ? nw_wifi_bss_count() : 0;
+++	printf("FUXI ATH12K: scan completed %u BSS count %d start error %d DMA error %u faults %u\n",
+++	    completed, count, error, wla_failed, fw_faults);
+++	for (int index = 0; completed && index < count && index < 64; index++) {
+++		struct nw_bss_info info;
+++		if (!nw_wifi_bss_get(index, &info)) {
+++			char ssid[33];
+++			unsigned length = MIN((unsigned)info.ssid_len, 32u);
+++			for (unsigned at = 0; at < length; at++) {
+++				ssid[at] = info.ssid[at] >= 0x20 && info.ssid[at] < 0x7f ? (char)info.ssid[at] : '?';
+++			}
+++			ssid[length] = 0;
+++			printf("FUXI ATH12K: BSS %d freq %u RSSI %d SSID %s\n", index,
+++			    info.freq_mhz, info.signal_dbm, ssid);
+++		}
+++	}
+++	nw_wifi_stop();
+++	if (wl_disable_irqs()) { error = -1; }
+++	bool success = !error && completed && count > 0 && !wla_failed && !fw_faults;
+++	printf("FUXI ATH12K: diagnostic %s; common containment follows\n", success ? "scan observed" : "incomplete");
+++	return success ? 0 : 5;
+++}
 diff --git a/xnu/patches/0103-fuxi-kernel-h1.patch b/xnu/patches/0103-fuxi-kernel-h1.patch
-index 39be642..e5c754d 100644
+index 39be64213fb3f55d852669cc749480ab13282a19..e5c754dec6d8bcf6b54c989c4412fc5f73b86013 100644
 --- a/xnu/patches/0103-fuxi-kernel-h1.patch
 +++ b/xnu/patches/0103-fuxi-kernel-h1.patch
 @@ -65,7 +65,7 @@
@@ -30764,7 +32509,7 @@ index 39be642..e5c754d 100644
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
 diff --git a/xnu/patches/0106-fuxi-unixnu.patch b/xnu/patches/0106-fuxi-unixnu.patch
-index d95faff..cac8cfa 100644
+index d95faffe4ea7ff938e356e6a5b4053a35619065e..cac8cfa10ba3ebad3333c0ab86cede84960d62ee 100644
 --- a/xnu/patches/0106-fuxi-unixnu.patch
 +++ b/xnu/patches/0106-fuxi-unixnu.patch
 @@ -42,7 +42,19 @@
@@ -31231,7 +32976,7 @@ index d95faff..cac8cfa 100644
  +++ b/bsd/dev/fuxi_unixnu_ufs.h
  @@ -0,0 +1,36 @@
 diff --git a/xnu/patches/0111-fuxi-user-profiler.patch b/xnu/patches/0111-fuxi-user-profiler.patch
-index 8349337..34b8d1c 100644
+index 8349337a07a3e684205b00f3835e0c55a2736f43..34b8d1cbf951e77c5b17b4ca443e19e6bbe7be73 100644
 --- a/xnu/patches/0111-fuxi-user-profiler.patch
 +++ b/xnu/patches/0111-fuxi-user-profiler.patch
 @@ -18,7 +18,7 @@
@@ -31245,7 +32990,7 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..457ee84
+index 0000000000000000000000000000000000000000..457ee84eeb0bb02f48d8f7842bad8211f1303ecd
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
 @@ -0,0 +1,7861 @@
@@ -39112,7 +40857,7 @@ index 0000000..457ee84
 + 	IOPMPowerSource::free();
 diff --git a/xnu/patches/0118-fuxi-exec-inject.patch b/xnu/patches/0118-fuxi-exec-inject.patch
 new file mode 100644
-index 0000000..34f1acf
+index 0000000000000000000000000000000000000000..34f1acfd51923932b41f74175f5617fd3978d835
 --- /dev/null
 +++ b/xnu/patches/0118-fuxi-exec-inject.patch
 @@ -0,0 +1,158 @@
@@ -39274,9 +41019,33 @@ index 0000000..34f1acf
 ++	n = snprintf(env, size, "DYLD_INSERT_LIBRARIES=%s", library);
 ++	return n > 0 && (size_t)n < size;
 ++}
+diff --git a/xnu/variants/ath12k-link.patch b/xnu/variants/ath12k-link.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab89526cbd65b67c616f67d2a18f5187b35e6197
+--- /dev/null
++++ b/xnu/variants/ath12k-link.patch
+@@ -0,0 +1,18 @@
++--- a/makedefs/MakeInc.def
+++++ b/makedefs/MakeInc.def
++@@ -854,6 +854,15 @@
++ 
++ LDFILES_KERNEL_ONLY = $(TARGET)/all-kpi.exp $(TARGET)/all-alias.exp $(TARGET)/symbolsets.plist
++ 
+++ifneq ($(strip $(FUXI_ATH12K_OBJECT)),)
+++ifeq ($(CURRENT_ARCH_CONFIG)-$(CURRENT_MACHINE_CONFIG),ARM64-FUXI)
+++LDFILES_KERNEL_ONLY += $(FUXI_ATH12K_OBJECT)
+++LDFLAGS_KERNEL_ONLY += -Wl,-u,_nw_wifi_start,-u,_nw_wifi_step,-u,_nw_wifi_stop \
+++    -Wl,-u,_nw_wifi_poll,-u,_nw_wifi_irq_mode,-u,_nw_wifi_scan \
+++    -Wl,-u,_nw_wifi_bss_count,-u,_nw_wifi_bss_get,-u,_nw_wifi_stats
+++endif
+++endif
+++
++ #
++ # Default runtime libraries to be linked with the kernel
++ #
 diff --git a/xnu/variants/ram9g.patch b/xnu/variants/ram9g.patch
 new file mode 100644
-index 0000000..a22cc1a
+index 0000000000000000000000000000000000000000..a22cc1a2b63a9f9bdb5070857b8828b5a8759081
 --- /dev/null
 +++ b/xnu/variants/ram9g.patch
 @@ -0,0 +1,22 @@
