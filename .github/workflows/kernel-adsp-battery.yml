@@ -156,6 +156,7 @@ jobs:
           python3 source/tools/test-fuxi-ath12k-link.py ath12k-out
           python3 source/tools/ci/ath12k-link.py ath12k-out
           (cd source && python3 tools/test-fuxi-wlan-ath12k.py --sanitize)
+          (cd source && python3 tools/test-fuxi-wlan-ios.py)
           echo "FUXI_ATH12K_OBJECT=$PWD/ath12k-out/fuxi_ath12k.o" >> "$GITHUB_ENV"
       - name: Build and audit kernel
         shell: bash
