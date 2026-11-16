@@ -1,0 +1,58 @@
+name: Validate isolated 000 hardware preparation
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/adsp-battery
+    paths:
+      - patches/hw000-preparation.patch
+      - .github/workflows/hw000-preparation.yml
+permissions:
+  contents: read
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CC: clang
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Prepare pinned public source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source remote add origin https://github.com/zgl97/ios-fuxi.git
+          git -C source fetch --no-tags --depth=1 origin 979e2f08c704677bb75934ae96d4686ba9d1692b
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = 979e2f08c704677bb75934ae96d4686ba9d1692b
+          for patch in surface-stride bo-slots surfrow-mode2 perf-governor ib-profile perf-wide prof-live prof-inclusive swipe-pacing prof-inclusive-wait prof-edges taps-presets input-fixes taps-page2 ibprof-draws taps-page1 backlight-dsi adsp-battery; do
+            git -C source apply --check "../harness/patches/kernel-$patch.patch"
+            git -C source apply "../harness/patches/kernel-$patch.patch"
+          done
+          git -C source apply --check ../harness/patches/hw000-preparation.patch
+          git -C source apply ../harness/patches/hw000-preparation.patch
+      - name: Verify bounded production helpers
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/test-fuxi-bt-geni-fifo.py --sanitize
+          python3 tools/test-fuxi-haptic-fifo.py --cc clang
+          python3 tools/test-fuxi-haptic-fifo.py --cc clang --syntax-only
+          clang -target arm64-apple-darwin -ffreestanding -mgeneral-regs-only -std=c11 -Wall -Wextra -Werror -fsyntax-only -I xnu/fuxi-bluetooth xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.c
+          python3 tools/test-fuxi-ram-admission.py
+          python3 tools/test-fuxi-charge-evidence.py
+          python3 tools/inspect-fuxi-bluetooth-abi.py --self-test
+      - name: Verify default-off gates
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/sync-fuxi-adsp.py --check
+          python3 tools/test-fuxi-bluetooth-xnu.py --sanitize
+          CC=clang python3 tools/test-fuxi-haptic-pulse.py
