@@ -3710,10 +3710,10 @@ index 0000000000000000000000000000000000000000..21fe2c599e823e075c5e37cb2094a725
 +device; until then the torch remains unverified.
 diff --git a/docs-lanes/wlan-ath12k.md b/docs-lanes/wlan-ath12k.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..e2eb411c4959b81b31ba544f9284788e1d73823f
+index 0000000000000000000000000000000000000000..33011798175d6811531441bb14218c150fd85a04
 --- /dev/null
 +++ b/docs-lanes/wlan-ath12k.md
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,89 @@
 +# Fuxi ath12k board adapter
 +
 +The existing WLAN diagnostic reached FW_READY, INI, CFG and a successful
@@ -3744,10 +3744,17 @@ index 0000000000000000000000000000000000000000..e2eb411c4959b81b31ba544f9284788e
 +currently needs `board-2.bin` staged before the experiment can start.
 +Firmware, phone device trees and Apple binaries are not CI inputs.
 +
-+After module stage 4, the adapter requests one scan. It polls for at most
-+90 seconds, prints at most 64 BSS records, stops the module and enters common
-+containment. It does not provide an iOS Wi-Fi settings interface, connection,
-+IP traffic or persistent networking yet.
++Before module initialization, the adapter installs the required native
++control transport. After module stage 4, its diagnostic client attaches a
++session, obtains the connection generation through an INFO request, and
++submits one wildcard SCAN request through the real cfg80211 control queue.
++Reply sequence, session, generation, status and complete framing must match.
++Both an accepted scan reply and a successful SCAN_DONE event are required;
++an aborted event or command error cannot pass. The client has no password,
++association, key or packet operations. It polls for at most 90 seconds,
++prints at most 64 BSS records, stops the module and enters common containment.
++It does not expose a native userspace socket, iOS Wi-Fi settings interface,
++connection, IP traffic or persistent networking yet.
 +
 +Host validation includes 236471 native MSVC ASan checks and 30000 allocator
 +transitions, PCI write-one-to-clear preservation, release ordering and
@@ -3772,8 +3779,8 @@ index 0000000000000000000000000000000000000000..e2eb411c4959b81b31ba544f9284788e
 +It contains 125 public source objects with the existing source lock and
 +13 kernel imports.
 +
-+The variant patch adds the object as a link dependency and retains all nine
-+board entry points. After linking, the build requires those entry points to
++The variant patch adds the object as a link dependency and retains all 13
++board and control entry points. After linking, the build requires those entry points to
 +be defined in the unstripped kernel and records the object and kernel hashes
 +in `ath12k-link.json`. Other kernel targets reject the object input.
 +
@@ -3788,9 +3795,14 @@ index 0000000000000000000000000000000000000000..e2eb411c4959b81b31ba544f9284788e
 +commands and the actual pinned bundle, including wrong target, ABI flags,
 +source lock, imports, exports and corrupted object rejection.
 +
-+The board adapter has not yet completed a full XNU build or a device scan.
-+Host models and an independently built object do not establish hardware
-+acceptance.
++CI run 43896202460 completed the original full XNU build. Its first device
++test reached the firmware cache and DMA/SMMU setup, then returned -16 before
++PCI probing. The missing control transport made nl80211 initialization
++return -EBUSY; the module requires a transport even for diagnostics. The
++adapter now supplies a bounded scan-only peer instead of ignoring this
++initialization failure. Host tests cover the handshake, actual pinned wire
++codec, transport ABI, stale replies/events, malformed frames, command errors
++and scan event/reply ordering. A successful device scan remains unverified.
 diff --git a/docs-lanes/wlan-bdf-provenance.md b/docs-lanes/wlan-bdf-provenance.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..8966843a83976916bf29e741711126125ba217ee
@@ -5058,10 +5070,10 @@ index efb83f1a7b85c06880b62dbcc349a5c960dc90ee..745d165560fa6e569237487e84f49261
          uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
 diff --git a/tools/ci/ath12k-link.py b/tools/ci/ath12k-link.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..2894867c98c3a86cfe7a34ac749fa869b0efcd79
+index 0000000000000000000000000000000000000000..2b9d110cf19b79e71c8f75d7d1bf4c76c1e2afe2
 --- /dev/null
 +++ b/tools/ci/ath12k-link.py
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,135 @@
 +import argparse
 +import hashlib
 +import json
@@ -5075,6 +5087,8 @@ index 0000000000000000000000000000000000000000..2894867c98c3a86cfe7a34ac749fa869
 +    '_nw_wifi_start', '_nw_wifi_step', '_nw_wifi_stop', '_nw_wifi_poll',
 +    '_nw_wifi_irq_mode', '_nw_wifi_scan', '_nw_wifi_bss_count',
 +    '_nw_wifi_bss_get', '_nw_wifi_stats',
++    '_nw_wifi_set_platform', '_nw_wifi_control_transport_set',
++    '_nw_wifi_control_attach', '_nw_wifi_control_receive',
 +)
 +IMPORTS = {
 +    '_bzero', '_memcmp', '_memcpy', '_memmove', '_memset', '_snprintf',
@@ -8193,10 +8207,10 @@ index 07edd64102c4f63750fbea49c41cb02001b5cb48..b83b489188f20ba83f5f537854af093d
          for name, text in before.items():
 diff --git a/tools/sync-fuxi-wlan.py b/tools/sync-fuxi-wlan.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..53e3ad22c4918e33879001f179b9b40cb19158cd
+index 0000000000000000000000000000000000000000..0aab414be2d0d183197a27b59a34d0cfb6718e3a
 --- /dev/null
 +++ b/tools/sync-fuxi-wlan.py
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,46 @@
 +import argparse
 +import difflib
 +from pathlib import Path
@@ -8224,7 +8238,8 @@ index 0000000000000000000000000000000000000000..53e3ad22c4918e33879001f179b9b40c
 +replacement = ''.join(difflib.unified_diff([], body.splitlines(True), fromfile=original_path,
 +                                            tofile='b/bsd/dev/fuxi_wlan.c'))
 +expected = text[:start] + replacement + text[end:]
-+for name in ('fuxi_wlan_arena.h', 'fuxi_wlan_ath12k.h', 'fuxi_wlan_ath12k.inc'):
++for name in ('fuxi_wlan_arena.h', 'fuxi_wlan_ath12k.h', 'fuxi_wlan_ath12k.inc',
++             'fuxi_wlan_control.h'):
 +    body = (source.parent / name).read_text(encoding='utf-8')
 +    assert body.endswith('\n') and '\r' not in body
 +    marker = '--- /dev/null\n+++ b/bsd/dev/' + name + '\n'
@@ -15893,10 +15908,10 @@ index 0000000000000000000000000000000000000000..bb751037050ba705b9423efe8b3c20e2
 +    main()
 diff --git a/tools/test-fuxi-wlan-ath12k.py b/tools/test-fuxi-wlan-ath12k.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..3119c66b9e9735cbee39ceba4b1d01e3b84241cc
+index 0000000000000000000000000000000000000000..4a36434b98f4de2a5e04d82a73abbc9c9a1dc76c
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ath12k.py
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,281 @@
 +import argparse
 +import json
 +import os
@@ -16079,9 +16094,12 @@ index 0000000000000000000000000000000000000000..3119c66b9e9735cbee39ceba4b1d01e3
 +    'nw_wifi_stats': ('stage', 'scans', 'frames', 'beacons', 'bss_seen', 'last_err'),
 +    'nw_bss_info': ('bssid', 'ssid_len', 'ssid', 'freq_mhz', 'signal_dbm', 'caps',
 +                    'beacon_int', 'age_ms', 'ie_len', 'ie'),
++    'nw_control_transport': ('context', 'send', 'wake'),
 +}
 +ABI_SYMBOLS = ('nw_wifi_start', 'nw_wifi_step', 'nw_wifi_stop', 'nw_wifi_poll',
-+               'nw_wifi_irq_mode', 'nw_wifi_scan', 'nw_wifi_bss_count', 'nw_wifi_bss_get')
++               'nw_wifi_irq_mode', 'nw_wifi_scan', 'nw_wifi_bss_count', 'nw_wifi_bss_get',
++               'nw_wifi_set_platform', 'nw_wifi_control_transport_set',
++               'nw_wifi_control_attach', 'nw_wifi_control_receive')
 +
 +
 +def abi_source(reference):
@@ -16091,6 +16109,7 @@ index 0000000000000000000000000000000000000000..3119c66b9e9735cbee39ceba4b1d01e3
 +    lines += ['#include "fuxi_wlan_ath12k.h"']
 +    lines += [f'#undef {name}' for name in symbols]
 +    lines += ['#include ' + json.dumps(reference.resolve().as_posix())]
++    lines += ['#include ' + json.dumps((reference.parent / 'nw_control_endpoint.h').resolve().as_posix())]
 +    for name, fields in ABI_FIELDS.items():
 +        lines += [
 +            f'_Static_assert(sizeof(struct {name}) == sizeof(struct fuxi_{name}), "{name} size");',
@@ -16099,14 +16118,14 @@ index 0000000000000000000000000000000000000000..3119c66b9e9735cbee39ceba4b1d01e3
 +        for field in fields:
 +            lines.append(f'_Static_assert(offsetof(struct {name}, {field}) == '
 +                         f'offsetof(struct fuxi_{name}, {field}), "{name}.{field} offset");')
-+    for name in ('lx_platform', 'nw_board'):
++    for name in ('lx_platform', 'nw_board', 'nw_control_transport'):
 +        lines += [f'static struct {name} upstream_{name};',
 +                  f'static struct fuxi_{name} local_{name};']
 +    lines += ['int main(void) {', 'unsigned offset;']
-+    for name in ('lx_platform', 'nw_board'):
++    for name in ('lx_platform', 'nw_board', 'nw_control_transport'):
 +        lines += [f'local_{name}.{field} = upstream_{name}.{field};' for field in ABI_FIELDS[name]]
 +    lines += ['if (fwa_config_offset(0, 4, 0, &offset)) return 1;',
-+              'puts("PASS pinned module ABI: four structure sizes/alignments, all field offsets and platform callbacks");',
++              'puts("PASS pinned module ABI: five structure sizes/alignments, all field offsets and platform/control callbacks");',
 +              'return 0;', '}']
 +    return '\n'.join(lines) + '\n'
 +
@@ -16154,9 +16173,21 @@ index 0000000000000000000000000000000000000000..3119c66b9e9735cbee39ceba4b1d01e3
 +        source.write_text(unlinked, encoding='utf-8', newline='\n')
 +        subprocess.run(command, cwd=directory, env=environment, check=True, timeout=120)
 +        subprocess.run([str(output)], cwd=directory, env=environment, check=True, timeout=120)
++        source.write_text((ROOT / 'tools/test-fuxi-wlan-control.c').read_text(), encoding='utf-8', newline='\n')
++        subprocess.run(command, cwd=directory, env=environment, check=True, timeout=120)
++        subprocess.run([str(output)], cwd=directory, env=environment, check=True, timeout=120)
 +        if arguments.abi_header:
 +            source.write_text(abi_source(arguments.abi_header), encoding='utf-8', newline='\n')
 +            subprocess.run(command, cwd=directory, env=environment, check=True, timeout=120)
++            subprocess.run([str(output)], cwd=directory, env=environment, check=True, timeout=120)
++            module_root = arguments.abi_header.resolve().parent.parent
++            source.write_text(
++                '#define FWC_REFERENCE_CODEC 1\n#include "nw_control.h"\n' +
++                '#include ' + json.dumps((module_root / 'src/nw_control_wire.c').as_posix()) + '\n' +
++                (ROOT / 'tools/test-fuxi-wlan-control.c').read_text(),
++                encoding='utf-8', newline='\n')
++            include_flags = [f'/I{module_root / "include"}'] if msvc else ['-I', str(module_root / 'include')]
++            subprocess.run(command + include_flags, cwd=directory, env=environment, check=True, timeout=120)
 +            subprocess.run([str(output)], cwd=directory, env=environment, check=True, timeout=120)
 +
 +
@@ -16737,6 +16768,156 @@ index 0000000000000000000000000000000000000000..9cff8f47c999c7084c5c024d3ff087a4
 +
 +if __name__ == '__main__':
 +    unittest.main()
+diff --git a/tools/test-fuxi-wlan-control.c b/tools/test-fuxi-wlan-control.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..cea2fab5b505cadd3ebffa9c3bd4037d70458a70
+--- /dev/null
++++ b/tools/test-fuxi-wlan-control.c
+@@ -0,0 +1,144 @@
++#include <assert.h>
++#include <stdio.h>
++#include "fuxi_wlan_control.h"
++
++static size_t
++message(uint8_t *bytes, unsigned kind, unsigned operation, uint32_t sequence,
++    uint64_t session, uint64_t generation, unsigned status)
++{
++	memset(bytes, 0, 80);
++	fwc_write(bytes, 0x3143574e, 4);
++	fwc_write(bytes + 4, 1, 2);
++	fwc_write(bytes + 6, kind, 2);
++	fwc_write(bytes + 8, operation, 2);
++	fwc_write(bytes + 12, sequence, 4);
++	fwc_write(bytes + 16, 40, 4);
++	fwc_write(bytes + 20, status, 4);
++	fwc_write(bytes + 24, session, 8);
++	fwc_write(bytes + 32, generation, 8);
++	return 40;
++}
++
++static void
++rejected(struct fwc_probe *probe, const void *bytes, size_t length)
++{
++	struct fwc_probe before = *probe;
++	assert(fwc_probe_receive(probe, probe->session, bytes, length));
++	assert(!memcmp(probe, &before, sizeof(before)));
++}
++
++static void
++info(struct fwc_probe *probe)
++{
++	uint8_t bytes[80];
++	assert(fwc_probe_request(probe, bytes, 39) == 0);
++	assert(fwc_probe_request(probe, bytes, sizeof(bytes)) == 40);
++	assert(fwc_read16(bytes + 8) == 1 && fwc_read32(bytes + 12) == 1);
++	assert(fwc_probe_request(probe, bytes, sizeof(bytes)) == 0);
++#if defined(FWC_REFERENCE_CODEC)
++	struct nw_control_view view;
++	assert(!nw_control_decode(bytes, 40, &view));
++	assert(view.header.kind == NW_CONTROL_REQUEST && view.header.operation == NW_CONTROL_INFO);
++	assert(view.header.session == probe->session && !view.header.generation);
++#endif
++	message(bytes, 2, 1, 2, probe->session, 7, 0);
++	rejected(probe, bytes, 40);
++	message(bytes, 2, 1, 1, probe->session + 1, 7, 0);
++	rejected(probe, bytes, 40);
++	message(bytes, 2, 1, 1, probe->session, 0, 0);
++	rejected(probe, bytes, 40);
++	message(bytes, 2, 1, 1, probe->session, 7, 0);
++	assert(!fwc_probe_receive(probe, probe->session, bytes, 40));
++	assert(probe->info_ready && probe->generation == 7 && !probe->pending_operation);
++	rejected(probe, bytes, 40);
++}
++
++static void
++scan(struct fwc_probe *probe)
++{
++	uint8_t bytes[80];
++	assert(fwc_probe_request(probe, bytes, 79) == 0);
++	assert(fwc_probe_request(probe, bytes, sizeof(bytes)) == 80);
++	assert(fwc_read16(bytes + 8) == 2 && fwc_read64(bytes + 32) == 7);
++	assert(fwc_read16(bytes + 40) == 19 && fwc_read16(bytes + 42) == 37);
++	for (unsigned index = 44; index < 80; index++) { assert(!bytes[index]); }
++#if defined(FWC_REFERENCE_CODEC)
++	struct nw_control_view view;
++	assert(!nw_control_decode(bytes, 80, &view));
++	assert(view.header.operation == NW_CONTROL_SCAN && view.header.sequence == 2);
++	size_t length;
++	const uint8_t *ssids = nw_control_get(&view, NW_CONTROL_ATTR_SCAN_SSIDS, &length);
++	assert(ssids && length == 33 && !ssids[0]);
++#endif
++	message(bytes, 3, 0x101, 0, probe->session, 8, 0);
++	rejected(probe, bytes, 40);
++	message(bytes, 3, 0x101, 1, probe->session, 7, 0);
++	rejected(probe, bytes, 40);
++	message(bytes, 3, 0x101, 0, probe->session, 7, 0);
++	assert(!fwc_probe_receive(probe, probe->session, bytes, 40));
++	assert(!probe->scan_accepted && !probe->scan_done);
++	message(bytes, 3, 0x102, 0, probe->session, 7, 0);
++	assert(!fwc_probe_receive(probe, probe->session, bytes, 40));
++	assert(probe->scan_done && !probe->scan_accepted);
++	message(bytes, 2, 2, probe->pending_sequence, probe->session, 7, 0);
++	assert(!fwc_probe_receive(probe, probe->session, bytes, 40));
++	assert(probe->scan_done && probe->scan_accepted && !probe->error);
++	assert(!fwc_probe_request(probe, bytes, sizeof(bytes)));
++}
++
++int
++main(void)
++{
++	struct fwc_probe probe = { .session = 0x1122334455667788ull };
++	info(&probe);
++	scan(&probe);
++	uint8_t bytes[80];
++	struct fwc_probe failed = { .session = 13 };
++	info(&failed);
++	assert(fwc_probe_request(&failed, bytes, sizeof(bytes)) == 80);
++	message(bytes, 2, 2, failed.pending_sequence, failed.session, 7, 2);
++	assert(!fwc_probe_receive(&failed, failed.session, bytes, 40));
++	assert(failed.error == 2 && !failed.scan_accepted);
++	assert(!fwc_probe_request(&failed, bytes, sizeof(bytes)));
++	failed = (struct fwc_probe){ .session = 13 };
++	info(&failed);
++	assert(fwc_probe_request(&failed, bytes, sizeof(bytes)) == 80);
++	message(bytes, 3, 0x102, 0, failed.session, 7, 9);
++	assert(!fwc_probe_receive(&failed, failed.session, bytes, 40));
++	assert(failed.error == 9 && !failed.scan_accepted);
++	message(bytes, 3, 0x102, 0, probe.session, 7, 0);
++	for (size_t length = 0; length < 40; length++) { rejected(&probe, bytes, length); }
++	rejected(&probe, bytes, 65537);
++	for (unsigned offset = 0; offset < 40; offset++) {
++		for (unsigned value = 0; value < 256; value++) {
++			uint8_t original = bytes[offset];
++			bytes[offset] = (uint8_t)value;
++			struct fwc_probe copy = probe;
++			int result = fwc_probe_receive(&copy, probe.session, bytes, 40);
++			if (result) { assert(!memcmp(&copy, &probe, sizeof(copy))); }
++			bytes[offset] = original;
++		}
++	}
++	fwc_write(bytes + 16, 48, 4);
++	fwc_write(bytes + 40, 1, 2);
++	fwc_write(bytes + 42, 5, 2);
++	bytes[44] = 'x';
++	assert(!fwc_probe_receive(&probe, probe.session, bytes, 48));
++	bytes[47] = 1;
++	rejected(&probe, bytes, 48);
++	bytes[47] = 0;
++	fwc_write(bytes + 42, 3, 2);
++	rejected(&probe, bytes, 48);
++	fwc_write(bytes + 42, 9, 2);
++	rejected(&probe, bytes, 48);
++	fwc_write(bytes + 42, 5, 2);
++	fwc_write(bytes + 16, 56, 4);
++	memcpy(bytes + 48, bytes + 40, 8);
++	rejected(&probe, bytes, 56);
++	fwc_write(bytes + 48, 46, 2);
++	rejected(&probe, bytes, 56);
++	struct fwc_probe exhausted = { .session = 1, .sequence = (uint32_t)-1 };
++	assert(!fwc_probe_request(&exhausted, bytes, sizeof(bytes)));
++	puts("PASS native scan control: handshake, wire ABI, session/generation/replay rejection, scan reply/event order, failure propagation and 10240 header mutations");
++	return 0;
++}
 diff --git a/tools/test-fuxi-wlan-m6.py b/tools/test-fuxi-wlan-m6.py
 index 41003b6cc3507ba11e094b8d9f3f091c494a45e9..ebdc9c0d08394aca2e7933280a3d9123d65fe6c6 100755
 --- a/tools/test-fuxi-wlan-m6.py
@@ -31000,10 +31181,10 @@ index 0000000000000000000000000000000000000000..83fb1204b809252e45fc563867f5a909
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.h b/xnu/fuxi-wlan/fuxi_wlan_ath12k.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..11204ae345e78ce2c7081123feb06013bf6e2053
+index 0000000000000000000000000000000000000000..add45872197cbf689df20ed3faa8946570003bb9
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,78 @@
 +#ifndef FUXI_WLAN_ATH12K_H
 +#define FUXI_WLAN_ATH12K_H
 +#include <stdint.h>
@@ -31051,6 +31232,15 @@ index 0000000000000000000000000000000000000000..11204ae345e78ce2c7081123feb06013
 +	uint16_t ie_len;
 +	uint8_t ie[384];
 +};
++struct nw_control_transport {
++	void *context;
++	int (*send)(void *context, uint64_t session, const void *bytes, size_t length);
++	void (*wake)(void *context);
++};
++extern void nw_wifi_set_platform(const struct lx_platform *);
++extern int nw_wifi_control_transport_set(const struct nw_control_transport *);
++extern int nw_wifi_control_attach(uint64_t *);
++extern int nw_wifi_control_receive(uint64_t, size_t, int (*)(void *, void *, size_t), void *);
 +extern int nw_wifi_start(const struct lx_platform *, const struct nw_board *);
 +extern int nw_wifi_step(void);
 +extern void nw_wifi_stop(void);
@@ -31075,12 +31265,13 @@ index 0000000000000000000000000000000000000000..11204ae345e78ce2c7081123feb06013
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
 new file mode 100644
-index 0000000000000000000000000000000000000000..382e044b65413f6dcd52d98d1b5481a1b117ee8e
+index 0000000000000000000000000000000000000000..df7b5fe1b26af38f25357441e8128a507ad9efa2
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,395 @@
 +#include "fuxi_wlan_arena.h"
 +#include "fuxi_wlan_ath12k.h"
++#include "fuxi_wlan_control.h"
 +
 +#define WLA_BYTES (128u << 20)
 +#define WLA_BLOCKS 16384u
@@ -31314,6 +31505,41 @@ index 0000000000000000000000000000000000000000..382e044b65413f6dcd52d98d1b5481a1
 +extern void _disable_preemption(void);
 +extern void _enable_preemption(void);
 +
++#if defined(FUXI_ATH12K_LINKED)
++static struct fwc_probe wla_control;
++static unsigned wla_control_awake;
++
++static int
++wla_control_send(void *context, uint64_t session, const void *bytes, size_t length)
++{
++	struct fwc_probe *probe = context;
++	if (fwc_probe_receive(probe, session, bytes, length)) {
++		probe->error = -1;
++		return 2;
++	}
++	const uint8_t *message = bytes;
++	if (fwc_read16(message + 6) == 2 || fwc_read16(message + 8) == 0x102) {
++		printf("FUXI ATH12K: control operation %u status %u generation %llu\n",
++		    fwc_read16(message + 8), fwc_read32(message + 20), probe->generation);
++	}
++	return 0;
++}
++
++static void
++wla_control_wake(void *context)
++{
++	(void)context;
++	wla_control_awake = 1;
++}
++
++static int
++wla_control_read(void *context, void *destination, size_t length)
++{
++	memcpy(destination, context, length);
++	return 0;
++}
++#endif
++
 +static bool
 +wla_available(void)
 +{
@@ -31334,6 +31560,18 @@ index 0000000000000000000000000000000000000000..382e044b65413f6dcd52d98d1b5481a1
 +		wla_now_ns, wla_now_ns, fw_delay, _disable_preemption, _enable_preemption
 +	};
 +	static struct nw_board board;
++	memset(&wla_control, 0, sizeof(wla_control));
++	wla_control_awake = 0;
++	nw_wifi_set_platform(&platform);
++	const struct nw_control_transport control = {
++		&wla_control, wla_control_send, wla_control_wake
++	};
++	int control_error = nw_wifi_control_transport_set(&control);
++	if (control_error) {
++		printf("FUXI ATH12K: control transport refused status %d\n", control_error);
++		return 6;
++	}
++	printf("FUXI ATH12K: diagnostic control transport installed\n");
 +	uint32_t flags = 0;
 +	wla_express = wl_diag_cap(WL_EPCFG, 0x10, false, &flags);
 +	wla_msi = wl_diag_cap(WL_EPCFG, 5, false, &flags);
@@ -31364,24 +31602,42 @@ index 0000000000000000000000000000000000000000..382e044b65413f6dcd52d98d1b5481a1
 +	printf("FUXI ATH12K: start from PBL, full BAR, owned 128 MiB DMA, IRQ polling; legacy MHI skipped\n");
 +	nw_wifi_irq_mode(0);
 +	int error = nw_wifi_start(&platform, &board);
-+	bool requested = false, completed = false;
++	bool attached = false, completed = false;
 +	uint64_t started = wla_now_ms(), report = started;
-+	while (!error && !fw_faults && !wla_failed && wla_now_ms() - started < 90000) {
++	while (!error && !fw_faults && !wla_failed && !wla_control.error &&
++	    wla_now_ms() - started < 90000) {
++		wla_control_awake = 0;
 +		(void)nw_wifi_step();
 +		uint64_t now = wla_now_ms();
-+		if (!requested && nw_wifi_stats.stage >= 4) {
-+			error = nw_wifi_scan(NULL, 0);
-+			requested = !error;
-+			printf("FUXI ATH12K: scan requested result %d\n", error);
++		if (!attached && nw_wifi_stats.stage >= 4) {
++			error = nw_wifi_control_attach(&wla_control.session);
++			attached = !error;
++			printf("FUXI ATH12K: control attached result %d\n", error);
 +		}
-+		if (requested && nw_wifi_stats.scans) { completed = true; break; }
++		if (attached && !error) {
++			uint8_t request[80];
++			size_t length = fwc_probe_request(&wla_control, request, sizeof(request));
++			if (length) {
++				error = nw_wifi_control_receive(wla_control.session, length, wla_control_read, request);
++				printf("FUXI ATH12K: control request %u queued result %d\n",
++				    fwc_read16(request + 8), error);
++			}
++		}
++		if (wla_control.scan_accepted && wla_control.scan_done &&
++		    !wla_control.error && nw_wifi_stats.scans) {
++			completed = true;
++			break;
++		}
 +		if (now >= report) {
 +			report = now + 5000;
 +			printf("FUXI ATH12K: stage %u scans %u BSS %u error %d\n", nw_wifi_stats.stage,
 +			    nw_wifi_stats.scans, nw_wifi_stats.bss_seen, nw_wifi_stats.last_err);
 +			if (wl_smmu_fault(0) || wl_rc_check()) { error = -1; break; }
 +		}
-+		wl_sleep(1);
++		if (!wla_control_awake) { wl_sleep(1); }
++	}
++	if (!error && wla_control.error) {
++		error = wla_control.error < 0 ? wla_control.error : -wla_control.error;
 +	}
 +	int count = completed ? nw_wifi_bss_count() : 0;
 +	printf("FUXI ATH12K: scan completed %u BSS count %d start error %d DMA error %u faults %u\n",
@@ -31408,6 +31664,131 @@ index 0000000000000000000000000000000000000000..382e044b65413f6dcd52d98d1b5481a1
 +	return 1;
 +#endif
 +}
+diff --git a/xnu/fuxi-wlan/fuxi_wlan_control.h b/xnu/fuxi-wlan/fuxi_wlan_control.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e18103ee944006ef9f9d9b5156f0057a1bb365e
+--- /dev/null
++++ b/xnu/fuxi-wlan/fuxi_wlan_control.h
+@@ -0,0 +1,119 @@
++#ifndef FUXI_WLAN_CONTROL_H
++#define FUXI_WLAN_CONTROL_H
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++
++struct fwc_probe {
++	uint64_t session, generation;
++	uint32_t sequence, pending_sequence;
++	unsigned pending_operation, info_ready, scan_queued, scan_accepted, scan_done;
++	int error;
++};
++
++static inline uint16_t
++fwc_read16(const uint8_t *bytes)
++{
++	return (uint16_t)((uint16_t)bytes[0] | (uint16_t)bytes[1] << 8);
++}
++
++static inline uint32_t
++fwc_read32(const uint8_t *bytes)
++{
++	return (uint32_t)fwc_read16(bytes) | (uint32_t)fwc_read16(bytes + 2) << 16;
++}
++
++static inline uint64_t
++fwc_read64(const uint8_t *bytes)
++{
++	return (uint64_t)fwc_read32(bytes) | (uint64_t)fwc_read32(bytes + 4) << 32;
++}
++
++static inline void
++fwc_write(uint8_t *bytes, uint64_t value, unsigned count)
++{
++	for (unsigned index = 0; index < count; index++) {
++		bytes[index] = (uint8_t)(value >> (index * 8));
++	}
++}
++
++static inline size_t
++fwc_probe_request(struct fwc_probe *probe, uint8_t *bytes, size_t capacity)
++{
++	if (!probe || !bytes || !probe->session || probe->error ||
++	    probe->pending_operation || probe->scan_queued) { return 0; }
++	unsigned operation = probe->info_ready ? 2 : 1;
++	size_t length = operation == 2 ? 80 : 40;
++	if (capacity < length || probe->sequence == UINT32_MAX) { return 0; }
++	memset(bytes, 0, length);
++	fwc_write(bytes, 0x3143574e, 4);
++	fwc_write(bytes + 4, 1, 2);
++	fwc_write(bytes + 6, 1, 2);
++	fwc_write(bytes + 8, operation, 2);
++	fwc_write(bytes + 12, ++probe->sequence, 4);
++	fwc_write(bytes + 16, length, 4);
++	fwc_write(bytes + 24, probe->session, 8);
++	fwc_write(bytes + 32, probe->generation, 8);
++	if (operation == 2) {
++		fwc_write(bytes + 40, 19, 2);
++		fwc_write(bytes + 42, 37, 2);
++		probe->scan_queued = 1;
++	}
++	probe->pending_sequence = probe->sequence;
++	probe->pending_operation = operation;
++	return length;
++}
++
++static inline int
++fwc_probe_receive(struct fwc_probe *probe, uint64_t session, const void *message, size_t length)
++{
++	if (!probe || !message || !session || session != probe->session ||
++	    length < 40 || length > 65536 || (length & 3)) { return 1; }
++	const uint8_t *bytes = message;
++	unsigned kind = fwc_read16(bytes + 6), operation = fwc_read16(bytes + 8);
++	unsigned status = fwc_read32(bytes + 20);
++	uint64_t generation = fwc_read64(bytes + 32);
++	if (fwc_read32(bytes) != 0x3143574e || fwc_read16(bytes + 4) != 1 ||
++	    fwc_read16(bytes + 10) || fwc_read32(bytes + 16) != length ||
++	    fwc_read64(bytes + 24) != session || status >= 11 || !generation ||
++	    (kind != 2 && kind != 3) ||
++	    (kind == 2 && (operation < 1 || operation >= 14)) ||
++	    (kind == 3 && (operation < 0x100 || operation >= 0x10f))) { return 1; }
++	uint64_t attributes = 0;
++	for (size_t offset = 40; offset < length;) {
++		unsigned attribute = fwc_read16(bytes + offset);
++		unsigned size = fwc_read16(bytes + offset + 2);
++		if (!attribute || attribute >= 46 || size < 4 || size > length - offset ||
++		    (attributes & ((uint64_t)1 << attribute))) { return 1; }
++		attributes |= (uint64_t)1 << attribute;
++		size_t padded = (size + 3u) & ~(size_t)3u;
++		if (padded > length - offset) { return 1; }
++		for (size_t index = size; index < padded; index++) {
++			if (bytes[offset + index]) { return 1; }
++		}
++		offset += padded;
++	}
++	if (kind == 2) {
++		if (!probe->pending_operation || operation != probe->pending_operation ||
++		    fwc_read32(bytes + 12) != probe->pending_sequence ||
++		    (operation != 1 && generation != probe->generation)) { return 1; }
++		probe->pending_operation = 0;
++		if (status) { probe->error = (int)status; return 0; }
++		if (operation == 1) {
++			probe->generation = generation;
++			probe->info_ready = 1;
++		} else {
++			probe->scan_accepted = 1;
++		}
++	} else {
++		if (!probe->info_ready || generation != probe->generation ||
++		    fwc_read32(bytes + 12)) { return 1; }
++		if (operation == 0x101 || operation == 0x102) {
++			if (!probe->scan_queued) { return 1; }
++			if (status) { probe->error = (int)status; }
++			if (operation == 0x102) { probe->scan_done = 1; }
++		}
++	}
++	return 0;
++}
++#endif
 diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
 index 0ca28384a623fc36e987daa43e85e29b84c11540..0d215ede6b71c5c85a3bca7ccfcac02c1b1dce16 100644
 --- a/xnu/patches/0098-fuxi-native-adreno-abi.patch
@@ -31571,7 +31952,7 @@ index 0ca28384a623fc36e987daa43e85e29b84c11540..0d215ede6b71c5c85a3bca7ccfcac02c
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..ad0a432d36b1b9c4055845b4be71e4ac81dab877 100644
+index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..c5ccf7e71f93eb360eda9bbf865e511cf02febf0 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -32042,7 +32423,7 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..ad0a432d36b1b9c4055845b4be71e4ac
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,528 @@
+@@ -5899,3 +6092,725 @@
  + }
  + r[3] = 0;
  +}
@@ -32169,7 +32550,7 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..ad0a432d36b1b9c4055845b4be71e4ac
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ath12k.h
-+@@ -0,0 +1,69 @@
++@@ -0,0 +1,78 @@
 ++#ifndef FUXI_WLAN_ATH12K_H
 ++#define FUXI_WLAN_ATH12K_H
 ++#include <stdint.h>
@@ -32217,6 +32598,15 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..ad0a432d36b1b9c4055845b4be71e4ac
 ++	uint16_t ie_len;
 ++	uint8_t ie[384];
 ++};
+++struct nw_control_transport {
+++	void *context;
+++	int (*send)(void *context, uint64_t session, const void *bytes, size_t length);
+++	void (*wake)(void *context);
+++};
+++extern void nw_wifi_set_platform(const struct lx_platform *);
+++extern int nw_wifi_control_transport_set(const struct nw_control_transport *);
+++extern int nw_wifi_control_attach(uint64_t *);
+++extern int nw_wifi_control_receive(uint64_t, size_t, int (*)(void *, void *, size_t), void *);
 ++extern int nw_wifi_start(const struct lx_platform *, const struct nw_board *);
 ++extern int nw_wifi_step(void);
 ++extern void nw_wifi_stop(void);
@@ -32241,9 +32631,10 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..ad0a432d36b1b9c4055845b4be71e4ac
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ath12k.inc
-+@@ -0,0 +1,329 @@
++@@ -0,0 +1,395 @@
 ++#include "fuxi_wlan_arena.h"
 ++#include "fuxi_wlan_ath12k.h"
+++#include "fuxi_wlan_control.h"
 ++
 ++#define WLA_BYTES (128u << 20)
 ++#define WLA_BLOCKS 16384u
@@ -32477,6 +32868,41 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..ad0a432d36b1b9c4055845b4be71e4ac
 ++extern void _disable_preemption(void);
 ++extern void _enable_preemption(void);
 ++
+++#if defined(FUXI_ATH12K_LINKED)
+++static struct fwc_probe wla_control;
+++static unsigned wla_control_awake;
+++
+++static int
+++wla_control_send(void *context, uint64_t session, const void *bytes, size_t length)
+++{
+++	struct fwc_probe *probe = context;
+++	if (fwc_probe_receive(probe, session, bytes, length)) {
+++		probe->error = -1;
+++		return 2;
+++	}
+++	const uint8_t *message = bytes;
+++	if (fwc_read16(message + 6) == 2 || fwc_read16(message + 8) == 0x102) {
+++		printf("FUXI ATH12K: control operation %u status %u generation %llu\n",
+++		    fwc_read16(message + 8), fwc_read32(message + 20), probe->generation);
+++	}
+++	return 0;
+++}
+++
+++static void
+++wla_control_wake(void *context)
+++{
+++	(void)context;
+++	wla_control_awake = 1;
+++}
+++
+++static int
+++wla_control_read(void *context, void *destination, size_t length)
+++{
+++	memcpy(destination, context, length);
+++	return 0;
+++}
+++#endif
+++
 ++static bool
 ++wla_available(void)
 ++{
@@ -32497,6 +32923,18 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..ad0a432d36b1b9c4055845b4be71e4ac
 ++		wla_now_ns, wla_now_ns, fw_delay, _disable_preemption, _enable_preemption
 ++	};
 ++	static struct nw_board board;
+++	memset(&wla_control, 0, sizeof(wla_control));
+++	wla_control_awake = 0;
+++	nw_wifi_set_platform(&platform);
+++	const struct nw_control_transport control = {
+++		&wla_control, wla_control_send, wla_control_wake
+++	};
+++	int control_error = nw_wifi_control_transport_set(&control);
+++	if (control_error) {
+++		printf("FUXI ATH12K: control transport refused status %d\n", control_error);
+++		return 6;
+++	}
+++	printf("FUXI ATH12K: diagnostic control transport installed\n");
 ++	uint32_t flags = 0;
 ++	wla_express = wl_diag_cap(WL_EPCFG, 0x10, false, &flags);
 ++	wla_msi = wl_diag_cap(WL_EPCFG, 5, false, &flags);
@@ -32527,24 +32965,42 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..ad0a432d36b1b9c4055845b4be71e4ac
 ++	printf("FUXI ATH12K: start from PBL, full BAR, owned 128 MiB DMA, IRQ polling; legacy MHI skipped\n");
 ++	nw_wifi_irq_mode(0);
 ++	int error = nw_wifi_start(&platform, &board);
-++	bool requested = false, completed = false;
+++	bool attached = false, completed = false;
 ++	uint64_t started = wla_now_ms(), report = started;
-++	while (!error && !fw_faults && !wla_failed && wla_now_ms() - started < 90000) {
+++	while (!error && !fw_faults && !wla_failed && !wla_control.error &&
+++	    wla_now_ms() - started < 90000) {
+++		wla_control_awake = 0;
 ++		(void)nw_wifi_step();
 ++		uint64_t now = wla_now_ms();
-++		if (!requested && nw_wifi_stats.stage >= 4) {
-++			error = nw_wifi_scan(NULL, 0);
-++			requested = !error;
-++			printf("FUXI ATH12K: scan requested result %d\n", error);
+++		if (!attached && nw_wifi_stats.stage >= 4) {
+++			error = nw_wifi_control_attach(&wla_control.session);
+++			attached = !error;
+++			printf("FUXI ATH12K: control attached result %d\n", error);
 ++		}
-++		if (requested && nw_wifi_stats.scans) { completed = true; break; }
+++		if (attached && !error) {
+++			uint8_t request[80];
+++			size_t length = fwc_probe_request(&wla_control, request, sizeof(request));
+++			if (length) {
+++				error = nw_wifi_control_receive(wla_control.session, length, wla_control_read, request);
+++				printf("FUXI ATH12K: control request %u queued result %d\n",
+++				    fwc_read16(request + 8), error);
+++			}
+++		}
+++		if (wla_control.scan_accepted && wla_control.scan_done &&
+++		    !wla_control.error && nw_wifi_stats.scans) {
+++			completed = true;
+++			break;
+++		}
 ++		if (now >= report) {
 ++			report = now + 5000;
 ++			printf("FUXI ATH12K: stage %u scans %u BSS %u error %d\n", nw_wifi_stats.stage,
 ++			    nw_wifi_stats.scans, nw_wifi_stats.bss_seen, nw_wifi_stats.last_err);
 ++			if (wl_smmu_fault(0) || wl_rc_check()) { error = -1; break; }
 ++		}
-++		wl_sleep(1);
+++		if (!wla_control_awake) { wl_sleep(1); }
+++	}
+++	if (!error && wla_control.error) {
+++		error = wla_control.error < 0 ? wla_control.error : -wla_control.error;
 ++	}
 ++	int count = completed ? nw_wifi_bss_count() : 0;
 ++	printf("FUXI ATH12K: scan completed %u BSS count %d start error %d DMA error %u faults %u\n",
@@ -32571,6 +33027,128 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..ad0a432d36b1b9c4055845b4be71e4ac
 ++	return 1;
 ++#endif
 ++}
++--- /dev/null
+++++ b/bsd/dev/fuxi_wlan_control.h
++@@ -0,0 +1,119 @@
+++#ifndef FUXI_WLAN_CONTROL_H
+++#define FUXI_WLAN_CONTROL_H
+++#include <stdint.h>
+++#include <stddef.h>
+++#include <string.h>
+++
+++struct fwc_probe {
+++	uint64_t session, generation;
+++	uint32_t sequence, pending_sequence;
+++	unsigned pending_operation, info_ready, scan_queued, scan_accepted, scan_done;
+++	int error;
+++};
+++
+++static inline uint16_t
+++fwc_read16(const uint8_t *bytes)
+++{
+++	return (uint16_t)((uint16_t)bytes[0] | (uint16_t)bytes[1] << 8);
+++}
+++
+++static inline uint32_t
+++fwc_read32(const uint8_t *bytes)
+++{
+++	return (uint32_t)fwc_read16(bytes) | (uint32_t)fwc_read16(bytes + 2) << 16;
+++}
+++
+++static inline uint64_t
+++fwc_read64(const uint8_t *bytes)
+++{
+++	return (uint64_t)fwc_read32(bytes) | (uint64_t)fwc_read32(bytes + 4) << 32;
+++}
+++
+++static inline void
+++fwc_write(uint8_t *bytes, uint64_t value, unsigned count)
+++{
+++	for (unsigned index = 0; index < count; index++) {
+++		bytes[index] = (uint8_t)(value >> (index * 8));
+++	}
+++}
+++
+++static inline size_t
+++fwc_probe_request(struct fwc_probe *probe, uint8_t *bytes, size_t capacity)
+++{
+++	if (!probe || !bytes || !probe->session || probe->error ||
+++	    probe->pending_operation || probe->scan_queued) { return 0; }
+++	unsigned operation = probe->info_ready ? 2 : 1;
+++	size_t length = operation == 2 ? 80 : 40;
+++	if (capacity < length || probe->sequence == UINT32_MAX) { return 0; }
+++	memset(bytes, 0, length);
+++	fwc_write(bytes, 0x3143574e, 4);
+++	fwc_write(bytes + 4, 1, 2);
+++	fwc_write(bytes + 6, 1, 2);
+++	fwc_write(bytes + 8, operation, 2);
+++	fwc_write(bytes + 12, ++probe->sequence, 4);
+++	fwc_write(bytes + 16, length, 4);
+++	fwc_write(bytes + 24, probe->session, 8);
+++	fwc_write(bytes + 32, probe->generation, 8);
+++	if (operation == 2) {
+++		fwc_write(bytes + 40, 19, 2);
+++		fwc_write(bytes + 42, 37, 2);
+++		probe->scan_queued = 1;
+++	}
+++	probe->pending_sequence = probe->sequence;
+++	probe->pending_operation = operation;
+++	return length;
+++}
+++
+++static inline int
+++fwc_probe_receive(struct fwc_probe *probe, uint64_t session, const void *message, size_t length)
+++{
+++	if (!probe || !message || !session || session != probe->session ||
+++	    length < 40 || length > 65536 || (length & 3)) { return 1; }
+++	const uint8_t *bytes = message;
+++	unsigned kind = fwc_read16(bytes + 6), operation = fwc_read16(bytes + 8);
+++	unsigned status = fwc_read32(bytes + 20);
+++	uint64_t generation = fwc_read64(bytes + 32);
+++	if (fwc_read32(bytes) != 0x3143574e || fwc_read16(bytes + 4) != 1 ||
+++	    fwc_read16(bytes + 10) || fwc_read32(bytes + 16) != length ||
+++	    fwc_read64(bytes + 24) != session || status >= 11 || !generation ||
+++	    (kind != 2 && kind != 3) ||
+++	    (kind == 2 && (operation < 1 || operation >= 14)) ||
+++	    (kind == 3 && (operation < 0x100 || operation >= 0x10f))) { return 1; }
+++	uint64_t attributes = 0;
+++	for (size_t offset = 40; offset < length;) {
+++		unsigned attribute = fwc_read16(bytes + offset);
+++		unsigned size = fwc_read16(bytes + offset + 2);
+++		if (!attribute || attribute >= 46 || size < 4 || size > length - offset ||
+++		    (attributes & ((uint64_t)1 << attribute))) { return 1; }
+++		attributes |= (uint64_t)1 << attribute;
+++		size_t padded = (size + 3u) & ~(size_t)3u;
+++		if (padded > length - offset) { return 1; }
+++		for (size_t index = size; index < padded; index++) {
+++			if (bytes[offset + index]) { return 1; }
+++		}
+++		offset += padded;
+++	}
+++	if (kind == 2) {
+++		if (!probe->pending_operation || operation != probe->pending_operation ||
+++		    fwc_read32(bytes + 12) != probe->pending_sequence ||
+++		    (operation != 1 && generation != probe->generation)) { return 1; }
+++		probe->pending_operation = 0;
+++		if (status) { probe->error = (int)status; return 0; }
+++		if (operation == 1) {
+++			probe->generation = generation;
+++			probe->info_ready = 1;
+++		} else {
+++			probe->scan_accepted = 1;
+++		}
+++	} else {
+++		if (!probe->info_ready || generation != probe->generation ||
+++		    fwc_read32(bytes + 12)) { return 1; }
+++		if (operation == 0x101 || operation == 0x102) {
+++			if (!probe->scan_queued) { return 1; }
+++			if (status) { probe->error = (int)status; }
+++			if (operation == 0x102) { probe->scan_done = 1; }
+++		}
+++	}
+++	return 0;
+++}
+++#endif
 diff --git a/xnu/patches/0103-fuxi-kernel-h1.patch b/xnu/patches/0103-fuxi-kernel-h1.patch
 index 39be64213fb3f55d852669cc749480ab13282a19..e5c754dec6d8bcf6b54c989c4412fc5f73b86013 100644
 --- a/xnu/patches/0103-fuxi-kernel-h1.patch
@@ -41308,13 +41886,13 @@ index 0000000000000000000000000000000000000000..34f1acfd51923932b41f74175f5617fd
 ++}
 diff --git a/xnu/variants/ath12k-link.patch b/xnu/variants/ath12k-link.patch
 new file mode 100644
-index 0000000000000000000000000000000000000000..1b30fd1893e53950bc9d90635c82df4dc227a97d
+index 0000000000000000000000000000000000000000..358792118d7d3f08c8259b61694f1a616e23953b
 --- /dev/null
 +++ b/xnu/variants/ath12k-link.patch
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,28 @@
 +--- a/makedefs/MakeInc.def
 ++++ b/makedefs/MakeInc.def
-+@@ -854,6 +854,15 @@
++@@ -854,6 +854,17 @@
 + 
 + LDFILES_KERNEL_ONLY = $(TARGET)/all-kpi.exp $(TARGET)/all-alias.exp $(TARGET)/symbolsets.plist
 + 
@@ -41323,7 +41901,9 @@ index 0000000000000000000000000000000000000000..1b30fd1893e53950bc9d90635c82df4d
 ++LDFILES_KERNEL_ONLY += $(FUXI_ATH12K_OBJECT)
 ++LDFLAGS_KERNEL_ONLY += -Wl,-u,_nw_wifi_start,-u,_nw_wifi_step,-u,_nw_wifi_stop \
 ++    -Wl,-u,_nw_wifi_poll,-u,_nw_wifi_irq_mode,-u,_nw_wifi_scan \
-++    -Wl,-u,_nw_wifi_bss_count,-u,_nw_wifi_bss_get,-u,_nw_wifi_stats
+++    -Wl,-u,_nw_wifi_bss_count,-u,_nw_wifi_bss_get,-u,_nw_wifi_stats \
+++    -Wl,-u,_nw_wifi_set_platform,-u,_nw_wifi_control_transport_set \
+++    -Wl,-u,_nw_wifi_control_attach,-u,_nw_wifi_control_receive
 ++endif
 ++endif
 ++
