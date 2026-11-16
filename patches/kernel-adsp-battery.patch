@@ -297,7 +297,7 @@ index c7d2b39..22b499a 100644
          if args.root_extents:
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..073f6d4
+index 0000000..9c9b30b
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
 @@ -0,0 +1,142 @@
@@ -437,7 +437,7 @@ index 0000000..073f6d4
 +    if args.check:
 +        assert PATCH.read_text() == patch, 'fuxi-adsp sources differ; run tools/sync-fuxi-adsp.py'
 +    else:
-+        PATCH.write_text(patch)
++        PATCH.write_text(patch, newline='\n')
 +    print(f'PASS: fuxi-adsp canonical sources match 0117 ({len(SOURCES)} sources in the build list, {len(HEADERS)} other files)')
 +
 +
@@ -3791,10 +3791,10 @@ index 0000000..5633228
 +}
 diff --git a/xnu/fuxi-adsp/SweetBattery.cpp b/xnu/fuxi-adsp/SweetBattery.cpp
 new file mode 100644
-index 0000000..32e5255
+index 0000000..4be20a9
 --- /dev/null
 +++ b/xnu/fuxi-adsp/SweetBattery.cpp
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,478 @@
 +/*
 + * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
 + * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
@@ -3810,6 +3810,7 @@ index 0000000..32e5255
 +#include <IOKit/IOWorkLoop.h>
 +#include <IOKit/IOTimerEventSource.h>
 +#include <IOKit/pwr_mgt/IOPMPowerSource.h>
++#include <IOKit/pwr_mgt/IOPM.h>
 +#include <libkern/c++/OSCollectionIterator.h>
 +#include <pexpert/pexpert.h>
 +/* bsd/dev/sweet_spmi.c */
@@ -4062,6 +4063,28 @@ index 0000000..32e5255
 +	if (b.external_known && b.status_known) {
 +		setIsCharging(b.charging != 0);
 +		putBool("FullyCharged", b.fully_charged != 0);
++	}
++	if (b.external_known) {
++		OSDictionary *adapter = OSDictionary::withCapacity(4);
++		if (adapter) {
++			const char *keys[] = {kIOPMPSAdapterDetailsFamilyKey, kIOPMPSAdapterDetailsVoltage,
++			    kIOPMPSAdapterDetailsAmperageKey, kIOPMPSAdapterDetailsWattsKey};
++			const UInt32 values[] = {b.external ? b.adapter_family : 0,
++			    b.external && b.adapter_mv > 0 ? (UInt32)b.adapter_mv : 0,
++			    b.external && b.adapter_ma > 0 ? (UInt32)b.adapter_ma : 0,
++			    b.external && b.adapter_watts > 0 ? (UInt32)b.adapter_watts : 0};
++			for (unsigned index = 0; index < sizeof(values) / sizeof(values[0]); index++) {
++				OSNumber *number = OSNumber::withNumber(values[index], 32);
++				if (number) {
++					adapter->setObject(keys[index], number);
++					number->release();
++				}
++			}
++			const OSSymbol *key = OSSymbol::withCString(kIOPMPSAdapterDetailsKey);
++			if (key) setPSProperty(key, adapter);
++			OSSafeReleaseNULL(key);
++			adapter->release();
++		}
 +	}
 +	setAtWarnLevel(false);
 +	/* Never a critical shutdown from this path: the PMIC cuts off an empty cell. */
@@ -5119,10 +5142,10 @@ index 0000000..07be418
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp_battery.c b/xnu/fuxi-adsp/fuxi_adsp_battery.c
 new file mode 100644
-index 0000000..67cd53c
+index 0000000..b40d2f7
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp_battery.c
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,296 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* fuxiadsp=2: the client of the battery manager the audio DSP runs (PMIC GLINK channel "PMIC_RTR_ADSP_APPS"). Phase 1 only reads:
 + * every refresh cycle of ShengBattmgr.c (one request in flight, 2 s per request, a cycle every 60 s and at each notification) ends
@@ -5155,7 +5178,7 @@ index 0000000..67cd53c
 +extern unsigned fuxi_adsp_mode(void);
 +
 +#define FB_REQUEST_MS 2000u
-+#define FB_REFRESH_MS 60000u
++#define FB_REFRESH_MS 10000u
 +#define FB_SLOW_EVERY 10u
 +#define FB_RING 16u
 +
@@ -5242,6 +5265,10 @@ index 0000000..67cd53c
 +    b.cycles = s->cycles > 0 ? s->cycles : 0;
 +    b.minutes_to_empty = s->time_to_empty_min;
 +    b.minutes_to_full = s->time_to_full_min;
++    b.adapter_family = s->adapter_family;
++    b.adapter_mv = s->adapter_mv;
++    b.adapter_ma = s->adapter_ma;
++    b.adapter_watts = s->adapter_watts;
 +    b.present = s->present ? 1 : 0;
 +    b.external = s->external ? 1 : 0;
 +    b.external_known = s->external_known ? 1 : 0;
@@ -5417,10 +5444,10 @@ index 0000000..67cd53c
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp_battery.h b/xnu/fuxi-adsp/fuxi_adsp_battery.h
 new file mode 100644
-index 0000000..547bc1e
+index 0000000..b89d988
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp_battery.h
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,31 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* fuxiadsp=3: the battery manager's readings as SweetBattery (iokit/Kernel/arm/SweetBattery.cpp) publishes them to powerd.
 + * Shared by bsd/dev/fuxi_adsp_battery.c (C) and SweetBattery.cpp (C++); plain data only. */
@@ -5438,6 +5465,8 @@ index 0000000..547bc1e
 +    int32_t temperature;              /* centidegrees C, valid only with temperature_valid */
 +    int32_t raw_mah, full_mah, design_mah, cycles;  /* 0: not reported */
 +    int32_t minutes_to_empty, minutes_to_full;      /* -1: unknown */
++    uint32_t adapter_family;
++    int32_t adapter_mv, adapter_ma, adapter_watts;
 +    uint8_t present, external, external_known, charging, status_known, fully_charged, temperature_valid, pad;
 +} FuxiAdspBattery;
 +
@@ -7311,10 +7340,10 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..71a06c2
+index 0000000..2476eae
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,5100 @@
+@@ -0,0 +1,5134 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,22 @@
@@ -8351,7 +8380,7 @@ index 0000000..71a06c2
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp_battery.c
-+@@ -0,0 +1,292 @@
++@@ -0,0 +1,296 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* fuxiadsp=2: the client of the battery manager the audio DSP runs (PMIC GLINK channel "PMIC_RTR_ADSP_APPS"). Phase 1 only reads:
 ++ * every refresh cycle of ShengBattmgr.c (one request in flight, 2 s per request, a cycle every 60 s and at each notification) ends
@@ -8384,7 +8413,7 @@ index 0000000..71a06c2
 ++extern unsigned fuxi_adsp_mode(void);
 ++
 ++#define FB_REQUEST_MS 2000u
-++#define FB_REFRESH_MS 60000u
+++#define FB_REFRESH_MS 10000u
 ++#define FB_SLOW_EVERY 10u
 ++#define FB_RING 16u
 ++
@@ -8471,6 +8500,10 @@ index 0000000..71a06c2
 ++    b.cycles = s->cycles > 0 ? s->cycles : 0;
 ++    b.minutes_to_empty = s->time_to_empty_min;
 ++    b.minutes_to_full = s->time_to_full_min;
+++    b.adapter_family = s->adapter_family;
+++    b.adapter_mv = s->adapter_mv;
+++    b.adapter_ma = s->adapter_ma;
+++    b.adapter_watts = s->adapter_watts;
 ++    b.present = s->present ? 1 : 0;
 ++    b.external = s->external ? 1 : 0;
 ++    b.external_known = s->external_known ? 1 : 0;
@@ -12029,7 +12062,7 @@ index 0000000..71a06c2
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp_battery.h
-+@@ -0,0 +1,29 @@
++@@ -0,0 +1,31 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* fuxiadsp=3: the battery manager's readings as SweetBattery (iokit/Kernel/arm/SweetBattery.cpp) publishes them to powerd.
 ++ * Shared by bsd/dev/fuxi_adsp_battery.c (C) and SweetBattery.cpp (C++); plain data only. */
@@ -12047,6 +12080,8 @@ index 0000000..71a06c2
 ++    int32_t temperature;              /* centidegrees C, valid only with temperature_valid */
 ++    int32_t raw_mah, full_mah, design_mah, cycles;  /* 0: not reported */
 ++    int32_t minutes_to_empty, minutes_to_full;      /* -1: unknown */
+++    uint32_t adapter_family;
+++    int32_t adapter_mv, adapter_ma, adapter_watts;
 ++    uint8_t present, external, external_known, charging, status_known, fully_charged, temperature_valid, pad;
 ++} FuxiAdspBattery;
 ++
@@ -12194,7 +12229,13 @@ index 0000000..71a06c2
 +  */
 + #if defined(ARM64_BOARD_CONFIG_SWEET)
 + #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
-+@@ -15,6 +18,11 @@
++@@ -10,11 +13,17 @@
++ #include <IOKit/IOWorkLoop.h>
++ #include <IOKit/IOTimerEventSource.h>
++ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+++#include <IOKit/pwr_mgt/IOPM.h>
++ #include <libkern/c++/OSCollectionIterator.h>
++ #include <pexpert/pexpert.h>
 + /* bsd/dev/sweet_spmi.c */
 + extern "C" int sweet_spmi_init(void);
 + extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
@@ -12206,7 +12247,7 @@ index 0000000..71a06c2
 + 
 + class SweetBattery : public IOPMPowerSource {
 + 	OSDeclareDefaultStructors(SweetBattery);
-+@@ -23,16 +31,21 @@
++@@ -23,16 +32,21 @@
 + 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 + 	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
 + 	void free(void) APPLE_KEXT_OVERRIDE;
@@ -12229,7 +12270,7 @@ index 0000000..71a06c2
 + 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
 + 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
 + 	static bool readWord(unsigned address, uint16_t *value);
-+@@ -40,6 +53,33 @@
++@@ -40,6 +54,33 @@
 + };
 + OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
 + 
@@ -12263,7 +12304,7 @@ index 0000000..71a06c2
 + bool
 + SweetBattery::init(OSDictionary *dictionary)
 + {
-+@@ -51,7 +91,7 @@
++@@ -51,7 +92,7 @@
 + 	}
 + 	fLoop = NULL;
 + 	fTimer = NULL;
@@ -12272,7 +12313,7 @@ index 0000000..71a06c2
 + 	if (dictionary) {
 + 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
 + 		if (!it) {
-+@@ -72,6 +112,8 @@
++@@ -72,6 +113,8 @@
 + 		}
 + 	}
 + 	fLastMode = -1;
@@ -12281,7 +12322,7 @@ index 0000000..71a06c2
 + 	return true;
 + }
 + 
-+@@ -203,9 +245,99 @@
++@@ -203,9 +246,121 @@
 + 	return 100;
 + }
 + 
@@ -12305,6 +12346,28 @@ index 0000000..71a06c2
 ++	if (b.external_known && b.status_known) {
 ++		setIsCharging(b.charging != 0);
 ++		putBool("FullyCharged", b.fully_charged != 0);
+++	}
+++	if (b.external_known) {
+++		OSDictionary *adapter = OSDictionary::withCapacity(4);
+++		if (adapter) {
+++			const char *keys[] = {kIOPMPSAdapterDetailsFamilyKey, kIOPMPSAdapterDetailsVoltage,
+++			    kIOPMPSAdapterDetailsAmperageKey, kIOPMPSAdapterDetailsWattsKey};
+++			const UInt32 values[] = {b.external ? b.adapter_family : 0,
+++			    b.external && b.adapter_mv > 0 ? (UInt32)b.adapter_mv : 0,
+++			    b.external && b.adapter_ma > 0 ? (UInt32)b.adapter_ma : 0,
+++			    b.external && b.adapter_watts > 0 ? (UInt32)b.adapter_watts : 0};
+++			for (unsigned index = 0; index < sizeof(values) / sizeof(values[0]); index++) {
+++				OSNumber *number = OSNumber::withNumber(values[index], 32);
+++				if (number) {
+++					adapter->setObject(keys[index], number);
+++					number->release();
+++				}
+++			}
+++			const OSSymbol *key = OSSymbol::withCString(kIOPMPSAdapterDetailsKey);
+++			if (key) setPSProperty(key, adapter);
+++			OSSafeReleaseNULL(key);
+++			adapter->release();
+++		}
 ++	}
 ++	setAtWarnLevel(false);
 ++	/* Never a critical shutdown from this path: the PMIC cuts off an empty cell. */
@@ -12381,7 +12444,7 @@ index 0000000..71a06c2
 + 	uint8_t type, present, usb, path, charger, error, temperature;
 + 	uint16_t rawVoltage;
 + 	bool valid = fReal &&
-+@@ -252,7 +384,8 @@
++@@ -252,7 +407,8 @@
 + 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
 + 	if (self && self->fRunning) {
 + 		self->poll();
@@ -12391,7 +12454,7 @@ index 0000000..71a06c2
 + 	}
 + }
 + 
-+@@ -265,17 +398,20 @@
++@@ -265,17 +421,20 @@
 + 	int real = 0;
 + 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
 + 	fReal = real == 1 && sweet_spmi_init() == 0;
