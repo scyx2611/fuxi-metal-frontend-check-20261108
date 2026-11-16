@@ -2099,10 +2099,10 @@ index 0000000000000000000000000000000000000000..ad99370f8f5007bb39e994d952c10778
 +不新增 HEADERS 或 build-list 項目；`fuxi_pmic.c` 已在既有 SOURCES 中。
 diff --git a/docs-lanes/pmic-torch.md b/docs-lanes/pmic-torch.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..f261e09693ac3a9684303e1fc82db10c5b112d93
+index 0000000000000000000000000000000000000000..6b6576e9e126a4ec7a4e9148204d3377362a58d1
 --- /dev/null
 +++ b/docs-lanes/pmic-torch.md
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,110 @@
 +# PM8550 torch control
 +
 +`fuxi,pmic=1` surveys the PMIC. Mode 2 runs one 40 mA, 80 ms pulse with a
@@ -2116,9 +2116,12 @@ index 0000000000000000000000000000000000000000..f261e09693ac3a9684303e1fc82db10c
 +60 or 80 mA; zero stops. Each write renews a two-second lease. Mode 3 now
 +uses continuous torch output. It writes the current and software-strobe
 +configuration once, disables the flash timeout, and keeps the module and
-+channel enabled until stop, a level change, lease expiration or a failed
++channel enabled until stop, lease expiration or a failed
 +health check. Its 20 ms health checks only read registers. An unchanged
-+level never disables or re-enables the output.
++level never writes registers. A change between nonzero levels checks the
++existing configuration and fault status, updates only channel 0 target
++current at offset `0x42`, verifies the new configuration and fault status,
++and preserves the original idle snapshot for the eventual stop.
 +
 +This replaces the old mode 3 sequence of 80 ms pulses and per-pulse
 +restoration. In the 2026-11-16 manual run
@@ -2132,6 +2135,18 @@ index 0000000000000000000000000000000000000000..f261e09693ac3a9684303e1fc82db10c
 +module enable and software channel strobe. Mode 2 retains its bounded pulse
 +implementation. No thermal thresholds, boost settings or channel ownership
 +are changed.
++
++Live current updates follow Qualcomm's `qti_flash_led_enable` in
++`drivers/leds/leds-qti-flash.c`, pinned at Android kernel/msm commit
++`b6410c3f75259c0ca2df45a01838d2e46272723e`. Its already-enabled torch path
++returns after configuring current, before timer or strobe setup:
++https://android.googlesource.com/kernel/msm/+/b6410c3f75259c0ca2df45a01838d2e46272723e/drivers/leds/leds-qti-flash.c
++The current resolution stays fixed at 5 mA, so the fuxi live update needs
++only the target current write. The existing 20/40/60/80 mA limits remain.
++In `native-hw000torchsteady-user-boot-1` on 2026-11-16, the user confirmed
++continuous light at a fixed level but observed a blink while changing
++brightness. That version stopped and restarted for every level change.
++The live update correction still requires separate physical observation.
 +
 +Mode 3 reads all three fault status bytes and verifies its configuration
 +during each health check. Stop disables the channel and module, requires two
@@ -2161,10 +2176,12 @@ index 0000000000000000000000000000000000000000..f261e09693ac3a9684303e1fc82db10c
 +caller admission, renewal, expiration, invalid levels, overflow and latched failure. These
 +checks do not establish visible light or continuous output quality.
 +`tools/test-fuxi-torch-steady.py --sanitize` adds four modeled 120-second
-+holds with exactly one enable transition, 100 requested level changes,
-+explicit stop, lease expiration and injected read/write/drop failures.
-+The new continuous implementation still requires an actual device run and
-+human observation.
++holds with exactly one enable transition, 100 requested levels including
++upward and downward changes, and all nonzero level pairs without cycling
++the output. It checks explicit stop, lease expiration, injected failures at
++every update read, failed and dropped current writes, configuration changes
++and fault status before and after a current update, and no restart after
++failure. Physical brightness transitions remain a manual device check.
 +
 +The survey also reads haptic boost offset 0x41 and additional haptic
 +configuration offsets. The boost channel is owner 3. No haptic writes are
@@ -15403,10 +15420,10 @@ index 0000000000000000000000000000000000000000..f23f150e4496c835fc4a59db1fa6a44c
 +    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-torch-steady.py b/tools/test-fuxi-torch-steady.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..e04f2e85edeaf04e1793590dc3d3636922fbd8b6
+index 0000000000000000000000000000000000000000..bb751037050ba705b9423efe8b3c20e29a752fca
 --- /dev/null
 +++ b/tools/test-fuxi-torch-steady.py
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,307 @@
 +import argparse
 +import os
 +from pathlib import Path
@@ -15426,7 +15443,7 @@ index 0000000000000000000000000000000000000000..e04f2e85edeaf04e1793590dc3d36369
 +typedef struct {
 +    uint8_t registers[256], original[256];
 +    unsigned reads, writes, fail_read, fail_write, drop_write, fail_after_write;
-+    unsigned starts, stops, holding;
++    unsigned starts, stops, holding, live_updates, corrupt_after_update;
 +    uint64_t now_us, drop_mask;
 +} Model;
 +static unsigned active(const Model *model) {
@@ -15449,8 +15466,14 @@ index 0000000000000000000000000000000000000000..e04f2e85edeaf04e1793590dc3d36369
 +    unsigned before = active(model);
 +    if (model->writes != model->drop_write &&
 +        !(model->writes < 64 && (model->drop_mask & (UINT64_C(1) << model->writes)))) {
-+        if (before) CHECK(offset == 0x46 || offset == 0x4e);
++        if (before) CHECK(offset == 0x42 || offset == 0x46 || offset == 0x4e);
++        if (before && offset == 0x42) {
++            CHECK(value <= 15 && (value & 3) == 3);
++            model->live_updates++;
++        }
 +        model->registers[offset] = value;
++        if (before && offset == 0x42 && model->corrupt_after_update)
++            model->registers[model->corrupt_after_update] ^= 1;
 +    }
 +    unsigned after = active(model);
 +    if (!before && after) {
@@ -15516,18 +15539,93 @@ index 0000000000000000000000000000000000000000..e04f2e85edeaf04e1793590dc3d36369
 +    FuxiTorchRuntime runtime = {0};
 +    fixture(&model, &state);
 +    FuxiTorchIo io = io_for(&model);
++    static const unsigned levels[] = {1, 2, 3, 4, 3, 2};
 +    for (unsigned round = 0; round < 100; round++) {
-+        unsigned level = round % 4 + 1;
++        unsigned level = levels[round % 6];
 +        CHECK(!fuxi_torch_steady_step(&io, &state, level));
 +        CHECK(active(&model) && state.level == level && !state.failed);
++        CHECK(!memcmp(state.saved, (uint8_t[]){0x89, 23, 0x0a, 4, 0x20, 0}, 6));
 +    }
-+    CHECK(model.starts == 100 && model.stops == 99);
++    CHECK(model.starts == 1 && !model.stops && model.live_updates == 99 && model.writes == 105);
 +    CHECK(!fuxi_torch_request(&runtime, 4, 0));
 +    CHECK(fuxi_torch_requested(&runtime, 1999999999) == 4);
 +    CHECK(!fuxi_torch_requested(&runtime, 2000000000));
 +    CHECK(!fuxi_torch_steady_step(&io, &state, 0));
-+    CHECK(!active(&model) && model.stops == 100 && !state.prepared);
++    CHECK(!active(&model) && model.stops == 1 && !state.prepared && model.writes == 111);
 +    CHECK(!memcmp(model.registers, model.original, sizeof(model.original)));
++}
++static void latched_off(Model *model, FuxiTorchIo *io, FuxiTorchSteady *state) {
++    CHECK(state->failed && !active(model) && model->starts == 1 && model->stops == 1);
++    unsigned reads = model->reads, writes = model->writes;
++    for (unsigned level = 0; level <= 4; level++)
++        CHECK(fuxi_torch_steady_step(io, state, level) < 0);
++    CHECK(model->reads == reads && model->writes == writes);
++}
++static void live_current_changes(void) {
++    static const unsigned observed[] = {0x3e, 0x42, 0x49, 0x4a, 0x46, 0x4e, 6, 7, 9};
++    for (unsigned previous = 1; previous <= 4; previous++) {
++        for (unsigned level = 1; level <= 4; level++) {
++            Model model;
++            FuxiTorchSteady state;
++            fixture(&model, &state);
++            FuxiTorchIo io = io_for(&model);
++            CHECK(!fuxi_torch_steady_step(&io, &state, previous));
++            uint8_t enabled[256], saved[6];
++            memcpy(enabled, model.registers, sizeof(enabled));
++            memcpy(saved, state.saved, sizeof(saved));
++            unsigned reads = model.reads, writes = model.writes;
++            model.holding = previous == level;
++            CHECK(!fuxi_torch_steady_step(&io, &state, level));
++            unsigned update_reads = model.reads - reads, update_writes = model.writes - writes;
++            CHECK(model.starts == 1 && !model.stops && active(&model) && state.level == level);
++            CHECK(update_writes == (previous != level ? 1u : 0u));
++            CHECK(model.live_updates == (previous != level ? 1u : 0u));
++            CHECK(!memcmp(saved, state.saved, sizeof(saved)));
++            enabled[0x42] = (uint8_t)(level * 4 - 1);
++            CHECK(!memcmp(enabled, model.registers, sizeof(enabled)));
++            model.holding = 0;
++            CHECK(!fuxi_torch_steady_step(&io, &state, 0));
++            CHECK(model.starts == 1 && model.stops == 1 && !state.prepared);
++            CHECK(!memcmp(model.registers, model.original, sizeof(model.original)));
++            if (previous == level) continue;
++            for (unsigned index = 1; index <= update_reads; index++) {
++                fixture(&model, &state);
++                CHECK(!fuxi_torch_steady_step(&io, &state, previous));
++                model.fail_read = model.reads + index;
++                CHECK(fuxi_torch_steady_step(&io, &state, level) < 0);
++                latched_off(&model, &io, &state);
++            }
++            for (unsigned after = 0; after <= 1; after++) {
++                fixture(&model, &state);
++                CHECK(!fuxi_torch_steady_step(&io, &state, previous));
++                model.fail_write = model.writes + 1;
++                model.fail_after_write = after;
++                CHECK(fuxi_torch_steady_step(&io, &state, level) < 0);
++                latched_off(&model, &io, &state);
++            }
++            fixture(&model, &state);
++            CHECK(!fuxi_torch_steady_step(&io, &state, previous));
++            model.drop_write = model.writes + 1;
++            CHECK(fuxi_torch_steady_step(&io, &state, level) < 0);
++            latched_off(&model, &io, &state);
++            for (unsigned index = 0; index < sizeof(observed) / sizeof(observed[0]); index++) {
++                fixture(&model, &state);
++                CHECK(!fuxi_torch_steady_step(&io, &state, previous));
++                unsigned enabled_before = active(&model);
++                model.registers[observed[index]] ^= 1;
++                if (enabled_before && !active(&model)) model.stops++;
++                CHECK(fuxi_torch_steady_step(&io, &state, level) < 0);
++                latched_off(&model, &io, &state);
++                CHECK(!model.live_updates);
++                fixture(&model, &state);
++                CHECK(!fuxi_torch_steady_step(&io, &state, previous));
++                model.corrupt_after_update = observed[index];
++                CHECK(fuxi_torch_steady_step(&io, &state, level) < 0);
++                latched_off(&model, &io, &state);
++                CHECK(model.live_updates == 1);
++            }
++        }
++    }
 +}
 +static void failures(void) {
 +    Model model;
@@ -15597,8 +15695,9 @@ index 0000000000000000000000000000000000000000..e04f2e85edeaf04e1793590dc3d36369
 +int main(void) {
 +    steady_output();
 +    transitions_and_expiry();
++    live_current_changes();
 +    failures();
-+    printf("PASS steady torch: %u checks; four 120s modeled holds without disable/re-enable; stop, lease expiry, level changes and injected failures\n", checks);
++    printf("PASS steady torch: %u checks; four 120s modeled holds and all level pairs without disable/re-enable; stop, lease expiry and injected failures\n", checks);
 +    return 0;
 +}
 +'''
@@ -24131,10 +24230,10 @@ index 0000000000000000000000000000000000000000..6bd480ab4dff5b0ba14a51ec1a81341a
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_torch_steady.h b/xnu/fuxi-adsp/fuxi_torch_steady.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..f829135b3d9280446ff6049f072240c1ea3e0808
+index 0000000000000000000000000000000000000000..1f7db7e3f0e7591b97f2b65baed772ca4dc2adae
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_torch_steady.h
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,134 @@
 +#ifndef FUXI_TORCH_STEADY_H
 +#define FUXI_TORCH_STEADY_H
 +#include "fuxi_torch_pulse.h"
@@ -24245,15 +24344,19 @@ index 0000000000000000000000000000000000000000..f829135b3d9280446ff6049f072240c1
 +    int result = 0, cleanup = 0;
 +    if (!level) {
 +        result = fuxi_torch_steady_stop(io, state);
-+    } else if (state->level == level) {
++    } else if (state->prepared) {
 +        result = fuxi_torch_steady_check(io, state);
 +        cleanup = 1;
-+    } else {
-+        result = fuxi_torch_steady_stop(io, state);
-+        if (!result) {
-+            result = fuxi_torch_steady_start(io, state, level);
-+            cleanup = 1;
++        if (!result && state->level != level) {
++            result = fuxi_torch_steady_write(io, 0x42, (uint8_t)(level * 4 - 1));
++            if (!result) {
++                state->level = level;
++                result = fuxi_torch_steady_check(io, state);
++            }
 +        }
++    } else {
++        result = fuxi_torch_steady_start(io, state, level);
++        cleanup = 1;
 +    }
 +    if (result) {
 +        if (state->prepared && cleanup) {
@@ -32990,10 +33093,10 @@ index 8349337a07a3e684205b00f3835e0c55a2736f43..34b8d1cbf951e77c5b17b4ca443e19e6
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000000000000000000000000000000000000..457ee84eeb0bb02f48d8f7842bad8211f1303ecd
+index 0000000000000000000000000000000000000000..5ab0149d0df3321ebf8d1f84ffc1df363424f016
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,7861 @@
+@@ -0,0 +1,7865 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,27 @@
@@ -40326,7 +40429,7 @@ index 0000000000000000000000000000000000000000..457ee84eeb0bb02f48d8f7842bad8211
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_torch_steady.h
-+@@ -0,0 +1,130 @@
++@@ -0,0 +1,134 @@
 ++#ifndef FUXI_TORCH_STEADY_H
 ++#define FUXI_TORCH_STEADY_H
 ++#include "fuxi_torch_pulse.h"
@@ -40437,15 +40540,19 @@ index 0000000000000000000000000000000000000000..457ee84eeb0bb02f48d8f7842bad8211
 ++    int result = 0, cleanup = 0;
 ++    if (!level) {
 ++        result = fuxi_torch_steady_stop(io, state);
-++    } else if (state->level == level) {
+++    } else if (state->prepared) {
 ++        result = fuxi_torch_steady_check(io, state);
 ++        cleanup = 1;
-++    } else {
-++        result = fuxi_torch_steady_stop(io, state);
-++        if (!result) {
-++            result = fuxi_torch_steady_start(io, state, level);
-++            cleanup = 1;
+++        if (!result && state->level != level) {
+++            result = fuxi_torch_steady_write(io, 0x42, (uint8_t)(level * 4 - 1));
+++            if (!result) {
+++                state->level = level;
+++                result = fuxi_torch_steady_check(io, state);
+++            }
 ++        }
+++    } else {
+++        result = fuxi_torch_steady_start(io, state, level);
+++        cleanup = 1;
 ++    }
 ++    if (result) {
 ++        if (state->prepared && cleanup) {
