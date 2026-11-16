@@ -1,0 +1,46 @@
+name: Build libfuxi-sb.dylib (status bar follows the punch hole)
+on:
+  workflow_dispatch:
+  # A workflow that is not on the default branch cannot be dispatched by hand, so the branch push starts it.
+  push:
+    branches:
+      - codex/adsp-battery
+    paths:
+      - userland/fuxi-shape/**
+      - .github/workflows/sb-shape.yml
+permissions:
+  contents: read
+jobs:
+  dylib:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build, sign ad hoc, check
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+          cc=$(xcrun --sdk iphoneos --find clang)
+          mkdir -p out
+          "$cc" -target arm64-apple-ios16.0 -isysroot "$sdk" -O2 -Wall -Wextra -Werror -fstack-protector-strong \
+              -dynamiclib userland/fuxi-shape/FuxiShape.c -lobjc \
+              -install_name /usr/local/lib/fuxi/libfuxi-sb.dylib -o out/libfuxi-sb.dylib
+          codesign -f -s - out/libfuxi-sb.dylib
+          codesign --verify --strict out/libfuxi-sb.dylib
+          lipo -info out/libfuxi-sb.dylib | tee out/lipo.txt
+          grep -q 'arm64$' out/lipo.txt
+          otool -L out/libfuxi-sb.dylib | tee out/otool-L.txt
+          otool -l out/libfuxi-sb.dylib | grep -A4 LC_BUILD_VERSION | tee out/build-version.txt
+          nm -u out/libfuxi-sb.dylib | tee out/undefined.txt
+          (cd out && shasum -a 256 libfuxi-sb.dylib > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fuxi-sb-shape
+          path: out/
+          retention-days: 7
