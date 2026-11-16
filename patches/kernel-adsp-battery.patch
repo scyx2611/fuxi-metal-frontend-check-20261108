@@ -2340,6 +2340,394 @@ index 0000000..dce5f73
 +default actual-DTB CLI、`--inventory-json -` stdin 入口都通過 JSON／counts／defer／null／source-hash assertions。可讀既有 inventory JSON file 的 `--inventory-json FILE`，不需要修改既有 inventory；本次 stdin 檢查在記憶體中重用其輸出，沒有新寫 inventory 檔。另複核官方 tag／commit identity、13/13 upstream Git blobs／SHA-256，以及上述 32 MiB-aligned proposal 的 whitelist／holes／metadata arithmetic。
 +
 +**仍待證：**當次 board-patched compiled configuration（ARM_LARGE_MEMORY／XNU_MONITOR／KASAN／page-table granules）、actual boot_args／ADT named owners、PTOV／PTE／cache state、topOfKernelData／first_avail／free-page counts、所有 dynamic activation／placement／lifetime、live-owner 完整 PA extents、late-add accounting 與 DMA／security access，以及新 bank 和新 layout 的實機存取／穩定性。沒有 hardware writes，沒有重做主線 RAM512 測試，沒有日常部署或全 12GB 可用保證。
+diff --git a/docs-lanes/ram-android-owner-20261116.md b/docs-lanes/ram-android-owner-20261116.md
+new file mode 100644
+index 0000000..574aaa7
+--- /dev/null
++++ b/docs-lanes/ram-android-owner-20261116.md
+@@ -0,0 +1,382 @@
++# Fuxi 8/12GB SKU、Android owners 與 30MiB shadow 提案
++
++日期：2026-11-16。這是 host-only evidence／source／算法 checkpoint，不是新增 RAM admission。只新增本文件；RAM shadow 四檔已由主代理提交於 `27bb0cf5536d1ad2d9826b273ca48a0f9b49bf99` 並 freeze。本 worker 不改 loader／shim／mkadt／GPU／sync／其他 agents 檔案，不操作手機、鎖、adb／fastboot、commit／push。文件只保留摘要、hash 與 owning references，不收錄或發布 raw DTB、private memory capture、payload／boot image。
++
++## 先分 SKU，再分 layout
++
++**目前連接設備是使用者確認的 12GB 版。主代理另在當前 live FDT 的 `/memory` property `ddr_size` 確認四個 bytes `0000000c`，按 big-endian u32 解碼為 12。** 本輪 `ro.boot.ddr_size` 無值不表示 8GB，更不能用 `/memory` union 或 `MemTotal` 猜 SKU。
++
++| 項目 | 12GB SKU | 8GB SKU |
++| --- | --- | --- |
++| identity／topology evidence | 使用者確認＋live FDT `ddr_size=12`，現有 capture 僅適用此 SKU | 無 captured DTB、獨立 live map、boot 或 hardware test；unsupported／fail-closed |
++| 現行 layout | `usable9g` 是 `[0x8c0000000,0xafe000000)`＝9184MiB 階段窗口，不是 12GB 整合終點 | 不複用 12GB PA topology；也不把現有 `full`／5GiB 窗口叫作 8GB profile |
++| GPU scratch | 此 12GB layout 的 `[0xafe000000,0xb00000000)`＝32MiB，固定排除 | scratch base／size／owners 未證；不得硬編 `0xafe000000` 或猜另一個 PA |
++| counters | physical SKU、DT advertisement、metadata span、managed／allocatable／free bytes 分開 | 必須取得自己的 advertisement、保留 union、usable counters；目前未知量維持 null |
++| 允許的下一步 | 繼續 12GB 共用 driver／host proof／小 bank 準備 | 只做辨識與拒絕 regression；不 build 可 boot 候選 |
++
++12GB 上縮小 available memory，可測共用 driver、allocation 壓力與 SKU／越界拒絕；**不是 8GB 真實 topology／owner validation 或正式 8GB 驗收**。正式 8GB 驗收最後仍需 8GB 實機；不讓尚缺的 8GB 證據阻擋 12GB 的 bounded 準備。
++
++主代理 owns `tools/mkadt-fuxi.py`、`tools/test-fuxi-ram9g.py` 與兩個 work/prepare loaders 的 SKU/layout 分離和 metadata；本文件不代改。`physical_sku=12g` 與 `usable_layout=9g` 是不同欄位，不把一個 size selector 當 SKU。主代理回報 9184MiB 日常 chain-v6 已部署；這不是全 RAM、全 12GB 或 8GB 的硬體驗收。
++
++**12g/9g image 絕不能在 8GB 上進入 XNU／GPU staging。** Host packer 的 SKU gate 不替代 runtime FDT guard：入口須在任何 kernel／scratch 寫入之前，驗證傳入 FDT、唯一合法 `ddr_size` 的 big-endian u32、image SKU 相符，以及該 SKU 的 live advertised ranges／reserved extents。missing／malformed／conflict／8GB unsupported 必須停止 XNU 路徑，不能 fallback 到 12GB PA 常數。此處是 guard contract，尚未宣稱已接入部署影像。
++
++## 當前 Android capture 對照
++
++Capture 時間為 `2026-11-16T16:05:37.896075+08:00`。本 worker 只讀 host copy，五個 records 的長度與 SHA-256 均已核對。來源 manifest：[memory.json](D:/xiaomi13/fuxi_ios/work/adsp-battery/android-memory-20261116-1606/memory.json:3)。
++
++| 輸入／視圖 | 本次數字／狀態 | 不能推出的結論 |
++| --- | --- | --- |
++| iomem.txt | 12217 bytes；SHA-256 `01f9cf713d9327d5c4eabe25a3c695ea6bf4dab6535b5394508929784f1780fe` | 不是完整的 dynamic／firmware／iOS owners manifest |
++| meminfo.txt | 1234 bytes；SHA-256 `c00259db11de24928c061b202813cdac5c6347d7041aa1dcabbdb9c60410a2e6` | 不代表每頁均可供 XNU 使用 |
++| Android System RAM union | 14 段，12049768448 bytes＝11491.5546875MiB | 包含列於其內的 reserved children，不是 free RAM |
++| Linux MemTotal | 11459124KiB＝11190.55078125MiB | OS managed 視圖，不是 physical SKU 或 XNU allocatable |
++| Linux CmaTotal | 790528KiB＝772MiB，CmaFree 為 0 | 不與候選／DT dynamic size requests 相加減，不視為額外空閒 bank |
++| memblock-memory／reserved | 兩者皆 `MISSING_READ_ONLY_INTERFACE` | missing 不表示零保留或 owner coverage complete |
++| DT advertisement union | 12543721472 bytes＝11962.625MiB | 此數不是焊接 DRAM 總量／全 12GB 可加入 VM 的證明 |
++
++DT host reference SHA-256 為 `2d7e97ea52bf67a79ef7b99487131a41bd87fc0ab774983ce62bfb9fa79fb9fa`；本 worker 用既有 [parser](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/tools/fuxi-inspect-dtb.py:13) 再核對 `/memory/ddr_size`，確為 `0000000c`／big-endian u32 12。reuse inventory 和 union/intersection/subtract，不另發布 DTB。iomem 的 inclusive end 先加一轉成 `[start,end)`，再對 parent／child 重疊及相鄰去重。所有本次 System RAM 均在 DT advertised union 內。
++
++| DT 幾何候選 `[start,end)` | MiB | 與 Android 已列 owners 的 raw byte-union 交集 MiB |
++| --- | ---: | ---: |
++| `[0x880000000,0x8b9d00000)` | 925 | 0；完整列於 System RAM，但 absence／lifetime 未證 |
++| `[0x8b9f00000,0x8bbd00000)` | 30 | 0；同上，仍 defer |
++| `[0xa7400000,0xb8000000)` | 268 | 78.515625，Kernel code／data 與 reserved |
++| `[0xbab00000,0xd4d00000)` | 418 | 364，reserved |
++| `[0xe7cb0000,0xff800000)` | 379.3125 | 316，reserved |
++
++來源：[高位兩 banks](D:/xiaomi13/fuxi_ios/work/adsp-battery/android-memory-20261116-1606/iomem.txt:294)・[Linux kernel owners](D:/xiaomi13/fuxi_ios/work/adsp-battery/android-memory-20261116-1606/iomem.txt:278)・[MemTotal](D:/xiaomi13/fuxi_ios/work/adsp-battery/android-memory-20261116-1606/meminfo.txt:1)。全部 15 個 DT 候選合計 2336815104 bytes＝2228.560546875MiB，其中 Android 已列 owners 交集為 795361280 bytes＝758.515625MiB；**相減不是可 admit 量**。另有 `[0xa4a80800,0xa4a81000)` 的 2KiB 不在 Android System RAM，16KiB replay 必須排除不完整頁。
++
++目前 9184MiB 窗口內 Android reserved union 是 328122368 bytes＝312.921875MiB；GPU 固定 32MiB 全落於 Android reserved union，末尾重複 parent/child 不重算。這些是 Android 當前 phase 的觀測，不意味日常 XNU 的同位址持久佔用，也不據此縮改主線窗口。
++
++**925 與 30MiB 是兩個各自 contiguous 的 lower banks，合起來不是 contiguous：** 中間 `[0x8b9d00000,0x8b9f00000)` 有 2MiB hole；30MiB 與 current bank 間 `[0x8bbd00000,0x8c0000000)` 有 67MiB hole。高位兩個候選仍可能命中 `demura_heap_region`、`mem_dump_region`、`ramoops_region`、`debug_kinfo_region` 的 allocation windows；unknown placement、zero reg、no-map／reusable lifetime 仍 pending。沒有 child owner 標籤不表示無 owner。
++
++Android capture 沒有解除 iOS loader／persistent monitor／USB DMA／original及relocated FDT／payload／kernel、ADT、boot_args staging 的 owner gate。`persistent_owner_clearance_verified=false`、`xnu_admission_verified=false`、`allocatable_after_all_owners_bytes=null`；任何下一個 shadow replay 都必須保存 phase、source hash、未解析理由及 coverage，不能將 null 改成 0。
++
++既有 [actual-trace checkpoint](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/docs-lanes/ram-admission-checkpoint.md:83) 的 **69 個 pending evidence／owner records**（63 unresolved reserved-memory、1 unresolved `/memory`、4 live-runtime groups、1 integration gate）仍保留；不是 69 個可相加的保留量，也不是每頁都與 69 個 owner 重疊。本輪 owner observations／native synthetic bits 不解除這些 records，不重做或修改 frozen trace／ledger：`pending=69`、`shadow_released_pages=0`、`allocatable_bytes=null`，沒有 VM release。
++
++## 本輪下一個最小邊界
++
++只評估 12GB 的 30MiB／1920 PFNs，不加入 925MiB，不移 GPU scratch，不改已部署 9184MiB 窗口。本輪後續 source／native proof 只允許 query／分類／計畫，不呼叫 `vm_page_create`、`ml_static_mfree` 或 free-list release；production pmap／PTE／cache state 仍未證。
++
++### 已查 chain-v6／shim owners
++
++不能只讀 development ksrc 而假定它就是部署 shim：[chain builder](D:/xiaomi13/fuxi_ios/work/boot-chain/build-chain.py:28) 的 source 是 `D:/xiaomi13/fuxi_ios/ios-fuxi/shim`，chain-v6 使用 `native-dly-ram9g-batfresh-sb127-loader` 的 loader/payload objects。[build record](D:/xiaomi13/fuxi_ios/work/boot-chain/chain-v6-ram9g-batfresh/build.txt:3)
++
++| Owner／邊界 | 本輪 host 核對 | 925／30MiB 結論 |
++| --- | --- | --- |
++| 完整 chain image | stored monitor `before.json` 的 `[0xa8000000,0xabfe0000)`，66977792 bytes；與 loader.elf `_head/_end/_image_end` symbol offsets 一致 | 兩 bank 都無交集；只綁定該 boot record，不是所有未來 load placements |
++| BSS／stacks／USB DMA | BSS `[0xa8044000,0xa8074000)`；兩 stacks 在其後、payload 前；16KiB `dma_area` 在 `[0xa8070000,0xa8074000)` | 全在上述 image 內；DMA lifetime 不能因 XNU launch 就當作結束 |
++| embedded payload／Linux footprint | payload `[0xa8084000,0xa914cff0)`；Linux 由 `0xa9200000` 起，image header footprint 止於 `0xabfe0000` | 兩 bank 都無交集；不收錄原始 payload/boot image |
++| kernel／ADT／boot_args destination | payload header 經原 owning affine 公式得 ADT `0x8c2790000`、boot_args `0x8c2794000`、top `0x8c2798000`；kernel destination 在 current bank | 兩 bank 都無交集；不是 free-page／metadata allocation clearance |
++| runtime original FDT | probe 保存 pointer/length，但此 stored `before.json` 沒有其 extent；`probe_fdt` symbol 的 PA 只是 pointer 變數地址 | **unknown／pending，不能把變數地址當 FDT extent**；仍可能妨礙任一新 bank |
++
++來源：[stored MON_IMAGE/MON_END](D:/xiaomi13/fuxi_ios/work/Codex-Xiaomi13-GPU-20261109/native-hw000chainv6-ram9g-batfresh-boot-1/before.json:11)・[chain linker footprint](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader-chain.ld:13)・[USB static buffer](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:37)・[DMA pointer](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:1426)・[persistent secondary loop](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:780)・[FDT pointer](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:1547)・[destination gate](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader.c:120)・[ADT/top formula](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader.c:177)。
++
++可審計 hashes：`before.json`＝`44ae548d5adcac33b0843a1b08c4ad1452bff5cb016127ef3740d984a49a7da2`；chain `loader.elf`＝`b5ce327c9301c98889ba9f2ab130fc93d3682b849b29c4e0f264551b768c4c45`；loader `memory-layout.json`＝`70cf7cb52d0cfa4c0ad24199c93cdd5ce2f6608b3026dbc433b6ba1df89b6317`。只讀既有檔案／ELF symbols，沒有 build/deploy chain。
++
++在本輪讀到的 source 中，probe 只驗 FDT magic/total length，loader 驗 scalar layout 和 GPU/FDT overlap；**沒有 `/memory/ddr_size` runtime SKU gate**。chain 的 invalid FDT/initrd 可沿原 fallback 走 XNU，因此 chain mode decision 不能充當 SKU guard。[probe entry](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-probe/probe.c:1533)・[GPU staging 前](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/loader.c:149)・[chain selection](D:/xiaomi13/fuxi_ios/ios-fuxi/shim/fuxi-loader/chain.c:133)。這是只讀研究時的狀態，不宣稱主代理後續 guard 已部署；本 worker 不代改入口。
++
++### 實際 applied owning-file replay
++
++既有官方 tag [xnu-8796.141.3](https://github.com/apple-oss-distributions/xnu/tree/xnu-8796.141.3)，commit `1b191cb58250d0705d8a51287127505aa4bc0789`。在 TemporaryDirectory 複製六個必要公開 owning files，再按照 [prepare-kernel](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/tools/ci/prepare-kernel.py:16) 的 lexicographic required-patch 順序，對命中這六檔的 `0008,0010,0011,0012,0082,0101` **逐個實際 `git apply --check`／`git apply`**，未執行 provider/build scripts。9g variant 修改 FG constants，未命中這六檔。本輪 generator SHA-256 為 `efbcf409234ba6134bc20b5c441fbdf00b70b613528d0461c5a4e4edd8b75ee4`。
++
++這補足純 official source 不能代表 local applied modifications 的缺口；**仍是六檔 source-level replay，不是完整當次 CI tree／headers／compiled configuration 或部署 kernel 的重建證明**。沒有新建持久 source cache，也沒有改 generator／production tree。
++
++| Applied view | SHA-256 | 實際行號／不變量 |
++| --- | --- | --- |
++| `osfmk/arm64/arm_vm_init.c` | `b2de540a9c87c68cfa05305e419c1cf0b026da1f983d8ae372326338e01f3b6a` | 1871 base、1886 size；1901／1925 physmap capacity；1636 scalar prefix release |
++| `osfmk/arm/pmap/pmap.c` | `39f0124dda9e52ad167bf6c69a6d50f11cb777a1ee2b59b45c30e4a90c0b98bb` | 2207 PV origin；2593 count、2617 span、2637 next_page；11216 valid_page 仍 scalar |
++| `osfmk/arm/pmap/pmap_data.h` | `26f464e4dc2dd71da80d1155f7314a8f107d0a8be54965ac03def390a7dadc17` | 75 `pa_valid`、98 `pa_index`，未改的實際 bodies |
++| `osfmk/arm/pmap/pmap_data.c` | `564ee64643bc22d66a36734fa75c3967fca7f592b3dd4f1c1c41160db7742b67` | 613 PTD heuristics、633 dense npages；tables 由 scalar mem_size 配置 |
++| `osfmk/vm/vm_resident.c` | `0c0dd352efef32cb032cd0a84f77cce77ba77a90412420df76d2e0f5e9ea81e1` | 1208 wired accounting；1433 vm_pages span；1556 first PFN；1694 explicit late create |
++| `osfmk/vm/vm_page.h` | `527fc93aaf8c5fa8f66c6ca213d8b9fc59dd924f5af0ad45d55424f8051334a3` | 422 array PFN＝index＋first；out-of-array 用顯式 PFN |
++
++後四檔沒有被本輪命中 patches 改動，精確 local owning references 可直接使用：[pa_valid/index](D:/xiaomi13/fuxi_ios/work/adsp-battery/ram-source-reference/xnu-8796.141.3/osfmk/arm/pmap/pmap_data.h:75)・[PV sizing](D:/xiaomi13/fuxi_ios/work/adsp-battery/ram-source-reference/xnu-8796.141.3/osfmk/arm/pmap/pmap_data.c:633)・[startup enumeration](D:/xiaomi13/fuxi_ios/work/adsp-battery/ram-source-reference/xnu-8796.141.3/osfmk/vm/vm_resident.c:1538)・[PFN identity](D:/xiaomi13/fuxi_ios/work/adsp-battery/ram-source-reference/xnu-8796.141.3/osfmk/vm/vm_page.h:422)。前兩檔的 applied 行號是上述 hash 綁定的生成 view，不假裝它們仍等於 official 行號；修改來源：[physmap padding](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/xnu/patches/0011-sweet-physmap-alignment-padding.patch:1)・[Fuxi conversion](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/xnu/patches/0082-fuxi-ram-bringup.patch:1)・[physical cache gate](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/xnu/patches/0101-fuxi-gpu-nc-cache-sync.patch:7)。
++
++### 30MiB 最小算法／只列五個耦合修改點
++
++1. **SKU/owner gate 在先。** 僅 user/live-FDT 確認的 12GB profile 可做此 geometry；8GB／missing／conflict 拒絕。original FDT、monitor lifetime、上述四個 dynamic windows 及 unknown owners 未清查前，新 bank 一律 defer。guard 不替換主代理 packer/loader 工作。
++2. **metadata span 與 managed/free eligibility 分開。** proposal 為 `[0x8b8000000,0xafe000000)`＝9312MiB／595968 dense slots，白名單只含 current9184＋extra30＝589696 pages。29MiB 未選 prefix＋2/67MiB holes＝98MiB／6272 slots 不能 release。`pa_valid/pa_index`／PV sizing 必須協同；kernel、ADT、bootstrap metadata 等已管理 wired pages不能因「不是 free」就被 `pa_valid` 誤拒絕，holes／GPU 則不成為 managed RAM。pp_attr budget＝1191936 bytes、LP64 page-rounded PV heads＝4767744 bytes；PTD／vm_pages／actual free totals 仍待 compiled sizes/first_avail，不能填零。
++3. **physmap 與 prefix release 按 whitelist 切段。** 若採 aligned base proposal，PA/VA base 須成對下移 128MiB，保留既有 image PA/VA offset；不是直接修改 12g size。applied arm_vm_init 的 scalar prefix mapping/release 必須拆分，不得 map/free 29＋2＋67MiB；30MiB 邊界需 16KiB/L3 handling，並重新驗 PTOV segments、8-entry/VA capacity 及 GPU NC alias。既有 [FG base/size gate](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/xnu/fuxi-adreno/fuxi_adreno.c:659)／[physical cache scalar gate](D:/xiaomi13/fuxi_ios/work/adsp-battery/ksrc/xnu/patches/0101-fuxi-gpu-nc-cache-sync.patch:7) 也需改成明確的 span/managed/scratch-disjoint invariant，不能關掉檢查或搬 GPU。
++4. **startup vm_pages 不 compact 跨洞。** 保留已清查、contiguous current `first_avail..avail_end` startup tail；30MiB 不塞進其 implicit-PFN array。extra PFNs 是 `[0x22e7c0,0x22ef40)`，1920 頁；current 首 PFN `0x230000`，不是 extra end `0x22ef40`。若 current tail 也有洞，此捷徑不成立。owner/metadata/mapping 全完成後才另外評估 explicit `vm_page_create` 路徑，不能拿跳洞的 pmap_next_page 當完整修復。
++5. **release-once/accounting 才是 admission 邊界。** 下列 native patch 只產生 shadow 計畫，不接 VM；未來 consumer 必須整段 preflight、phase/lifetime clear、單次 release 和 counter 守恆。span 不可直接灌入 `max_mem` 的 wired formula；不能把 6272 hole slots、925MiB 未選 bank 或 772MiB requests/CMA 變成 free count。現有 frozen ledger 可作獨立 oracle，不修改它或假稱它已有 wire-format/boot consumer。
++
++### Native patch 草案：只新增 shadow query，原 helpers 不動
++
++以下 diff 的目標是 replay 後的 `pmap_data.h`；`pa_valid/pa_index` 完全保留。default query 只 reject/defer；`FUXI_RAM30_HOST_PROOF=1` 僅供 native fixture 產生 hypothetic plan，和 `FUXI` 一起編譯會直接 `#error`。沒有 allocator、mapping、boot registration 或可 boot 8GB profile。三個 proof bits 是 host assertion（1＝iOS owners，2＝pmap/dense metadata，4＝VM PFN/accounting），不是證據驗證器；本次實際 evidence 未設齊這三 bits。
++
++```diff
++--- a/osfmk/arm/pmap/pmap_data.h
+++++ b/osfmk/arm/pmap/pmap_data.h
++@@ -99,7 +99,55 @@ pa_index(pmap_paddr_t pa)
++ {
++ 	return (unsigned int)atop(pa - vm_first_phys);
++ }
++ 
+++#ifndef FUXI_RAM30_HOST_PROOF
+++#define FUXI_RAM30_HOST_PROOF 0
+++#endif
+++#if defined(FUXI) && FUXI_RAM30_HOST_PROOF
+++#error FUXI_RAM30_HOST_PROOF_is_not_a_boot_feature
+++#endif
+++
+++enum fuxi_ram30_shadow_action {
+++    FUXI_RAM30_REJECT,
+++    FUXI_RAM30_DEFER,
+++    FUXI_RAM30_CURRENT_GEOMETRY,
+++    FUXI_RAM30_PLAN_EXPLICIT_PFN
+++};
+++
+++static inline bool
+++fuxi_ram30_sku_matches(uint32_t image_sku, const uint8_t *ddr_size,
+++    unsigned int property_bytes)
+++{
+++    if (image_sku != 12 || !ddr_size || property_bytes != 4)
+++        return false;
+++    uint32_t live_sku = (uint32_t)ddr_size[0] << 24 | (uint32_t)ddr_size[1] << 16 |
+++        (uint32_t)ddr_size[2] << 8 | ddr_size[3];
+++    return live_sku == 12;
+++}
+++
+++static inline enum fuxi_ram30_shadow_action
+++fuxi_ram30_shadow_pa(uint32_t image_sku, const uint8_t *ddr_size,
+++    unsigned int property_bytes, uint64_t pa, const unsigned int *ios_proofs,
+++    unsigned int *metadata_index)
+++{
+++    const uint64_t metadata_base = 0x8b8000000ULL;
+++    const uint64_t bank_start = 0x8b9f00000ULL;
+++    const uint64_t bank_end = 0x8bbd00000ULL;
+++    const uint64_t current_start = 0x8c0000000ULL;
+++    const uint64_t current_end = 0xafe000000ULL;
+++    if (PAGE_SIZE != 0x4000 || !metadata_index || (pa & 0x3fffULL) ||
+++        (pa >> 14) > 0xffffffffULL || !fuxi_ram30_sku_matches(image_sku, ddr_size, property_bytes))
+++        return FUXI_RAM30_REJECT;
+++    bool extra = pa >= bank_start && pa < bank_end;
+++    bool current = pa >= current_start && pa < current_end;
+++    if (!extra && !current)
+++        return FUXI_RAM30_REJECT;
+++    *metadata_index = (unsigned int)((pa - metadata_base) >> 14);
+++    if (!ios_proofs || *ios_proofs != 7 || !FUXI_RAM30_HOST_PROOF)
+++        return FUXI_RAM30_DEFER;
+++    return extra ? FUXI_RAM30_PLAN_EXPLICIT_PFN : FUXI_RAM30_CURRENT_GEOMETRY;
+++}
+++
++ /* See the definition of pv_head_table for more information. */
++ extern pv_entry_t **pv_head_table;
++ 
++```
++
++### Native driver：公開 fixtures，不讀 DTB/cache
++
++此 driver 的 `pa_valid/pa_index` bodies 與上表已 applied 的 owning source 完全相同；其 globals／PAGE_SIZE 是 host fixture，不冒充 actual boot_args。`ram30-shadow-body.h` 由前述 diff 的 added lines 取得。
++
++```c
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#define PAGE_SIZE UINT64_C(0x4000)
++#define atop(value) ((value) >> 14)
++typedef uint64_t pmap_paddr_t;
++static pmap_paddr_t vm_first_phys = UINT64_C(0x8c0000000);
++static pmap_paddr_t vm_last_phys = UINT64_C(0xafe000000);
++static inline bool
++pa_valid(pmap_paddr_t pa)
++{
++	return (pa >= vm_first_phys) && (pa < vm_last_phys);
++}
++static inline unsigned int
++pa_index(pmap_paddr_t pa)
++{
++	return (unsigned int)atop(pa - vm_first_phys);
++}
++#include "ram30-shadow-body.h"
++static uint64_t checks;
++#define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "FAIL %d: %s\n", __LINE__, #condition); exit(1); } checks++; } while (0)
++int main(int argument_count, char **arguments)
++{
++    if (argument_count == 2 && !strcmp(arguments[1], "asan-canary")) {
++        volatile uint8_t *canary = malloc(1);
++        CHECK(canary != NULL);
++        canary[1] = 1;
++        free((void *)canary);
++        return 0;
++    }
++    CHECK(argument_count == 1);
++    const uint8_t sku12[] = {0, 0, 0, 12}, sku8[] = {0, 0, 0, 8}, little[] = {12, 0, 0, 0};
++    const unsigned int complete = 7, pending = 0;
++    unsigned int ordinal = UINT32_MAX;
++    CHECK(fuxi_ram30_sku_matches(12, sku12, 4));
++    CHECK(!fuxi_ram30_sku_matches(8, sku8, 4) && !fuxi_ram30_sku_matches(8, sku12, 4));
++    CHECK(!fuxi_ram30_sku_matches(12, sku8, 4) && !fuxi_ram30_sku_matches(12, little, 4));
++    CHECK(!fuxi_ram30_sku_matches(12, NULL, 4) && !fuxi_ram30_sku_matches(12, sku12, 3));
++    CHECK(!fuxi_ram30_sku_matches(12, sku12, 5) && !fuxi_ram30_sku_matches(0, sku12, 4));
++    CHECK(!pa_valid(UINT64_C(0x8b9f00000)) && pa_valid(UINT64_C(0x8c0000000)));
++    CHECK(pa_index(UINT64_C(0x8c0000000)) == 0);
++    CHECK(fuxi_ram30_shadow_pa(12, sku12, 4, UINT64_C(0x8b9f00000), NULL, &ordinal) == FUXI_RAM30_DEFER && ordinal == 1984);
++    CHECK(fuxi_ram30_shadow_pa(12, sku12, 4, UINT64_C(0x8bbcfC000), &pending, &ordinal) == FUXI_RAM30_DEFER && ordinal == 3903);
++    CHECK(fuxi_ram30_shadow_pa(12, sku12, 4, UINT64_C(0x8b9f00001), &complete, &ordinal) == FUXI_RAM30_REJECT);
++    CHECK(fuxi_ram30_shadow_pa(12, sku12, 4, UINT64_C(1) << 46, &complete, &ordinal) == FUXI_RAM30_REJECT);
++    CHECK(fuxi_ram30_shadow_pa(12, sku12, 4, UINT64_MAX & ~UINT64_C(0x3fff), &complete, &ordinal) == FUXI_RAM30_REJECT);
++    CHECK(fuxi_ram30_shadow_pa(12, sku12, 4, 0, &complete, &ordinal) == FUXI_RAM30_REJECT);
++    CHECK(fuxi_ram30_shadow_pa(12, sku12, 4, UINT64_C(0x8b9f00000), &complete, NULL) == FUXI_RAM30_REJECT);
++    CHECK(fuxi_ram30_shadow_pa(12, sku12, 4, UINT64_C(0x8bbd00000), &complete, &ordinal) == FUXI_RAM30_REJECT);
++    CHECK(fuxi_ram30_shadow_pa(12, sku12, 4, UINT64_C(0xafe000000), &complete, &ordinal) == FUXI_RAM30_REJECT);
++    for (unsigned int incomplete = 0; incomplete <= 8; incomplete++) {
++        if (incomplete == 7) continue;
++        CHECK(fuxi_ram30_shadow_pa(12, sku12, 4, UINT64_C(0x8b9f00000), &incomplete, &ordinal) == FUXI_RAM30_DEFER);
++    }
++    uint64_t deferred = 0, holes = 0, planned = 0, current = 0;
++    for (uint64_t slot = 0; slot < 595968; slot++) {
++        uint64_t pa = UINT64_C(0x8b8000000) + slot * PAGE_SIZE;
++        bool whitelist = (pa >= UINT64_C(0x8b9f00000) && pa < UINT64_C(0x8bbd00000)) || pa >= vm_first_phys;
++        enum fuxi_ram30_shadow_action result = fuxi_ram30_shadow_pa(12, sku12, 4, pa, NULL, &ordinal);
++        if (!whitelist) { CHECK(result == FUXI_RAM30_REJECT); holes++; continue; }
++        CHECK(result == FUXI_RAM30_DEFER && ordinal == slot);
++        CHECK(UINT64_C(0x8b8000000) + (uint64_t)ordinal * PAGE_SIZE == pa);
++        deferred++;
++        result = fuxi_ram30_shadow_pa(12, sku12, 4, pa, &complete, &ordinal);
++        if (!FUXI_RAM30_HOST_PROOF) CHECK(result == FUXI_RAM30_DEFER);
++        else if (pa < vm_first_phys) { CHECK(result == FUXI_RAM30_PLAN_EXPLICIT_PFN && !pa_valid(pa)); planned++; }
++        else { CHECK(result == FUXI_RAM30_CURRENT_GEOMETRY && pa_index(pa) + 8192 == ordinal); current++; }
++    }
++    for (uint64_t pa = UINT64_C(0x880000000); pa < UINT64_C(0x8b9d00000); pa += PAGE_SIZE)
++        CHECK(fuxi_ram30_shadow_pa(12, sku12, 4, pa, &complete, &ordinal) == FUXI_RAM30_REJECT);
++    for (uint64_t pa = UINT64_C(0xafe000000); pa < UINT64_C(0xb00000000); pa += PAGE_SIZE)
++        CHECK(fuxi_ram30_shadow_pa(12, sku12, 4, pa, &complete, &ordinal) == FUXI_RAM30_REJECT);
++    for (uint64_t pa = UINT64_C(0x8b9f00000); pa < UINT64_C(0x8bbd00000); pa += PAGE_SIZE)
++        CHECK(fuxi_ram30_shadow_pa(12, sku8, 4, pa, &complete, &ordinal) == FUXI_RAM30_REJECT &&
++              fuxi_ram30_shadow_pa(8, sku12, 4, pa, &complete, &ordinal) == FUXI_RAM30_REJECT);
++    CHECK(deferred == 589696 && holes == 6272 && deferred + holes == 595968);
++    CHECK(planned == (FUXI_RAM30_HOST_PROOF ? 1920 : 0));
++    CHECK(current == (FUXI_RAM30_HOST_PROOF ? 587776 : 0));
++    CHECK(UINT64_C(0x230000) - UINT64_C(0x22ef40) == 4288);
++    CHECK(UINT64_C(0x22ef40) - UINT64_C(0x22e7c0) == 1920);
++    printf("{\"host_proof\":%d,\"checks\":%llu,\"deferred_unknown_owner_pfns\":%llu,\"excluded_span_slots\":%llu,\"hypothetical_extra_plan_pfns\":%llu,\"vm_release_called\":false,\"physical_device_test\":false}\n",
++        FUXI_RAM30_HOST_PROOF, (unsigned long long)checks, (unsigned long long)deferred,
++        (unsigned long long)holes, (unsigned long long)planned);
++    return 0;
++}
++```
++
++### 可重現 native／ASan 命令
++
++在 ksrc 根目錄執行以下 PowerShell。它只抽取本文件公開 C/diff 到 TemporaryDirectory，reuse 現有 compiler discovery，不執行 audio tests，不讀 DTB／Android capture／官方 cache。C11 warnings-as-errors＋ASan 不可 skip；兩模式的 intentional heap OOB 都必須被捕捉，`FUXI`＋host-proof compile 必須因指定 `#error` 失敗。只有 host 模式可做 synthetic plan，沒有 VM release 或 boot image。
++
++```powershell
++Set-Location -LiteralPath D:\xiaomi13\fuxi_ios\work\adsp-battery\ksrc
++$text = Get-Content -LiteralPath docs-lanes/ram-android-owner-20261116.md -Raw -Encoding UTF8
++[regex]::Match($text, '(?ms)^```python\r?\n(.*?)^```').Groups[1].Value | python -B -
++if ($LASTEXITCODE -ne 0) { throw 'RAM30 public native proof failed' }
++```
++
++```python
++from pathlib import Path
++import importlib.util
++import json
++import os
++import re
++import subprocess
++import sys
++import tempfile
++sys.dont_write_bytecode = True
++root = Path.cwd()
++text = (root / 'docs-lanes/ram-android-owner-20261116.md').read_text(encoding='utf-8')
++diff = re.search(r'^```diff\n(.*?)^```$', text, re.S | re.M).group(1)
++code = re.search(r'^```c\n(.*?)^```$', text, re.S | re.M).group(1)
++body = ''.join(line[1:] + '\n' for line in diff.splitlines() if line.startswith('+') and not line.startswith('+++'))
++spec = importlib.util.spec_from_file_location('ram30_compiler', root / 'tools/test-fuxi-audio-prep.py')
++module = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(module)
++compiler, environment = module.compiler_environment()
++environment = dict(environment, ASAN_OPTIONS='halt_on_error=1:detect_leaks=0')
++msvc = Path(compiler[0].strip('"')).name.lower() in ('cl', 'cl.exe')
++print('compiler:', compiler[0])
++with tempfile.TemporaryDirectory(prefix='fuxi-ram30-native-') as temporary:
++    directory = Path(temporary)
++    (directory / 'ram30-shadow-body.h').write_text(body, encoding='utf-8')
++    source = directory / 'driver.c'
++    source.write_text(code, encoding='utf-8')
++    flags = (['/nologo', '/TC', '/std:c11', '/W4', '/WX', '/Od', '/Zi', '/MD', '/fsanitize=address'] if msvc else
++             ['-std=c11', '-Wall', '-Wextra', '-Werror', '-pedantic', '-O1', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer'])
++    for enabled in (0, 1):
++        executable = directory / (f'ram30-{enabled}.exe' if os.name == 'nt' else f'ram30-{enabled}')
++        definition = ([] if not enabled else ['/DFUXI_RAM30_HOST_PROOF=1'] if msvc else ['-DFUXI_RAM30_HOST_PROOF=1'])
++        output = [f'/Fe:{executable}', f'/Fd:{directory / f"ram30-{enabled}.pdb"}'] if msvc else ['-o', str(executable)]
++        subprocess.run(compiler + flags + definition + [str(source)] + output, cwd=directory, env=environment, check=True, timeout=60)
++        result = subprocess.run([str(executable)], cwd=directory, env=environment, capture_output=True, text=True, check=True, timeout=60)
++        checks = json.loads(result.stdout)
++        if (checks['host_proof'] != enabled or checks['checks'] <= 1000000 or
++            checks['deferred_unknown_owner_pfns'] != 589696 or checks['excluded_span_slots'] != 6272 or
++            checks['hypothetical_extra_plan_pfns'] != (1920 if enabled else 0) or
++            checks['vm_release_called'] is not False or checks['physical_device_test'] is not False):
++            raise ValueError('Native shadow counts/default-off contract mismatch')
++        print(json.dumps(checks))
++        canary = subprocess.run([str(executable), 'asan-canary'], cwd=directory, env=environment, capture_output=True, text=True, timeout=30)
++        report = canary.stdout + canary.stderr
++        if canary.returncode == 0 or 'AddressSanitizer' not in report or 'heap-buffer-overflow' not in report:
++            raise ValueError('ASan runtime did not catch intentional host-only heap OOB')
++        print(f'PASS ASan mode={enabled}: heap-buffer-overflow caught, exit={canary.returncode}')
++    definition = ['/DFUXI=1', '/DFUXI_RAM30_HOST_PROOF=1'] if msvc else ['-DFUXI=1', '-DFUXI_RAM30_HOST_PROOF=1']
++    output = ['/c', f'/Fo:{directory / "boot-forbidden.obj"}'] if msvc else ['-c', '-o', str(directory / 'boot-forbidden.o')]
++    guard = subprocess.run(compiler + flags + definition + [str(source)] + output, cwd=directory, env=environment, capture_output=True, text=True, timeout=60)
++    if guard.returncode == 0 or 'FUXI_RAM30_HOST_PROOF_is_not_a_boot_feature' not in guard.stdout + guard.stderr:
++        raise ValueError('FUXI+host-proof must fail compilation by required #error')
++    print('PASS boot guard: FUXI+HOST_PROOF compilation rejected by required #error')
++print(json.dumps({'input_mode': 'public-doc-fixtures-only', 'private_dtb_read': False, 'source_cache_read': False,
++                  'sanitizer_skipped': False, 'production_pmap_verified': False, 'new_bank_admitted': False}))
++```
++
++第二命令是**明示的 local source check**，只需要官方 cache 的 `pmap_data.h`，不讀實機 DTB/capture；缺 source 或 hash 不符就失敗。該檔未被命中 patches 改動，hash 與六檔 applied replay 一致。diff 以 LF bytes 寫出，避免 Windows `write_text` 將 context 轉成 CRLF。
++
++```powershell
++Set-Location -LiteralPath D:\xiaomi13\fuxi_ios\work\adsp-battery\ksrc
++@'
++from pathlib import Path
++import hashlib
++import re
++import shutil
++import subprocess
++import tempfile
++root = Path.cwd()
++text = (root / 'docs-lanes/ram-android-owner-20261116.md').read_text(encoding='utf-8')
++source = root.parent / 'ram-source-reference/xnu-8796.141.3/osfmk/arm/pmap/pmap_data.h'
++if hashlib.sha256(source.read_bytes()).hexdigest() != '26f464e4dc2dd71da80d1155f7314a8f107d0a8be54965ac03def390a7dadc17':
++    raise ValueError('Actual applied owning-header hash mismatch; no source fallback')
++code = re.search(r'^```c\n(.*?)^```$', text, re.S | re.M).group(1)
++for name in ('pa_valid', 'pa_index'):
++    pattern = rf'{name}\(pmap_paddr_t pa\)\n\{{(.*?)\n\}}'
++    if re.search(pattern, code, re.S).group(1) != re.search(pattern, source.read_text(encoding='utf-8'), re.S).group(1):
++        raise ValueError('Native helper body differs from actual source: ' + name)
++with tempfile.TemporaryDirectory(prefix='fuxi-ram30-source-check-') as temporary:
++    directory = Path(temporary)
++    destination = directory / 'osfmk/arm/pmap/pmap_data.h'
++    destination.parent.mkdir(parents=True)
++    shutil.copyfile(source, destination)
++    proposal = directory / 'ram30-shadow-proposal.patch'
++    proposal.write_bytes(re.search(r'^```diff\n(.*?)^```$', text, re.S | re.M).group(1).encode('utf-8'))
++    for operation in (['--check'], []):
++        subprocess.run(['git', '-C', str(directory), 'apply', *operation, str(proposal)], check=True, timeout=30)
++print('PASS owning hash/native bodies/regular git apply --check and apply; temporary copy only')
++'@ | python -B -
++if ($LASTEXITCODE -ne 0) { throw 'RAM30 local source check failed' }
++```
++
++### 本輪實際結果與下一個 gate
++
++MSVC `14.50.35717`，`/std:c11 /W4 /WX /Od /Zi /MD /fsanitize=address` 實際編譯／執行；沒有 sanitizer skip。首次 default-off 的 unused-parameter 警告已用 proof gate 順序修正，未降低警告等級。
++
++| Check | 實際結果 |
++| --- | --- |
++| 未定義 host-proof，default-off | 1838558 CHECKs；589696 unknown-owner PFNs 全 defer；6272 span slots reject；extra plan＝0 |
++| host-proof＝1，公開 synthetic bits | 同 1838558 CHECKs；pending 仍全 defer；只在 bits＝7 的 synthetic query 計畫 extra1920＋current587776；不是 admission |
++| 邊界／守恆 | 16KiB、null/malformed/endian SKU、8GB/mismatch、NULL/incomplete owners、64-bit extremes、PA↔dense index，595968＝589696＋6272；925MiB scope-unselected／32MiB GPU 全拒絕 |
++| ASan runtime／boot guard | 兩模式 intentional heap-buffer-overflow 均 exit1 且有 ASan 診斷；`FUXI`＋host-proof compile 因指定 `#error` 拒絕 |
++| actual owning source | 六檔依 `0008,0010,0011,0012,0082,0101` 實際 replay，hash 全符；native 原 helper bodies 相同；doc diff regular `git apply --check`＋apply 通過（只在 temporary copy） |
++
++公開 C driver SHA-256＝`7eb9e34cf5a6296ecb1c0f1577efc298460c85dd488cf6efe472d4fbd594726f`；diff added-body SHA-256＝`51a7ef9d01e2e1e90f34d27f82dceb087ef4f232df9f3d5c29a65e7ecc0ab42e`（UTF-8/LF）。public native 命令不依私有 capture 或 source cache；local source check 另行明示，不能在 public CI 偷偷 skip 缺資料。
++
++**最小下一安全步驟：** 主代理完成入口的 SKU/runtime FDT 拒絕 gate，並對這一個 12GB／30MiB bank 補齊 iOS handoff phase 的 original/relocated FDT extent、persistent monitor／DMA coverage、dynamic-window placement/lifetime；Android 當前 owner evidence 不代替此 clearance。未齊就保持 defer，不產可 boot new-bank profile。owner 清查後，才依上述五個耦合點做完整 applied-tree 的 metadata／physmap／explicit-PFN／counter host proof，再決定獨立實機驗證；不可只改 scalar base/size 或直接 late release。
++
++本輪沒有 VM release、production pmap/PTE/PTOV/GPU alias 實測、完整 kernel build 或任何 hardware writes；新 bank admitted＝false、final allocatable bytes＝null。8GB 正式驗收仍需 8GB 實機；12GB 縮小 available memory regression 不冒充該驗收，也不把 9184MiB／9GiB 階段窗口當成 12GB 的終點。925MiB 候選、772MiB size requests/CMA 均未轉成可用量。
 diff --git a/docs-lanes/ram-multirange-preparation.md b/docs-lanes/ram-multirange-preparation.md
 new file mode 100644
 index 0000000..d77cedf
@@ -2499,6 +2887,122 @@ index 0000000..1dfcd16
 +with independent boot-argument and device-tree stubs. It checks argument
 +priority, missing properties, lookup failures, length limits and string
 +termination under ASan/UBSan.
+diff --git a/docs-lanes/torch-timer-source-checkpoint.md b/docs-lanes/torch-timer-source-checkpoint.md
+new file mode 100644
+index 0000000..e44384b
+--- /dev/null
++++ b/docs-lanes/torch-timer-source-checkpoint.md
+@@ -0,0 +1,110 @@
++# Torch timer source checkpoint
++
++## Scope
++
++The production pulse changes only the channel-0 safety-timer setup byte at
++offset `0x3e`, from `0x8a` to `0x89`. This lowers the worst source-decoded
++duration; it does not relax fault handling or establish a hardware fix.
++
++The existing type `0x18` / subtype `0x07` admission remains mandatory. The
++local live DT identifies PM8550 SID 1, flash base `0xee00`, compatible
++`qcom,pm8350c-flash-led`. The OEM driver selects four channels for that
++compatible and defines the four-channel subtype as `0x07`. Linux v6.12
++selects its four-channel register map for type `0x18` / subtype `0x07`,
++including channel timers at `0x3e + channel`.
++
++## Primary source contract
++
++Both sources use bit 7 to enable the timer and 10 ms timer steps. The
++duration below is the source-derived inverse of their integer programming
++formula at exact 10 ms multiples, not a measured PM8550 cutoff.
++
++| Primary source | Programming rule | `0x8a` model | `0x89` model |
++| --- | --- | --- | --- |
++| MiCode Fuxi OEM | `round(timeout_ms / 10) - 1` | 110 ms | 100 ms |
++| Linux v6.12 | `timeout_ms / 10` | 100 ms | 90 ms |
++
++Thus `0x89` retains the enable bit and is at most 100 ms under both pinned
++source interpretations. The source disagreement is not resolved by this
++checkpoint, and neither interpretation is substituted for device evidence.
++
++- [OEM driver](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/leds/leds-qti-flash.c#L221):
++  commit `7fad87dc178d09489b74a714e4a525d56f546855`, SHA256
++  `56e96975b820e8f88b4ae6fcf7acedfb53f577424e9f7d9b16637c86652f514d`;
++  `timeout_to_code()`, timer enable/step definitions, subtype and match table.
++- [OEM PM8550 DT](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/pm8550.dtsi#L120):
++  commit `5647c799a064dfec73332a4fe2ef7aa3fb2f4887`, PM8550 SID 1 flash
++  peripheral and `qcom,pm8350c-flash-led` compatible.
++- [Linux v6.12 driver](https://github.com/torvalds/linux/blob/v6.12/drivers/leds/flash/leds-qcom-flash.c#L368):
++  SHA256 `41575a93352acf5598563bcb943fbdf07931a443fd5ad649dc1d4bd836a0916f`;
++  `set_flash_timeout()` and the type/subtype-specific four-channel map.
++
++Both driver bytes were fetched and hash-checked again for this checkpoint.
++
++## Unchanged safety boundaries
++
++- The software pulse wait remains 80,000 us; levels remain 20/40/60/80 mA.
++- Lease duration and runtime failure latch are unchanged; no retry or re-enable
++  is introduced after failure.
++- All three status offsets `0x06`, `0x07`, `0x09` still reject every nonzero
++  byte, including post-disable `0x09 bit4`. No normal-status exemption is added.
++- Timer write/readback still precedes module/channel enable. The write allowlist,
++  bounded two-sample disable confirmation and saved-register restoration stay
++  unchanged. Unconfirmed disable still retains the newly programmed timer;
++  the existing 110,000 us cleanup wait is unchanged, not a pulse extension.
++- Existing canonical integration, `fuxi_pmic.c`, sync and aggregate patch are
++  untouched. The main agent owns propagation into the next kernel. Existing
++  `timer=100ms` log text is not an autonomous-cutoff measurement.
++
++## Host verification
++
++Run from the source checkout:
++
++```text
++python -B tools/test-fuxi-torch-pulse.py
++python -B tools/test-fuxi-torch-audit.py
++```
++
++The pulse test checks both source decoders over the enable bit and all 128
++timer codes, shows that the old byte exceeds the OEM 100 ms source bound,
++and runs the production sequence and fault/drop/delayed-readback cases under
++both timer models. Each model checks expiration immediately before and at
++its own modeled deadline. Every channel enable requires verified `0x89`
++and both decoded durations at most 100,000 us.
++
++The audit test checks the actual production timer write/readback ordering,
++both source upper bounds, the unchanged 80 ms wait and 1 ms confirmation
++wait, and a synthetic post-disable `0x09=0x10` read with transport `rc=0`
++that still returns `-5` while configuration restoration succeeds. Existing
++read-failure and audit-capacity/time-overflow cases remain covered.
++
++`tools/test-fuxi-torch-runtime.py` has no timer-byte expectation and needs no
++source change. Its lease and latch checks remain separate from the two
++callback models.
++
++The local checkpoint passed both listed scripts with MSVC 14.50.35717,
++C11, `/W4 /WX` and AddressSanitizer. The unchanged runtime test's C body
++also passed with the same detected compiler and sanitizer, using a temporary
++host build without editing its Python runner. Local UBSan was not run;
++the existing non-MSVC runners retain their ASan/UBSan flags.
++
++These are deterministic host/source checks. The modeled `expired` field
++is not a physical output observation, and ASan/UBSan cannot prove PMIC timer
++start/cancel semantics, oscillator tolerance, optical cutoff, SPMI latency,
++or finite physical shutdown.
++
++## Device evidence still missing
++
++The existing `native-hw000torchraw-120s-boot-1` run used the old byte, not
++this checkpoint. It confirmed successful transport, bounded off readbacks
++and restoration, then failed on a transient post-disable `0x09=0x10`.
++Software had already disabled output before the nominal source deadlines;
++that trace contains no autonomous-device-cutoff proof.
++
++The main agent's next bounded device diagnostic must preserve the cutoff,
++current, lease and failure latch, verify the new byte before enable, and
++record per-channel status and timestamped shutdown observations. Even a
++successful software-disabled pulse is not autonomous-cutoff acceptance.
++The meaning and clear/lifetime behavior of actual PM8550 `0x09 bit4`, the
++timer's start/cancel behavior, and physical cutoff remain unverified. This
++encoding correction neither explains nor fixes the observed status failure.
 diff --git a/docs-lanes/wlan-bdf-provenance.md b/docs-lanes/wlan-bdf-provenance.md
 new file mode 100644
 index 0000000..8966843
@@ -12954,10 +13458,10 @@ index 0000000..1d7b73c
 +    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-torch-audit.py b/tools/test-fuxi-torch-audit.py
 new file mode 100644
-index 0000000..77b8d90
+index 0000000..4c40af5
 --- /dev/null
 +++ b/tools/test-fuxi-torch-audit.py
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,181 @@
 +import importlib.util
 +import os
 +from pathlib import Path
@@ -12974,6 +13478,7 @@ index 0000000..77b8d90
 +
 +typedef struct {
 +    uint8_t registers[256];
++    uint8_t postdisable_status;
 +    unsigned reads;
 +    unsigned fail_read;
 +    uint64_t now;
@@ -12986,6 +13491,9 @@ index 0000000..77b8d90
 +    int result = ++model->reads == model->fail_read ? -1 : 0;
 +    assert(offset < 256);
 +    if (!result) *value = model->registers[offset];
++    if (!result && model->postdisable_status && offset == 9 &&
++        model->now > model->audit.started && !model->registers[0x4e] &&
++        !(model->registers[0x46] & 0x80)) *value = model->postdisable_status;
 +    fuxi_torch_audit_record(&model->audit, 'R', offset, result ? 0 : *value, result, model->now);
 +    return result;
 +}
@@ -13032,15 +13540,40 @@ index 0000000..77b8d90
 +    assert(model.audit.events[0].operation == 'R' && model.audit.events[0].offset == 4);
 +    assert(model.audit.events[model.audit.count - 1].elapsed_us == 81000);
 +    unsigned wait_events = 0;
++    unsigned timer_event = FUXI_TORCH_AUDIT_CAPACITY;
++    unsigned timer_verified = FUXI_TORCH_AUDIT_CAPACITY;
++    unsigned module_event = FUXI_TORCH_AUDIT_CAPACITY;
++    unsigned channel_event = FUXI_TORCH_AUDIT_CAPACITY;
 +    for (unsigned index = 0; index < model.audit.count; index++) {
 +        const FuxiTorchAuditEvent *event = &model.audit.events[index];
 +        assert(!event->result);
++        if (event->offset == 0x3e && event->value == 0x89) {
++            if (event->operation == 'W') {
++                assert(timer_event == FUXI_TORCH_AUDIT_CAPACITY);
++                timer_event = index;
++                unsigned code = event->value & 0x7fu;
++                unsigned mainline_us = code * 10000u;
++                unsigned oem_us = (code + 1u) * 10000u;
++                assert(event->value & 0x80);
++                assert(mainline_us == 90000u && oem_us == 100000u);
++                assert(mainline_us <= 100000u && oem_us <= 100000u);
++            } else if (event->operation == 'R') {
++                assert(timer_verified == FUXI_TORCH_AUDIT_CAPACITY);
++                timer_verified = index;
++            }
++        }
++        if (event->operation == 'W' && event->offset == 0x46 && (event->value & 0x80))
++            module_event = index;
++        if (event->operation == 'W' && event->offset == 0x4e && event->value == 1)
++            channel_event = index;
 +        if (event->operation == 'S' || event->operation == 'E') {
 +            assert(event->offset == 80000 || event->offset == 1000);
 +            wait_events++;
 +        }
 +    }
 +    assert(wait_events == 4);
++    assert(timer_event < timer_verified && timer_verified < module_event);
++    assert(module_event < channel_event && channel_event < model.audit.count);
 +    unsigned read_count = model.reads;
 +    for (unsigned failure = 1; failure <= read_count; failure++) {
 +        fixture(&model);
@@ -13057,6 +13590,20 @@ index 0000000..77b8d90
 +        assert(errors == 1 && !model.audit.dropped);
 +    }
 +    fixture(&model);
++    model.postdisable_status = 0x10;
++    assert(fuxi_torch_pulse_level(&io, 4) == -5);
++    assert(!memcmp(original, model.registers, sizeof(original)));
++    unsigned postdisable_events = 0;
++    for (unsigned index = 0; index < model.audit.count; index++) {
++        const FuxiTorchAuditEvent *event = &model.audit.events[index];
++        assert(!event->result);
++        if (event->operation == 'R' && event->offset == 9 && event->value == 0x10) {
++            assert(event->elapsed_us == 81000);
++            postdisable_events++;
++        }
++    }
++    assert(postdisable_events == 1 && !model.audit.dropped);
++    fixture(&model);
 +    fuxi_torch_audit_record(&model.audit, 'R', 7, 0x20, -2, model.now - 1);
 +    assert(model.audit.events[0].elapsed_us == UINT64_MAX);
 +    fuxi_torch_audit_begin(&model.audit, UINT64_MAX - 999);
@@ -13072,7 +13619,7 @@ index 0000000..77b8d90
 +    assert(!model.audit.count && !model.audit.dropped && !model.audit.started);
 +    fuxi_torch_audit_begin(NULL, 0);
 +    fuxi_torch_audit_record(NULL, 'R', 0, 0, 0, 0);
-+    puts("PASS production torch audit: bounded disable confirmation, every read failure, sleep timing, 64-event bound, reset, clock rollback and overflow");
++    puts("PASS production torch audit: 0x89 dual-primary source bounds and verified timer-before-enable, postdisable 0x09 bit4 recorded/refused, bounded disable confirmation, every read failure, sleep timing, 64-event bound, reset, clock rollback and overflow; no device cutoff proof");
 +    return 0;
 +}
 +'''
@@ -13098,10 +13645,10 @@ index 0000000..77b8d90
 +    subprocess.run([str(binary)], cwd=directory, env=environment, check=True, timeout=60)
 diff --git a/tools/test-fuxi-torch-pulse.py b/tools/test-fuxi-torch-pulse.py
 new file mode 100644
-index 0000000..66d295b
+index 0000000..6f741f8
 --- /dev/null
 +++ b/tools/test-fuxi-torch-pulse.py
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,189 @@
 +import importlib.util
 +import os
 +from pathlib import Path
@@ -13116,11 +13663,22 @@ index 0000000..66d295b
 +#include "fuxi_torch_pulse.h"
 +struct model {
 +    uint8_t registers[256], original[256];
++    uint8_t postdisable_status;
 +    unsigned reads, writes, fail_read, fail_write, drop_write, quarantine, dead, fault;
 +    unsigned now, start, pulses, peak_current, expired, level;
-+    unsigned off_delay_reads, pending_off_reads, timer_fault;
++    unsigned off_delay_reads, pending_off_reads, timer_fault, timer_source;
 +    uint64_t drop_mask;
 +};
++static unsigned mainline_timer_us(uint8_t timer) {
++    return (timer&0x80) ? (timer&0x7f)*10000u : 0;
++}
++static unsigned oem_timer_us(uint8_t timer) {
++    return (timer&0x80) ? ((timer&0x7f)+1u)*10000u : 0;
++}
++static unsigned modeled_timer_us(const struct model *state) {
++    return state->timer_source ? oem_timer_us(state->registers[0x3e]) :
++        mainline_timer_us(state->registers[0x3e]);
++}
 +static int active(struct model *state) {
 +    return (state->registers[0x46]&0x80) && (state->registers[0x4e]&1) && !state->expired;
 +}
@@ -13130,6 +13688,10 @@ index 0000000..66d295b
 +    if(++state->reads==state->fail_read) return -1;
 +    if(state->fault && state->pulses && offset==6) {*value=1; return 0;}
 +    if(state->timer_fault && state->expired && offset==9) {*value=1; return 0;}
++    if(state->postdisable_status && state->pulses && offset==9 &&
++       !state->registers[0x4e] && !(state->registers[0x46]&0x80)) {
++        *value=state->postdisable_status; return 0;
++    }
 +    *value=state->registers[offset];
 +    if(offset==0x4e && state->pending_off_reads && !--state->pending_off_reads)
 +        state->registers[offset]=0;
@@ -13144,7 +13706,11 @@ index 0000000..66d295b
 +    if(state->writes!=state->drop_write && !(state->drop_mask&(1ull<<state->writes))) {
 +        if(active(state) && offset!=0x46 && offset!=0x4e) assert(0);
 +        if(offset==0x4e && value) {
-+            assert(value==1 && state->registers[0x3e]==0x8a && (state->registers[0x49]&1));
++            assert(value==1 && state->registers[0x3e]==0x89 && (state->registers[0x49]&1));
++            assert(mainline_timer_us(state->registers[0x3e])==90000u);
++            assert(oem_timer_us(state->registers[0x3e])==100000u);
++            assert(mainline_timer_us(state->registers[0x3e])<=100000u);
++            assert(oem_timer_us(state->registers[0x3e])<=100000u);
 +            assert((state->registers[0x4a]&7)==1 && state->registers[0x42]==state->level*4-1);
 +            assert(state->registers[0x46]&0x80);
 +            state->start=state->now; state->pulses++; state->expired=0; state->peak_current=state->level*20;
@@ -13160,10 +13726,11 @@ index 0000000..66d295b
 +    struct model *state=context;
 +    state->now+=microseconds;
 +    if(state->pulses && (state->registers[0x3e]&0x80) &&
-+       state->now-state->start>=(state->registers[0x3e]&0x7f)*10000u) state->expired=1;
++       state->now-state->start>=modeled_timer_us(state)) state->expired=1;
 +}
-+static void fixture(struct model *state) {
++static void fixture(struct model *state, unsigned timer_source) {
 +    memset(state,0,sizeof(*state));
++    state->timer_source=timer_source;
 +    state->level=2;
 +    state->registers[4]=0x18; state->registers[5]=7;
 +    state->registers[0x3e]=11; state->registers[0x42]=23;
@@ -13176,57 +13743,79 @@ index 0000000..66d295b
 +    assert(!active(state) && state->pulses<=1 && state->peak_current<=80);
 +    return result;
 +}
-+int main(void) {
++static void test_primary(unsigned timer_source) {
 +    struct model state;
-+    fixture(&state); assert(!run(&state));
++    fixture(&state,timer_source); assert(!run(&state));
 +    assert(state.pulses==1 && state.now==81000 && state.writes==12);
 +    assert(!memcmp(state.registers,state.original,256));
 +    unsigned reads=state.reads;
-+    fixture(&state); state.registers[4]=0; assert(run(&state)<0 && !state.writes);
-+    fixture(&state); state.registers[5]=4; assert(run(&state)<0 && !state.writes);
-+    fixture(&state); state.registers[0x46]|=0x80;
++    fixture(&state,timer_source); state.registers[4]=0; assert(run(&state)<0 && !state.writes);
++    fixture(&state,timer_source); state.registers[5]=4; assert(run(&state)<0 && !state.writes);
++    fixture(&state,timer_source); state.registers[0x46]|=0x80;
 +    FuxiTorchIo busy={&state,read_register,write_register,wait_us};
 +    assert(fuxi_torch_pulse(&busy)==-2 && !state.writes);
-+    fixture(&state); state.registers[0x4e]=2; assert(run(&state)==-2 && !state.writes);
-+    fixture(&state); state.registers[6]=1; assert(run(&state)==-2 && !state.writes);
++    fixture(&state,timer_source); state.registers[0x4e]=2; assert(run(&state)==-2 && !state.writes);
++    fixture(&state,timer_source); state.registers[6]=1; assert(run(&state)==-2 && !state.writes);
++    fixture(&state,timer_source); state.registers[9]=0x10; assert(run(&state)==-2 && !state.writes);
 +    for(unsigned index=1;index<=reads;index++) {
-+        fixture(&state); state.fail_read=index; assert(run(&state)<0);
++        fixture(&state,timer_source); state.fail_read=index; assert(run(&state)<0);
 +    }
 +    for(unsigned index=1;index<=12;index++) {
-+        fixture(&state); state.fail_write=index; assert(run(&state)<0);
++        fixture(&state,timer_source); state.fail_write=index; assert(run(&state)<0);
 +    }
 +    for(unsigned index=1;index<=12;index++) {
-+        fixture(&state); state.drop_write=index; run(&state);
-+        fixture(&state); state.fail_write=index; state.quarantine=1; assert(run(&state)<0);
++        fixture(&state,timer_source); state.drop_write=index; run(&state);
++        fixture(&state,timer_source); state.fail_write=index; state.quarantine=1; assert(run(&state)<0);
 +    }
-+    fixture(&state); state.drop_mask=(1ull<<7)|(1ull<<8);
++    fixture(&state,timer_source); state.drop_mask=(1ull<<7)|(1ull<<8);
 +    assert(run(&state)==-6 && state.expired && state.now==193000);
-+    assert(state.registers[0x3e]==0x8a && state.writes==8);
++    assert(state.registers[0x3e]==0x89 && state.writes==8);
 +    for(unsigned delayed_reads=1;delayed_reads<=2;delayed_reads++) {
-+        fixture(&state); state.off_delay_reads=delayed_reads;
++        fixture(&state,timer_source); state.off_delay_reads=delayed_reads;
 +        assert(!run(&state) && state.now==81000+delayed_reads*1000);
 +        assert(!memcmp(state.registers,state.original,256));
 +        unsigned delayed_read_count=state.reads;
 +        for(unsigned failure=1;failure<=delayed_read_count;failure++) {
-+            fixture(&state); state.off_delay_reads=delayed_reads; state.fail_read=failure;
++            fixture(&state,timer_source); state.off_delay_reads=delayed_reads; state.fail_read=failure;
 +            assert(run(&state)<0);
 +        }
 +    }
-+    fixture(&state); state.off_delay_reads=3;
-+    assert(run(&state)==-6 && state.registers[0x3e]==0x8a && state.writes==8);
-+    fixture(&state); state.drop_mask=(1ull<<7)|(1ull<<8); state.timer_fault=1;
-+    assert(run(&state)==-6 && state.expired && state.registers[0x3e]==0x8a);
-+    fixture(&state); state.fault=1; assert(run(&state)==-5);
++    fixture(&state,timer_source); state.off_delay_reads=3;
++    assert(run(&state)==-6 && state.registers[0x3e]==0x89 && state.writes==8);
++    fixture(&state,timer_source); state.drop_mask=(1ull<<7)|(1ull<<8); state.timer_fault=1;
++    assert(run(&state)==-6 && state.expired && state.registers[0x3e]==0x89);
++    fixture(&state,timer_source); state.fault=1; assert(run(&state)==-5);
++    assert(!memcmp(state.registers,state.original,256));
++    fixture(&state,timer_source); state.postdisable_status=0x10;
++    assert(run(&state)==-5 && state.pulses==1 && state.writes==12);
 +    assert(!memcmp(state.registers,state.original,256));
 +    for(unsigned level=0;level<=5;level++) {
-+        fixture(&state); state.level=level;
++        fixture(&state,timer_source); state.level=level;
 +        if(!level || level>4) assert(run(&state)<0 && !state.writes);
 +        else {
 +            assert(!run(&state) && state.peak_current==level*20);
 +            assert(!memcmp(state.registers,state.original,256));
 +        }
 +    }
-+    puts("PASS: production torch pulse, four 20..80mA levels, 80ms duration, timer-before-enable, bounded two-sample disable, delayed readback, every read/write failure and retained-timer cleanup");
++    fixture(&state,timer_source);
++    state.registers[0x3e]=0x89; state.registers[0x46]|=0x80;
++    state.registers[0x4e]=1; state.pulses=1;
++    unsigned deadline=modeled_timer_us(&state);
++    assert(deadline>=80000u && deadline<=100000u);
++    wait_us(&state,deadline-1u); assert(active(&state) && !state.expired);
++    wait_us(&state,1); assert(!active(&state) && state.expired && state.now==deadline);
++}
++int main(void) {
++    for(unsigned code=0;code<128;code++) {
++        uint8_t enabled=(uint8_t)(code|0x80);
++        assert(!mainline_timer_us((uint8_t)code) && !oem_timer_us((uint8_t)code));
++        assert(mainline_timer_us(enabled)==code*10000u);
++        assert(oem_timer_us(enabled)==(code+1u)*10000u);
++    }
++    assert(mainline_timer_us(0x89)==90000u && oem_timer_us(0x89)==100000u);
++    assert(mainline_timer_us(0x8a)==100000u && oem_timer_us(0x8a)>100000u);
++    for(unsigned timer_source=0;timer_source<2;timer_source++) test_primary(timer_source);
++    puts("PASS: production torch pulse, 0x89 dual-primary decode models (OEM 100ms/mainline 90ms), four 20..80mA levels, 80ms wait, timer-before-enable, bounded two-sample disable, delayed readback, every read/write failure, retained-timer cleanup and postdisable 0x09 bit4 refusal; no device cutoff proof");
 +    return 0;
 +}
 +'''
@@ -13968,15 +14557,20 @@ index 12293f1..dbd7876 100755
  '''
 diff --git a/tools/test-fuxi-wlan-w18.py b/tools/test-fuxi-wlan-w18.py
 new file mode 100644
-index 0000000..99b9323
+index 0000000..87ad158
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-w18.py
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,280 @@
 +#!/usr/bin/env python3
 +"""Compile the production WLAN timeline with the existing independent W16 peer.
 +
 +--standalone stages source fixtures in a temporary directory for parallel work.
 +The default also validates the repository's canonical source mirrors.
++
++HOST_CAP SECONDARY=2 matches the same-device exported cnss2 module, SHA256
++32f9cbf282f00ce1447942a78668d53b3023b3e8119eca61a8cf19cff03e5390.
++Its inlined caller stores valid=1 at request+0x130 and enum=2 at +0x134,
++matching the primary AArch64 schema. Loaded-buffer identity is not established.
 +"""
 +from pathlib import Path
 +import argparse
@@ -13988,7 +14582,39 @@ index 0000000..99b9323
 +w16 = importlib.util.module_from_spec(spec)
 +spec.loader.exec_module(w16)
 +
-+peer = w16.TESTS.split('int main(void) {', 1)[0]
++CAP_PEER = r'''
++static unsigned cap_strip(const uint8_t *body,unsigned length,uint8_t *baseline,bool enabled) {
++    unsigned cursor=0,output=0,found=0;
++    assert(length<=512);
++    while(cursor<length) {
++        assert(length-cursor>=3);
++        unsigned size=body[cursor+1]|((unsigned)body[cursor+2]<<8);
++        assert(size<=length-cursor-3);
++        assert(body[cursor]!=0x11 && body[cursor]!=0x1f);
++        if(body[cursor]==0x20) {
++            const uint8_t expected[]={2,0,0,0};
++            assert(enabled && ++found==1 && size==sizeof(expected));
++            assert(!memcmp(body+cursor+3,expected,sizeof(expected)));
++        } else {
++            memcpy(baseline+output,body+cursor,size+3);output+=size+3;
++        }
++        cursor+=size+3;
++    }
++    assert(found==(unsigned)enabled);
++    return output;
++}
++'''
++
++peer = CAP_PEER + w16.TESTS.split('int main(void) {', 1)[0]
++peer = peer.replace('if(msg==0x34) {', r'''
++    if(msg==0x34) {
++        uint8_t baseline[519];
++        assert(len>=7);
++        memcpy(baseline,q,7);
++        unsigned size=cap_strip(q+7,len-7,baseline+7,cap_arg && !strcmp(cap_arg,"1"));
++        baseline[5]=(uint8_t)size;baseline[6]=(uint8_t)(size>>8);
++        q=baseline;len=size+7;
++''')
 +peer = peer.replace('static unsigned start_case,', 'static unsigned timeline_case;\nstatic unsigned start_case,')
 +peer = peer.replace('unsigned step=seen15++;', r'''
 +        unsigned step=seen15++;
@@ -14033,7 +14659,46 @@ index 0000000..99b9323
 +    assert(!memcmp(contexts,(void *)wl_contexts.va,sizeof(contexts)));
 +    assert(!memcmp(ipcr,(void *)wl_ipcr.va,wl_ipcr.size));free(ipcr);
 +}
++static void host_cap_selectors(void) {
++    const char *values[]={NULL,"0","1","-1","2","01","+1","0x1","1junk","","2147483648","1000000000000000000000000000000"};
++    for(int qrtr=0;qrtr<=6;qrtr++)for(int variant=0;variant<=1;variant++) {
++        for(unsigned index=0;index<sizeof(values)/sizeof(values[0]);index++) {
++            cap_arg=values[index];qrtr_arg=qrtr;w18_arg=variant;w16_arg=0;
++            unsigned before=ne;
++            wl_probe_configure();
++            bool selected=qrtr==5 && variant==1;
++            bool invalid=selected && index>=3;
++            assert(wl_variant_invalid==invalid && ne==before);
++            assert(wl18_cap_invalid==invalid);
++            assert(wl18_host_cap==(selected && index==2));
++            assert(wl18_cap_refused()==invalid && ne==before);
++            if(invalid)assert(wl5_step(17)==0x6c && ne==before);
++        }
++    }
++    cap_arg=NULL;qrtr_arg=5;w18_arg=1;wl_probe_configure();
++    assert(!wl18_host_cap && !wl_variant_invalid);
++}
++static void host_cap_wire(void) {
++    const unsigned policies[]={0,WL17_HOSTMEM,WL17_MLOALL};
++    for(unsigned variant=0;variant<=2;variant++) {
++        for(unsigned policy=0;policy<sizeof(policies)/sizeof(policies[0]);policy++) {
++            if(variant==2 && policies[policy]==WL17_MLOALL)continue;
++            struct wl12_encoder baseline={0},selected={0};uint8_t stripped[512];
++            wl12_mlo_variant=variant;wl17_bits=policies[policy];
++            wl12_mlo_enabled=true;wl12_num_phy=2;wl18_host_cap=false;
++            assert(!wl12_host_cap(&baseline));
++            unsigned size=cap_strip(baseline.data,baseline.len,stripped,false);
++            assert(size==baseline.len && !memcmp(stripped,baseline.data,size));
++            wl18_host_cap=true;assert(!wl12_host_cap(&selected));
++            size=cap_strip(selected.data,selected.len,stripped,true);
++            assert(selected.len==baseline.len+7 && size==baseline.len);
++            assert(!memcmp(stripped,baseline.data,size));
++        }
++    }
++    wl12_mlo_variant=wl17_bits=0;wl18_host_cap=false;
++}
 +int main(void) {
++    host_cap_selectors();host_cap_wire();
 +    for(int qrtr=0;qrtr<=6;qrtr++)for(int variant=-1;variant<=2;variant++) {
 +        qrtr_arg=qrtr;w16_arg=0;w18_arg=variant;wl_probe_configure();
 +        assert(wl_variant_invalid==(qrtr==5 && (variant<0 || variant>1)));
@@ -14103,16 +14768,37 @@ index 0000000..99b9323
 +    fail_bm=fail_perst=true;wl5_abort(28);
 +    assert(!frees && wl_ipcr.va && wl14_m3.va);
 +    fail_bm=fail_perst=false;contain();
-+    puts("W18 selectors, exact QMI, phase transitions, exact MODE EOT, bounded silence, six read-only accesses, faults, RDDM and quarantine passed");
++    const char *profiles[]={NULL,"0","1"};
++    for(unsigned profile=0;profile<sizeof(profiles)/sizeof(profiles[0]);profile++) {
++        for(unsigned failure=0;failure<=22;failure+=22) {
++            cap_arg=profiles[profile];boot18(3,failure,0);
++            assert(wl18_host_cap==(profile==2));
++            assert((finish_step()!=0)==(failure!=0) && seen15==3);
++            assert(!!strstr(logbuf,"HOST_CAP TLV 0x20")== (profile==2));
++            if(failure)sample_line("phase MODE timeout","elapsed 10000 ms");
++            check_no_ce();contain();
++        }
++    }
++    cap_arg=NULL;
++    puts("W18 selectors, exact QMI, single-TLV HOST_CAP A/B, phase transitions, exact MODE EOT, bounded silence, six read-only accesses, faults, RDDM and quarantine passed");
 +    return 0;
 +}
 +'''
 +
 +
 +def run():
++    driver = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
++    assert 'fw_run(unsigned limit)\n{\n\tif (wl18_cap_refused()) { return; }' in driver
 +    m6 = w16.w15.w14.w12.w11.w10.m6o.m6
 +    m6.PREAMBLE = m6.PREAMBLE.replace('static bool PE_parse_boot_argn(',
-+                                     'static int w18_arg;\nstatic bool PE_parse_boot_argn(')
++                                     'static int w18_arg;\nstatic const char *cap_arg;\nstatic bool PE_parse_boot_argn(')
++    m6.PREAMBLE = m6.PREAMBLE.replace(
++        'static bool PE_parse_boot_arg_str(const char *name, char *out, int size) {',
++        'static bool PE_parse_boot_arg_str(const char *name, char *out, int size) {\n'
++        '    if(!strcmp(name,"fuxiwlancap")) {\n'
++        '        if(cap_arg) { strncpy(out,cap_arg,size); return true; }\n'
++        '        return false;\n'
++        '    }')
 +    m6.PREAMBLE = m6.PREAMBLE.replace(
 +        'if(!strcmp(name,"fuxiwlanw18")) { assert(size==sizeof(int)); return false; }',
 +        'if(!strcmp(name,"fuxiwlanw18")) { assert(size==sizeof(int)); memcpy(out,&w18_arg,size); return true; }')
@@ -21003,7 +21689,7 @@ index 0000000..7558fa9
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_torch_pulse.h b/xnu/fuxi-adsp/fuxi_torch_pulse.h
 new file mode 100644
-index 0000000..49e0d14
+index 0000000..9bdc64d
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_torch_pulse.h
 @@ -0,0 +1,93 @@
@@ -21034,7 +21720,7 @@ index 0000000..49e0d14
 +        const unsigned status[] = {6, 7, 9};
 +        if (io->read(io->context, status[index], &value) || value) return -2;
 +    }
-+    const uint8_t setup[] = {0x8a, (uint8_t)(level * 4 - 1),
++    const uint8_t setup[] = {0x89, (uint8_t)(level * 4 - 1),
 +        (uint8_t)(saved[2] | 1), (uint8_t)((saved[3] & ~7u) | 1)};
 +    for (unsigned index = 0; index < 4; index++) {
 +        if (io->write(io->context, registers[index], setup[index]) ||
@@ -27003,7 +27689,7 @@ index c8376e4..d363e22 100644
  int sweet_ufs_rootdev(dev_t *dev);
  
 diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
-index 1b46ea1..c929a22 100644
+index 1b46ea1..6705050 100644
 --- a/xnu/fuxi-wlan/fuxi_wlan.c
 +++ b/xnu/fuxi-wlan/fuxi_wlan.c
 @@ -78,6 +78,7 @@
@@ -27053,7 +27739,7 @@ index 1b46ea1..c929a22 100644
  static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
  static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
  static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
-+static bool wl18_enabled;
++static bool wl18_enabled, wl18_host_cap, wl18_cap_invalid;
  static unsigned wl_rails_variant;
  static bool wl_rails_requested;
  static bool wl16_large, wl16_redrive;
@@ -27061,11 +27747,11 @@ index 1b46ea1..c929a22 100644
  	}
  	wl15_variant = 0;
  	wl16_variant = 0; wl16_large = wl16_redrive = false;
-+	wl18_enabled = false;
++	wl18_enabled = wl18_host_cap = wl18_cap_invalid = false;
  	if (wl_w15) {
  		int variant = 0;
  		(void)PE_parse_boot_argn("fuxiwlanw15", &variant, sizeof(variant));
-@@ -1041,6 +1052,13 @@ wl_probe_configure(void)
+@@ -1041,6 +1052,23 @@ wl_probe_configure(void)
  			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
  			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
  		}
@@ -27076,10 +27762,35 @@ index 1b46ea1..c929a22 100644
 +		if (variant) {
 +			printf("FUXI WLAN: W18 timeline %d valid %u\n", variant, !wl_variant_invalid);
 +		}
++	}
++	if (wl18_enabled) {
++		char capability[16] = {0};
++		if (PE_parse_boot_arg_str("fuxiwlancap", capability, sizeof(capability))) {
++			if ((capability[0] != '0' && capability[0] != '1') || capability[1]) {
++				wl_variant_invalid = wl18_cap_invalid = true;
++			} else { wl18_host_cap = capability[0] == '1'; }
++			printf("FUXI WLAN: W18 host cap selector %u valid %u (1 adds SECONDARY=2 only)\n",
++			    wl18_host_cap, !wl_variant_invalid);
++		}
  	}
  	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
  	if (wl_w14) {
-@@ -3176,6 +3194,10 @@ static unsigned wl12_num_phy;
+@@ -1085,6 +1113,14 @@ wl_probe_configure(void)
+ 	printf("FUXI WLAN: M6n cnss=%s valid=%u (PDC before step 1)\n",
+ 	    wl_cnss_names[wl_cnss], !wl_variant_invalid);
+ }
++
++static bool
++wl18_cap_refused(void)
++{
++	if (!wl18_cap_invalid) { return false; }
++	printf("FUXI WLAN: invalid fuxiwlancap (expected exact 0 or 1); refused before WLAN power writes\n");
++	return true;
++}
+ #define WL_CNSS_IOVA 0xa0000000ull
+ #define WL_CNSS_IOVA_END 0xb0000000ull
+ #define WL_LEGACY_IOVA 0x10000000ull
+@@ -3176,6 +3212,10 @@ static unsigned wl12_num_phy;
  static bool wl13_delayed, wl13_negotiated;
  static bool wl14_ready, wl14_init_done, wl14_board_valid;
  static uint64_t wl15_ready_time;
@@ -27090,7 +27801,7 @@ index 1b46ea1..c929a22 100644
  static uint32_t wl14_board;
  static int wl_w12_run(void);
  static int wl_qmi_w12(const uint8_t *, unsigned);
-@@ -3206,6 +3228,40 @@ static struct wl_context *wl_channel(unsigned ch) { return (void *)(wl_contexts.
+@@ -3206,6 +3246,40 @@ static struct wl_context *wl_channel(unsigned ch) { return (void *)(wl_contexts.
  static struct wl_tre *wl_ipcr_ring(unsigned off) { return (void *)(wl_ipcr.va + off); }
  static void wl_w11_barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
  
@@ -27131,7 +27842,7 @@ index 1b46ea1..c929a22 100644
  /* RAM-only snapshot: channel RP is diagnostic, never used to reclaim TREs.
   * Completion events remain authoritative. Do not repair a live device-owned
   * RP even when it resembles type/ER words (as in try15c/try15d). */
-@@ -3567,7 +3623,15 @@ wl_w11_events(void)
+@@ -3567,7 +3641,15 @@ wl_w11_events(void)
  					if (ev.ptr != wl_ipcr.iova+roff+ri*16 || (ch == 20 && ri == wl_tx_write)) { return wl_w11_fail("transfer completion pointer/order"); }
  					struct wl_tre tre = wl_ipcr_ring(roff)[ri];
  					if (bytes > (ch == 20 ? WL_IPCR_TXMTU : WL_IPCR_MTU) || bytes > (tre.d0 & 0xffff)) { return wl_w11_fail("transfer completion length"); }
@@ -27148,7 +27859,7 @@ index 1b46ea1..c929a22 100644
  					else {
  						uint64_t lo = wl_ipcr.iova + WL_IPCR_RXBUF;
  						if (tre.ptr < lo || tre.ptr >= lo+WL_IPCR_N*WL_IPCR_MTU ||
-@@ -3669,6 +3733,7 @@ wl_w11_run(void)
+@@ -3669,6 +3751,7 @@ wl_w11_run(void)
  	wl12_reply = wl12_requested = wl12_ready = false;
  	wl13_delayed = wl13_negotiated = false;
  	wl14_ready = wl14_init_done = wl14_board_valid = false; wl14_board = 0;
@@ -27156,7 +27867,7 @@ index 1b46ea1..c929a22 100644
  	wl_chdb = wl_mrd(0x18); wl_erdb = wl_mrd(0x20);
  	if (!wl_qrtr || !wl_amss_reached || !wl_contexts_published || wl_w11_guard() ||
  	    (wl_chdb & 7) || wl_chdb < 0x100 || wl_chdb > 0x3c00 ||
-@@ -3779,6 +3844,10 @@ wl12_send(struct wl12_encoder *e, unsigned msg, unsigned stage)
+@@ -3779,6 +3862,10 @@ wl12_send(struct wl12_encoder *e, unsigned msg, unsigned stage)
  	e->data[0] = 0; wl_put16(e->data+1, wl12_txn);
  	wl_put16(e->data+3, msg); wl_put16(e->data+5, e->len-7);
  	printf("FUXI WLAN: %s send txn %u msg %#x stage %u\n", wl_w15 && stage >= WL15_INI ? "W15" : "W12", wl12_txn, msg, stage);
@@ -27167,7 +27878,18 @@ index 1b46ea1..c929a22 100644
  	int error = wl_qrtr_send(1, wl_server_node, wl_server_port, e->data, e->len);
  	if (!error && stage == WL15_MODE) { wl16_snapshot("MODE queued"); }
  	return error;
-@@ -4281,6 +4350,7 @@ static void
+@@ -3844,6 +3931,10 @@ wl12_host_cap(struct wl12_encoder *e)
+ 	    wl12_tlv(e, 0x14, 1, 1) || wl12_tlv(e, 0x16, 1, 1) ||
+ 	    wl12_tlv(e, 0x17, 1, 1) || wl12_tlv(e, 0x1a, 0, 1) ||
+ 	    wl12_tlv(e, 0x1c, 0, 1)) { return 1; }
++	if (wl18_host_cap) {
++		if (wl12_tlv(e, 0x20, 2, 4)) { return 1; }
++		printf("FUXI WLAN: W18 HOST_CAP TLV 0x20 host_build_type SECONDARY=2 len=4\n");
++	}
+ 	int links = wl17_mlo_links(wl12_mlo_variant, wl17_bits, wl12_mlo_enabled, wl12_num_phy);
+ 	bool mlo = links != 0;
+ 	if (mlo) {
+@@ -4281,6 +4372,7 @@ static void
  wl15_timeout_snapshot(void)
  {
  	if (!wl_w15 || wl12_stage != WL15_MODE) { return; }
@@ -27175,7 +27897,7 @@ index 1b46ea1..c929a22 100644
  	wl16_snapshot("MODE timeout");
  	wl15_elapsed("MODE timeout");
  	wl_wlfw_diagnostics("W15 MODE timeout");
-@@ -4345,11 +4415,15 @@ wl12_wait(unsigned what, const char *stage)
+@@ -4345,11 +4437,15 @@ wl12_wait(unsigned what, const char *stage)
  	/* Match ath12k's ten-second WLFW timeout, with bounded transport passes. */
  	for (unsigned ms = 0; ms <= 10000; ms += 10) {
  		if (wl_w11_events()) {
@@ -27191,7 +27913,7 @@ index 1b46ea1..c929a22 100644
  		if (ms < 10000) { wl_sleep(10); }
  	}
  	if (wl12_mlo_variant == 1 && wl12_msg == 0x57) {
-@@ -4494,6 +4568,7 @@ static int
+@@ -4494,6 +4590,7 @@ static int
  wl_w15_run(void)
  {
  	static struct wl12_encoder e;
@@ -27199,7 +27921,7 @@ index 1b46ea1..c929a22 100644
  	bzero(&e, sizeof(e)); e.len = 7;
  	/* qmi_wlanfw_wlan_ini_req_msg_v01 / *_ei: optional 0x10 u8.
  	 * Explicit lane policy: disable fw log (0). Upstream v6.12 sends 1. */
-@@ -4501,11 +4576,13 @@ wl_w15_run(void)
+@@ -4501,11 +4598,13 @@ wl_w15_run(void)
  	if (wl12_tlv(&e, 0x10, 0, 1) || wl12_send(&e, 0x2f, WL15_INI) ||
  	    wl12_wait(0, "WLAN_INI reply") || wl_w11_wait(3, "W15 INI TX drain")) { return 1; }
  	printf("FUXI WLAN: W15 wlan ini ok\n");
@@ -27213,7 +27935,7 @@ index 1b46ea1..c929a22 100644
  	wl16_snapshot("CFG reply/before MODE");
  	if (wl16_redrive) {
  		printf("FUXI WLAN: W16 before MODE re-ring posted RX; no CE init before MODE (ath12k v6.12 order)\n");
-@@ -4520,6 +4597,7 @@ wl_w15_run(void)
+@@ -4520,6 +4619,7 @@ wl_w15_run(void)
  	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
  	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
  	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
@@ -27221,6 +27943,14 @@ index 1b46ea1..c929a22 100644
  	wl16_snapshot("MODE reply");
  	wl12_stage = WL15_OBSERVE;
  	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
+@@ -5190,6 +5290,7 @@ wl17_clk_step(void)
+ static void
+ fw_run(unsigned limit)
+ {
++	if (wl18_cap_refused()) { return; }
+ 	uint32_t *r4 = wl4_report;
+ 	r4[0] = WL4_MAGIC;
+ 	r4[1] = limit;
 diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
 index 0ca2838..0d215ed 100644
 --- a/xnu/patches/0098-fuxi-native-adreno-abi.patch
@@ -27384,7 +28114,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..6421c42 100644
+index d21bf85..a5d62ac 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -27392,7 +28122,7 @@ index d21bf85..6421c42 100644
  --- a/bsd/dev/fuxi_wlan.c
  +++ b/bsd/dev/fuxi_wlan.c
 -@@ -0,0 +1,5315 @@
-+@@ -0,0 +1,5393 @@
++@@ -0,0 +1,5416 @@
  +/*
  + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
  + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -27443,7 +28173,7 @@ index d21bf85..6421c42 100644
  +static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
  +static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
  +static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
-++static bool wl18_enabled;
+++static bool wl18_enabled, wl18_host_cap, wl18_cap_invalid;
  +static unsigned wl_rails_variant;
  +static bool wl_rails_requested;
  +static bool wl16_large, wl16_redrive;
@@ -27451,11 +28181,11 @@ index d21bf85..6421c42 100644
  +	}
  +	wl15_variant = 0;
  +	wl16_variant = 0; wl16_large = wl16_redrive = false;
-++	wl18_enabled = false;
+++	wl18_enabled = wl18_host_cap = wl18_cap_invalid = false;
  +	if (wl_w15) {
  +		int variant = 0;
  +		(void)PE_parse_boot_argn("fuxiwlanw15", &variant, sizeof(variant));
-@@ -1073,6 +1084,13 @@
+@@ -1073,6 +1084,23 @@
  +			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
  +			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
  +		}
@@ -27466,10 +28196,35 @@ index d21bf85..6421c42 100644
 ++		if (variant) {
 ++			printf("FUXI WLAN: W18 timeline %d valid %u\n", variant, !wl_variant_invalid);
 ++		}
+++	}
+++	if (wl18_enabled) {
+++		char capability[16] = {0};
+++		if (PE_parse_boot_arg_str("fuxiwlancap", capability, sizeof(capability))) {
+++			if ((capability[0] != '0' && capability[0] != '1') || capability[1]) {
+++				wl_variant_invalid = wl18_cap_invalid = true;
+++			} else { wl18_host_cap = capability[0] == '1'; }
+++			printf("FUXI WLAN: W18 host cap selector %u valid %u (1 adds SECONDARY=2 only)\n",
+++			    wl18_host_cap, !wl_variant_invalid);
+++		}
  +	}
  +	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
  +	if (wl_w14) {
-@@ -3208,6 +3226,10 @@
+@@ -1117,6 +1145,14 @@
+ +	printf("FUXI WLAN: M6n cnss=%s valid=%u (PDC before step 1)\n",
+ +	    wl_cnss_names[wl_cnss], !wl_variant_invalid);
+ +}
+++
+++static bool
+++wl18_cap_refused(void)
+++{
+++	if (!wl18_cap_invalid) { return false; }
+++	printf("FUXI WLAN: invalid fuxiwlancap (expected exact 0 or 1); refused before WLAN power writes\n");
+++	return true;
+++}
+ +#define WL_CNSS_IOVA 0xa0000000ull
+ +#define WL_CNSS_IOVA_END 0xb0000000ull
+ +#define WL_LEGACY_IOVA 0x10000000ull
+@@ -3208,6 +3244,10 @@
  +static bool wl13_delayed, wl13_negotiated;
  +static bool wl14_ready, wl14_init_done, wl14_board_valid;
  +static uint64_t wl15_ready_time;
@@ -27480,7 +28235,7 @@ index d21bf85..6421c42 100644
  +static uint32_t wl14_board;
  +static int wl_w12_run(void);
  +static int wl_qmi_w12(const uint8_t *, unsigned);
-@@ -3238,6 +3260,40 @@
+@@ -3238,6 +3278,40 @@
  +static struct wl_tre *wl_ipcr_ring(unsigned off) { return (void *)(wl_ipcr.va + off); }
  +static void wl_w11_barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
  +
@@ -27521,7 +28276,7 @@ index d21bf85..6421c42 100644
  +/* RAM-only snapshot: channel RP is diagnostic, never used to reclaim TREs.
  + * Completion events remain authoritative. Do not repair a live device-owned
  + * RP even when it resembles type/ER words (as in try15c/try15d). */
-@@ -3599,7 +3655,15 @@
+@@ -3599,7 +3673,15 @@
  +					if (ev.ptr != wl_ipcr.iova+roff+ri*16 || (ch == 20 && ri == wl_tx_write)) { return wl_w11_fail("transfer completion pointer/order"); }
  +					struct wl_tre tre = wl_ipcr_ring(roff)[ri];
  +					if (bytes > (ch == 20 ? WL_IPCR_TXMTU : WL_IPCR_MTU) || bytes > (tre.d0 & 0xffff)) { return wl_w11_fail("transfer completion length"); }
@@ -27538,7 +28293,7 @@ index d21bf85..6421c42 100644
  +					else {
  +						uint64_t lo = wl_ipcr.iova + WL_IPCR_RXBUF;
  +						if (tre.ptr < lo || tre.ptr >= lo+WL_IPCR_N*WL_IPCR_MTU ||
-@@ -3701,6 +3765,7 @@
+@@ -3701,6 +3783,7 @@
  +	wl12_reply = wl12_requested = wl12_ready = false;
  +	wl13_delayed = wl13_negotiated = false;
  +	wl14_ready = wl14_init_done = wl14_board_valid = false; wl14_board = 0;
@@ -27546,7 +28301,7 @@ index d21bf85..6421c42 100644
  +	wl_chdb = wl_mrd(0x18); wl_erdb = wl_mrd(0x20);
  +	if (!wl_qrtr || !wl_amss_reached || !wl_contexts_published || wl_w11_guard() ||
  +	    (wl_chdb & 7) || wl_chdb < 0x100 || wl_chdb > 0x3c00 ||
-@@ -3811,6 +3876,10 @@
+@@ -3811,6 +3894,10 @@
  +	e->data[0] = 0; wl_put16(e->data+1, wl12_txn);
  +	wl_put16(e->data+3, msg); wl_put16(e->data+5, e->len-7);
  +	printf("FUXI WLAN: %s send txn %u msg %#x stage %u\n", wl_w15 && stage >= WL15_INI ? "W15" : "W12", wl12_txn, msg, stage);
@@ -27557,7 +28312,18 @@ index d21bf85..6421c42 100644
  +	int error = wl_qrtr_send(1, wl_server_node, wl_server_port, e->data, e->len);
  +	if (!error && stage == WL15_MODE) { wl16_snapshot("MODE queued"); }
  +	return error;
-@@ -4313,6 +4382,7 @@
+@@ -3876,6 +3963,10 @@
+ +	    wl12_tlv(e, 0x14, 1, 1) || wl12_tlv(e, 0x16, 1, 1) ||
+ +	    wl12_tlv(e, 0x17, 1, 1) || wl12_tlv(e, 0x1a, 0, 1) ||
+ +	    wl12_tlv(e, 0x1c, 0, 1)) { return 1; }
+++	if (wl18_host_cap) {
+++		if (wl12_tlv(e, 0x20, 2, 4)) { return 1; }
+++		printf("FUXI WLAN: W18 HOST_CAP TLV 0x20 host_build_type SECONDARY=2 len=4\n");
+++	}
+ +	int links = wl17_mlo_links(wl12_mlo_variant, wl17_bits, wl12_mlo_enabled, wl12_num_phy);
+ +	bool mlo = links != 0;
+ +	if (mlo) {
+@@ -4313,6 +4404,7 @@
  +wl15_timeout_snapshot(void)
  +{
  +	if (!wl_w15 || wl12_stage != WL15_MODE) { return; }
@@ -27565,7 +28331,7 @@ index d21bf85..6421c42 100644
  +	wl16_snapshot("MODE timeout");
  +	wl15_elapsed("MODE timeout");
  +	wl_wlfw_diagnostics("W15 MODE timeout");
-@@ -4377,11 +4447,15 @@
+@@ -4377,11 +4469,15 @@
  +	/* Match ath12k's ten-second WLFW timeout, with bounded transport passes. */
  +	for (unsigned ms = 0; ms <= 10000; ms += 10) {
  +		if (wl_w11_events()) {
@@ -27581,7 +28347,7 @@ index d21bf85..6421c42 100644
  +		if (ms < 10000) { wl_sleep(10); }
  +	}
  +	if (wl12_mlo_variant == 1 && wl12_msg == 0x57) {
-@@ -4526,6 +4600,7 @@
+@@ -4526,6 +4622,7 @@
  +wl_w15_run(void)
  +{
  +	static struct wl12_encoder e;
@@ -27589,7 +28355,7 @@ index d21bf85..6421c42 100644
  +	bzero(&e, sizeof(e)); e.len = 7;
  +	/* qmi_wlanfw_wlan_ini_req_msg_v01 / *_ei: optional 0x10 u8.
  +	 * Explicit lane policy: disable fw log (0). Upstream v6.12 sends 1. */
-@@ -4533,11 +4608,13 @@
+@@ -4533,11 +4630,13 @@
  +	if (wl12_tlv(&e, 0x10, 0, 1) || wl12_send(&e, 0x2f, WL15_INI) ||
  +	    wl12_wait(0, "WLAN_INI reply") || wl_w11_wait(3, "W15 INI TX drain")) { return 1; }
  +	printf("FUXI WLAN: W15 wlan ini ok\n");
@@ -27603,7 +28369,7 @@ index d21bf85..6421c42 100644
  +	wl16_snapshot("CFG reply/before MODE");
  +	if (wl16_redrive) {
  +		printf("FUXI WLAN: W16 before MODE re-ring posted RX; no CE init before MODE (ath12k v6.12 order)\n");
-@@ -4552,6 +4629,7 @@
+@@ -4552,6 +4651,7 @@
  +	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
  +	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
  +	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
@@ -27611,6 +28377,14 @@ index d21bf85..6421c42 100644
  +	wl16_snapshot("MODE reply");
  +	wl12_stage = WL15_OBSERVE;
  +	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
+@@ -5222,6 +5322,7 @@
+ +static void
+ +fw_run(unsigned limit)
+ +{
+++	if (wl18_cap_refused()) { return; }
+ +	uint32_t *r4 = wl4_report;
+ +	r4[0] = WL4_MAGIC;
+ +	r4[1] = limit;
 diff --git a/xnu/patches/0103-fuxi-kernel-h1.patch b/xnu/patches/0103-fuxi-kernel-h1.patch
 index 39be642..f4c3ab1 100644
 --- a/xnu/patches/0103-fuxi-kernel-h1.patch
@@ -28301,7 +29075,7 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..ae9e7e5
+index 0000000..0858900
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
 @@ -0,0 +1,7585 @@
@@ -34963,7 +35737,7 @@ index 0000000..ae9e7e5
 ++        const unsigned status[] = {6, 7, 9};
 ++        if (io->read(io->context, status[index], &value) || value) return -2;
 ++    }
-++    const uint8_t setup[] = {0x8a, (uint8_t)(level * 4 - 1),
+++    const uint8_t setup[] = {0x89, (uint8_t)(level * 4 - 1),
 ++        (uint8_t)(saved[2] | 1), (uint8_t)((saved[3] & ~7u) | 1)};
 ++    for (unsigned index = 0; index < 4; index++) {
 ++        if (io->write(io->context, registers[index], setup[index]) ||

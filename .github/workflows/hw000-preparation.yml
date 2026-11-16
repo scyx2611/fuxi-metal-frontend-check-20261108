@@ -5,6 +5,7 @@ on:
     branches:
       - codex/adsp-battery
     paths:
+      - patches/kernel-adsp-battery.patch
       - patches/hw000-preparation.patch
       - .github/workflows/hw000-preparation.yml
 permissions:
@@ -64,6 +65,9 @@ jobs:
           python3 tools/test-fuxi-wlan-bdf-inventory.py
           python3 tools/test-fuxi-battery-pause.py --sanitize
           python3 tools/test-fuxi-battery-publication.py --sanitize
+          python3 tools/test-fuxi-torch-pulse.py --sanitize
+          python3 tools/test-fuxi-torch-audit.py --sanitize
+          python3 tools/test-fuxi-wlan-w18.py
           python3 tools/test-fuxi-charge-evidence.py
           python3 tools/inspect-fuxi-bluetooth-abi.py --self-test
       - name: Verify default-off gates
