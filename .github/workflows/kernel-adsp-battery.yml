@@ -115,6 +115,7 @@ jobs:
           (cd source && python3 tools/test-fuxi-rpmh-shared.py)
           (cd source && python3 tools/test-fuxi-torch-pulse.py)
           (cd source && python3 tools/test-fuxi-torch-runtime.py)
+          (cd source && python3 tools/test-fuxi-torch-steady.py --sanitize)
           (cd source && python3 tools/test-fuxi-torch-audit.py)
           (cd source && CC=clang python3 tools/test-fuxi-haptic-pulse.py)
           (cd source && CC=clang python3 tools/test-fuxi-haptic-pulse.py --syntax-only)
