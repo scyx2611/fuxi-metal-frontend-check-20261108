@@ -22268,10 +22268,10 @@ index 0000000..72eedb5
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp.c b/xnu/fuxi-adsp/fuxi_adsp.c
 new file mode 100644
-index 0000000..0e8bfa7
+index 0000000..430d5fd
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp.c
-@@ -0,0 +1,900 @@
+@@ -0,0 +1,919 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 + *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -22294,7 +22294,8 @@ index 0000000..0e8bfa7
 + * IPCC (SPI 229) and RSC (SPI 5) lines are masked in the distributor first: a level line left enabled by the boot stages would
 + * otherwise storm sleh's ownerless EOI path. MMIO and the carveouts are mapped with kernel_map VA and pmap entries (never
 + * ml_io_map: its 8 MiB submap is KMA_NOFAIL). The firmware comes from modem_a in place (fuxi_adsp_fw.c). Refused when fuxiwlan is
-+ * set until combined ADSP/WLAN hardware validation is complete; both now use fuxi_rpmh_shared's mutex.
++ * set until combined ADSP/WLAN hardware validation is complete (a test loader may opt in with ADT fuxi,adsp-wlan=1); both now use
++ * fuxi_rpmh_shared's mutex.
 + *
 + * One kernel thread owns every step and all protocol state; clients (ShengAdsp.h) register channels and queue sends from any
 + * thread, and their callbacks run on this thread (they must not block or call sheng_adsp_send). */
@@ -23125,16 +23126,30 @@ index 0000000..0e8bfa7
 +    return mode;
 +}
 +
++/* ADT /chosen u32 "fuxi,adsp-wlan" = 1 (test loaders, for the combined hardware validation): 2 and 3 run alongside fuxiwlan, the
++ * two sharing the apps RSC through fuxi_rpmh_shared's mutex. Any other value or none keeps the guard. */
++static int fa_with_wlan(void)
++{
++    uint32_t value = 0;
++    DTEntry chosen;
++    const void *prop;
++    unsigned bytes;
++    if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++        SecureDTGetProperty(chosen, "fuxi,adsp-wlan", &prop, &bytes) == kSuccess && bytes == sizeof(uint32_t))
++        memcpy(&value, prop, sizeof(value));
++    return value == 1;
++}
++
 +/* The mode that runs: 0 off, 1 survey, 2 start the DSP and log the battery manager, 3 also feed SweetBattery. 2 and 3 fall back to
-+ * 1 with fuxiwlan until combined hardware validation. Read again on every call, so SweetBattery can ask before or
-+ * after fuxi_adsp_init ran. */
++ * 1 with fuxiwlan until combined hardware validation, unless fuxi,adsp-wlan opts in. Read again on every call, so SweetBattery
++ * can ask before or after fuxi_adsp_init ran. */
 +unsigned fuxi_adsp_mode(void);
 +unsigned fuxi_adsp_mode(void)
 +{
 +    char wlan[8];
 +    const unsigned mode = fa_mode();
 +    if (!mode) return 0;
-+    if (mode >= 2 && PE_parse_boot_argn("fuxiwlan", wlan, sizeof(wlan))) return 1;
++    if (mode >= 2 && PE_parse_boot_argn("fuxiwlan", wlan, sizeof(wlan)) && !fa_with_wlan()) return 1;
 +    return mode > 3 ? 3 : mode;
 +}
 +
@@ -23158,6 +23173,10 @@ index 0000000..0e8bfa7
 +    if (!run || gStarted) return;
 +    if (asked >= 2 && run < 2) {
 +        printf("FUXI ADSP: fuxiadsp=%u refused with fuxiwlan (combined hardware validation pending); surveying only\n", asked);
++    } else if (run >= 2 && fa_with_wlan()) {
++        char wlan[8];
++        if (PE_parse_boot_argn("fuxiwlan", wlan, sizeof(wlan)))
++            printf("FUXI ADSP: fuxiadsp=%u alongside fuxiwlan (fuxi,adsp-wlan=1: combined test, shared RSC mutex)\n", run);
 +    }
 +    gStarted = 1;
 +    if (run >= 2) {
@@ -38326,10 +38345,10 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..5ab0149
+index 0000000..4304d45
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,7865 @@
+@@ -0,0 +1,7884 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,27 @@
@@ -38362,7 +38381,7 @@ index 0000000..5ab0149
 + bsd/dev/unix_startup.c			standard
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp.c
-+@@ -0,0 +1,900 @@
++@@ -0,0 +1,919 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 ++ *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -38385,7 +38404,8 @@ index 0000000..5ab0149
 ++ * IPCC (SPI 229) and RSC (SPI 5) lines are masked in the distributor first: a level line left enabled by the boot stages would
 ++ * otherwise storm sleh's ownerless EOI path. MMIO and the carveouts are mapped with kernel_map VA and pmap entries (never
 ++ * ml_io_map: its 8 MiB submap is KMA_NOFAIL). The firmware comes from modem_a in place (fuxi_adsp_fw.c). Refused when fuxiwlan is
-++ * set until combined ADSP/WLAN hardware validation is complete; both now use fuxi_rpmh_shared's mutex.
+++ * set until combined ADSP/WLAN hardware validation is complete (a test loader may opt in with ADT fuxi,adsp-wlan=1); both now use
+++ * fuxi_rpmh_shared's mutex.
 ++ *
 ++ * One kernel thread owns every step and all protocol state; clients (ShengAdsp.h) register channels and queue sends from any
 ++ * thread, and their callbacks run on this thread (they must not block or call sheng_adsp_send). */
@@ -39216,16 +39236,30 @@ index 0000000..5ab0149
 ++    return mode;
 ++}
 ++
+++/* ADT /chosen u32 "fuxi,adsp-wlan" = 1 (test loaders, for the combined hardware validation): 2 and 3 run alongside fuxiwlan, the
+++ * two sharing the apps RSC through fuxi_rpmh_shared's mutex. Any other value or none keeps the guard. */
+++static int fa_with_wlan(void)
+++{
+++    uint32_t value = 0;
+++    DTEntry chosen;
+++    const void *prop;
+++    unsigned bytes;
+++    if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+++        SecureDTGetProperty(chosen, "fuxi,adsp-wlan", &prop, &bytes) == kSuccess && bytes == sizeof(uint32_t))
+++        memcpy(&value, prop, sizeof(value));
+++    return value == 1;
+++}
+++
 ++/* The mode that runs: 0 off, 1 survey, 2 start the DSP and log the battery manager, 3 also feed SweetBattery. 2 and 3 fall back to
-++ * 1 with fuxiwlan until combined hardware validation. Read again on every call, so SweetBattery can ask before or
-++ * after fuxi_adsp_init ran. */
+++ * 1 with fuxiwlan until combined hardware validation, unless fuxi,adsp-wlan opts in. Read again on every call, so SweetBattery
+++ * can ask before or after fuxi_adsp_init ran. */
 ++unsigned fuxi_adsp_mode(void);
 ++unsigned fuxi_adsp_mode(void)
 ++{
 ++    char wlan[8];
 ++    const unsigned mode = fa_mode();
 ++    if (!mode) return 0;
-++    if (mode >= 2 && PE_parse_boot_argn("fuxiwlan", wlan, sizeof(wlan))) return 1;
+++    if (mode >= 2 && PE_parse_boot_argn("fuxiwlan", wlan, sizeof(wlan)) && !fa_with_wlan()) return 1;
 ++    return mode > 3 ? 3 : mode;
 ++}
 ++
@@ -39249,6 +39283,10 @@ index 0000000..5ab0149
 ++    if (!run || gStarted) return;
 ++    if (asked >= 2 && run < 2) {
 ++        printf("FUXI ADSP: fuxiadsp=%u refused with fuxiwlan (combined hardware validation pending); surveying only\n", asked);
+++    } else if (run >= 2 && fa_with_wlan()) {
+++        char wlan[8];
+++        if (PE_parse_boot_argn("fuxiwlan", wlan, sizeof(wlan)))
+++            printf("FUXI ADSP: fuxiadsp=%u alongside fuxiwlan (fuxi,adsp-wlan=1: combined test, shared RSC mutex)\n", run);
 ++    }
 ++    gStarted = 1;
 ++    if (run >= 2) {
