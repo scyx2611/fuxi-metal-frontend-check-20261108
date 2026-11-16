@@ -11,7 +11,10 @@
 #include <unistd.h>
 
 static unsigned torch_hooked;
+static unsigned torch_metadata_hooked;
+static unsigned torch_metadata_logged;
 static unsigned torch_level;
+static IMP torch_metadata_original;
 static dispatch_source_t torch_timer;
 static pthread_mutex_t torch_control_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -154,9 +157,61 @@ static bool torch_signature(Method method, char result, unsigned count, char thi
     return true;
 }
 
+static id torch_module_capabilities(id self, SEL selector, id information)
+{
+    if (information && torch_ready() &&
+        CFGetTypeID((CFTypeRef)information) == CFDictionaryGetTypeID()) {
+        CFDictionaryRef dictionary = (CFDictionaryRef)information;
+        CFTypeRef identifier = CFDictionaryGetValue(dictionary, CFSTR("CFBundleIdentifier"));
+        CFTypeRef capabilities = CFDictionaryGetValue(dictionary, CFSTR("UIRequiredDeviceCapabilities"));
+        if (identifier && CFGetTypeID(identifier) == CFStringGetTypeID() &&
+            CFEqual(identifier, CFSTR("com.apple.control-center.FlashlightModule")) &&
+            capabilities && CFGetTypeID(capabilities) == CFArrayGetTypeID()) {
+            CFMutableArrayRef filtered = CFArrayCreateMutableCopy(kCFAllocatorDefault, 0,
+                (CFArrayRef)capabilities);
+            CFMutableDictionaryRef updated = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, dictionary);
+            if (filtered && updated) {
+                bool removed = false;
+                for (CFIndex index = CFArrayGetCount(filtered); index > 0; index--) {
+                    if (CFEqual(CFArrayGetValueAtIndex(filtered, index - 1), CFSTR("camera-flash"))) {
+                        CFArrayRemoveValueAtIndex(filtered, index - 1);
+                        removed = true;
+                    }
+                }
+                if (removed) {
+                    CFDictionarySetValue(updated, CFSTR("UIRequiredDeviceCapabilities"), filtered);
+                    id result = ((id (*)(id, SEL, id))torch_metadata_original)(self, selector, (id)updated);
+                    CFRelease(updated);
+                    CFRelease(filtered);
+                    if (!__atomic_exchange_n(&torch_metadata_logged, 1u, __ATOMIC_ACQ_REL))
+                        torch_log("fuxi: SpringBoard: native FlashlightModule capability admitted\n");
+                    return result;
+                }
+            }
+            if (updated) CFRelease(updated);
+            if (filtered) CFRelease(filtered);
+        }
+    }
+    return ((id (*)(id, SEL, id))torch_metadata_original)(self, selector, information);
+}
+
+static void torch_hook_metadata(void)
+{
+    if (__atomic_load_n(&torch_metadata_hooked, __ATOMIC_ACQUIRE) || !torch_ready()) return;
+    Class target = objc_getClass("CCSModuleMetadata");
+    if (target == NULL) return;
+    Method method = class_getClassMethod(target, sel_registerName("_requiredCapabilitiesForInfoDictionary:"));
+    if (!torch_signature(method, '@', 3, '@')) return;
+    if (__atomic_exchange_n(&torch_metadata_hooked, 1u, __ATOMIC_ACQ_REL)) return;
+    torch_metadata_original = method_getImplementation(method);
+    (void)method_setImplementation(method, (IMP)torch_module_capabilities);
+    torch_log("fuxi: SpringBoard: native FlashlightModule metadata hook ready\n");
+}
+
 bool fuxi_flashlight_hook(void);
 bool fuxi_flashlight_hook(void)
 {
+    torch_hook_metadata();
     if (__atomic_load_n(&torch_hooked, __ATOMIC_ACQUIRE)) return true;
     if (!torch_ready()) return false;
     Class target = objc_getClass("AVFlashlight");
