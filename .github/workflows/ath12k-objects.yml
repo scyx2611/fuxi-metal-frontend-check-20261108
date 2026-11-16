@@ -1,0 +1,36 @@
+name: Build Ath12kWifi kernel objects for Fuxi (link inputs and their kernel imports)
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/adsp-battery
+    paths:
+      - tools/build-ath12k-objects.sh
+      - .github/workflows/ath12k-objects.yml
+permissions:
+  contents: read
+jobs:
+  objects:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Build and combine
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash harness/tools/build-ath12k-objects.sh "$PWD/ath12k-work" "$PWD/ath12k-out"
+          cat ath12k-out/fuxi_ath12k.undefined.txt
+          cat ath12k-out/fuxi_ath12k.size.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuxi-ath12k-objects
+          path: ath12k-out/
+          if-no-files-found: warn
+          retention-days: 7
