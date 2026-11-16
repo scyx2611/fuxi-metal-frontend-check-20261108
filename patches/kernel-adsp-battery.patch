@@ -183,6 +183,29 @@ index 0000000..1dee5fc
 +The survey also reads haptic boost offset 0x41 and additional haptic
 +configuration offsets. The boost channel is owner 3. No haptic writes are
 +introduced by this change.
+diff --git a/docs-lanes/tap-command.md b/docs-lanes/tap-command.md
+new file mode 100644
+index 0000000..1dfcd16
+--- /dev/null
++++ b/docs-lanes/tap-command.md
+@@ -0,0 +1,17 @@
++# Device UI scripts in ADT
++
++Synthetic UI tests still require the explicit `fuxitaps=S` boot argument.
++The `fuxitapcmd` boot argument keeps priority. When it is absent, the key
++thread can read `/chosen/fuxi,tapcmd` instead. The ADT value must contain
++between one and 399 command bytes followed by one NUL, with no embedded
++NUL. Missing or malformed properties stop the test script.
++
++This leaves the original GPU and daily boot arguments available within
++the 608-byte payload field. The command grammar, coordinates, delays and
++three existing presets are unchanged. No synthetic input starts in a
++daily boot that omits `fuxitaps`.
++
++`tools/test-fuxi-tap-command.py` compiles the production property reader
++with independent boot-argument and device-tree stubs. It checks argument
++priority, missing properties, lookup failures, length limits and string
++termination under ASan/UBSan.
 diff --git a/shim/fuxi-probe/probe.c b/shim/fuxi-probe/probe.c
 index efb83f1..745d165 100644
 --- a/shim/fuxi-probe/probe.c
@@ -527,6 +550,19 @@ index 0000000..529b3a0
 +
 +if __name__ == '__main__':
 +    main()
+diff --git a/tools/sync-fuxi-h1.py b/tools/sync-fuxi-h1.py
+index 07edd64..b83b489 100755
+--- a/tools/sync-fuxi-h1.py
++++ b/tools/sync-fuxi-h1.py
+@@ -52,7 +52,7 @@ def main():
+     if args.check:
+         assert PATCH.read_text() == expected, 'H1 sources differ; run tools/sync-fuxi-h1.py'
+     else:
+-        PATCH.write_text(expected)
++        PATCH.write_text(expected, encoding='utf-8', newline='\n')
+     # Verify the generated overlay really applies after the input stack.
+     with tempfile.TemporaryDirectory(prefix='fuxi-h1-check-') as tmp:
+         for name, text in before.items():
 diff --git a/tools/sync-fuxi-wlan.py b/tools/sync-fuxi-wlan.py
 new file mode 100644
 index 0000000..fdda29b
@@ -809,6 +845,114 @@ index 0000000..e360b63
 +    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-g', '-Wall', '-Wextra', '-Werror',
 +                    '-pthread', '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
 +                    '-I' + str(sources), str(cfile), str(sources / 'QcomRpmh.c'), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
+diff --git a/tools/test-fuxi-tap-command.py b/tools/test-fuxi-tap-command.py
+new file mode 100644
+index 0000000..1d7b73c
+--- /dev/null
++++ b/tools/test-fuxi-tap-command.py
+@@ -0,0 +1,102 @@
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++
++root = Path(__file__).resolve().parents[1]
++production = (root / 'xnu/fuxi-h1/fuxi_keys.c').read_text()
++start = production.index('static int\nfk_taps_command(')
++finish = production.index('\nstatic void\nfk_taps(', start)
++helper = production[start:finish]
++source = r'''
++#include <assert.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++typedef void *DTEntry;
++enum { kSuccess = 0 };
++static const char *boot_command;
++static const void *adt_property;
++static unsigned adt_length;
++static int lookup_error, property_error;
++static int PE_parse_boot_argn(const char *name, char *output, int capacity) {
++    assert(!strcmp(name, "fuxitapcmd"));
++    if (!boot_command) return 0;
++    assert(strlen(boot_command) < (size_t)capacity);
++    strcpy(output, boot_command);
++    return 1;
++}
++static int SecureDTLookupEntry(void *parent, const char *path, DTEntry *entry) {
++    assert(!parent && !strcmp(path, "/chosen"));
++    *entry = (void *)1;
++    return lookup_error;
++}
++static int SecureDTGetProperty(DTEntry entry, const char *name, void **value, unsigned *length) {
++    assert(entry == (void *)1 && !strcmp(name, "fuxi,tapcmd"));
++    *value = (void *)adt_property;
++    *length = adt_length;
++    return property_error;
++}
++''' + helper + r'''
++int main(void) {
++    char output[400], expected[400], maximum[401];
++    memset(expected, 0x5a, sizeof(expected));
++    memcpy(output, expected, sizeof(output));
++    boot_command = "t414,1535";
++    assert(fk_taps_command(output, sizeof(output)));
++    assert(!strcmp(output, boot_command));
++    boot_command = NULL;
++    assert(!fk_taps_command(output, sizeof(output)));
++    adt_property = "s999,0,999,999;t414,1535;w3000;t414,1535";
++    adt_length = (unsigned)strlen(adt_property) + 1;
++    assert(fk_taps_command(output, sizeof(output)));
++    assert(!strcmp(output, adt_property));
++    boot_command = "@3";
++    assert(fk_taps_command(output, sizeof(output)));
++    assert(!strcmp(output, "@3"));
++    boot_command = NULL;
++    memcpy(output, expected, sizeof(output));
++    lookup_error = 1;
++    assert(!fk_taps_command(output, sizeof(output)));
++    lookup_error = 0;
++    property_error = 1;
++    assert(!fk_taps_command(output, sizeof(output)));
++    property_error = 0;
++    adt_property = "";
++    adt_length = 0;
++    assert(!fk_taps_command(output, sizeof(output)));
++    adt_length = 1;
++    assert(!fk_taps_command(output, sizeof(output)));
++    adt_property = "t1,2";
++    adt_length = 4;
++    assert(!fk_taps_command(output, sizeof(output)));
++    adt_property = "t1,2\0t3,4";
++    adt_length = 10;
++    assert(!fk_taps_command(output, sizeof(output)));
++    assert(!memcmp(output, expected, sizeof(output)));
++    memset(maximum, 'x', sizeof(maximum));
++    maximum[399] = '\0';
++    adt_property = maximum;
++    adt_length = 400;
++    assert(fk_taps_command(output, sizeof(output)));
++    assert(!memcmp(output, maximum, sizeof(output)));
++    adt_length = 401;
++    memcpy(output, expected, sizeof(output));
++    assert(!fk_taps_command(output, sizeof(output)));
++    assert(!memcmp(output, expected, sizeof(output)));
++    adt_property = NULL;
++    adt_length = 4;
++    assert(!fk_taps_command(output, sizeof(output)));
++    puts("PASS: production ADT tap command bounds, termination, missing properties and boot-argument priority");
++    return 0;
++}
++'''
++with tempfile.TemporaryDirectory(prefix='fuxi-tap-command-') as temporary:
++    directory = Path(temporary)
++    cfile, binary = directory / 'tap-command.c', directory / 'tap-command'
++    cfile.write_text(source)
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-D_POSIX_C_SOURCE=200809L',
++                    '-g', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
++                    '-fno-omit-frame-pointer', str(cfile), '-o', str(binary)], check=True)
 +    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-torch-pulse.py b/tools/test-fuxi-torch-pulse.py
 new file mode 100644
@@ -7244,10 +7388,54 @@ index 0000000..6bd480a
 +}
 +#endif
 diff --git a/xnu/fuxi-h1/fuxi_keys.c b/xnu/fuxi-h1/fuxi_keys.c
-index 8f1d60f..e71e7c2 100644
+index 8f1d60f..3bdff20 100644
 --- a/xnu/fuxi-h1/fuxi_keys.c
 +++ b/xnu/fuxi-h1/fuxi_keys.c
-@@ -668,6 +668,8 @@ fk_taps(void *arg, wait_result_t wr)
+@@ -39,6 +39,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include "sweet_spmi_bus.h"
+ #include "fuxi_key_state.h"
+ 
+@@ -575,6 +576,26 @@ fk_taps_nums(const char *p, long *out, int max, int *count)
+ 	return p;
+ }
+ 
++static int
++fk_taps_command(char *command, size_t capacity)
++{
++	if (PE_parse_boot_argn("fuxitapcmd", command, (int)capacity)) {
++		return 1;
++	}
++	DTEntry chosen;
++	void *property = NULL;
++	unsigned length = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "fuxi,tapcmd", &property, &length) != kSuccess ||
++	    !property || length < 2 || length > capacity ||
++	    strnlen(property, length) != length - 1) {
++		return 0;
++	}
++	memcpy(command, property, length);
++	printf("FUXI TAPS: using ADT command (%u bytes)\n", length);
++	return 1;
++}
++
+ static void
+ fk_taps(void *arg, wait_result_t wr)
+ {
+@@ -584,7 +605,7 @@ fk_taps(void *arg, wait_result_t wr)
+ 	char cmds[400]; /* fuxitapcmd=@1: page 2, open Settings (row 1 col 1 there), scroll it, go home, back to page 1 (a user's session); @2: the slow home drag; @3: open Settings from home page 1 (row 2 col 1, the default layout) */ static const char *const fk_taps_presets[] = {"s540,2390,540,999,99;s900,1200,180,1200,300;t148,285;w800;s540,1900,540,700,300;s540,1900,540,700,300;s540,700,540,1900,300;s540,1900,540,700,300;s540,2390,540,999,99;s180,1200,900,1200,300", "s540,2390,540,999,99;s900,999,180,999,8000;s180,999,900,999,8000", "s540,2390,540,999,99;t148,570;w800;s540,1900,540,700,300;s540,1900,540,700,300;s540,700,540,1900,300;s540,1900,540,700,300;s540,2390,540,999,99;s900,1200,180,1200,300;s180,1200,900,1200,300"};
+ 
+ 	(void)wr;
+-	if (!PE_parse_boot_argn("fuxitapcmd", cmds, sizeof(cmds))) {
++	if (!fk_taps_command(cmds, sizeof(cmds))) {
+ 		printf("FUXI TAPS: fuxitapcmd missing\n");
+ 		(void)thread_terminate(current_thread());
+ 		thread_block(THREAD_CONTINUE_NULL);
+@@ -668,6 +689,8 @@ fk_taps(void *arg, wait_result_t wr)
   * the General and About rows in Settings. Device tests only (synthetic touch).
   */
  static unsigned fk_tour_hold = 45, fk_tour_general = 2100, fk_tour_about = 400;
@@ -7256,7 +7444,7 @@ index 8f1d60f..e71e7c2 100644
  
  static void
  fk_tap(int x, int y)
-@@ -739,6 +741,34 @@ fk_tour(void *arg, wait_result_t wr)
+@@ -739,6 +762,34 @@ fk_tour(void *arg, wait_result_t wr)
  	fk_swipe(1000, 10, 1000, 1100, 250);    /* Control Center */
  	fk_script_sleep(2000);
  	fk_tour_shot(&shot, "control-center");
@@ -7291,7 +7479,7 @@ index 8f1d60f..e71e7c2 100644
  	/* A home gesture on another page only returns to page 1 the second time. */
  	fk_tour_home();
  	fk_tour_home();
-@@ -759,6 +789,16 @@ fk_tour(void *arg, wait_result_t wr)
+@@ -759,6 +810,16 @@ fk_tour(void *arg, wait_result_t wr)
  	fk_tour_home();
  	fk_tour_app(&shot, 670, 860, "photos");
  	fk_tour_home();
@@ -7995,19 +8183,144 @@ index d21bf85..624ed26 100644
  +{
  +	/* BCM requests wait for the TCS IRQ and request responses on all cmds. */
 diff --git a/xnu/patches/0103-fuxi-kernel-h1.patch b/xnu/patches/0103-fuxi-kernel-h1.patch
-index 39be642..fac61cc 100644
+index 39be642..f4c3ab1 100644
 --- a/xnu/patches/0103-fuxi-kernel-h1.patch
 +++ b/xnu/patches/0103-fuxi-kernel-h1.patch
-@@ -332,7 +332,7 @@
+@@ -65,7 +65,7 @@
+  #endif /* ARM64_BOARD_CONFIG_SWEET */
+ --- a/bsd/dev/fuxi_keys.c
+ +++ b/bsd/dev/fuxi_keys.c
+-@@ -14,21 +14,41 @@
++@@ -14,21 +14,42 @@
+   * channels. With boot-arg fuxikeys_gpiocfg=1, and only if GPIO6 is not an
+   * enabled input, the Linux pinctrl defaults for that one pin are written
+   * through its RW channel (volatile PMIC GPIO config, nothing else).
+@@ -94,6 +94,7 @@
+  #include <kern/sched_prim.h>
+  #include <machine/machine_routines.h>
+  #include <pexpert/pexpert.h>
+++#include <pexpert/device_tree.h>
+ +#include "sweet_spmi_bus.h"
+ +#include "fuxi_key_state.h"
+  
+@@ -108,7 +109,7 @@
+  
+  #define FK_CORE_PA     0x0c400000u
+  #define FK_CNFG_PA     0x0c42d000u
+-@@ -42,12 +62,52 @@
++@@ -42,12 +63,52 @@
+  #define FK_PON_PWR     0x80u
+  #define FK_PON_RESIN   0x40u
+  #define FK_NO_APID     0xffffu
+@@ -161,7 +162,7 @@
+  
+  static uint32_t
+  fk_rd(vm_offset_t base, uint32_t off)
+-@@ -79,9 +139,9 @@
++@@ -79,9 +140,9 @@
+  }
+  
+  static bool
+@@ -174,7 +175,7 @@
+  		return false;
+  	}
+  	uint32_t off = 0x20u * apid;
+-@@ -100,12 +160,22 @@
++@@ -100,12 +161,22 @@
+  		}
+  		delay(1);
+  	}
+@@ -198,7 +199,7 @@
+  {
+  	*(volatile uint32_t *)(chan + 0x10u) = val;           /* WDATA0 */
+  	__asm__ volatile("dmb oshst" ::: "memory");
+-@@ -122,6 +192,15 @@
++@@ -122,6 +193,15 @@
+  }
+  
+  static bool
+@@ -214,7 +215,7 @@
+  fk_gpio_input(uint8_t subtype, uint8_t mode, uint8_t en)
+  {
+  	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+-@@ -133,8 +212,9 @@
++@@ -133,8 +213,9 @@
+  fk_gpio_dump(const char *when, uint8_t *subtype, uint8_t *mode, uint8_t *en)
+  {
+  	uint8_t type = 0, vin = 0, pull = 0, rt = 0;
+@@ -225,7 +226,7 @@
+  	    fk_read(fk_gpio_apid, 0x40, mode) &&
+  	    fk_read(fk_gpio_apid, 0x41, &vin) &&
+  	    fk_read(fk_gpio_apid, 0x42, &pull) &&
+-@@ -154,6 +234,80 @@
++@@ -154,6 +235,80 @@
+  	thread_block(THREAD_CONTINUE_NULL);
+  }
+  
+@@ -306,7 +307,7 @@
+  static bool
+  fk_setup(void)
+  {
+-@@ -172,12 +326,13 @@
++@@ -172,12 +327,13 @@
+  		    version, count);
+  		return false;
+  	}
+@@ -322,7 +323,7 @@
+  	    fk_read(fk_pon_apid, FK_PON_RT, &pon);
+  	printf("FUXI KEYS: arb=%#x apids=%u pon-apid=%u/ee%u gpio6-apid=%u/ee%u pon ok=%d type=%#x subtype=%#x rt=%#x st=%#x\n",
+  	    version, count, fk_pon_apid, pon_owner, fk_gpio_apid, gpio_owner,
+-@@ -226,8 +381,7 @@
++@@ -226,8 +382,7 @@
+  static void
+  fk_thread(void *arg, wait_result_t result)
+  {
+@@ -332,7 +333,7 @@
   	unsigned errors = 0;
   	(void)arg;
   	(void)result;
 -@@ -236,38 +390,435 @@
-+@@ -236,38 +390,475 @@
++@@ -236,38 +391,495 @@
   	}
   	for (;;) {
   		uint8_t pon = 0, gpio = 1;
-@@ -632,6 +632,8 @@
+@@ -539,6 +540,26 @@
+ +	return p;
+ +}
+ +
+++static int
+++fk_taps_command(char *command, size_t capacity)
+++{
+++	if (PE_parse_boot_argn("fuxitapcmd", command, (int)capacity)) {
+++		return 1;
+++	}
+++	DTEntry chosen;
+++	void *property = NULL;
+++	unsigned length = 0;
+++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
+++	    SecureDTGetProperty(chosen, "fuxi,tapcmd", &property, &length) != kSuccess ||
+++	    !property || length < 2 || length > capacity ||
+++	    strnlen(property, length) != length - 1) {
+++		return 0;
+++	}
+++	memcpy(command, property, length);
+++	printf("FUXI TAPS: using ADT command (%u bytes)\n", length);
+++	return 1;
+++}
+++
+ +static void
+ +fk_taps(void *arg, wait_result_t wr)
+ +{
+@@ -548,7 +569,7 @@
+ +	char cmds[400]; /* fuxitapcmd=@1: page 2, open Settings (row 1 col 1 there), scroll it, go home, back to page 1 (a user's session); @2: the slow home drag; @3: open Settings from home page 1 (row 2 col 1, the default layout) */ static const char *const fk_taps_presets[] = {"s540,2390,540,999,99;s900,1200,180,1200,300;t148,285;w800;s540,1900,540,700,300;s540,1900,540,700,300;s540,700,540,1900,300;s540,1900,540,700,300;s540,2390,540,999,99;s180,1200,900,1200,300", "s540,2390,540,999,99;s900,999,180,999,8000;s180,999,900,999,8000", "s540,2390,540,999,99;t148,570;w800;s540,1900,540,700,300;s540,1900,540,700,300;s540,700,540,1900,300;s540,1900,540,700,300;s540,2390,540,999,99;s900,1200,180,1200,300;s180,1200,900,1200,300"};
+ +
+ +	(void)wr;
+-+	if (!PE_parse_boot_argn("fuxitapcmd", cmds, sizeof(cmds))) {
+++	if (!fk_taps_command(cmds, sizeof(cmds))) {
+ +		printf("FUXI TAPS: fuxitapcmd missing\n");
+ +		(void)thread_terminate(current_thread());
+ +		thread_block(THREAD_CONTINUE_NULL);
+@@ -632,6 +653,8 @@
  + * the General and About rows in Settings. Device tests only (synthetic touch).
  + */
  +static unsigned fk_tour_hold = 45, fk_tour_general = 2100, fk_tour_about = 400;
@@ -8016,7 +8329,7 @@ index 39be642..fac61cc 100644
  +
  +static void
  +fk_tap(int x, int y)
-@@ -703,6 +705,34 @@
+@@ -703,6 +726,34 @@
  +	fk_swipe(1000, 10, 1000, 1100, 250);    /* Control Center */
  +	fk_script_sleep(2000);
  +	fk_tour_shot(&shot, "control-center");
@@ -8051,7 +8364,7 @@ index 39be642..fac61cc 100644
  +	/* A home gesture on another page only returns to page 1 the second time. */
  +	fk_tour_home();
  +	fk_tour_home();
-@@ -723,6 +753,16 @@
+@@ -723,6 +774,16 @@
  +	fk_tour_home();
  +	fk_tour_app(&shot, 670, 860, "photos");
  +	fk_tour_home();
@@ -8068,12 +8381,12 @@ index 39be642..fac61cc 100644
  +	printf("FUXI TOUR: done\n");
  +	(void)thread_terminate(current_thread());
  +	thread_block(THREAD_CONTINUE_NULL);
-@@ -786,7 +826,7 @@
+@@ -786,7 +847,7 @@
   }
   
   void
 -@@ -289,5 +840,227 @@
-+@@ -289,5 +880,227 @@
++@@ -289,5 +901,227 @@
   	} else {
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
