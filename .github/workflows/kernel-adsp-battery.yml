@@ -1,6 +1,14 @@
 name: Build kernel with the audio DSP and its battery manager (fuxiadsp, on top of fuxibacklight=4)
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ram_layout:
+        type: string
+        default: full
+      artifact_name:
+        type: string
+        default: fuxi-kernel-adsp-battery
   # A workflow that is not on the default branch cannot be dispatched by hand, so the branch push starts it.
   push:
     branches:
@@ -40,6 +48,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
       FUXI_IIG_MODE: replay
+      FUXI_RAM_LAYOUT: ${{ inputs.ram_layout || 'full' }}
     steps:
       - name: Check out public test harness
         uses: actions/checkout@v4
@@ -100,6 +109,7 @@ jobs:
           git -C source apply ../harness/patches/kernel-adsp-battery.patch
           (cd source && python3 tools/sync-fuxi-adsp.py --check && python3 tools/sync-fuxi-unixnu.py --check && python3 tools/sync-fuxi-backlight.py --check)
           (cd source && python3 tools/test-fuxi-prof.py)
+          (cd source && python3 tools/test-fuxi-ram9g.py)
       - name: Build and audit kernel
         shell: bash
         run: |
@@ -111,7 +121,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fuxi-kernel-adsp-battery
+          name: ${{ inputs.artifact_name || 'fuxi-kernel-adsp-battery' }}
           path: source/tools/out/ci/kernel-metal4/
           if-no-files-found: warn
           retention-days: 7

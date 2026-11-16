@@ -1,0 +1,17 @@
+name: Build isolated Fuxi 9 GiB kernel
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/adsp-battery
+    paths:
+      - patches/kernel-adsp-battery.patch
+      - .github/workflows/kernel-adsp-ram9g.yml
+permissions:
+  contents: read
+jobs:
+  kernel:
+    uses: ./.github/workflows/kernel-adsp-battery.yml
+    with:
+      ram_layout: 9g
+      artifact_name: fuxi-kernel-adsp-ram9g
