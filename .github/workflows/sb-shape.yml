@@ -29,7 +29,7 @@ jobs:
           cc=$(xcrun --sdk iphoneos --find clang)
           mkdir -p out
           "$cc" -target arm64-apple-ios16.0 -isysroot "$sdk" -O2 -Wall -Wextra -Werror -fstack-protector-strong \
-              -dynamiclib userland/fuxi-shape/FuxiShape.c -lobjc \
+              -dynamiclib userland/fuxi-shape/FuxiShape.c -lobjc -framework CoreFoundation -framework IOKit \
               -install_name /usr/local/lib/fuxi/libfuxi-sb.dylib -o out/libfuxi-sb.dylib
           codesign -f -s - out/libfuxi-sb.dylib
           codesign --verify --strict out/libfuxi-sb.dylib
