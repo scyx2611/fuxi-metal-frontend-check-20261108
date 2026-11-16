@@ -8577,10 +8577,10 @@ index 0000000..5d4e218
 +    main()
 diff --git a/tools/test-fuxi-battery-publication.py b/tools/test-fuxi-battery-publication.py
 new file mode 100644
-index 0000000..d592102
+index 0000000..922f6a1
 --- /dev/null
 +++ b/tools/test-fuxi-battery-publication.py
-@@ -0,0 +1,791 @@
+@@ -0,0 +1,865 @@
 +import argparse
 +import os
 +from pathlib import Path
@@ -9096,9 +9096,33 @@ index 0000000..d592102
 +    configure_pause(130000, 0); host_ttl = 3600000; fuxi_adsp_battery_start(1); seed_pause_connected();
 +    CHECK(fb_pause.reason == FuxiBatteryPollPauseTtl && fb_max_age_ms == 3600000 && host_pause_cancels == 1);
 +}
++static unsigned change_calls;
++void host_consumer_change_tests(void);
++static void change_seen(void *arg) { CHECK(arg == &change_calls && fb_pub_lock == 1); change_calls++; }
++static void test_change_asks_for_a_sample(void)
++{
++    reset_source(); change_calls = 0; fb_change_key = 0;
++    fuxi_adsp_battery_on_change(change_seen, &change_calls);
++    seed_connected();
++    CHECK(change_calls >= 1);
++    unsigned before = change_calls;
++    answer_field(BmVoltage, 4290000, 0); answer_field(BmCurrent, -90000, 0); answer_field(BmUsbOnline, 1, 0);
++    CHECK(change_calls == before);
++    answer_field(BmUsbOnline, 0, 0);
++    CHECK(change_calls == before + 1);
++    FuxiAdspBattery value = reading(); CHECK(!value.external && !value.charging);
++    answer_field(BmUsbOnline, 0, 0); CHECK(change_calls == before + 1);
++    answer_field(BmUsbOnline, 1, 0); CHECK(change_calls == before + 2);
++    answer_field(BmCapacity, 9600, 0); CHECK(change_calls == before + 3);
++    answer_field(BmCapacity, 9590, 0); CHECK(change_calls == before + 3);
++    fuxi_adsp_battery_on_change(NULL, NULL);
++    answer_field(BmUsbOnline, 0, 0); CHECK(change_calls == before + 3);
++}
 +int main(void)
 +{
++    host_consumer_change_tests();
 +    test_bootstrap_and_flow_expiry(); test_bad_soc_and_partial_unplug();
++    test_change_asks_for_a_sample();
 +    test_loss_ring_and_recovery(); test_accepted_get_only_and_ingress_age();
 +    test_configured_ttl_and_failed_refresh();
 +    test_native_pause_ttl_aliases_and_recovery(); test_native_pause_late_reply_and_sets();
@@ -9115,6 +9139,16 @@ index 0000000..d592102
 +extern "C" void host_consumer_assert(int condition, const char *name);
 +#define REQUIRE(condition) host_consumer_assert((condition) != 0, #condition)
 +typedef uint32_t UInt32;
++struct OSObject {};
++struct IOInterruptEventSource {
++    unsigned pending = 0;
++    bool enabled = true;
++    void interruptOccurred(void *context, void *provider, int index) {
++        REQUIRE(!context && !provider && !index);
++        if (enabled) pending++;
++    }
++};
++#define OSDynamicCast(type, value) static_cast<type *>(value)
 +
 +struct Properties {
 +    struct Entry { const char *key; uint64_t value; } entries[80];
@@ -9167,12 +9201,15 @@ index 0000000..d592102
 +enum { kIOBatteryInstalled = 1, kIOBatteryChargerConnect = 2, kIOBatteryCharge = 4 };
 +static int IOLog(const char *format, ...) { (void)format; return 0; }
 +
-+class SweetBattery {
++class SweetBattery : public OSObject {
 +public:
 +    FuxiAdspBattery fAdspLast = {};
 +    bool fAdspSOCShown = false, fAdspTemperatureShown = false, fAdspShown = false;
 +    int fLastMode = -1;
 +    unsigned fShown = 0, fShownLogs = 0, updates = 0;
++    IOInterruptEventSource *fNotify = nullptr;
++    bool fRunning = false, changeDuringPoll = false;
++    unsigned polls = 0;
 +    Properties properties, adapter_properties, legacy_properties;
 +    SweetBattery() {
 +        fAdspLast.percent = 100; fAdspLast.voltage_mv = 4200;
@@ -9180,6 +9217,12 @@ index 0000000..d592102
 +        fAdspLast.temperature = 2500;
 +    }
 +    void publishAdsp(const FuxiAdspBattery &incoming);
++    static void adspChanged(void *owner);
++    static void adspChangedFired(OSObject *, IOInterruptEventSource *, int);
++    void poll() {
++        polls++;
++        if (changeDuringPoll) { changeDuringPoll = false; adspChanged(this); }
++    }
 +    void putBool(const char *key, bool value) { properties.put(key, value); }
 +    void putNumber(const char *key, uint32_t value) { properties.put(key, value); }
 +    void setBatteryInstalled(bool value) { properties.put("primary_present", value); }
@@ -9202,6 +9245,30 @@ index 0000000..d592102
 +};
 +
 +@PUBLISH_ADSP@
++@CHANGE_CALLBACKS@
++
++extern "C" void host_consumer_change_tests(void)
++{
++    SweetBattery changed;
++    IOInterruptEventSource event;
++    changed.fNotify = &event;
++    changed.fRunning = true;
++    SweetBattery::adspChanged(nullptr);
++    for (unsigned index = 0; index < 100; index++) SweetBattery::adspChanged(&changed);
++    REQUIRE(event.pending == 100 && changed.polls == 0);
++    event.pending = 0;
++    changed.changeDuringPoll = true;
++    SweetBattery::adspChangedFired(&changed, &event, 100);
++    REQUIRE(changed.polls == 1 && event.pending == 1);
++    SweetBattery::adspChangedFired(&changed, &event, 1);
++    REQUIRE(changed.polls == 2);
++    changed.fRunning = false;
++    SweetBattery::adspChangedFired(&changed, &event, 1);
++    REQUIRE(changed.polls == 2);
++    changed.fNotify = nullptr;
++    SweetBattery::adspChanged(&changed);
++    REQUIRE(event.pending == 1);
++}
 +
 +static SweetBattery consumer;
 +extern "C" void host_consumer_reset(void) { consumer = SweetBattery(); }
@@ -9280,6 +9347,9 @@ index 0000000..d592102
 +        (poll, "if (fLastMode == -1) publish(100, 4200, 0, true, true, false, true, false, false);"),
 +        (poll, "publishAdsp(adsp);\n\t\treturn;"),
 +        (start, "publishAdsp(unavailable);"),
++        (start, "fuxi_adsp_battery_on_change(&SweetBattery::adspChanged, this);"),
++        (text, "fuxi_adsp_battery_on_change(NULL, NULL);\n#endif\n\tif (fLoop && fTimerAdded) {"),
++        (text, "self->fNotify->interruptOccurred(NULL, NULL, 0);"),
 +        (text, "fAdspLast.temperature = 2500;"),
 +    ]
 +    for section, required in expected:
@@ -9313,7 +9383,11 @@ index 0000000..d592102
 +            consumer_text, re.S)
 +        assert publish, "production publishAdsp method not found"
 +        consumer = temporary / "consumer_host.cpp"
-+        consumer.write_text(CONSUMER_HOST.replace("@PUBLISH_ADSP@", publish[0]), encoding="utf-8")
++        callbacks = re.search(r"void\s+SweetBattery::adspChanged\(.*?\n\}\n(?=#endif)",
++            consumer_text, re.S)
++        assert callbacks, "production change callbacks not found"
++        consumer.write_text(CONSUMER_HOST.replace("@PUBLISH_ADSP@", publish[0]).replace(
++            "@CHANGE_CALLBACKS@", callbacks[0]), encoding="utf-8")
 +        consumer_object = temporary / ("consumer_host.obj" if msvc else "consumer_host.o")
 +        if msvc:
 +            consumer_flags = ["/nologo", "/TP", "/std:c++17", "/W4", "/WX", "/Od", "/Zi", "/MD", "/c"]
@@ -19464,10 +19538,10 @@ index 0000000..5633228
 +}
 diff --git a/xnu/fuxi-adsp/SweetBattery.cpp b/xnu/fuxi-adsp/SweetBattery.cpp
 new file mode 100644
-index 0000000..6b9f7d9
+index 0000000..72eedb5
 --- /dev/null
 +++ b/xnu/fuxi-adsp/SweetBattery.cpp
-@@ -0,0 +1,520 @@
+@@ -0,0 +1,585 @@
 +/*
 + * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
 + * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
@@ -19479,6 +19553,9 @@ index 0000000..6b9f7d9
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOWorkLoop.h>
 +#include <IOKit/IOTimerEventSource.h>
++#if defined(FUXI)
++#include <IOKit/IOInterruptEventSource.h>
++#endif
 +#include <IOKit/pwr_mgt/IOPMPowerSource.h>
 +#include <IOKit/pwr_mgt/IOPM.h>
 +#include <libkern/c++/OSCollectionIterator.h>
@@ -19516,8 +19593,14 @@ index 0000000..6b9f7d9
 +	void publishAdsp(const FuxiAdspBattery &b);
 +	FuxiAdspBattery fAdspLast;
 +	bool fAdspSOCShown, fAdspTemperatureShown;
++	IOInterruptEventSource *fNotify;
++	bool fNotifyAdded;
 +#endif
 +	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
++#if defined(FUXI)
++	static void adspChanged(void *owner);
++	static void adspChangedFired(OSObject *owner, IOInterruptEventSource *sender, int count);
++#endif
 +	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
 +	static bool readWord(unsigned address, uint16_t *value);
 +	static unsigned estimatePercent(unsigned mv);
@@ -19564,6 +19647,8 @@ index 0000000..6b9f7d9
 +	fTimer = NULL;
 +	fTimerAdded = fRunning = fReal = fAdsp = fAdspShown = false;
 +#if defined(FUXI)
++	fNotify = NULL;
++	fNotifyAdded = false;
 +	bzero(&fAdspLast, sizeof(fAdspLast));
 +	fAdspSOCShown = fAdspTemperatureShown = false;
 +	fAdspLast.percent = 100;
@@ -19902,6 +19987,28 @@ index 0000000..6b9f7d9
 +	    charging, full, true, currentValid);
 +}
 +
++#if defined(FUXI)
++void
++SweetBattery::adspChanged(void *owner)
++{
++	SweetBattery *self = (SweetBattery *)owner;
++	if (self && self->fNotify) {
++		self->fNotify->interruptOccurred(NULL, NULL, 0);
++	}
++}
++
++void
++SweetBattery::adspChangedFired(OSObject *owner, IOInterruptEventSource *sender, int count)
++{
++	(void)sender;
++	(void)count;
++	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
++	if (self && self->fRunning) {
++		self->poll();
++	}
++}
++#endif
++
 +void
 +SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
 +{
@@ -19934,6 +20041,21 @@ index 0000000..6b9f7d9
 +			fTimerAdded = true;
 +			fRunning = true;
 +			fTimer->setTimeoutMS(fAdsp ? 10000 : 30000);
++#if defined(FUXI)
++			if (fAdsp) {
++				fNotify = new IOInterruptEventSource;
++				if (fNotify && fNotify->init(this, &SweetBattery::adspChangedFired) &&
++				    fLoop->addEventSource(fNotify) == kIOReturnSuccess) {
++					fNotifyAdded = true;
++					fNotify->enable();
++					fuxi_adsp_battery_on_change(&SweetBattery::adspChanged, this);
++					fNotify->interruptOccurred(NULL, NULL, 0);
++				} else {
++					OSSafeReleaseNULL(fNotify);
++					IOLog("SWEET BATTERY: change event unavailable; periodic polling retained\n");
++				}
++			}
++#endif
 +		} else {
 +			fReal = false;
 +#if defined(FUXI)
@@ -19958,9 +20080,18 @@ index 0000000..6b9f7d9
 +void
 +SweetBattery::stop(IOService *provider)
 +{
++#if defined(FUXI)
++	fuxi_adsp_battery_on_change(NULL, NULL);
++#endif
 +	if (fLoop && fTimerAdded) {
 +		/* Serialize against a running timer callback, including rearming. */
 +		(void)fLoop->runAction(&SweetBattery::stopPolling, this);
++#if defined(FUXI)
++		if (fNotifyAdded) {
++			fLoop->removeEventSource(fNotify);
++			fNotifyAdded = false;
++		}
++#endif
 +		fLoop->removeEventSource(fTimer);
 +		fTimerAdded = false;
 +	}
@@ -19975,6 +20106,11 @@ index 0000000..6b9f7d9
 +		return kIOReturnBadArgument;
 +	}
 +	self->fRunning = false;
++#if defined(FUXI)
++	if (self->fNotify) {
++		self->fNotify->disable();
++	}
++#endif
 +	self->fTimer->cancelTimeout();
 +	self->fTimer->disable();
 +	return kIOReturnSuccess;
@@ -19983,6 +20119,9 @@ index 0000000..6b9f7d9
 +void
 +SweetBattery::free(void)
 +{
++#if defined(FUXI)
++	OSSafeReleaseNULL(fNotify);
++#endif
 +	OSSafeReleaseNULL(fTimer);
 +	OSSafeReleaseNULL(fLoop);
 +	IOPMPowerSource::free();
@@ -20896,10 +21035,10 @@ index 0000000..0e8bfa7
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp_battery.c b/xnu/fuxi-adsp/fuxi_adsp_battery.c
 new file mode 100644
-index 0000000..2d8e25e
+index 0000000..92fccc5
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp_battery.c
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,483 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* fuxiadsp=2: the client of the battery manager the audio DSP runs (PMIC GLINK channel "PMIC_RTR_ADSP_APPS"). Phase 1 only reads:
 + * every refresh cycle of ShengBattmgr.c (one request in flight, 2 s per request, a cycle every 60 s and at each notification) ends
@@ -20956,6 +21095,9 @@ index 0000000..2d8e25e
 +static uint32_t fb_max_age_ms = FUXI_BATTERY_DEFAULT_MAX_AGE_MS;
 +static FuxiBatteryPollPause fb_pause;
 +static int fb_publish;
++static void (*fb_change_fn)(void *);  /* under fb_pub_lock, like the reading it watches */
++static void *fb_change_arg;
++static uint32_t fb_change_key;
 +static uint32_t fb_implausible;
 +static uint64_t fbNowMs(void);
 +
@@ -21118,6 +21260,16 @@ index 0000000..2d8e25e
 +    if (!b.sequence) b.sequence = 1;
 +    fbValidity(&b, now_ms);
 +    fuxi_battery_prep_merge(&fb_pub, &b);
++    /* 2026-11-16 torchlock trip: the cable was pulled twice for about 10 and 15 s; this file saw both at once, SweetBattery's
++     * 30 s sample saw neither, and iOS kept showing a charger. Ask for a sample whenever the shown state changes. */
++    const uint32_t key = ((uint32_t)fb_pub.percent & 0xffu) | ((uint32_t)(fb_pub.external != 0) << 8) |
++        ((uint32_t)(fb_pub.charging != 0) << 9) | ((uint32_t)(fb_pub.fully_charged != 0) << 10) |
++        ((uint32_t)(b.external_known != 0) << 11) | ((uint32_t)(b.status_known != 0) << 12) |
++        ((uint32_t)(fb_pub.present != 0) << 13) | ((uint32_t)(b.soc_known != 0) << 14) | 0x10000u;
++    if (key != fb_change_key) {
++        fb_change_key = key;
++        if (fb_change_fn) fb_change_fn(fb_change_arg);
++    }
 +}
 +
 +static int fbValueValid(unsigned field, int32_t value)
@@ -21136,6 +21288,14 @@ index 0000000..2d8e25e
 +}
 +
 +int fuxi_adsp_battery_wanted(void) { return fuxi_adsp_mode() >= 3; }
++
++void fuxi_adsp_battery_on_change(void (*fn)(void *), void *arg)
++{
++    lck_mtx_lock(&fb_pub_lock);
++    fb_change_fn = fn;
++    fb_change_arg = fn ? arg : NULL;
++    lck_mtx_unlock(&fb_pub_lock);
++}
 +
 +/* Test loaders only (fuxi,adsp=4, fuxi_adsp.c): once the boot tour sets fuxi_tour_battery_test (bsd/dev/fuxi_keys.c), every
 + * reading handed to SweetBattery says "57%, unplugged, discharging" while the log keeps the real one, so a screenshot shows whether
@@ -21364,10 +21524,10 @@ index 0000000..2d8e25e
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp_battery.h b/xnu/fuxi-adsp/fuxi_adsp_battery.h
 new file mode 100644
-index 0000000..90c6c08
+index 0000000..eec4fbf
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp_battery.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,38 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* fuxiadsp=3: the battery manager's readings as SweetBattery (iokit/Kernel/arm/SweetBattery.cpp) publishes them to powerd.
 + * Shared by bsd/dev/fuxi_adsp_battery.c (C) and SweetBattery.cpp (C++); plain data only. */
@@ -21397,6 +21557,10 @@ index 0000000..90c6c08
 +/* 1 when the DSP's battery manager is meant to feed the power source (fuxiadsp=3); SweetBattery then polls. */
 +int fuxi_adsp_battery_wanted(void);
 +int fuxi_adsp_battery_reading(FuxiAdspBattery *out);
++/* SweetBattery samples the reading on a 30 s timer. fn(arg) is called, with the reading's lock held, each time something iOS
++ * shows changes (charger, charging, full, percent, presence, or their validity), so the sample can be taken at once.
++ * fn must only schedule work: it must not call back into this file. NULL unregisters; no call is in flight on return. */
++void fuxi_adsp_battery_on_change(void (*fn)(void *), void *arg);
 +
 +#ifdef __cplusplus
 +}
@@ -30679,10 +30843,10 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..c5f8fcb
+index 0000000..dc3b66a
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,7597 @@
+@@ -0,0 +1,7721 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,27 @@
@@ -31763,7 +31927,7 @@ index 0000000..c5f8fcb
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp_battery.c
-+@@ -0,0 +1,462 @@
++@@ -0,0 +1,483 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* fuxiadsp=2: the client of the battery manager the audio DSP runs (PMIC GLINK channel "PMIC_RTR_ADSP_APPS"). Phase 1 only reads:
 ++ * every refresh cycle of ShengBattmgr.c (one request in flight, 2 s per request, a cycle every 60 s and at each notification) ends
@@ -31820,6 +31984,9 @@ index 0000000..c5f8fcb
 ++static uint32_t fb_max_age_ms = FUXI_BATTERY_DEFAULT_MAX_AGE_MS;
 ++static FuxiBatteryPollPause fb_pause;
 ++static int fb_publish;
+++static void (*fb_change_fn)(void *);  /* under fb_pub_lock, like the reading it watches */
+++static void *fb_change_arg;
+++static uint32_t fb_change_key;
 ++static uint32_t fb_implausible;
 ++static uint64_t fbNowMs(void);
 ++
@@ -31982,6 +32149,16 @@ index 0000000..c5f8fcb
 ++    if (!b.sequence) b.sequence = 1;
 ++    fbValidity(&b, now_ms);
 ++    fuxi_battery_prep_merge(&fb_pub, &b);
+++    /* 2026-11-16 torchlock trip: the cable was pulled twice for about 10 and 15 s; this file saw both at once, SweetBattery's
+++     * 30 s sample saw neither, and iOS kept showing a charger. Ask for a sample whenever the shown state changes. */
+++    const uint32_t key = ((uint32_t)fb_pub.percent & 0xffu) | ((uint32_t)(fb_pub.external != 0) << 8) |
+++        ((uint32_t)(fb_pub.charging != 0) << 9) | ((uint32_t)(fb_pub.fully_charged != 0) << 10) |
+++        ((uint32_t)(b.external_known != 0) << 11) | ((uint32_t)(b.status_known != 0) << 12) |
+++        ((uint32_t)(fb_pub.present != 0) << 13) | ((uint32_t)(b.soc_known != 0) << 14) | 0x10000u;
+++    if (key != fb_change_key) {
+++        fb_change_key = key;
+++        if (fb_change_fn) fb_change_fn(fb_change_arg);
+++    }
 ++}
 ++
 ++static int fbValueValid(unsigned field, int32_t value)
@@ -32000,6 +32177,14 @@ index 0000000..c5f8fcb
 ++}
 ++
 ++int fuxi_adsp_battery_wanted(void) { return fuxi_adsp_mode() >= 3; }
+++
+++void fuxi_adsp_battery_on_change(void (*fn)(void *), void *arg)
+++{
+++    lck_mtx_lock(&fb_pub_lock);
+++    fb_change_fn = fn;
+++    fb_change_arg = fn ? arg : NULL;
+++    lck_mtx_unlock(&fb_pub_lock);
+++}
 ++
 ++/* Test loaders only (fuxi,adsp=4, fuxi_adsp.c): once the boot tour sets fuxi_tour_battery_test (bsd/dev/fuxi_keys.c), every
 ++ * reading handed to SweetBattery says "57%, unplugged, discharging" while the log keeps the real one, so a screenshot shows whether
@@ -37278,7 +37463,7 @@ index 0000000..c5f8fcb
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp_battery.h
-+@@ -0,0 +1,34 @@
++@@ -0,0 +1,38 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* fuxiadsp=3: the battery manager's readings as SweetBattery (iokit/Kernel/arm/SweetBattery.cpp) publishes them to powerd.
 ++ * Shared by bsd/dev/fuxi_adsp_battery.c (C) and SweetBattery.cpp (C++); plain data only. */
@@ -37308,6 +37493,10 @@ index 0000000..c5f8fcb
 ++/* 1 when the DSP's battery manager is meant to feed the power source (fuxiadsp=3); SweetBattery then polls. */
 ++int fuxi_adsp_battery_wanted(void);
 ++int fuxi_adsp_battery_reading(FuxiAdspBattery *out);
+++/* SweetBattery samples the reading on a 30 s timer. fn(arg) is called, with the reading's lock held, each time something iOS
+++ * shows changes (charger, charging, full, percent, presence, or their validity), so the sample can be taken at once.
+++ * fn must only schedule work: it must not call back into this file. NULL unregisters; no call is in flight on return. */
+++void fuxi_adsp_battery_on_change(void (*fn)(void *), void *arg);
 ++
 ++#ifdef __cplusplus
 ++}
@@ -37983,9 +38172,13 @@ index 0000000..c5f8fcb
 ++#endif
 +--- a/iokit/Kernel/arm/SweetBattery.cpp
 ++++ b/iokit/Kernel/arm/SweetBattery.cpp
-+@@ -10,11 +10,18 @@
++@@ -9,12 +9,22 @@
++ #include <IOKit/IOLib.h>
 + #include <IOKit/IOWorkLoop.h>
 + #include <IOKit/IOTimerEventSource.h>
+++#if defined(FUXI)
+++#include <IOKit/IOInterruptEventSource.h>
+++#endif
 + #include <IOKit/pwr_mgt/IOPMPowerSource.h>
 ++#include <IOKit/pwr_mgt/IOPM.h>
 + #include <libkern/c++/OSCollectionIterator.h>
@@ -38002,7 +38195,7 @@ index 0000000..c5f8fcb
 + 
 + class SweetBattery : public IOPMPowerSource {
 + 	OSDeclareDefaultStructors(SweetBattery);
-+@@ -23,16 +30,23 @@
++@@ -23,23 +33,63 @@
 + 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 + 	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
 + 	void free(void) APPLE_KEXT_OVERRIDE;
@@ -38023,11 +38216,17 @@ index 0000000..c5f8fcb
 ++	void publishAdsp(const FuxiAdspBattery &b);
 ++	FuxiAdspBattery fAdspLast;
 ++	bool fAdspSOCShown, fAdspTemperatureShown;
+++	IOInterruptEventSource *fNotify;
+++	bool fNotifyAdded;
 ++#endif
 + 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+++#if defined(FUXI)
+++	static void adspChanged(void *owner);
+++	static void adspChangedFired(OSObject *owner, IOInterruptEventSource *sender, int count);
+++#endif
 + 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
 + 	static bool readWord(unsigned address, uint16_t *value);
-+@@ -40,6 +54,33 @@
++ 	static unsigned estimatePercent(unsigned mv);
 + };
 + OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
 + 
@@ -38061,13 +38260,15 @@ index 0000000..c5f8fcb
 + bool
 + SweetBattery::init(OSDictionary *dictionary)
 + {
-+@@ -51,7 +92,17 @@
++@@ -51,7 +101,19 @@
 + 	}
 + 	fLoop = NULL;
 + 	fTimer = NULL;
 +-	fTimerAdded = fRunning = fReal = false;
 ++	fTimerAdded = fRunning = fReal = fAdsp = fAdspShown = false;
 ++#if defined(FUXI)
+++	fNotify = NULL;
+++	fNotifyAdded = false;
 ++	bzero(&fAdspLast, sizeof(fAdspLast));
 ++	fAdspSOCShown = fAdspTemperatureShown = false;
 ++	fAdspLast.percent = 100;
@@ -38080,7 +38281,7 @@ index 0000000..c5f8fcb
 + 	if (dictionary) {
 + 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
 + 		if (!it) {
-+@@ -72,6 +123,8 @@
++@@ -72,6 +134,8 @@
 + 		}
 + 	}
 + 	fLastMode = -1;
@@ -38089,7 +38290,7 @@ index 0000000..c5f8fcb
 + 	return true;
 + }
 + 
-+@@ -203,9 +256,142 @@
++@@ -203,9 +267,142 @@
 + 	return 100;
 + }
 + 
@@ -38232,17 +38433,48 @@ index 0000000..c5f8fcb
 + 	uint8_t type, present, usb, path, charger, error, temperature;
 + 	uint16_t rawVoltage;
 + 	bool valid = fReal &&
-+@@ -252,7 +438,8 @@
++@@ -246,13 +443,36 @@
++ 	    charging, full, true, currentValid);
++ }
++ 
++-void
++-SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
++-{
+++#if defined(FUXI)
+++void
+++SweetBattery::adspChanged(void *owner)
+++{
+++	SweetBattery *self = (SweetBattery *)owner;
+++	if (self && self->fNotify) {
+++		self->fNotify->interruptOccurred(NULL, NULL, 0);
+++	}
+++}
+++
+++void
+++SweetBattery::adspChangedFired(OSObject *owner, IOInterruptEventSource *sender, int count)
+++{
+++	(void)sender;
+++	(void)count;
 + 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
 + 	if (self && self->fRunning) {
 + 		self->poll();
 +-		sender->setTimeoutMS(30000);
+++	}
+++}
+++#endif
+++
+++void
+++SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+++{
+++	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+++	if (self && self->fRunning) {
+++		self->poll();
 ++		/* Every 10 s until the DSP's first reading arrives, then every 30 s. */
 ++		sender->setTimeoutMS(self->fAdsp && !self->fAdspShown ? 10000 : 30000);
 + 	}
 + }
 + 
-+@@ -265,19 +452,33 @@
++@@ -265,19 +485,48 @@
 + 	int real = 0;
 + 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
 + 	fReal = real == 1 && sweet_spmi_init() == 0;
@@ -38260,6 +38492,21 @@ index 0000000..c5f8fcb
 + 			fRunning = true;
 +-			fTimer->setTimeoutMS(30000);
 ++			fTimer->setTimeoutMS(fAdsp ? 10000 : 30000);
+++#if defined(FUXI)
+++			if (fAdsp) {
+++				fNotify = new IOInterruptEventSource;
+++				if (fNotify && fNotify->init(this, &SweetBattery::adspChangedFired) &&
+++				    fLoop->addEventSource(fNotify) == kIOReturnSuccess) {
+++					fNotifyAdded = true;
+++					fNotify->enable();
+++					fuxi_adsp_battery_on_change(&SweetBattery::adspChanged, this);
+++					fNotify->interruptOccurred(NULL, NULL, 0);
+++				} else {
+++					OSSafeReleaseNULL(fNotify);
+++					IOLog("SWEET BATTERY: change event unavailable; periodic polling retained\n");
+++				}
+++			}
+++#endif
 + 		} else {
 + 			fReal = false;
 +-			poll();
@@ -38280,6 +38527,47 @@ index 0000000..c5f8fcb
 + 		}
 + 	}
 + 	registerService();
++@@ -287,9 +536,18 @@
++ void
++ SweetBattery::stop(IOService *provider)
++ {
+++#if defined(FUXI)
+++	fuxi_adsp_battery_on_change(NULL, NULL);
+++#endif
++ 	if (fLoop && fTimerAdded) {
++ 		/* Serialize against a running timer callback, including rearming. */
++ 		(void)fLoop->runAction(&SweetBattery::stopPolling, this);
+++#if defined(FUXI)
+++		if (fNotifyAdded) {
+++			fLoop->removeEventSource(fNotify);
+++			fNotifyAdded = false;
+++		}
+++#endif
++ 		fLoop->removeEventSource(fTimer);
++ 		fTimerAdded = false;
++ 	}
++@@ -304,6 +562,11 @@
++ 		return kIOReturnBadArgument;
++ 	}
++ 	self->fRunning = false;
+++#if defined(FUXI)
+++	if (self->fNotify) {
+++		self->fNotify->disable();
+++	}
+++#endif
++ 	self->fTimer->cancelTimeout();
++ 	self->fTimer->disable();
++ 	return kIOReturnSuccess;
++@@ -312,6 +575,9 @@
++ void
++ SweetBattery::free(void)
++ {
+++#if defined(FUXI)
+++	OSSafeReleaseNULL(fNotify);
+++#endif
++ 	OSSafeReleaseNULL(fTimer);
++ 	OSSafeReleaseNULL(fLoop);
++ 	IOPMPowerSource::free();
 diff --git a/xnu/patches/0118-fuxi-exec-inject.patch b/xnu/patches/0118-fuxi-exec-inject.patch
 new file mode 100644
 index 0000000..34f1acf
