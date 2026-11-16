@@ -113,6 +113,7 @@ jobs:
           (cd source && python3 tools/sync-fuxi-wlan.py --check)
           (cd source && python3 tools/test-fuxi-rpmh-shared.py)
           (cd source && python3 tools/test-fuxi-torch-pulse.py)
+          (cd source && python3 tools/test-fuxi-torch-runtime.py)
           (cd source && python3 tools/test-fuxi-ramtest.py)
           (cd source && python3 tools/test-fuxi-wlan-m6i.py)
           (cd source && python3 tools/test-fuxi-wlan-rails.py)

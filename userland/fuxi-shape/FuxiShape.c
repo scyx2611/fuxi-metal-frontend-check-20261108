@@ -55,6 +55,7 @@ static double shape_w = 300.0, shape_h = 98.0;
 static unsigned shape_said;
 static int hooked;                      /* 0 not yet, 1 replaced */
 static IMP original_shape;
+extern bool fuxi_flashlight_hook(void);
 
 static void
 say(const char *format, ...)
@@ -185,6 +186,7 @@ image_added(const struct mach_header *header, intptr_t slide)
 	(void)header;
 	(void)slide;
 	(void)try_hook();
+	(void)fuxi_flashlight_hook();
 }
 
 __attribute__((constructor)) static void
@@ -208,7 +210,6 @@ fuxi_shape_init(void)
 	}
 	if (!try_hook()) {
 		say("fuxi: SpringBoard: -[%s %s] not there yet; waiting for images\n", SHAPE_CLASS, SHAPE_SELECTOR);
-		/* called at once for every image already there, then for each one added */
-		_dyld_register_func_for_add_image(image_added);
 	}
+	_dyld_register_func_for_add_image(image_added);
 }

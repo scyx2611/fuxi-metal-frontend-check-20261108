@@ -138,6 +138,50 @@ index 0000000..7349474
 +`tools/test-fuxi-ramtest.py` checks the production range gate and injects every single-bit error
 +in a non-power-of-two buffer, plus a word-alias corruption. Kernel compilation and device
 +results are recorded separately.
+diff --git a/docs-lanes/pmic-torch.md b/docs-lanes/pmic-torch.md
+new file mode 100644
+index 0000000..237aa7d
+--- /dev/null
++++ b/docs-lanes/pmic-torch.md
+@@ -0,0 +1,38 @@
++# PM8550 torch control
++
++`fuxi,pmic=1` surveys the PMIC. Mode 2 runs one 40 mA, 80 ms pulse with a
++100 ms hardware timer. The initial mode 2 device run returned success and
++restored all saved registers. Visible light and the Control Center path are
++separate acceptance checks.
++
++Mode 3 maps the same owner-0 flash channel, starts an idle worker, and exposes
++the root-write `kern.fuxitorch` integer. Values 1 through 4 request 20, 40,
++60 or 80 mA; zero stops. Each write renews a two-second lease. The worker
++performs bounded 80 ms pulses, each protected by a verified 100 ms hardware
++timer and followed by output-disable verification and register restoration.
++A failed pulse latches the worker off until reboot. Lease expiration stops
++further pulses. The worker sleeps during the pulse.
++
++The pulse implementation accepts only flash type 0x18, subtype 7, an idle
++module and clear fault status. Its write allowlist is 0x3e, 0x42, 0x46,
++0x49, 0x4a and 0x4e. If output disable cannot be verified, the timer is
++retained. No boost ownership is changed.
++
++The SpringBoard library adapts AVFlashlight only when the mode 3 sysctl is
++available and all selected Objective-C method signatures match iOS 16.
++Its level argument and return use `float`. The adapted initialization calls
++NSObject initialization without creating an Apple camera-server object.
++The original deallocation path already accepts a null private implementation.
++The library renews the selected level every 500 ms; renewal and stop writes
++share one mutex. A SpringBoard crash therefore stops renewal.
++
++`tools/test-fuxi-torch-pulse.py` exercises the production register sequence,
++all four current levels, injected failures, dropped writes and restoration.
++`tools/test-fuxi-torch-runtime.py` exercises the production lease state,
++renewal, expiration, invalid levels, overflow and latched failure. These
++checks do not establish visible light, continuous output quality, sandbox
++permission or UI behavior. Mode 3 still requires a device run.
++
++The survey also reads haptic boost offset 0x41 and additional haptic
++configuration offsets. The boost channel is owner 3. No haptic writes are
++introduced by this change.
 diff --git a/shim/fuxi-probe/probe.c b/shim/fuxi-probe/probe.c
 index efb83f1..745d165 100644
 --- a/shim/fuxi-probe/probe.c
@@ -336,7 +380,7 @@ index c7d2b39..22b499a 100644
          if args.root_extents:
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..0d61bd6
+index 0000000..529b3a0
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
 @@ -0,0 +1,142 @@
@@ -363,7 +407,7 @@ index 0000000..0d61bd6
 +SOURCES = ('fuxi_adsp.c', 'fuxi_adsp_fw.c', 'fuxi_adsp_battery.c', 'fuxi_amp.c', 'fuxi_pmic.c', 'fuxi_ramtest.c', 'fuxi_rpmh_shared.c', 'QcomSmem.c', 'QcomSmp2p.c', 'QcomGlink.c',
 +           'QcomMdt.c', 'QcomQmp.c', 'QcomRpmh.c', 'QcomQrtr.c', 'FatVolume.c', 'ShengBattmgr.c', 'ShengQrtr.c', 'GeniI2c.c')
 +HEADERS = ('QcomSmem.h', 'QcomSmp2p.h', 'QcomGlink.h', 'QcomMdt.h', 'QcomQmp.h', 'QcomRpmh.h', 'QcomScm.h', 'QcomQrtr.h',
-+           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h', 'fuxi_adsp_battery.h', 'fuxi_rpmh_shared.h', 'fuxi_torch_pulse.h', 'fuxi_ramtest_pattern.h', 'GeniI2c.h')
++           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h', 'fuxi_adsp_battery.h', 'fuxi_rpmh_shared.h', 'fuxi_torch_pulse.h', 'fuxi_torch_runtime.h', 'fuxi_ramtest_pattern.h', 'GeniI2c.h')
 +MODIFIED = {'iokit/Kernel/arm/SweetBattery.cpp': ('0062-sweet-touch-power-battery.patch', 'SweetBattery.cpp')}
 +# bsd/dev/LICENSE.UniXNU-sheng already comes with 0098 (the GPU fence interrupt is adapted from sheng too); --check
 +# verifies that the local copy is the same text.
@@ -767,10 +811,10 @@ index 0000000..e360b63
 +    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-torch-pulse.py b/tools/test-fuxi-torch-pulse.py
 new file mode 100644
-index 0000000..e9344e6
+index 0000000..3c6b447
 --- /dev/null
 +++ b/tools/test-fuxi-torch-pulse.py
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,115 @@
 +import os
 +from pathlib import Path
 +import subprocess
@@ -785,7 +829,7 @@ index 0000000..e9344e6
 +struct model {
 +    uint8_t registers[256], original[256];
 +    unsigned reads, writes, fail_read, fail_write, drop_write, quarantine, dead, fault;
-+    unsigned now, start, pulses, peak_current, expired;
++    unsigned now, start, pulses, peak_current, expired, level;
 +    uint64_t drop_mask;
 +};
 +static int active(struct model *state) {
@@ -809,9 +853,9 @@ index 0000000..e9344e6
 +        if(active(state) && offset!=0x46 && offset!=0x4e) assert(0);
 +        if(offset==0x4e && value) {
 +            assert(value==1 && state->registers[0x3e]==0x8a && (state->registers[0x49]&1));
-+            assert((state->registers[0x4a]&7)==1 && state->registers[0x42]==7);
++            assert((state->registers[0x4a]&7)==1 && state->registers[0x42]==state->level*4-1);
 +            assert(state->registers[0x46]&0x80);
-+            state->start=state->now; state->pulses++; state->expired=0; state->peak_current=40;
++            state->start=state->now; state->pulses++; state->expired=0; state->peak_current=state->level*20;
 +        }
 +        state->registers[offset]=value;
 +    }
@@ -826,6 +870,7 @@ index 0000000..e9344e6
 +}
 +static void fixture(struct model *state) {
 +    memset(state,0,sizeof(*state));
++    state->level=2;
 +    state->registers[4]=0x18; state->registers[5]=7;
 +    state->registers[0x3e]=11; state->registers[0x42]=23;
 +    state->registers[0x49]=0x0a; state->registers[0x4a]=1; state->registers[0x46]=0x20;
@@ -833,8 +878,8 @@ index 0000000..e9344e6
 +}
 +static int run(struct model *state) {
 +    FuxiTorchIo io={state,read_register,write_register,wait_us};
-+    int result=fuxi_torch_pulse(&io);
-+    assert(!active(state) && state->pulses<=1 && state->peak_current<=40);
++    int result=state->level==2 ? fuxi_torch_pulse(&io) : fuxi_torch_pulse_level(&io,state->level);
++    assert(!active(state) && state->pulses<=1 && state->peak_current<=80);
 +    return result;
 +}
 +int main(void) {
@@ -865,13 +910,79 @@ index 0000000..e9344e6
 +    assert(state.registers[0x3e]==0x8a && state.writes==8);
 +    fixture(&state); state.fault=1; assert(run(&state)==-5);
 +    assert(!memcmp(state.registers,state.original,256));
-+    puts("PASS: real torch pulse, 40mA limit, 80ms duration, timer-before-enable, busy/fault checks, failure cleanup and register restore");
++    for(unsigned level=0;level<=5;level++) {
++        fixture(&state); state.level=level;
++        if(!level || level>4) assert(run(&state)<0 && !state.writes);
++        else {
++            assert(!run(&state) && state.peak_current==level*20);
++            assert(!memcmp(state.registers,state.original,256));
++        }
++    }
++    puts("PASS: real torch pulse, four 20..80mA levels, 80ms duration, timer-before-enable, busy/fault checks, failure cleanup and register restore");
 +    return 0;
 +}
 +'''
 +with tempfile.TemporaryDirectory(prefix='fuxi-torch-pulse-') as temporary:
 +    directory = Path(temporary)
 +    cfile, binary = directory / 'pulse.c', directory / 'pulse'
++    cfile.write_text(source)
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-g', '-Wall', '-Wextra', '-Werror',
++                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
++                    '-I' + str(root / 'xnu/fuxi-adsp'), str(cfile), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
+diff --git a/tools/test-fuxi-torch-runtime.py b/tools/test-fuxi-torch-runtime.py
+new file mode 100644
+index 0000000..4fac3c1
+--- /dev/null
++++ b/tools/test-fuxi-torch-runtime.py
+@@ -0,0 +1,52 @@
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++
++root = Path(__file__).resolve().parents[1]
++source = r'''
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "fuxi_torch_runtime.h"
++int main(void) {
++    FuxiTorchRuntime state={0}, saved;
++    assert(!fuxi_torch_requested(&state,0));
++    assert(!fuxi_torch_request(&state,4,100));
++    assert(fuxi_torch_requested(&state,2000000099ull)==4);
++    assert(!fuxi_torch_requested(&state,2000000100ull));
++    for(unsigned level=1;level<=4;level++) {
++        assert(!fuxi_torch_request(&state,level,10000000000ull));
++        assert(fuxi_torch_requested(&state,11000000000ull)==level);
++        assert(!fuxi_torch_request(&state,level,11000000000ull));
++        assert(fuxi_torch_requested(&state,12000000000ull)==level);
++        assert(!fuxi_torch_requested(&state,13000000000ull));
++        assert(!fuxi_torch_request(&state,level,0));
++        assert(!fuxi_torch_request(&state,0,1));
++        assert(!fuxi_torch_requested(&state,1));
++    }
++    saved=state;
++    assert(fuxi_torch_request(&state,5,0)<0);
++    assert(!memcmp(&state,&saved,sizeof(state)));
++    assert(fuxi_torch_request(&state,1,UINT64_MAX-1)<0);
++    assert(!memcmp(&state,&saved,sizeof(state)));
++    assert(!fuxi_torch_request(&state,1,0));
++    state.failed=1;
++    assert(!fuxi_torch_requested(&state,1));
++    assert(fuxi_torch_request(&state,1,2)<0);
++    assert(!fuxi_torch_request(&state,0,3));
++    assert(!fuxi_torch_request(&state,0,UINT64_MAX));
++    assert(fuxi_torch_request(NULL,1,0)<0);
++    puts("PASS: production torch lease expires, renews, stops immediately, rejects overflow and latches hardware failure");
++    return 0;
++}
++'''
++with tempfile.TemporaryDirectory(prefix='fuxi-torch-runtime-') as temporary:
++    directory = Path(temporary)
++    cfile, binary = directory / 'runtime.c', directory / 'runtime'
 +    cfile.write_text(source)
 +    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-g', '-Wall', '-Wextra', '-Werror',
 +                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
@@ -6450,26 +6561,34 @@ index 0000000..09ce08d
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_pmic.c b/xnu/fuxi-adsp/fuxi_pmic.c
 new file mode 100644
-index 0000000..1cb54fe
+index 0000000..e3c8e51
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_pmic.c
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,325 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/kauth.h>
++#include <sys/sysctl.h>
 +#include <kern/clock.h>
 +#include <kern/locks.h>
++#include <kern/thread.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <vm/vm_kern.h>
 +#include <vm/pmap.h>
 +#include "fuxi_torch_pulse.h"
++#include "fuxi_torch_runtime.h"
 +
 +extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
 +    unsigned, void *);
 +void fuxi_pmic_init(void);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern void IOSleep(unsigned milliseconds);
 +
 +struct fp_window {
 +    uint64_t physical;
@@ -6486,6 +6605,9 @@ index 0000000..1cb54fe
 +static uint8_t fp_poisoned[1024];
 +static unsigned fp_started;
 +static struct fp_window fp_flash_channel;
++static LCK_MTX_DECLARE(fp_torch_lock, &fp_group);
++static FuxiTorchRuntime fp_torch_state;
++static unsigned fp_torch_ready;
 +
 +static kern_return_t fp_map(struct fp_window *window)
 +{
@@ -6564,8 +6686,9 @@ index 0000000..1cb54fe
 +static void fp_survey(unsigned sid, unsigned base, const char *name)
 +{
 +    static const uint8_t offsets[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x10, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b,
-+        0x4c, 0x4d, 0x4e, 0x50, 0x5c, 0x5d, 0x63, 0x66};
++        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x10, 0x26, 0x41, 0x46, 0x47, 0x48, 0x49,
++        0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x50, 0x5c, 0x5d, 0x60, 0x63, 0x66, 0x67,
++        0x68, 0x70, 0x71, 0x72};
 +    unsigned owner = 7;
 +    int apid = fp_find(sid, base >> 8, &owner);
 +    printf("FUXI PMIC: %s sid=%u base=%#x APID=%d owner=%u survey-only\n", name, sid, base, apid, owner);
@@ -6621,26 +6744,117 @@ index 0000000..1cb54fe
 +    delay(microseconds);
 +}
 +
-+static void fp_flash_pulse(void)
++static int fp_flash_prepare(void)
 +{
 +    unsigned owner = 7;
 +    int apid = fp_find(1, 0xee, &owner);
 +    if (apid < 0 || owner != 0) {
 +        printf("FUXI PMIC: flash pulse refused APID=%d owner=%u\n", apid, owner);
-+        return;
++        return -1;
 +    }
 +    uint64_t channel = 0x0c500000ull + (unsigned)apid * 0x1000u;
 +    fp_flash_channel.physical = channel & ~(uint64_t)PAGE_MASK;
 +    fp_flash_channel.size = PAGE_SIZE;
 +    if (fp_map(&fp_flash_channel) != KERN_SUCCESS) {
 +        printf("FUXI PMIC: flash channel mapping failed\n");
-+        return;
++        return -1;
 +    }
++    return 0;
++}
++
++static void fp_flash_pulse(void)
++{
++    if (fp_flash_prepare()) return;
 +    FuxiTorchIo io = {NULL, fp_flash_read, fp_flash_write, fp_flash_wait};
 +    printf("FUXI PMIC: flash pulse begin channel=0 current=40mA duration=80ms hardware-timer=100ms\n");
 +    int result = fuxi_torch_pulse(&io);
 +    printf("FUXI PMIC: flash pulse result=%d%s\n", result,
 +        result == 0 ? " registers restored; visible light needs observation" : " failed; not accepted");
++}
++
++static uint64_t fp_torch_now(void)
++{
++    uint64_t absolute, nanoseconds;
++    clock_get_uptime(&absolute);
++    absolutetime_to_nanoseconds(absolute, &nanoseconds);
++    return nanoseconds;
++}
++
++static int fp_torch_sysctl SYSCTL_HANDLER_ARGS
++{
++    (void)oidp;
++    (void)arg1;
++    (void)arg2;
++    if (!__atomic_load_n(&fp_torch_ready, __ATOMIC_ACQUIRE)) return ENOTSUP;
++    if (req->newptr && !kauth_cred_issuser(kauth_cred_get())) return EPERM;
++    lck_mtx_lock(&fp_torch_lock);
++    int value = (int)fuxi_torch_requested(&fp_torch_state, fp_torch_now());
++    int failed = fp_torch_state.failed;
++    lck_mtx_unlock(&fp_torch_lock);
++    if (failed && !req->newptr) return EIO;
++    int changed = 0;
++    int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++    if (error || !changed) return error;
++    if (value < 0 || value > 4) return EINVAL;
++    lck_mtx_lock(&fp_torch_lock);
++    error = fuxi_torch_request(&fp_torch_state, (unsigned)value, fp_torch_now()) ? EIO : 0;
++    lck_mtx_unlock(&fp_torch_lock);
++    return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, fuxitorch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, fp_torch_sysctl, "I", "Fuxi torch level 0..4, root writes, two second lease");
++
++static void fp_torch_wait(void *context, unsigned microseconds)
++{
++    (void)context;
++    IOSleep((microseconds + 999u) / 1000u);
++}
++
++static void fp_torch_worker(void *argument, wait_result_t wait_result)
++{
++    (void)argument;
++    (void)wait_result;
++    FuxiTorchIo io = {NULL, fp_flash_read, fp_flash_write, fp_torch_wait};
++    unsigned previous = 0;
++    for (;;) {
++        lck_mtx_lock(&fp_torch_lock);
++        unsigned level = fuxi_torch_requested(&fp_torch_state, fp_torch_now());
++        lck_mtx_unlock(&fp_torch_lock);
++        if (level != previous) {
++            printf("FUXI PMIC: torch request=%u current=%umA lease=2000ms\n", level, level * 20);
++            previous = level;
++        }
++        if (level) {
++            int result = fuxi_torch_pulse_level(&io, level);
++            lck_mtx_lock(&fp_torch_lock);
++            if (result) {
++                fp_torch_state.failed = 1;
++                fp_torch_state.level = 0;
++                printf("FUXI PMIC: torch runtime stopped rc=%d; reboot required\n", result);
++            } else {
++                fp_torch_state.pulses++;
++                if (fp_torch_state.pulses <= 4 || !(fp_torch_state.pulses & 63u))
++                    printf("FUXI PMIC: torch pulse=%llu level=%u timer=100ms restored\n",
++                        fp_torch_state.pulses, level);
++            }
++            lck_mtx_unlock(&fp_torch_lock);
++        }
++        IOSleep(level ? 1 : 20);
++    }
++}
++
++static void fp_torch_start(void)
++{
++    if (fp_flash_prepare()) return;
++    thread_t thread = NULL;
++    if (kernel_thread_start(fp_torch_worker, NULL, &thread) != KERN_SUCCESS) {
++        printf("FUXI PMIC: torch runtime worker failed\n");
++        return;
++    }
++    thread_deallocate(thread);
++    __atomic_store_n(&fp_torch_ready, 1u, __ATOMIC_RELEASE);
++    printf("FUXI PMIC: torch runtime ready; root sysctl kern.fuxitorch, 20..80mA, output off\n");
 +}
 +
 +void fuxi_pmic_init(void)
@@ -6655,7 +6869,7 @@ index 0000000..1cb54fe
 +        memcpy(&mode, property, sizeof(mode));
 +    }
 +    if (!mode || __atomic_exchange_n(&fp_started, 1u, __ATOMIC_ACQ_REL)) return;
-+    if (mode != 1 && mode != 2) {
++    if (mode != 1 && mode != 2 && mode != 3) {
 +        printf("FUXI PMIC: unsupported mode=%u; hardware untouched\n", mode);
 +        return;
 +    }
@@ -6673,6 +6887,7 @@ index 0000000..1cb54fe
 +    fp_survey(7, 0xf100, "haptic-pattern");
 +    fp_survey(7, 0xf200, "haptic-boost");
 +    if (mode == 2) fp_flash_pulse();
++    if (mode == 3) fp_torch_start();
 +}
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_ramtest.c b/xnu/fuxi-adsp/fuxi_ramtest.c
@@ -6887,10 +7102,10 @@ index 0000000..fd499b2
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_torch_pulse.h b/xnu/fuxi-adsp/fuxi_torch_pulse.h
 new file mode 100644
-index 0000000..48cd2d2
+index 0000000..df93326
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_torch_pulse.h
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,76 @@
 +#ifndef FUXI_TORCH_PULSE_H
 +#define FUXI_TORCH_PULSE_H
 +#include <stdint.h>
@@ -6902,12 +7117,12 @@ index 0000000..48cd2d2
 +    void (*wait_us)(void *, unsigned);
 +} FuxiTorchIo;
 +
-+static inline int fuxi_torch_pulse(const FuxiTorchIo *io)
++static inline int fuxi_torch_pulse_level(const FuxiTorchIo *io, unsigned level)
 +{
 +    static const unsigned registers[] = {0x3e, 0x42, 0x49, 0x4a, 0x46, 0x4e};
 +    uint8_t saved[6], value = 0, type = 0, subtype = 0;
 +    int result = -1, enabled = 0, restored = 1, disabled = 1;
-+    if (!io || !io->read || !io->write || !io->wait_us) return -1;
++    if (!io || !io->read || !io->write || !io->wait_us || level < 1 || level > 4) return -1;
 +    if (io->read(io->context, 4, &type) || io->read(io->context, 5, &subtype) ||
 +        type != 0x18 || subtype != 7) return -1;
 +    for (unsigned index = 0; index < 6; index++) {
@@ -6918,7 +7133,8 @@ index 0000000..48cd2d2
 +        const unsigned status[] = {6, 7, 9};
 +        if (io->read(io->context, status[index], &value) || value) return -2;
 +    }
-+    const uint8_t setup[] = {0x8a, 7, (uint8_t)(saved[2] | 1), (uint8_t)((saved[3] & ~7u) | 1)};
++    const uint8_t setup[] = {0x8a, (uint8_t)(level * 4 - 1),
++        (uint8_t)(saved[2] | 1), (uint8_t)((saved[3] & ~7u) | 1)};
 +    for (unsigned index = 0; index < 4; index++) {
 +        if (io->write(io->context, registers[index], setup[index]) ||
 +            io->read(io->context, registers[index], &value) || value != setup[index]) {
@@ -6959,6 +7175,42 @@ index 0000000..48cd2d2
 +        if (io->read(io->context, registers[index], &value) || value != saved[index]) restored = 0;
 +    }
 +    return restored ? result : -6;
++}
++
++static inline int fuxi_torch_pulse(const FuxiTorchIo *io)
++{
++    return fuxi_torch_pulse_level(io, 2);
++}
++#endif
+diff --git a/xnu/fuxi-adsp/fuxi_torch_runtime.h b/xnu/fuxi-adsp/fuxi_torch_runtime.h
+new file mode 100644
+index 0000000..bee12e9
+--- /dev/null
++++ b/xnu/fuxi-adsp/fuxi_torch_runtime.h
+@@ -0,0 +1,25 @@
++#ifndef FUXI_TORCH_RUNTIME_H
++#define FUXI_TORCH_RUNTIME_H
++#include <stdint.h>
++
++typedef struct {
++    unsigned level;
++    unsigned failed;
++    uint64_t pulses;
++    uint64_t deadline;
++} FuxiTorchRuntime;
++
++static inline int fuxi_torch_request(FuxiTorchRuntime *state, unsigned level, uint64_t now)
++{
++    if (!state || level > 4 || (level && (state->failed || now > UINT64_MAX - 2000000000ull))) return -1;
++    state->level = level;
++    state->deadline = level ? now + 2000000000ull : 0;
++    return 0;
++}
++
++static inline unsigned fuxi_torch_requested(FuxiTorchRuntime *state, uint64_t now)
++{
++    if (state->failed || (state->level && now >= state->deadline)) state->level = 0;
++    return state->level;
 +}
 +#endif
 diff --git a/xnu/fuxi-h1/fuxi_keys.c b/xnu/fuxi-h1/fuxi_keys.c
@@ -8277,10 +8529,10 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..5883d6a
+index 0000000..c19047a
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,5512 @@
+@@ -0,0 +1,5650 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,24 @@
@@ -9993,23 +10245,31 @@ index 0000000..5883d6a
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_pmic.c
-+@@ -0,0 +1,221 @@
++@@ -0,0 +1,325 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
 ++#include <sys/systm.h>
+++#include <sys/errno.h>
+++#include <sys/kauth.h>
+++#include <sys/sysctl.h>
 ++#include <kern/clock.h>
 ++#include <kern/locks.h>
+++#include <kern/thread.h>
 ++#include <machine/machine_routines.h>
 ++#include <pexpert/pexpert.h>
 ++#include <pexpert/device_tree.h>
 ++#include <vm/vm_kern.h>
 ++#include <vm/pmap.h>
 ++#include "fuxi_torch_pulse.h"
+++#include "fuxi_torch_runtime.h"
 ++
 ++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
 ++    unsigned, void *);
 ++void fuxi_pmic_init(void);
+++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+++extern void thread_deallocate(thread_t);
+++extern void IOSleep(unsigned milliseconds);
 ++
 ++struct fp_window {
 ++    uint64_t physical;
@@ -10026,6 +10286,9 @@ index 0000000..5883d6a
 ++static uint8_t fp_poisoned[1024];
 ++static unsigned fp_started;
 ++static struct fp_window fp_flash_channel;
+++static LCK_MTX_DECLARE(fp_torch_lock, &fp_group);
+++static FuxiTorchRuntime fp_torch_state;
+++static unsigned fp_torch_ready;
 ++
 ++static kern_return_t fp_map(struct fp_window *window)
 ++{
@@ -10104,8 +10367,9 @@ index 0000000..5883d6a
 ++static void fp_survey(unsigned sid, unsigned base, const char *name)
 ++{
 ++    static const uint8_t offsets[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-++        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x10, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b,
-++        0x4c, 0x4d, 0x4e, 0x50, 0x5c, 0x5d, 0x63, 0x66};
+++        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x10, 0x26, 0x41, 0x46, 0x47, 0x48, 0x49,
+++        0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x50, 0x5c, 0x5d, 0x60, 0x63, 0x66, 0x67,
+++        0x68, 0x70, 0x71, 0x72};
 ++    unsigned owner = 7;
 ++    int apid = fp_find(sid, base >> 8, &owner);
 ++    printf("FUXI PMIC: %s sid=%u base=%#x APID=%d owner=%u survey-only\n", name, sid, base, apid, owner);
@@ -10161,26 +10425,117 @@ index 0000000..5883d6a
 ++    delay(microseconds);
 ++}
 ++
-++static void fp_flash_pulse(void)
+++static int fp_flash_prepare(void)
 ++{
 ++    unsigned owner = 7;
 ++    int apid = fp_find(1, 0xee, &owner);
 ++    if (apid < 0 || owner != 0) {
 ++        printf("FUXI PMIC: flash pulse refused APID=%d owner=%u\n", apid, owner);
-++        return;
+++        return -1;
 ++    }
 ++    uint64_t channel = 0x0c500000ull + (unsigned)apid * 0x1000u;
 ++    fp_flash_channel.physical = channel & ~(uint64_t)PAGE_MASK;
 ++    fp_flash_channel.size = PAGE_SIZE;
 ++    if (fp_map(&fp_flash_channel) != KERN_SUCCESS) {
 ++        printf("FUXI PMIC: flash channel mapping failed\n");
-++        return;
+++        return -1;
 ++    }
+++    return 0;
+++}
+++
+++static void fp_flash_pulse(void)
+++{
+++    if (fp_flash_prepare()) return;
 ++    FuxiTorchIo io = {NULL, fp_flash_read, fp_flash_write, fp_flash_wait};
 ++    printf("FUXI PMIC: flash pulse begin channel=0 current=40mA duration=80ms hardware-timer=100ms\n");
 ++    int result = fuxi_torch_pulse(&io);
 ++    printf("FUXI PMIC: flash pulse result=%d%s\n", result,
 ++        result == 0 ? " registers restored; visible light needs observation" : " failed; not accepted");
+++}
+++
+++static uint64_t fp_torch_now(void)
+++{
+++    uint64_t absolute, nanoseconds;
+++    clock_get_uptime(&absolute);
+++    absolutetime_to_nanoseconds(absolute, &nanoseconds);
+++    return nanoseconds;
+++}
+++
+++static int fp_torch_sysctl SYSCTL_HANDLER_ARGS
+++{
+++    (void)oidp;
+++    (void)arg1;
+++    (void)arg2;
+++    if (!__atomic_load_n(&fp_torch_ready, __ATOMIC_ACQUIRE)) return ENOTSUP;
+++    if (req->newptr && !kauth_cred_issuser(kauth_cred_get())) return EPERM;
+++    lck_mtx_lock(&fp_torch_lock);
+++    int value = (int)fuxi_torch_requested(&fp_torch_state, fp_torch_now());
+++    int failed = fp_torch_state.failed;
+++    lck_mtx_unlock(&fp_torch_lock);
+++    if (failed && !req->newptr) return EIO;
+++    int changed = 0;
+++    int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+++    if (error || !changed) return error;
+++    if (value < 0 || value > 4) return EINVAL;
+++    lck_mtx_lock(&fp_torch_lock);
+++    error = fuxi_torch_request(&fp_torch_state, (unsigned)value, fp_torch_now()) ? EIO : 0;
+++    lck_mtx_unlock(&fp_torch_lock);
+++    return error;
+++}
+++
+++SYSCTL_PROC(_kern, OID_AUTO, fuxitorch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+++    0, 0, fp_torch_sysctl, "I", "Fuxi torch level 0..4, root writes, two second lease");
+++
+++static void fp_torch_wait(void *context, unsigned microseconds)
+++{
+++    (void)context;
+++    IOSleep((microseconds + 999u) / 1000u);
+++}
+++
+++static void fp_torch_worker(void *argument, wait_result_t wait_result)
+++{
+++    (void)argument;
+++    (void)wait_result;
+++    FuxiTorchIo io = {NULL, fp_flash_read, fp_flash_write, fp_torch_wait};
+++    unsigned previous = 0;
+++    for (;;) {
+++        lck_mtx_lock(&fp_torch_lock);
+++        unsigned level = fuxi_torch_requested(&fp_torch_state, fp_torch_now());
+++        lck_mtx_unlock(&fp_torch_lock);
+++        if (level != previous) {
+++            printf("FUXI PMIC: torch request=%u current=%umA lease=2000ms\n", level, level * 20);
+++            previous = level;
+++        }
+++        if (level) {
+++            int result = fuxi_torch_pulse_level(&io, level);
+++            lck_mtx_lock(&fp_torch_lock);
+++            if (result) {
+++                fp_torch_state.failed = 1;
+++                fp_torch_state.level = 0;
+++                printf("FUXI PMIC: torch runtime stopped rc=%d; reboot required\n", result);
+++            } else {
+++                fp_torch_state.pulses++;
+++                if (fp_torch_state.pulses <= 4 || !(fp_torch_state.pulses & 63u))
+++                    printf("FUXI PMIC: torch pulse=%llu level=%u timer=100ms restored\n",
+++                        fp_torch_state.pulses, level);
+++            }
+++            lck_mtx_unlock(&fp_torch_lock);
+++        }
+++        IOSleep(level ? 1 : 20);
+++    }
+++}
+++
+++static void fp_torch_start(void)
+++{
+++    if (fp_flash_prepare()) return;
+++    thread_t thread = NULL;
+++    if (kernel_thread_start(fp_torch_worker, NULL, &thread) != KERN_SUCCESS) {
+++        printf("FUXI PMIC: torch runtime worker failed\n");
+++        return;
+++    }
+++    thread_deallocate(thread);
+++    __atomic_store_n(&fp_torch_ready, 1u, __ATOMIC_RELEASE);
+++    printf("FUXI PMIC: torch runtime ready; root sysctl kern.fuxitorch, 20..80mA, output off\n");
 ++}
 ++
 ++void fuxi_pmic_init(void)
@@ -10195,7 +10550,7 @@ index 0000000..5883d6a
 ++        memcpy(&mode, property, sizeof(mode));
 ++    }
 ++    if (!mode || __atomic_exchange_n(&fp_started, 1u, __ATOMIC_ACQ_REL)) return;
-++    if (mode != 1 && mode != 2) {
+++    if (mode != 1 && mode != 2 && mode != 3) {
 ++        printf("FUXI PMIC: unsupported mode=%u; hardware untouched\n", mode);
 ++        return;
 ++    }
@@ -10213,6 +10568,7 @@ index 0000000..5883d6a
 ++    fp_survey(7, 0xf100, "haptic-pattern");
 ++    fp_survey(7, 0xf200, "haptic-boost");
 ++    if (mode == 2) fp_flash_pulse();
+++    if (mode == 3) fp_torch_start();
 ++}
 ++#endif
 +--- /dev/null
@@ -13300,7 +13656,7 @@ index 0000000..5883d6a
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_torch_pulse.h
-+@@ -0,0 +1,70 @@
++@@ -0,0 +1,76 @@
 ++#ifndef FUXI_TORCH_PULSE_H
 ++#define FUXI_TORCH_PULSE_H
 ++#include <stdint.h>
@@ -13312,12 +13668,12 @@ index 0000000..5883d6a
 ++    void (*wait_us)(void *, unsigned);
 ++} FuxiTorchIo;
 ++
-++static inline int fuxi_torch_pulse(const FuxiTorchIo *io)
+++static inline int fuxi_torch_pulse_level(const FuxiTorchIo *io, unsigned level)
 ++{
 ++    static const unsigned registers[] = {0x3e, 0x42, 0x49, 0x4a, 0x46, 0x4e};
 ++    uint8_t saved[6], value = 0, type = 0, subtype = 0;
 ++    int result = -1, enabled = 0, restored = 1, disabled = 1;
-++    if (!io || !io->read || !io->write || !io->wait_us) return -1;
+++    if (!io || !io->read || !io->write || !io->wait_us || level < 1 || level > 4) return -1;
 ++    if (io->read(io->context, 4, &type) || io->read(io->context, 5, &subtype) ||
 ++        type != 0x18 || subtype != 7) return -1;
 ++    for (unsigned index = 0; index < 6; index++) {
@@ -13328,7 +13684,8 @@ index 0000000..5883d6a
 ++        const unsigned status[] = {6, 7, 9};
 ++        if (io->read(io->context, status[index], &value) || value) return -2;
 ++    }
-++    const uint8_t setup[] = {0x8a, 7, (uint8_t)(saved[2] | 1), (uint8_t)((saved[3] & ~7u) | 1)};
+++    const uint8_t setup[] = {0x8a, (uint8_t)(level * 4 - 1),
+++        (uint8_t)(saved[2] | 1), (uint8_t)((saved[3] & ~7u) | 1)};
 ++    for (unsigned index = 0; index < 4; index++) {
 ++        if (io->write(io->context, registers[index], setup[index]) ||
 ++            io->read(io->context, registers[index], &value) || value != setup[index]) {
@@ -13369,6 +13726,39 @@ index 0000000..5883d6a
 ++        if (io->read(io->context, registers[index], &value) || value != saved[index]) restored = 0;
 ++    }
 ++    return restored ? result : -6;
+++}
+++
+++static inline int fuxi_torch_pulse(const FuxiTorchIo *io)
+++{
+++    return fuxi_torch_pulse_level(io, 2);
+++}
+++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_torch_runtime.h
++@@ -0,0 +1,25 @@
+++#ifndef FUXI_TORCH_RUNTIME_H
+++#define FUXI_TORCH_RUNTIME_H
+++#include <stdint.h>
+++
+++typedef struct {
+++    unsigned level;
+++    unsigned failed;
+++    uint64_t pulses;
+++    uint64_t deadline;
+++} FuxiTorchRuntime;
+++
+++static inline int fuxi_torch_request(FuxiTorchRuntime *state, unsigned level, uint64_t now)
+++{
+++    if (!state || level > 4 || (level && (state->failed || now > UINT64_MAX - 2000000000ull))) return -1;
+++    state->level = level;
+++    state->deadline = level ? now + 2000000000ull : 0;
+++    return 0;
+++}
+++
+++static inline unsigned fuxi_torch_requested(FuxiTorchRuntime *state, uint64_t now)
+++{
+++    if (state->failed || (state->level && now >= state->deadline)) state->level = 0;
+++    return state->level;
 ++}
 ++#endif
 +--- /dev/null
