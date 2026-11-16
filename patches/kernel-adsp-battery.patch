@@ -3710,10 +3710,10 @@ index 0000000000000000000000000000000000000000..21fe2c599e823e075c5e37cb2094a725
 +device; until then the torch remains unverified.
 diff --git a/docs-lanes/wlan-ath12k.md b/docs-lanes/wlan-ath12k.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..33011798175d6811531441bb14218c150fd85a04
+index 0000000000000000000000000000000000000000..daad2a536363a0dd71f2e6e870f844d1e0ff408d
 --- /dev/null
 +++ b/docs-lanes/wlan-ath12k.md
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,100 @@
 +# Fuxi ath12k board adapter
 +
 +The existing WLAN diagnostic reached FW_READY, INI, CFG and a successful
@@ -3735,6 +3735,10 @@ index 0000000000000000000000000000000000000000..33011798175d6811531441bb14218c15
 +
 +DMA map and free operations require owned allocations and matching pointer,
 +bus address and length. Invalid operations latch the adapter failed.
++The module's dma_kfree callback supplies zero length and bus address; that
++specific pair resolves an exact live allocation base through owned metadata.
++It does not admit interior pointers, stale buffers, the MSI sink, or a
++partially missing coherent-free identity.
 +Containment stops DMA and detaches the owned SMMU mapping before releasing
 +the arena. Metadata and cached firmware are released only after the arena
 +has been released; failed containment retains the allocations.
@@ -3803,6 +3807,13 @@ index 0000000000000000000000000000000000000000..33011798175d6811531441bb14218c15
 +initialization failure. Host tests cover the handshake, actual pinned wire
 +codec, transport ABI, stale replies/events, malformed frames, command errors
 +and scan event/reply ordering. A successful device scan remains unverified.
++
++The next local device test passed control initialization, recognized WCN7850,
++loaded the firmware and reached MHI Mission Mode (AMSS/M0). DMA ownership
++then latched failed because the adapter rejected the module's dma_kfree
++sentinel. The sentinel path now resolves the recorded identity while normal
++coherent frees retain exact size/address checks. Host regression exercises
++release and reuse through both callback forms.
 diff --git a/docs-lanes/wlan-bdf-provenance.md b/docs-lanes/wlan-bdf-provenance.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..8966843a83976916bf29e741711126125ba217ee
@@ -15908,10 +15919,10 @@ index 0000000000000000000000000000000000000000..bb751037050ba705b9423efe8b3c20e2
 +    main()
 diff --git a/tools/test-fuxi-wlan-ath12k.py b/tools/test-fuxi-wlan-ath12k.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..4a36434b98f4de2a5e04d82a73abbc9c9a1dc76c
+index 0000000000000000000000000000000000000000..819c76cbc36eeb86cdc8af3c6152f9fe42fd246d
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ath12k.py
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,310 @@
 +import argparse
 +import json
 +import os
@@ -15950,6 +15961,7 @@ index 0000000000000000000000000000000000000000..4a36434b98f4de2a5e04d82a73abbc9c
 +static struct { uintptr_t va; } wl_ath_arena;
 +static struct { void *memory; size_t bytes; } wla_firmware[4];
 +static unsigned normal_frees;
++@DMA_FREE@
 +static void wla_free(void *memory) {
 +    if (memory) { normal_frees++; free(memory); }
 +}
@@ -16022,6 +16034,20 @@ index 0000000000000000000000000000000000000000..4a36434b98f4de2a5e04d82a73abbc9c
 +    CHECK(!fwa_free(&arena, 7077888, first, bus));
 +    CHECK(fwa_free(&arena, 7077888, first, bus));
 +    CHECK(!fwa_map(&arena, first, 1));
++    first = fwa_alloc(&arena, 4097, &bus);
++    CHECK(first && bus);
++    CHECK(fwa_kfree(NULL, first));
++    CHECK(fwa_kfree(&arena, NULL));
++    CHECK(fwa_kfree(&arena, memory));
++    CHECK(fwa_kfree(&arena, (uint8_t *)first + 1));
++    CHECK(fwa_free(&arena, 0, first, bus));
++    CHECK(fwa_free(&arena, 4097, first, 0));
++    CHECK(!fwa_kfree(&arena, first));
++    CHECK(!fwa_map(&arena, first, 1));
++    CHECK(fwa_kfree(&arena, first));
++    void *recycled = fwa_alloc(&arena, 4097, &bus);
++    CHECK(recycled == first && fwa_map(&arena, recycled, 4097) == bus);
++    CHECK(!fwa_free(&arena, 4097, recycled, bus));
 +    verify(&arena); CHECK(arena.count == 2);
 +    struct slot { void *memory; uint64_t bus; uint32_t bytes; } slots[256] = {0};
 +    uint32_t random = 0x19031c4d;
@@ -16031,7 +16057,8 @@ index 0000000000000000000000000000000000000000..4a36434b98f4de2a5e04d82a73abbc9c
 +        struct slot *slot = &slots[index];
 +        if (slot->memory) {
 +            CHECK(fwa_map(&arena, slot->memory, slot->bytes) == slot->bus);
-+            CHECK(!fwa_free(&arena, slot->bytes, slot->memory, slot->bus));
++                if (round & 1) CHECK(!fwa_kfree(&arena, slot->memory));
++                else CHECK(!fwa_free(&arena, slot->bytes, slot->memory, slot->bus));
 +            CHECK(!fwa_map(&arena, slot->memory, 1));
 +            slot->memory = NULL;
 +        } else {
@@ -16061,6 +16088,17 @@ index 0000000000000000000000000000000000000000..4a36434b98f4de2a5e04d82a73abbc9c
 +    CHECK(!fwa_free(&arena, 4096, memory + 4096, bus));
 +    config_tests();
 +    wla_pool = arena;
++    void *callback_memory = fwa_alloc(&wla_pool, 4096, &bus);
++    CHECK(callback_memory);
++    wla_dma_free(0, callback_memory, 0);
++    CHECK(!wla_failed && !fwa_map(&wla_pool, callback_memory, 1));
++    callback_memory = fwa_alloc(&wla_pool, 4096, &bus);
++    CHECK(callback_memory);
++    wla_dma_free(0, callback_memory, bus);
++    CHECK(wla_failed && fwa_map(&wla_pool, callback_memory, 4096) == bus);
++    wla_failed = 0;
++    wla_dma_free(4096, callback_memory, bus);
++    CHECK(!wla_failed && !fwa_map(&wla_pool, callback_memory, 1));
 +    wla_blocks = malloc(sizeof(*wla_blocks) * 16);
 +    CHECK(wla_blocks);
 +    for (unsigned index = 0; index < 4; index++) {
@@ -16144,6 +16182,8 @@ index 0000000000000000000000000000000000000000..4a36434b98f4de2a5e04d82a73abbc9c
 +    config = config.replace('__asm__ volatile("dsb sy" ::: "memory");', '')
 +    release = 'static void\nwl_ath_release(' + adapter.split('static void\nwl_ath_release(', 1)[1].split(
 +        'static void *\nwla_dma_alloc(', 1)[0]
++    dma_free = 'static void\nwla_dma_free(' + adapter.split('static void\nwla_dma_free(', 1)[1].split(
++        'static uint64_t\nwla_dma_map(', 1)[0]
 +    unlinked = (
 +        '#include <stdbool.h>\n#include <stdio.h>\n#include "fuxi_wlan_ath12k.h"\n' +
 +        'static void\nwla_poll(' + adapter.split('static void\nwla_poll(', 1)[1].split(
@@ -16156,7 +16196,7 @@ index 0000000000000000000000000000000000000000..4a36434b98f4de2a5e04d82a73abbc9c
 +    with tempfile.TemporaryDirectory(prefix='ath12k-contract-') as directory:
 +        temporary = Path(directory)
 +        source = temporary / 'contracts.c'
-+        source.write_text(HOST.replace('@CONFIG@', config).replace('@RELEASE@', release))
++        source.write_text(HOST.replace('@CONFIG@', config).replace('@RELEASE@', release).replace('@DMA_FREE@', dma_free))
 +        output = temporary / ('contracts.exe' if os.name == 'nt' else 'contracts')
 +        if msvc:
 +            flags = ['/nologo', '/TC', '/std:c11', '/W4', '/WX', '/Od', '/Zi', '/MD']
@@ -31057,10 +31097,10 @@ index 1b46ea1b86a3c66d832977a14592f3d1bee16dac..09ba6837bf86a377e5cdcaffb41e0f16
  	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_arena.h b/xnu/fuxi-wlan/fuxi_wlan_arena.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..83fb1204b809252e45fc563867f5a909e241eaef
+index 0000000000000000000000000000000000000000..b8e326367a741c6550c2edcd03448a4f9c8d208d
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_arena.h
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,131 @@
 +#ifndef FUXI_WLAN_ARENA_H
 +#define FUXI_WLAN_ARENA_H
 +#include <stdint.h>
@@ -31178,6 +31218,19 @@ index 0000000000000000000000000000000000000000..83fb1204b809252e45fc563867f5a909
 +	}
 +	return 1;
 +}
++
++static int
++fwa_kfree(struct fwa_arena *arena, void *memory)
++{
++	if (!arena || !arena->memory || !memory) { return 1; }
++	for (uint32_t index = 1; index < arena->count; index++) {
++		const struct fwa_block *block = &arena->blocks[index];
++		if (block->requested && memory == arena->memory + block->offset) {
++			return fwa_free(arena, block->requested, memory, arena->bus + block->offset);
++		}
++	}
++	return 1;
++}
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.h b/xnu/fuxi-wlan/fuxi_wlan_ath12k.h
 new file mode 100644
@@ -31265,10 +31318,10 @@ index 0000000000000000000000000000000000000000..add45872197cbf689df20ed3faa89465
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
 new file mode 100644
-index 0000000000000000000000000000000000000000..df7b5fe1b26af38f25357441e8128a507ad9efa2
+index 0000000000000000000000000000000000000000..cca17e959d5576e86e6fed872abfbdc8b66a720d
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,407 @@
 +#include "fuxi_wlan_arena.h"
 +#include "fuxi_wlan_ath12k.h"
 +#include "fuxi_wlan_control.h"
@@ -31351,7 +31404,15 @@ index 0000000000000000000000000000000000000000..df7b5fe1b26af38f25357441e8128a50
 +static void
 +wla_dma_free(size_t bytes, void *memory, uint64_t bus)
 +{
-+	if (fwa_free(&wla_pool, bytes, memory, bus)) { wla_failed = 1; }
++	int error = !bytes && !bus ? fwa_kfree(&wla_pool, memory) :
++	    fwa_free(&wla_pool, bytes, memory, bus);
++	if (error) {
++		if (!wla_failed) {
++			printf("FUXI ATH12K: DMA free refused bytes %llu memory %p bus 0x%llx\n",
++			    (unsigned long long)bytes, memory, (unsigned long long)bus);
++		}
++		wla_failed = 1;
++	}
 +}
 +
 +static uint64_t
@@ -31367,6 +31428,10 @@ index 0000000000000000000000000000000000000000..df7b5fe1b26af38f25357441e8128a50
 +	if (direction < 0 || direction > 2 || bus < wla_pool.bus ||
 +	    bus - wla_pool.bus >= wla_pool.bytes ||
 +	    fwa_map(&wla_pool, wla_pool.memory + (bus - wla_pool.bus), bytes) != bus) {
++		if (!wla_failed) {
++			printf("FUXI ATH12K: DMA sync refused bus 0x%llx bytes %llu direction %d\n",
++			    (unsigned long long)bus, (unsigned long long)bytes, direction);
++		}
 +		wla_failed = 1;
 +		return;
 +	}
@@ -31952,7 +32017,7 @@ index 0ca28384a623fc36e987daa43e85e29b84c11540..0d215ede6b71c5c85a3bca7ccfcac02c
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..c5ccf7e71f93eb360eda9bbf865e511cf02febf0 100644
+index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..3167e7ab4bd8bc90415be55298abac4e919d889f 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -32423,13 +32488,13 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..c5ccf7e71f93eb360eda9bbf865e511c
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,725 @@
+@@ -5899,3 +6092,750 @@
  + }
  + r[3] = 0;
  +}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_arena.h
-+@@ -0,0 +1,118 @@
++@@ -0,0 +1,131 @@
 ++#ifndef FUXI_WLAN_ARENA_H
 ++#define FUXI_WLAN_ARENA_H
 ++#include <stdint.h>
@@ -32547,6 +32612,19 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..c5ccf7e71f93eb360eda9bbf865e511c
 ++	}
 ++	return 1;
 ++}
+++
+++static int
+++fwa_kfree(struct fwa_arena *arena, void *memory)
+++{
+++	if (!arena || !arena->memory || !memory) { return 1; }
+++	for (uint32_t index = 1; index < arena->count; index++) {
+++		const struct fwa_block *block = &arena->blocks[index];
+++		if (block->requested && memory == arena->memory + block->offset) {
+++			return fwa_free(arena, block->requested, memory, arena->bus + block->offset);
+++		}
+++	}
+++	return 1;
+++}
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ath12k.h
@@ -32631,7 +32709,7 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..c5ccf7e71f93eb360eda9bbf865e511c
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ath12k.inc
-+@@ -0,0 +1,395 @@
++@@ -0,0 +1,407 @@
 ++#include "fuxi_wlan_arena.h"
 ++#include "fuxi_wlan_ath12k.h"
 ++#include "fuxi_wlan_control.h"
@@ -32714,7 +32792,15 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..c5ccf7e71f93eb360eda9bbf865e511c
 ++static void
 ++wla_dma_free(size_t bytes, void *memory, uint64_t bus)
 ++{
-++	if (fwa_free(&wla_pool, bytes, memory, bus)) { wla_failed = 1; }
+++	int error = !bytes && !bus ? fwa_kfree(&wla_pool, memory) :
+++	    fwa_free(&wla_pool, bytes, memory, bus);
+++	if (error) {
+++		if (!wla_failed) {
+++			printf("FUXI ATH12K: DMA free refused bytes %llu memory %p bus 0x%llx\n",
+++			    (unsigned long long)bytes, memory, (unsigned long long)bus);
+++		}
+++		wla_failed = 1;
+++	}
 ++}
 ++
 ++static uint64_t
@@ -32730,6 +32816,10 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..c5ccf7e71f93eb360eda9bbf865e511c
 ++	if (direction < 0 || direction > 2 || bus < wla_pool.bus ||
 ++	    bus - wla_pool.bus >= wla_pool.bytes ||
 ++	    fwa_map(&wla_pool, wla_pool.memory + (bus - wla_pool.bus), bytes) != bus) {
+++		if (!wla_failed) {
+++			printf("FUXI ATH12K: DMA sync refused bus 0x%llx bytes %llu direction %d\n",
+++			    (unsigned long long)bus, (unsigned long long)bytes, direction);
+++		}
 ++		wla_failed = 1;
 ++		return;
 ++	}
