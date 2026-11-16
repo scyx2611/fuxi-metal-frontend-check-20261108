@@ -3475,10 +3475,10 @@ index 0000000..90c5aa6
 +protocol 或 continuous fail-closed route，不能把研究文件當作這些能力的驗收。
 diff --git a/docs-lanes/torch-timer-source-checkpoint.md b/docs-lanes/torch-timer-source-checkpoint.md
 new file mode 100644
-index 0000000..e44384b
+index 0000000..21fe2c5
 --- /dev/null
 +++ b/docs-lanes/torch-timer-source-checkpoint.md
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,185 @@
 +# Torch timer source checkpoint
 +
 +## Scope
@@ -3589,6 +3589,81 @@ index 0000000..e44384b
 +The meaning and clear/lifetime behavior of actual PM8550 `0x09 bit4`, the
 +timer's start/cancel behavior, and physical cutoff remain unverified. This
 +encoding correction neither explains nor fixes the observed status failure.
++
++## 2026-11-16: first device run with the bounded timer byte
++
++Run 24 used `native-ram9g-torchtimer-audit-loader` with the already verified
++`kernel-adsp-cap-timer-ram9g-artifact`. Temporary boot began at 18:43:00;
++Android completion, unmapped root and release of the owned locks were
++confirmed at 18:49:49. The daily boot partition was not changed. Host TSENS
++maximum was 48.5 C. The monitor recorded one recovered USB drop.
++
++The boot image SHA256 is
++`d1e812f14d3c23bb1f1ae27a13e881e5190e259336ebe4343b725b12349331de`;
++the kernel SHA256 is
++`aabeb78f6589b5cef2eafa31c8b353aacb857c64c7894884979c40269d8d4338`.
++The existing 80 mA / 120-second tap script was retained, including the
++original current, lease, disable checks and failed latch. The kernel and
++incoming-FDT guard differ from the older run, so this is not a strict
++same-kernel causal A/B.
++
++The USB log at
++`work/Codex-Xiaomi13-GPU-20261109/native-hw000torchtimer-120s-boot-1/boot.log`
++has SHA256
++`b6a59f13bc2bf2c03c715a9589ee9d8a7c735a625422cc3bbf4bdb526b82d8ad`.
++The persistent console was saved at 18:50:33 as
++`work/adsp-battery/fuxilog/20261116-185033/console.txt`, boot 26,
++flush 32, 316021 bytes, SHA256
++`c5f241ee3b3556ae7ba711744f7ec47e07ea2c956a1e859492e99a42872b4b35`.
++It also contains the second tap after the 120-second wait, beyond the
++240-second USB monitor window.
++
++The runtime counted 21 successful pulses before it latched off with
++`rc=-6`. The failing transaction was an observer read of SID1 `0xee46`,
++APID591, owner0, status `0x9`: DONE plus DROPPED, with no FAILURE or DENIED
++bit. In the 49-event audit, event11 writes `0x89` to timer `0x3e` and
++event12 verifies it before enable. Event38 reads post-disable `0x09=0`;
++the failing audit therefore does not reproduce the older `0x09=0x10`
++failure. It does not establish that the older flag can no longer occur.
++
++Configuration restoration writes and their readbacks succeeded. Event47
++is the final module-off confirmation read, `offset=0x46 rc=-1`; its
++placeholder zero is not a successful off observation. Event48 reads
++channels `0x4e=0` successfully. A later bounded diagnostic reads
++`module=0 channels=0 status=0/0/0 read-rc=0`. The failure latch and lease
++failure remained active; no write retry, ignored status or renewed pulse
++was added.
++
++The saved Linux v6.12 `spmi-pmic-arb-v6.12.c` treats DROPPED as `-EIO`.
++This trace does not prove why the transaction was dropped or justify
++blindly retrying an ambiguous transaction. The next work is the observer
++transaction / ownership path. Sustained visible light, the requested
++120-second illumination and autonomous hardware cutoff remain unverified.
++
++## Shared arbiter lock (source fix, device effect not yet observed)
++
++Source inspection after the DROPPED read found that `fuxi_pmic.c`
++serialized its SPMI arbiter transactions only with the private `fp_lock`.
++`fuxi_keys.c` polls the power and volume keys every 20 ms (and reads the
++RTC) on the same arbiter (core `0x0c400000`, observer `0x0c440000`,
++channels `0x0c500000`) under `sweet_spmi_bus_lock`, and the WLAN P17
++sleep-clock code takes that lock too. A torch or haptic transaction could
++therefore overlap a key-poll transaction in time. Linux serializes every
++arbiter transaction with one lock. This is a plausible cause of the
++DROPPED status; it is not proven to be the cause.
++
++`fp_read`, `fp_flash_write` and `fp_haptic_write` now take
++`sweet_spmi_bus_lock` for the whole command/poll sequence, inside
++`fp_lock` (order: `fp_lock`, then the bus lock; no path takes them in the
++other order). There is still no retry: a DROPPED, FAILURE or DENIED status
++latches exactly as before, and the pulse limits are unchanged.
++`tools/test-fuxi-haptic-survey.py` asserts the lock order, that every
++`fp_write32` sits inside the locked region and that no early exit skips
++the unlock.
++
++The fix has only been built and host-tested. Whether the 120-second tap
++script now completes without a DROPPED read has to be observed on the
++device; until then the torch remains unverified.
 diff --git a/docs-lanes/wlan-bdf-provenance.md b/docs-lanes/wlan-bdf-provenance.md
 new file mode 100644
 index 0000000..8966843
@@ -4043,10 +4118,10 @@ index 0000000..8966843
 +該 case 的 symlink 部分未驗證。AST、CLI help 與三個新檔 whitespace checks 通過。
 diff --git a/docs-lanes/wlan-hostcap-secondary-checkpoint.md b/docs-lanes/wlan-hostcap-secondary-checkpoint.md
 new file mode 100644
-index 0000000..91bf2a4
+index 0000000..161400a
 --- /dev/null
 +++ b/docs-lanes/wlan-hostcap-secondary-checkpoint.md
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,270 @@
 +# W18 HOST_CAP SECONDARY 單變量 checkpoint
 +
 +日期：2026-11-16。這是可測的 opt-in host-contract 差分，不是已證 native FW_READY 修正；沒有重建或聲稱復現缺少 raw／參數的 try16。
@@ -4264,6 +4339,125 @@ index 0000000..91bf2a4
 +expectation已更新以符合新 selector範圍，兩套 production peers亦已
 +以相同 wasm32 ASan／UBSan工具鏈重跑通過，包含全部W16 variants、
 +供電順序、共用鎖、fault與quarantine路徑。
++
++## 11. 第25趟 nm_modem 省略實機結果
++
++2026-11-16 18:55:06 temporary boot，18:59:58 已確認Android完成、
++root unmapped及自有鎖釋放，未寫daily boot_b。Host TSENS最高50.9°C。
++loader為 `native-wlan-w18-oem-no-nm-modem-ram9g-sb127-loader`，
++boot SHA256
++`5a3a29ac905ab93eb093e67f32c31cd2f16f60c0e6aee0dc29032e7c1f942063`，
++kernel SHA256
++`1311058383a2680914b77292e4d7883e72de8bdea5ceda6e16c893c592191da3`。
++
++新核心來自harness `5be6591` 的9g CI `43850892720`，production
++來源包含ksrc `723e740`及H1生成patch同步`1836f06`。5g CI
++`43850892769`同樣成功，兩份下載產物各40項manifest全部通過；
++5g kernel SHA256為
++`69f551cd5f1d68a914f5ef20cfd70fd4ca83713ff4232dd2f44ef8ecdaf83c89`。
++此5g仍是已核對的12GB SKU配置，不是8GB實機驗收。
++完整macOS host CI `43850892647`及新增portable／macOS雙job CI
++`43851634998`均成功；後者harness `984934e`只改workflow，
++未改kernel aggregate或重建上述兩份核心。
++
++同核心cap1對照loader
++`native-wlan-w18-oem-secondary-v2-ram9g-sb127-loader`也已建好。
++Host byte comparison確認整份payload只差 `fuxiwlancap=1/2` 的一個
++字元。此cap1對照尚未上機；不能把本次和舊核心第22趟當成嚴格A/B。
++五資產、39 extents、12GB／9g、36份shim來源及600-byte命令列均核對。
++
++USB log：
++`work/Codex-Xiaomi13-GPU-20261109/native-hw000w18-oem-no-nm-modem-boot-1/boot.log`，
++279875 bytes／4114行，SHA256
++`beb4fb316b641167a6ace5ca5d1eabdb313c880d9d3e22cb465e5c3cfb8e528c`。
++
++- 第182行確認selector2 valid；987／988行確認省略nm_modem、
++  保留SECONDARY。996行HOST_CAP reply txn2／msg0x34／result0／error0。
++- 1201行REGDB最後一段成功；1318／1319行BDF segment14／end1及
++  `bd_m3.elf ok`，全部15段完成；1325／1326行M3_INFO reply及m3 ok。
++- 2626／2627行仍為FW_READY `0x38`的10000ms timeout及failure；
++  2631行step28 code0x1c01。沒有進INI／CFG／MODE。
++- 2654–2661行MHI reset、bus master off、PERST asserted、host entries
++  pending0、power contained、MSI／SMMU undo、buffers freed與stop均完成。
++- Step20及28的CB6 FSR0x400／FAR0x138f1:99dff7a1／
++  FSYNR0x3d0d35/0x8d29／SID0x139f完全相同；不當作新增DMA fault，
++  不加stream mapping、不清未知狀態。
++
++19:00:38另保存持久console：
++`work/adsp-battery/fuxilog/20261116-190038/console.txt`，boot27、
++flush20、294002 bytes、SHA256
++`e92d865934fc380dfad24a1722fa47fc3d634427d2e9bc15893df7775b497f5c`。
++
++結論僅為此省略候選仍無法取得FW_READY，不是Wi-Fi修復。
++原廠HOST_CAP的其餘差異、DDR宣告及後續初始化仍需逐項確認契約；
++不直接照搬Android DMA／MSI，也不以0x21取代0x38。掃描、關聯、
++CE／HTC資料路徑與IP傳輸均未驗收。
+diff --git a/docs-lanes/wlan-p17.md b/docs-lanes/wlan-p17.md
+index 8e33183..801f972 100644
+--- a/docs-lanes/wlan-p17.md
++++ b/docs-lanes/wlan-p17.md
+@@ -1,6 +1,8 @@
+ # P17: opt-in probes for the silent WLAN_MODE (WCN7850)
+ 
+-Status: host-tested only. Every device effect is **not yet observed**.
++Status: host-tested; CLKCHECK and CLKON were observed on the device in
++trip 26 (see "Device evidence" below). Every other device effect,
++including BIGMEM, is **not yet observed**.
+ Blocker context: firmware reaches AMSS, INI and CFG reply OK, WLAN_MODE
+ (0x22) is consumed and never answered (see wlan-w16.md, wlan-bt.md).
+ 
+@@ -17,8 +19,9 @@ All behaviour is off by default. The switches are bits of the existing
+ | 0x040 | CLKCHECK | before any WLAN power write (step 1), read PMK8550 gpio3 (SID 0, PPID 0x0ba) over SPMI arbiter v7 and log it. Read only. Works with plain `fuxiwlan=N`, no QMI needed. |
+ | 0x080 | CLKON | as CLKCHECK, then if the pin is not an enabled function-2 output, EE 0 owns it and it is an LV/MV pin: write 0x42=5, 0x41=0, 0x44=2, 0x40=1, 0x46=0x80 on its RW channel and read back. Volatile PMIC state. |
+ | 0x100 | ERRDEC | wherever the WLFW diagnostics print the BHI words (W13 RESPOND_MEM, W15 MODE timeout), also classify ERRCODE/ERRDBG1..3; if the EE is RDDM and the RX sink exists (`fuxiwlanvec=rddm`), wait up to 1 s for RXVECSTATUS complete and scan the dump for assert/fatal text. |
++| 0x200 | BIGMEM | W13+ (`fuxiwlanqrtr>=3`) grants the firmware's first REQUEST_MEM as it stands (two chunks of about 7 and 8 MiB) instead of answering with zero segments to negotiate chunks of at most 2 MiB. Each target keeps the W13 power-of-two IOVA alignment (8 and 16 MiB here); backing is wired, not physically contiguous, mapped with 4 KiB leaves as before. Android cnss2 and mainline ath12k grant the large chunks directly; before W13 this lane did too, but only with 16 KiB-aligned IOVAs (try12), so large chunks with proper alignment were never run. |
+ 
+-Valid range is 0..0x1ff with low bits != 3. A suggested first run is
++Valid range is 0..0x3ff with low bits != 3. A suggested first run is
+ `fuxiwlanmlo=0x17d` (PHY_CAP, 0x33, MLOALL, PHY17, DMAALIGN, CLKCHECK, ERRDEC)
+ at `fuxiwlanqrtr=5`; add 0x80 only after the CLKCHECK line shows state 0.
+ 
+@@ -34,9 +37,29 @@ at `fuxiwlanqrtr=5`; add 0x80 only after the CLKCHECK line shows state 0.
+ - `FUXI WLAN: P17 phy cap TLV 0x17 len L value 0x...`
+ - `FUXI WLAN: P17 dma align size 0x.. align 0x.. IOVA 0x.. -> 0x..` (one per allocation; "target allocation/NC/map failed" would mean the pool ran out of space)
+ - `FUXI WLAN: P17 <label> ERRCODE 0xcafecace hi16 0xcafe ... class: ...` (and ERRDBG1..3), `P17 rddm upload RXVECSTATUS ...`, `P17 rddm text +0x...: ...`, `P17 rddm scan ... messages`, `P17 rddm-rec 000: ...`
++- `FUXI WLAN: P17 bigmem grants n=2 total=... without zero-segment negotiation; aligned IOVAs` (BIGMEM), followed by two `W12 target segment` lines and no `W13 decline large chunks` line
+ 
+ The success discriminator is unchanged: a matching successful MODE reply.
+ 
++## Device evidence
++
++Trip 26 (2026-11-16 19:20, temporary `fastboot boot`, OEM firmware
++`WLAN.HMT.1.0.c2-00058.3`, `fuxiwlanmlo=192` = CLKCHECK|CLKON, log
++`native-hw000w18-oem-slpclk-boot-1/boot.log`, SHA256
++`222d0de1ae1477b701971938f82459b667383d172de5166cd74dc36072108241`):
++
++- `P17 sleepclk pmk8550 gpio3 ppid 0xba apid 575 owner ee0 read 1 type 0x10 sub 0x12 mode 0 func 0 en 0x80 state 0`:
++  under XNU the 32 kHz sleep clock pin is **off** when the driver starts.
++- `P17 sleepclk enable writes ok 1 after: read 1 mode 0x1 func 0x2 en 0x80 state 0xff`:
++  CLKON turns it on and the readback agrees.
++- The firmware still does not send FW_READY (step 28 code 0x1c01; EE AMSS,
++  ERRCODE/ERRDBG all `0xcafecace`). The sleep clock alone is therefore not
++  the missing piece on the OEM firmware path. Its effect on the upstream
++  firmware's silent WLAN_MODE is not yet observed.
++- In that run the OEM firmware first asked for 7077888 (type 1) and 8454144
++  (type 4) bytes, was declined, and then asked for 31 chunks of at most
++  512 KiB. BIGMEM exists to test the first request as the single variable.
++
+ ## Provenance and caveats
+ 
+ - Sleep-clock pin sequence, power-of-two IOVA rule and the RAM-dump text
+@@ -68,6 +91,9 @@ sleep-clock decision and exact write order, exact error-word strings,
+ text-scan hits/dedup/format rejection), then reruns the W12 QMI harness
+ with 12 added cases whose HOST_CAP bytes (including `33 01 00 01` after
+ `27 08 00 ...`) are compared exactly, plus selector validity, IOVA alignment
+-in `wl_dma_alloc` and the ERRDEC log lines. SPMI MMIO and the RDDM wait are
++in `wl_dma_alloc` and the ERRDEC log lines. `tools/test-fuxi-wlan-w13.py`
++trial 14 runs BIGMEM against the literal two-chunk request and checks one
++real RESPOND_MEM, power-of-two IOVAs, the mapped leaves and that no
++zero-segment response is sent. SPMI MMIO and the RDDM wait are
+ not host-testable. 0099 is regenerated from `xnu/fuxi-wlan/fuxi_wlan.c`
+ (mirror check inside the m6/m6o tests).
 diff --git a/docs-lanes/wlan-w18-profile.md b/docs-lanes/wlan-w18-profile.md
 new file mode 100644
 index 0000000..c461d80
@@ -7502,7 +7696,7 @@ index c7d2b39..d27f1d3 100644
          ap.exit(1, str(error) + '\n')
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..98ed9fa
+index 0000000..a841ee8
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
 @@ -0,0 +1,157 @@
@@ -7574,13 +7768,13 @@ index 0000000..98ed9fa
 +        data = SOURCE_PATHS.get(name, SRC / name).read_bytes()
 +        assert b'\r' not in data, name + ' has CR line endings'
 +        assert data.endswith(b'\n'), name + ' lacks a final newline'
-+    new = ''.join(''.join(difflib.unified_diff([], SOURCE_PATHS.get(name, SRC / name).read_text().splitlines(True), fromfile='/dev/null',
++    new = ''.join(''.join(difflib.unified_diff([], SOURCE_PATHS.get(name, SRC / name).read_text(encoding='utf-8').splitlines(True), fromfile='/dev/null',
 +                                               tofile='b/bsd/dev/' + name)) for name in FILES)
 +    changed = ''
 +    for path, (_, local) in MODIFIED.items():
 +        data = (SRC / local).read_bytes()
 +        assert b'\r' not in data and data.endswith(b'\n'), local
-+        changed += ''.join(difflib.unified_diff(original(path).splitlines(True), (SRC / local).read_text().splitlines(True),
++        changed += ''.join(difflib.unified_diff(original(path).splitlines(True), (SRC / local).read_text(encoding='utf-8').splitlines(True),
 +                                                fromfile='a/' + path, tofile='b/' + path))
 +    return build_list_hunk() + new + changed
 +
@@ -7655,9 +7849,9 @@ index 0000000..98ed9fa
 +    want = list(BEFORE + AFTER)
 +    assert any(region[i:i + len(want)] == want for i in range(len(region))), 'build-list context changed: ' + repr(region)
 +    if args.check:
-+        assert PATCH.read_text() == patch, 'fuxi-adsp sources differ; run tools/sync-fuxi-adsp.py'
++        assert PATCH.read_text(encoding='utf-8') == patch, 'fuxi-adsp sources differ; run tools/sync-fuxi-adsp.py'
 +    else:
-+        PATCH.write_text(patch, newline='\n')
++        PATCH.write_text(patch, encoding='utf-8', newline='\n')
 +    print(f'PASS: fuxi-adsp canonical sources match 0117 ({len(SOURCES)} sources in the build list, {len(HEADERS)} other files)')
 +
 +
@@ -7678,7 +7872,7 @@ index 07edd64..b83b489 100755
          for name, text in before.items():
 diff --git a/tools/sync-fuxi-wlan.py b/tools/sync-fuxi-wlan.py
 new file mode 100644
-index 0000000..fdda29b
+index 0000000..ab26b3a
 --- /dev/null
 +++ b/tools/sync-fuxi-wlan.py
 @@ -0,0 +1,32 @@
@@ -7694,7 +7888,7 @@ index 0000000..fdda29b
 +parser.add_argument('--check', action='store_true')
 +args = parser.parse_args()
 +pattern = re.compile(r'^--- (?:a/bsd/dev/fuxi_wlan\.c|/dev/null)\n\+\+\+ b/bsd/dev/fuxi_wlan\.c\n@@ -0,0 \+1,\d+ @@\n', re.M)
-+text = patch.read_text()
++text = patch.read_text(encoding='utf-8')
 +matches = list(pattern.finditer(text))
 +assert len(matches) == 1
 +start = matches[0].start()
@@ -7703,7 +7897,7 @@ index 0000000..fdda29b
 +    end = len(text)
 +else:
 +    end += 1
-+body = source.read_text()
++body = source.read_text(encoding='utf-8')
 +assert body.endswith('\n')
 +original_path = matches[0].group(0).splitlines()[0][4:]
 +replacement = ''.join(difflib.unified_diff([], body.splitlines(True), fromfile=original_path,
@@ -7712,7 +7906,7 @@ index 0000000..fdda29b
 +if args.check:
 +    assert text == expected, 'fuxi-wlan canonical source differs from 0099'
 +else:
-+    patch.write_text(expected, newline='\n')
++    patch.write_text(expected, encoding='utf-8', newline='\n')
 +print('PASS: fuxi-wlan canonical source matches 0099')
 diff --git a/tools/test-fuxi-audio-prep.py b/tools/test-fuxi-audio-prep.py
 new file mode 100644
@@ -12326,10 +12520,10 @@ index 0000000..3144cfe
 +    main()
 diff --git a/tools/test-fuxi-haptic-survey.py b/tools/test-fuxi-haptic-survey.py
 new file mode 100644
-index 0000000..239ce31
+index 0000000..b4d70a7
 --- /dev/null
 +++ b/tools/test-fuxi-haptic-survey.py
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,308 @@
 +import argparse
 +import importlib.util
 +import os
@@ -12576,6 +12770,20 @@ index 0000000..239ce31
 +    end = text.index('\n}\n', start) + 3
 +    initializer = text[start:end]
 +    assert initializer.count('fp_haptic_fifo_survey(mode);') == 1
++    # 三種 arbiter 交易（observer 讀、flash 寫、haptic 寫）都要在與按鍵輪詢共用的匯流排鎖內完成，
++    # 鎖序固定 fp_lock -> bus，且交易途中不得跳過解鎖。
++    assert '#include "sweet_spmi_bus.h"' in text
++    assert len(re.findall(r'^\s+fp_write32\(', text, re.M)) == 5
++    for name, following in (('static int fp_read(', 'static void fp_survey('),
++                            ('static int fp_flash_write(', 'static void fp_flash_wait('),
++                            ('static int fp_haptic_write(', 'static int fp_haptic_prepare(')):
++        body = text[text.index(name):text.index(following)]
++        assert body.count('sweet_spmi_bus_lock();') == 1 and body.count('sweet_spmi_bus_unlock();') == 1, name
++        locked = body.index('sweet_spmi_bus_lock();')
++        label = body.index('bus_done:\n    sweet_spmi_bus_unlock();\ndone:\n    lck_mtx_unlock(&fp_lock);')
++        assert body.index('lck_mtx_lock(&fp_lock);') < locked < body.index('fp_write32(') < label, name
++        assert 'goto done;' not in body[locked:label] and 'return' not in body[locked:label], name
++        assert body.count('fp_write32(') == len(re.findall(r'fp_write32\(', body[locked:label])), name
 +    return survey, initializer
 +
 +
@@ -15580,6 +15788,74 @@ index 4edc566..d55e598 100755
      source = re.sub(r'__asm__ volatile\([^;]+;', '/* host barrier */;', source)
      with tempfile.TemporaryDirectory(prefix='fuxi-wlan-rails-') as tmp:
          cfile, binary = Path(tmp) / 'rails.c', Path(tmp) / 'rails'
+diff --git a/tools/test-fuxi-wlan-w13.py b/tools/test-fuxi-wlan-w13.py
+index a7785c8..778df26 100755
+--- a/tools/test-fuxi-wlan-w13.py
++++ b/tools/test-fuxi-wlan-w13.py
+@@ -74,7 +74,7 @@ static void qmi_peer(const uint8_t *q,unsigned len) {
+     }
+     if(msg==0x36) {
+         responses++;snapshot_start=ne;
+-        if(trial!=8 && responses==1) {
++        if(trial!=8 && trial!=14 && responses==1) {
+             const uint8_t zero[]={0,3,0,0x36,0,4,0,1,1,0,0};
+             assert(len==sizeof(zero) && !memcmp(q,zero,len));
+             assert(wl_iova_next==target_cursor);
+@@ -85,13 +85,15 @@ static void qmi_peer(const uint8_t *q,unsigned len) {
+             if(trial!=2 && trial!=3 && trial!=5)split_request();
+             return;
+         }
+-        assert(q[7]==1 && q[9]==0 && q[10]==(trial==8?5:9));
+         const unsigned types[]={1,3,4,9,2};
+-        unsigned count=trial==8?5:9;
++        const unsigned big_size[]={7274496,8454144}; /* trial 14: P17 BIGMEM grants the literal large request */
++        unsigned count=trial==8?5:trial==14?2:9;
++        assert(q[7]==1 && q[9]==0 && q[10]==count);
+         assert(len==11+17*count && q[8]==1+17*count);
+         for(unsigned i=0;i<count;i++) {
+             const uint8_t *v=q+11+17*i;uint64_t addr=get32(v)|((uint64_t)get32(v+4)<<32);
+-            unsigned size=trial==8?65537:chunk_size[i], type=trial==8?types[i]:(i<4?1:4);
++            unsigned size=trial==8?65537:trial==14?big_size[i]:chunk_size[i];
++            unsigned type=trial==8?types[i]:trial==14?(i?4:1):(i<4?1:4);
+             assert(get32(v+8)==size && get32(v+12)==type && !v[16]);
+             if(trial==8 && i==4) {assert(!addr && !wl_target[i].va);continue;}
+             /* Independent power-of-two test, explicit write permission decode. */
+@@ -113,7 +115,7 @@ static void qmi_peer(const uint8_t *q,unsigned len) {
+         if(trial==12)split_request(); /* forbidden after real provisioning */
+         return;
+     }
+-    assert(msg==0x24 && len==7 && txn==(trial==8?4:5) && wl12_ready);
++    assert(msg==0x24 && len==7 && txn==(trial==8||trial==14?4:5) && wl12_ready);
+     cap_requests++;
+     uint8_t p[sizeof(cap_reply)];memcpy(p,cap_reply,sizeof(p));put16(p+1,txn);
+     dev_qrtr(1,p,sizeof(p),false,false);
+@@ -161,6 +163,13 @@ int main(void) {
+         if(n==2)assert(strstr(logbuf,"queued before delayed RESPOND_MEM reply"));
+         unsigned before=ne;wl_finish(28);assert(ne==before && !frees);contain();
+     }
++    /* P17 BIGMEM: one real RESPOND_MEM for the two large chunks, power-of-two IOVAs, no negotiation. */
++    boot(14,true);wl17_bits=WL17_BIGMEM;
++    {int e=finish_step();if(e)fprintf(stderr,"trial %u\n%s",trial,logbuf);
++     assert(!e && wl_w11_ok && cap_requests==1 && responses==1 && !wl13_negotiated && wl12_txn==4);
++     assert(wl_target_n==2 && wl_target_total==15728640 && strstr(logbuf,"P17 bigmem grants n=2 total=15728640"));
++     assert(!strstr(logbuf,"zero segments before any target allocation") && strstr(logbuf,"AP[7:6]=1 RW"));}
++    wl_finish(28);contain();wl17_bits=0;
+     boot(8,false);done();assert(!wl13_negotiated && wl12_txn==4);
+     assert(strstr(logbuf,"unsupported target type 2"));wl_finish(28);assert(frees==allocations);dev_on=false;
+     const unsigned failures[]={3,4,5,6,7,9,10,11,12,13};
+diff --git a/tools/test-fuxi-wlan-w17.py b/tools/test-fuxi-wlan-w17.py
+index fce26f4..1038e4d 100644
+--- a/tools/test-fuxi-wlan-w17.py
++++ b/tools/test-fuxi-wlan-w17.py
+@@ -160,7 +160,7 @@ def integration():
+     /* P17 selector validity: legacy low bits, P17 bits, and pre-W12 handling. */
+     {
+         const struct {int v, bad;} t[]={{0,0},{1,0},{2,0},{3,1},{4,0},{5,0},{8,0},{9,0},{0xa,1},{0x10,1},{0x11,0},
+-            {0x12,1},{0x1fd,0},{0x1fc,1},{0x1ff,1},{0x200,1},{0x201,1},{-1,1},{0x100,0},{0x40,0},{0x80,0},{0x20,0}};
++            {0x12,1},{0x1fd,0},{0x1fc,1},{0x1ff,1},{0x200,0},{0x201,0},{0x2c0,0},{0x3fd,0},{0x3fc,1},{0x3ff,1},{0x400,1},{0x401,1},{-1,1},{0x100,0},{0x40,0},{0x80,0},{0x20,0}};
+         for(unsigned i=0;i<sizeof(t)/sizeof(t[0]);i++) {
+             qrtr_arg=2;mlo_present=true;mlo_arg=t[i].v;wl_probe_configure();
+             assert(wl_variant_invalid==(bool)t[i].bad);
 diff --git a/tools/test-fuxi-wlan-w18.py b/tools/test-fuxi-wlan-w18.py
 new file mode 100644
 index 0000000..dde4495
@@ -21870,10 +22146,10 @@ index 0000000..442bfbf
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_pmic.c b/xnu/fuxi-adsp/fuxi_pmic.c
 new file mode 100644
-index 0000000..ca9f40c
+index 0000000..508b7ae
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_pmic.c
-@@ -0,0 +1,584 @@
+@@ -0,0 +1,596 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
@@ -21895,6 +22171,7 @@ index 0000000..ca9f40c
 +#include "fuxi_torch_runtime.h"
 +#include "fuxi_torch_audit.h"
 +#include "fuxi_haptic_pulse.h"
++#include "sweet_spmi_bus.h"
 +
 +extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
 +    unsigned, void *);
@@ -21981,6 +22258,9 @@ index 0000000..ca9f40c
 +    int apid = fp_find(sid, address >> 8, &owner);
 +    if (apid < 0 || fp_poisoned[apid]) goto done;
 +    unsigned channel = (unsigned)apid * 0x20;
++    /* 同一個 arbiter 一次只服務一筆 EE0 交易；按鍵輪詢（20 ms）、RTC 與 WLAN P17 都用 sweet_spmi_bus_lock，
++     * 這裡在 fp_lock 之內再取它（順序固定 fp_lock -> bus），從命令寫入持有到結果讀完。 */
++    sweet_spmi_bus_lock();
 +    fp_write32(&fp_observer, channel, 1u << 27 | (address & 0xffu) << 4);
 +    for (unsigned poll = 0; poll < 1000; poll++) {
 +        uint32_t status = fp_read32(&fp_observer, channel + 8);
@@ -21993,12 +22273,14 @@ index 0000000..ca9f40c
 +                printf("FUXI PMIC: read rejected sid=%u addr=%#x APID=%d owner=%u status=%#x failure=%u denied=%u dropped=%u\n",
 +                    sid, address, apid, owner, status, !!(status & 2u), !!(status & 4u), !!(status & 8u));
 +            }
-+            goto done;
++            goto bus_done;
 +        }
 +        delay(1);
 +    }
 +    fp_poisoned[apid] = 1;
 +    printf("FUXI PMIC: timeout sid=%u addr=%#x APID=%d; channel disabled\n", sid, address, apid);
++bus_done:
++    sweet_spmi_bus_unlock();
 +done:
 +    lck_mtx_unlock(&fp_lock);
 +    return result;
@@ -22042,6 +22324,7 @@ index 0000000..ca9f40c
 +    uint64_t physical = 0x0c500000ull + (unsigned)apid * 0x1000u;
 +    if ((physical & ~(uint64_t)PAGE_MASK) != fp_flash_channel.physical) goto done;
 +    unsigned channel = physical & PAGE_MASK;
++    sweet_spmi_bus_lock();
 +    fp_write32(&fp_flash_channel, channel + 0x10, value);
 +    fp_write32(&fp_flash_channel, channel, offset << 4);
 +    for (unsigned poll = 0; poll < 1000; poll++) {
@@ -22053,12 +22336,14 @@ index 0000000..ca9f40c
 +                printf("FUXI PMIC: flash write rejected +%02x APID=%d owner=%u status=%#x failure=%u denied=%u dropped=%u\n",
 +                    offset, apid, owner, status, !!(status & 2u), !!(status & 4u), !!(status & 8u));
 +            }
-+            goto done;
++            goto bus_done;
 +        }
 +        delay(1);
 +    }
 +    fp_poisoned[apid] = 1;
 +    printf("FUXI PMIC: flash write timeout +%02x APID=%d; channel disabled\n", offset, apid);
++bus_done:
++    sweet_spmi_bus_unlock();
 +done:
 +    lck_mtx_unlock(&fp_lock);
 +    return result;
@@ -22264,18 +22549,21 @@ index 0000000..ca9f40c
 +    uint64_t physical = 0x0c500000ull + (unsigned)apid * 0x1000u;
 +    if ((physical & ~(uint64_t)PAGE_MASK) != window->physical) goto done;
 +    unsigned channel = physical & PAGE_MASK;
++    sweet_spmi_bus_lock();
 +    fp_write32(window, channel + 0x10, value);
 +    fp_write32(window, channel, (address & 0xffu) << 4);
 +    for (unsigned poll = 0; poll < 1000; poll++) {
 +        uint32_t status = fp_read32(window, channel + 8);
 +        if (status & 1u) {
 +            result = status & 0x0eu ? -1 : 0;
-+            goto done;
++            goto bus_done;
 +        }
 +        delay(1);
 +    }
 +    fp_poisoned[apid] = 1;
 +    printf("FUXI PMIC: haptic write timeout addr=%#x APID=%d; channel disabled\n", address, apid);
++bus_done:
++    sweet_spmi_bus_unlock();
 +done:
 +    lck_mtx_unlock(&fp_lock);
 +    return result;
@@ -28743,7 +29031,7 @@ index c8376e4..d363e22 100644
  int sweet_ufs_rootdev(dev_t *dev);
  
 diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
-index 1b46ea1..f27b4ab 100644
+index 1b46ea1..ffa86fa 100644
 --- a/xnu/fuxi-wlan/fuxi_wlan.c
 +++ b/xnu/fuxi-wlan/fuxi_wlan.c
 @@ -78,6 +78,7 @@
@@ -28798,7 +29086,30 @@ index 1b46ea1..f27b4ab 100644
  static unsigned wl_rails_variant;
  static bool wl_rails_requested;
  static bool wl16_large, wl16_redrive;
-@@ -1025,6 +1036,8 @@ wl_probe_configure(void)
+@@ -753,7 +764,10 @@ static bool wl16_large, wl16_redrive;
+ #define WL17_CLKCHECK 0x040u
+ #define WL17_CLKON 0x080u
+ #define WL17_ERRDEC 0x100u
+-#define WL17_MASK 0x1fcu
++/* BIGMEM：W13 以上直接配置韌體 REQUEST_MEM 要求的大塊（cnss2 與 mainline ath12k 的做法），
++ * 沿用 W13 的二的次方 IOVA 對齊，不做零段協商。預設關閉。 */
++#define WL17_BIGMEM 0x200u
++#define WL17_MASK 0x3fcu
+ static unsigned wl17_bits;
+ static unsigned wl17_phy17_len;
+ static uint64_t wl17_phy17_val;
+@@ -1016,15 +1030,17 @@ wl_probe_configure(void)
+ 			if (!wl17_bits && !bad) {
+ 				if (variant) { printf("FUXI WLAN: W12 mlo variant %d (1 PHY_CAP, 2 omit MLO) valid %u\n", variant, !wl_variant_invalid); }
+ 			} else {
+-				printf("FUXI WLAN: W12 mlo variant %d (1 PHY_CAP, 2 omit MLO) P17 bits %#x (hostmem %u mloall %u phy17 %u dmaalign %u clkcheck %u clkon %u errdec %u) valid %u\n",
++				printf("FUXI WLAN: W12 mlo variant %d (1 PHY_CAP, 2 omit MLO) P17 bits %#x (hostmem %u mloall %u phy17 %u dmaalign %u clkcheck %u clkon %u errdec %u bigmem %u) valid %u\n",
+ 				    variant, wl17_bits, !!(wl17_bits & WL17_HOSTMEM), !!(wl17_bits & WL17_MLOALL), !!(wl17_bits & WL17_PHY17),
+ 				    !!(wl17_bits & WL17_DMAALIGN), !!(wl17_bits & WL17_CLKCHECK), !!(wl17_bits & WL17_CLKON),
+-				    !!(wl17_bits & WL17_ERRDEC), !wl_variant_invalid);
++				    !!(wl17_bits & WL17_ERRDEC), !!(wl17_bits & WL17_BIGMEM), !wl_variant_invalid);
+ 			}
+ 		}
  	}
  	wl15_variant = 0;
  	wl16_variant = 0; wl16_large = wl16_redrive = false;
@@ -28807,7 +29118,7 @@ index 1b46ea1..f27b4ab 100644
  	if (wl_w15) {
  		int variant = 0;
  		(void)PE_parse_boot_argn("fuxiwlanw15", &variant, sizeof(variant));
-@@ -1041,6 +1054,26 @@ wl_probe_configure(void)
+@@ -1041,6 +1057,26 @@ wl_probe_configure(void)
  			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
  			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
  		}
@@ -28834,7 +29145,7 @@ index 1b46ea1..f27b4ab 100644
  	}
  	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
  	if (wl_w14) {
-@@ -1085,6 +1118,14 @@ wl_probe_configure(void)
+@@ -1085,6 +1121,14 @@ wl_probe_configure(void)
  	printf("FUXI WLAN: M6n cnss=%s valid=%u (PDC before step 1)\n",
  	    wl_cnss_names[wl_cnss], !wl_variant_invalid);
  }
@@ -28849,7 +29160,7 @@ index 1b46ea1..f27b4ab 100644
  #define WL_CNSS_IOVA 0xa0000000ull
  #define WL_CNSS_IOVA_END 0xb0000000ull
  #define WL_LEGACY_IOVA 0x10000000ull
-@@ -3176,6 +3217,10 @@ static unsigned wl12_num_phy;
+@@ -3176,6 +3220,10 @@ static unsigned wl12_num_phy;
  static bool wl13_delayed, wl13_negotiated;
  static bool wl14_ready, wl14_init_done, wl14_board_valid;
  static uint64_t wl15_ready_time;
@@ -28860,7 +29171,7 @@ index 1b46ea1..f27b4ab 100644
  static uint32_t wl14_board;
  static int wl_w12_run(void);
  static int wl_qmi_w12(const uint8_t *, unsigned);
-@@ -3206,6 +3251,40 @@ static struct wl_context *wl_channel(unsigned ch) { return (void *)(wl_contexts.
+@@ -3206,6 +3254,40 @@ static struct wl_context *wl_channel(unsigned ch) { return (void *)(wl_contexts.
  static struct wl_tre *wl_ipcr_ring(unsigned off) { return (void *)(wl_ipcr.va + off); }
  static void wl_w11_barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
  
@@ -28901,7 +29212,7 @@ index 1b46ea1..f27b4ab 100644
  /* RAM-only snapshot: channel RP is diagnostic, never used to reclaim TREs.
   * Completion events remain authoritative. Do not repair a live device-owned
   * RP even when it resembles type/ER words (as in try15c/try15d). */
-@@ -3567,7 +3646,15 @@ wl_w11_events(void)
+@@ -3567,7 +3649,15 @@ wl_w11_events(void)
  					if (ev.ptr != wl_ipcr.iova+roff+ri*16 || (ch == 20 && ri == wl_tx_write)) { return wl_w11_fail("transfer completion pointer/order"); }
  					struct wl_tre tre = wl_ipcr_ring(roff)[ri];
  					if (bytes > (ch == 20 ? WL_IPCR_TXMTU : WL_IPCR_MTU) || bytes > (tre.d0 & 0xffff)) { return wl_w11_fail("transfer completion length"); }
@@ -28918,7 +29229,7 @@ index 1b46ea1..f27b4ab 100644
  					else {
  						uint64_t lo = wl_ipcr.iova + WL_IPCR_RXBUF;
  						if (tre.ptr < lo || tre.ptr >= lo+WL_IPCR_N*WL_IPCR_MTU ||
-@@ -3669,6 +3756,7 @@ wl_w11_run(void)
+@@ -3669,6 +3759,7 @@ wl_w11_run(void)
  	wl12_reply = wl12_requested = wl12_ready = false;
  	wl13_delayed = wl13_negotiated = false;
  	wl14_ready = wl14_init_done = wl14_board_valid = false; wl14_board = 0;
@@ -28926,7 +29237,7 @@ index 1b46ea1..f27b4ab 100644
  	wl_chdb = wl_mrd(0x18); wl_erdb = wl_mrd(0x20);
  	if (!wl_qrtr || !wl_amss_reached || !wl_contexts_published || wl_w11_guard() ||
  	    (wl_chdb & 7) || wl_chdb < 0x100 || wl_chdb > 0x3c00 ||
-@@ -3779,6 +3867,10 @@ wl12_send(struct wl12_encoder *e, unsigned msg, unsigned stage)
+@@ -3779,6 +3870,10 @@ wl12_send(struct wl12_encoder *e, unsigned msg, unsigned stage)
  	e->data[0] = 0; wl_put16(e->data+1, wl12_txn);
  	wl_put16(e->data+3, msg); wl_put16(e->data+5, e->len-7);
  	printf("FUXI WLAN: %s send txn %u msg %#x stage %u\n", wl_w15 && stage >= WL15_INI ? "W15" : "W12", wl12_txn, msg, stage);
@@ -28937,7 +29248,7 @@ index 1b46ea1..f27b4ab 100644
  	int error = wl_qrtr_send(1, wl_server_node, wl_server_port, e->data, e->len);
  	if (!error && stage == WL15_MODE) { wl16_snapshot("MODE queued"); }
  	return error;
-@@ -3840,10 +3932,18 @@ wl12_host_cap(struct wl12_encoder *e)
+@@ -3840,10 +3935,18 @@ wl12_host_cap(struct wl12_encoder *e)
  {
  	/* ath12k_qmi_host_cap_send: fresh boot cal_done=0, memory mode=0,
  	 * internal clock bits 1/2/3, hw_params CNSS feature bits 3/4. */
@@ -28958,7 +29269,17 @@ index 1b46ea1..f27b4ab 100644
  	int links = wl17_mlo_links(wl12_mlo_variant, wl17_bits, wl12_mlo_enabled, wl12_num_phy);
  	bool mlo = links != 0;
  	if (mlo) {
-@@ -4281,6 +4381,7 @@ static void
+@@ -4071,7 +4174,8 @@ wl12_request_mem(const uint8_t *v, unsigned n)
+ 	}
+ 	if (off != n || wl_iova_next < wl_iova_base || wl_iova_next >= wl_iova_end ||
+ 	    rounded > wl_iova_end-wl_iova_next) { return wl_w11_fail("REQUEST_MEM trailing bytes/IOVA exhaustion"); }
+-	if (wl_w13 && ((wl13_negotiated && large) || (!large && cursor > wl_iova_end))) {
++	if (wl_w13 && ((wl13_negotiated && large) ||
++	    ((!large || (wl17_bits & WL17_BIGMEM)) && cursor > wl_iova_end))) {
+ 		return wl_w11_fail("REQUEST_MEM small-chunk limit/aligned IOVA exhaustion; negotiation exhausted");
+ 	}
+ 	wl_target_n = count; wl_target_total = total; wl12_requested = true;
+@@ -4281,6 +4385,7 @@ static void
  wl15_timeout_snapshot(void)
  {
  	if (!wl_w15 || wl12_stage != WL15_MODE) { return; }
@@ -28966,7 +29287,7 @@ index 1b46ea1..f27b4ab 100644
  	wl16_snapshot("MODE timeout");
  	wl15_elapsed("MODE timeout");
  	wl_wlfw_diagnostics("W15 MODE timeout");
-@@ -4345,11 +4446,15 @@ wl12_wait(unsigned what, const char *stage)
+@@ -4345,11 +4450,15 @@ wl12_wait(unsigned what, const char *stage)
  	/* Match ath12k's ten-second WLFW timeout, with bounded transport passes. */
  	for (unsigned ms = 0; ms <= 10000; ms += 10) {
  		if (wl_w11_events()) {
@@ -28982,7 +29303,7 @@ index 1b46ea1..f27b4ab 100644
  		if (ms < 10000) { wl_sleep(10); }
  	}
  	if (wl12_mlo_variant == 1 && wl12_msg == 0x57) {
-@@ -4494,6 +4599,7 @@ static int
+@@ -4494,6 +4603,7 @@ static int
  wl_w15_run(void)
  {
  	static struct wl12_encoder e;
@@ -28990,7 +29311,7 @@ index 1b46ea1..f27b4ab 100644
  	bzero(&e, sizeof(e)); e.len = 7;
  	/* qmi_wlanfw_wlan_ini_req_msg_v01 / *_ei: optional 0x10 u8.
  	 * Explicit lane policy: disable fw log (0). Upstream v6.12 sends 1. */
-@@ -4501,11 +4607,13 @@ wl_w15_run(void)
+@@ -4501,11 +4611,13 @@ wl_w15_run(void)
  	if (wl12_tlv(&e, 0x10, 0, 1) || wl12_send(&e, 0x2f, WL15_INI) ||
  	    wl12_wait(0, "WLAN_INI reply") || wl_w11_wait(3, "W15 INI TX drain")) { return 1; }
  	printf("FUXI WLAN: W15 wlan ini ok\n");
@@ -29004,7 +29325,7 @@ index 1b46ea1..f27b4ab 100644
  	wl16_snapshot("CFG reply/before MODE");
  	if (wl16_redrive) {
  		printf("FUXI WLAN: W16 before MODE re-ring posted RX; no CE init before MODE (ath12k v6.12 order)\n");
-@@ -4520,6 +4628,7 @@ wl_w15_run(void)
+@@ -4520,6 +4632,7 @@ wl_w15_run(void)
  	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
  	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
  	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
@@ -29012,7 +29333,19 @@ index 1b46ea1..f27b4ab 100644
  	wl16_snapshot("MODE reply");
  	wl12_stage = WL15_OBSERVE;
  	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
-@@ -5190,6 +5299,7 @@ wl17_clk_step(void)
+@@ -4599,7 +4712,10 @@ wl_w12_run(void)
+ 	if (wl12_wait(1, "REQUEST_MEM indication")) { return 1; }
+ 	for (unsigned round = 0; round < 2; round++) {
+ 		wl13_delayed = false;
+-		if (wl_w13 && !wl13_negotiated) {
++		if (wl_w13 && !wl13_negotiated && (wl17_bits & WL17_BIGMEM)) {
++			printf("FUXI WLAN: P17 bigmem grants n=%u total=%llu without zero-segment negotiation; aligned IOVAs\n",
++			    wl_target_n, wl_target_total);
++		} else if (wl_w13 && !wl13_negotiated) {
+ 			for (unsigned i = 0; i < wl_target_n; i++) {
+ 				if (wl13_supported(wl_target_type[i]) && wl_target_size[i] > WL13_CHUNK_LIMIT) {
+ 					wl13_delayed = true;
+@@ -5190,6 +5306,7 @@ wl17_clk_step(void)
  static void
  fw_run(unsigned limit)
  {
@@ -29183,7 +29516,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..11e31bd 100644
+index d21bf85..0f238b4 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -29191,7 +29524,7 @@ index d21bf85..11e31bd 100644
  --- a/bsd/dev/fuxi_wlan.c
  +++ b/bsd/dev/fuxi_wlan.c
 -@@ -0,0 +1,5315 @@
-+@@ -0,0 +1,5425 @@
++@@ -0,0 +1,5432 @@
  +/*
  + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
  + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -29247,7 +29580,30 @@ index d21bf85..11e31bd 100644
  +static unsigned wl_rails_variant;
  +static bool wl_rails_requested;
  +static bool wl16_large, wl16_redrive;
-@@ -1057,6 +1068,8 @@
+@@ -785,7 +796,10 @@
+ +#define WL17_CLKCHECK 0x040u
+ +#define WL17_CLKON 0x080u
+ +#define WL17_ERRDEC 0x100u
+-+#define WL17_MASK 0x1fcu
+++/* BIGMEM：W13 以上直接配置韌體 REQUEST_MEM 要求的大塊（cnss2 與 mainline ath12k 的做法），
+++ * 沿用 W13 的二的次方 IOVA 對齊，不做零段協商。預設關閉。 */
+++#define WL17_BIGMEM 0x200u
+++#define WL17_MASK 0x3fcu
+ +static unsigned wl17_bits;
+ +static unsigned wl17_phy17_len;
+ +static uint64_t wl17_phy17_val;
+@@ -1048,15 +1062,17 @@
+ +			if (!wl17_bits && !bad) {
+ +				if (variant) { printf("FUXI WLAN: W12 mlo variant %d (1 PHY_CAP, 2 omit MLO) valid %u\n", variant, !wl_variant_invalid); }
+ +			} else {
+-+				printf("FUXI WLAN: W12 mlo variant %d (1 PHY_CAP, 2 omit MLO) P17 bits %#x (hostmem %u mloall %u phy17 %u dmaalign %u clkcheck %u clkon %u errdec %u) valid %u\n",
+++				printf("FUXI WLAN: W12 mlo variant %d (1 PHY_CAP, 2 omit MLO) P17 bits %#x (hostmem %u mloall %u phy17 %u dmaalign %u clkcheck %u clkon %u errdec %u bigmem %u) valid %u\n",
+ +				    variant, wl17_bits, !!(wl17_bits & WL17_HOSTMEM), !!(wl17_bits & WL17_MLOALL), !!(wl17_bits & WL17_PHY17),
+ +				    !!(wl17_bits & WL17_DMAALIGN), !!(wl17_bits & WL17_CLKCHECK), !!(wl17_bits & WL17_CLKON),
+-+				    !!(wl17_bits & WL17_ERRDEC), !wl_variant_invalid);
+++				    !!(wl17_bits & WL17_ERRDEC), !!(wl17_bits & WL17_BIGMEM), !wl_variant_invalid);
+ +			}
+ +		}
  +	}
  +	wl15_variant = 0;
  +	wl16_variant = 0; wl16_large = wl16_redrive = false;
@@ -29256,7 +29612,7 @@ index d21bf85..11e31bd 100644
  +	if (wl_w15) {
  +		int variant = 0;
  +		(void)PE_parse_boot_argn("fuxiwlanw15", &variant, sizeof(variant));
-@@ -1073,6 +1086,26 @@
+@@ -1073,6 +1089,26 @@
  +			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
  +			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
  +		}
@@ -29283,7 +29639,7 @@ index d21bf85..11e31bd 100644
  +	}
  +	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
  +	if (wl_w14) {
-@@ -1117,6 +1150,14 @@
+@@ -1117,6 +1153,14 @@
  +	printf("FUXI WLAN: M6n cnss=%s valid=%u (PDC before step 1)\n",
  +	    wl_cnss_names[wl_cnss], !wl_variant_invalid);
  +}
@@ -29298,7 +29654,7 @@ index d21bf85..11e31bd 100644
  +#define WL_CNSS_IOVA 0xa0000000ull
  +#define WL_CNSS_IOVA_END 0xb0000000ull
  +#define WL_LEGACY_IOVA 0x10000000ull
-@@ -3208,6 +3249,10 @@
+@@ -3208,6 +3252,10 @@
  +static bool wl13_delayed, wl13_negotiated;
  +static bool wl14_ready, wl14_init_done, wl14_board_valid;
  +static uint64_t wl15_ready_time;
@@ -29309,7 +29665,7 @@ index d21bf85..11e31bd 100644
  +static uint32_t wl14_board;
  +static int wl_w12_run(void);
  +static int wl_qmi_w12(const uint8_t *, unsigned);
-@@ -3238,6 +3283,40 @@
+@@ -3238,6 +3286,40 @@
  +static struct wl_tre *wl_ipcr_ring(unsigned off) { return (void *)(wl_ipcr.va + off); }
  +static void wl_w11_barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
  +
@@ -29350,7 +29706,7 @@ index d21bf85..11e31bd 100644
  +/* RAM-only snapshot: channel RP is diagnostic, never used to reclaim TREs.
  + * Completion events remain authoritative. Do not repair a live device-owned
  + * RP even when it resembles type/ER words (as in try15c/try15d). */
-@@ -3599,7 +3678,15 @@
+@@ -3599,7 +3681,15 @@
  +					if (ev.ptr != wl_ipcr.iova+roff+ri*16 || (ch == 20 && ri == wl_tx_write)) { return wl_w11_fail("transfer completion pointer/order"); }
  +					struct wl_tre tre = wl_ipcr_ring(roff)[ri];
  +					if (bytes > (ch == 20 ? WL_IPCR_TXMTU : WL_IPCR_MTU) || bytes > (tre.d0 & 0xffff)) { return wl_w11_fail("transfer completion length"); }
@@ -29367,7 +29723,7 @@ index d21bf85..11e31bd 100644
  +					else {
  +						uint64_t lo = wl_ipcr.iova + WL_IPCR_RXBUF;
  +						if (tre.ptr < lo || tre.ptr >= lo+WL_IPCR_N*WL_IPCR_MTU ||
-@@ -3701,6 +3788,7 @@
+@@ -3701,6 +3791,7 @@
  +	wl12_reply = wl12_requested = wl12_ready = false;
  +	wl13_delayed = wl13_negotiated = false;
  +	wl14_ready = wl14_init_done = wl14_board_valid = false; wl14_board = 0;
@@ -29375,7 +29731,7 @@ index d21bf85..11e31bd 100644
  +	wl_chdb = wl_mrd(0x18); wl_erdb = wl_mrd(0x20);
  +	if (!wl_qrtr || !wl_amss_reached || !wl_contexts_published || wl_w11_guard() ||
  +	    (wl_chdb & 7) || wl_chdb < 0x100 || wl_chdb > 0x3c00 ||
-@@ -3811,6 +3899,10 @@
+@@ -3811,6 +3902,10 @@
  +	e->data[0] = 0; wl_put16(e->data+1, wl12_txn);
  +	wl_put16(e->data+3, msg); wl_put16(e->data+5, e->len-7);
  +	printf("FUXI WLAN: %s send txn %u msg %#x stage %u\n", wl_w15 && stage >= WL15_INI ? "W15" : "W12", wl12_txn, msg, stage);
@@ -29386,7 +29742,7 @@ index d21bf85..11e31bd 100644
  +	int error = wl_qrtr_send(1, wl_server_node, wl_server_port, e->data, e->len);
  +	if (!error && stage == WL15_MODE) { wl16_snapshot("MODE queued"); }
  +	return error;
-@@ -3872,10 +3964,18 @@
+@@ -3872,10 +3967,18 @@
  +{
  +	/* ath12k_qmi_host_cap_send: fresh boot cal_done=0, memory mode=0,
  +	 * internal clock bits 1/2/3, hw_params CNSS feature bits 3/4. */
@@ -29407,7 +29763,17 @@ index d21bf85..11e31bd 100644
  +	int links = wl17_mlo_links(wl12_mlo_variant, wl17_bits, wl12_mlo_enabled, wl12_num_phy);
  +	bool mlo = links != 0;
  +	if (mlo) {
-@@ -4313,6 +4413,7 @@
+@@ -4103,7 +4206,8 @@
+ +	}
+ +	if (off != n || wl_iova_next < wl_iova_base || wl_iova_next >= wl_iova_end ||
+ +	    rounded > wl_iova_end-wl_iova_next) { return wl_w11_fail("REQUEST_MEM trailing bytes/IOVA exhaustion"); }
+-+	if (wl_w13 && ((wl13_negotiated && large) || (!large && cursor > wl_iova_end))) {
+++	if (wl_w13 && ((wl13_negotiated && large) ||
+++	    ((!large || (wl17_bits & WL17_BIGMEM)) && cursor > wl_iova_end))) {
+ +		return wl_w11_fail("REQUEST_MEM small-chunk limit/aligned IOVA exhaustion; negotiation exhausted");
+ +	}
+ +	wl_target_n = count; wl_target_total = total; wl12_requested = true;
+@@ -4313,6 +4417,7 @@
  +wl15_timeout_snapshot(void)
  +{
  +	if (!wl_w15 || wl12_stage != WL15_MODE) { return; }
@@ -29415,7 +29781,7 @@ index d21bf85..11e31bd 100644
  +	wl16_snapshot("MODE timeout");
  +	wl15_elapsed("MODE timeout");
  +	wl_wlfw_diagnostics("W15 MODE timeout");
-@@ -4377,11 +4478,15 @@
+@@ -4377,11 +4482,15 @@
  +	/* Match ath12k's ten-second WLFW timeout, with bounded transport passes. */
  +	for (unsigned ms = 0; ms <= 10000; ms += 10) {
  +		if (wl_w11_events()) {
@@ -29431,7 +29797,7 @@ index d21bf85..11e31bd 100644
  +		if (ms < 10000) { wl_sleep(10); }
  +	}
  +	if (wl12_mlo_variant == 1 && wl12_msg == 0x57) {
-@@ -4526,6 +4631,7 @@
+@@ -4526,6 +4635,7 @@
  +wl_w15_run(void)
  +{
  +	static struct wl12_encoder e;
@@ -29439,7 +29805,7 @@ index d21bf85..11e31bd 100644
  +	bzero(&e, sizeof(e)); e.len = 7;
  +	/* qmi_wlanfw_wlan_ini_req_msg_v01 / *_ei: optional 0x10 u8.
  +	 * Explicit lane policy: disable fw log (0). Upstream v6.12 sends 1. */
-@@ -4533,11 +4639,13 @@
+@@ -4533,11 +4643,13 @@
  +	if (wl12_tlv(&e, 0x10, 0, 1) || wl12_send(&e, 0x2f, WL15_INI) ||
  +	    wl12_wait(0, "WLAN_INI reply") || wl_w11_wait(3, "W15 INI TX drain")) { return 1; }
  +	printf("FUXI WLAN: W15 wlan ini ok\n");
@@ -29453,7 +29819,7 @@ index d21bf85..11e31bd 100644
  +	wl16_snapshot("CFG reply/before MODE");
  +	if (wl16_redrive) {
  +		printf("FUXI WLAN: W16 before MODE re-ring posted RX; no CE init before MODE (ath12k v6.12 order)\n");
-@@ -4552,6 +4660,7 @@
+@@ -4552,6 +4664,7 @@
  +	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
  +	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
  +	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
@@ -29461,7 +29827,19 @@ index d21bf85..11e31bd 100644
  +	wl16_snapshot("MODE reply");
  +	wl12_stage = WL15_OBSERVE;
  +	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
-@@ -5222,6 +5331,7 @@
+@@ -4631,7 +4744,10 @@
+ +	if (wl12_wait(1, "REQUEST_MEM indication")) { return 1; }
+ +	for (unsigned round = 0; round < 2; round++) {
+ +		wl13_delayed = false;
+-+		if (wl_w13 && !wl13_negotiated) {
+++		if (wl_w13 && !wl13_negotiated && (wl17_bits & WL17_BIGMEM)) {
+++			printf("FUXI WLAN: P17 bigmem grants n=%u total=%llu without zero-segment negotiation; aligned IOVAs\n",
+++			    wl_target_n, wl_target_total);
+++		} else if (wl_w13 && !wl13_negotiated) {
+ +			for (unsigned i = 0; i < wl_target_n; i++) {
+ +				if (wl13_supported(wl_target_type[i]) && wl_target_size[i] > WL13_CHUNK_LIMIT) {
+ +					wl13_delayed = true;
+@@ -5222,6 +5338,7 @@
  +static void
  +fw_run(unsigned limit)
  +{
@@ -30171,10 +30549,10 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..0858900
+index 0000000..c5f8fcb
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,7585 @@
+@@ -0,0 +1,7597 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,27 @@
@@ -32058,7 +32436,7 @@ index 0000000..0858900
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_pmic.c
-+@@ -0,0 +1,584 @@
++@@ -0,0 +1,596 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
@@ -32080,6 +32458,7 @@ index 0000000..0858900
 ++#include "fuxi_torch_runtime.h"
 ++#include "fuxi_torch_audit.h"
 ++#include "fuxi_haptic_pulse.h"
+++#include "sweet_spmi_bus.h"
 ++
 ++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
 ++    unsigned, void *);
@@ -32166,6 +32545,9 @@ index 0000000..0858900
 ++    int apid = fp_find(sid, address >> 8, &owner);
 ++    if (apid < 0 || fp_poisoned[apid]) goto done;
 ++    unsigned channel = (unsigned)apid * 0x20;
+++    /* 同一個 arbiter 一次只服務一筆 EE0 交易；按鍵輪詢（20 ms）、RTC 與 WLAN P17 都用 sweet_spmi_bus_lock，
+++     * 這裡在 fp_lock 之內再取它（順序固定 fp_lock -> bus），從命令寫入持有到結果讀完。 */
+++    sweet_spmi_bus_lock();
 ++    fp_write32(&fp_observer, channel, 1u << 27 | (address & 0xffu) << 4);
 ++    for (unsigned poll = 0; poll < 1000; poll++) {
 ++        uint32_t status = fp_read32(&fp_observer, channel + 8);
@@ -32178,12 +32560,14 @@ index 0000000..0858900
 ++                printf("FUXI PMIC: read rejected sid=%u addr=%#x APID=%d owner=%u status=%#x failure=%u denied=%u dropped=%u\n",
 ++                    sid, address, apid, owner, status, !!(status & 2u), !!(status & 4u), !!(status & 8u));
 ++            }
-++            goto done;
+++            goto bus_done;
 ++        }
 ++        delay(1);
 ++    }
 ++    fp_poisoned[apid] = 1;
 ++    printf("FUXI PMIC: timeout sid=%u addr=%#x APID=%d; channel disabled\n", sid, address, apid);
+++bus_done:
+++    sweet_spmi_bus_unlock();
 ++done:
 ++    lck_mtx_unlock(&fp_lock);
 ++    return result;
@@ -32227,6 +32611,7 @@ index 0000000..0858900
 ++    uint64_t physical = 0x0c500000ull + (unsigned)apid * 0x1000u;
 ++    if ((physical & ~(uint64_t)PAGE_MASK) != fp_flash_channel.physical) goto done;
 ++    unsigned channel = physical & PAGE_MASK;
+++    sweet_spmi_bus_lock();
 ++    fp_write32(&fp_flash_channel, channel + 0x10, value);
 ++    fp_write32(&fp_flash_channel, channel, offset << 4);
 ++    for (unsigned poll = 0; poll < 1000; poll++) {
@@ -32238,12 +32623,14 @@ index 0000000..0858900
 ++                printf("FUXI PMIC: flash write rejected +%02x APID=%d owner=%u status=%#x failure=%u denied=%u dropped=%u\n",
 ++                    offset, apid, owner, status, !!(status & 2u), !!(status & 4u), !!(status & 8u));
 ++            }
-++            goto done;
+++            goto bus_done;
 ++        }
 ++        delay(1);
 ++    }
 ++    fp_poisoned[apid] = 1;
 ++    printf("FUXI PMIC: flash write timeout +%02x APID=%d; channel disabled\n", offset, apid);
+++bus_done:
+++    sweet_spmi_bus_unlock();
 ++done:
 ++    lck_mtx_unlock(&fp_lock);
 ++    return result;
@@ -32449,18 +32836,21 @@ index 0000000..0858900
 ++    uint64_t physical = 0x0c500000ull + (unsigned)apid * 0x1000u;
 ++    if ((physical & ~(uint64_t)PAGE_MASK) != window->physical) goto done;
 ++    unsigned channel = physical & PAGE_MASK;
+++    sweet_spmi_bus_lock();
 ++    fp_write32(window, channel + 0x10, value);
 ++    fp_write32(window, channel, (address & 0xffu) << 4);
 ++    for (unsigned poll = 0; poll < 1000; poll++) {
 ++        uint32_t status = fp_read32(window, channel + 8);
 ++        if (status & 1u) {
 ++            result = status & 0x0eu ? -1 : 0;
-++            goto done;
+++            goto bus_done;
 ++        }
 ++        delay(1);
 ++    }
 ++    fp_poisoned[apid] = 1;
 ++    printf("FUXI PMIC: haptic write timeout addr=%#x APID=%d; channel disabled\n", address, apid);
+++bus_done:
+++    sweet_spmi_bus_unlock();
 ++done:
 ++    lck_mtx_unlock(&fp_lock);
 ++    return result;
