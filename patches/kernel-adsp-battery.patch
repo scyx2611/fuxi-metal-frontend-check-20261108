@@ -3709,10 +3709,10 @@ index 0000000..21fe2c5
 +script now completes without a DROPPED read has to be observed on the
 +device; until then the torch remains unverified.
 diff --git a/docs-lanes/wifi-ios.md b/docs-lanes/wifi-ios.md
-index 326195b..b689546 100644
+index 326195b..aae12a5 100644
 --- a/docs-lanes/wifi-ios.md
 +++ b/docs-lanes/wifi-ios.md
-@@ -1,14 +1,18 @@
+@@ -1,14 +1,21 @@
  # P-WIFI: iOS Wi-Fi interface shim
  
 -Source-only, opt-in bring-up. Patch **0104-fuxi-wifi-ios.patch** publishes a
@@ -3724,8 +3724,11 @@ index 326195b..b689546 100644
 +to iOS 16.7 on Fuxi through a boot-lifetime backend. Its original synthetic
 +fixture remains mode 1. Mode 2 waits for the WCN7850 native backend from
 +patch 0099; that driver has completed a real 34-BSS diagnostic scan. The
-+new station bridge connects real power and scanning, with device validation
-+pending. Association, keys and Ethernet traffic remain unsupported.
++station bridge connects real power, scanning and (since 2026-11-17) joining:
++open and WPA2-Personal (CCMP) networks, the four-way and group handshakes,
++keys, port and Ethernet frames both ways. The join is host-tested only;
++device validation is pending. WPA3/SAE and networks that require MFP are
++refused with `EOPNOTSUPP`.
  
  ## Enablement and backend boundary
  
@@ -3737,28 +3740,65 @@ index 326195b..b689546 100644
  no interface, station thread or discovery services are created. Preserve all
  other caller boot arguments. No `fuxiwlan` argument is required for the fake
  backend. The existing USB Ethernet interface is `ue0`; it is not renamed.
-@@ -32,9 +36,12 @@ events. The backend changes the BSD carrier with `link_state`; unrequested
+@@ -32,15 +39,43 @@ events. The backend changes the BSD carrier with `link_state`; unrequested
  loss also calls `fuxi_wifi_sta_lost(errno)` after updating its state snapshot.
  The shim bounds cached SSIDs, information elements and channel counts.
  
 -For a future `fuxi_wlan` adapter, select its backend instead of `fake_backend`
 -at the init call, after firmware/data-path readiness. Supply Ethernet
 -encapsulation/decapsulation and a bounded worker for real RX. The ported
+-`fuxi_wifi_wpa.h` offers PMK derivation, four-way/group EAPOL processing and
+-key outputs. The adapter must generate fresh nonces, own EAPOL routing and
+-retransmission/timeouts, program pairwise/group firmware keys, and assert
+-carrier only after successful installation. Nothing binds QMI success to a
+-usable link today. The crypto library is compiled and tested but is not used
+-by the open synthetic BSS.
 +The native `fuxi_wlan` adapter publishes after INFO and GET_CHANNELS have
-+succeeded, and leaves Ethernet carrier down. It supports applied radio power,
-+active/passive scans, one directed SSID and up to 64 frequencies. Nonzero
-+dwell requests currently return unsupported because the pinned control ABI
-+cannot express them. A single wireless worker executes all module calls.
-+The ported
- `fuxi_wifi_wpa.h` offers PMK derivation, four-way/group EAPOL processing and
- key outputs. The adapter must generate fresh nonces, own EAPOL routing and
- retransmission/timeouts, program pairwise/group firmware keys, and assert
++succeeded, and leaves Ethernet carrier down until a join completes. It supports
++applied radio power, active/passive scans, one directed SSID and up to 64
++frequencies. Nonzero dwell requests currently return unsupported because the
++pinned control ABI cannot express them. A single wireless worker executes all
++module calls; station callers hand it one operation at a time.
++
++Scan results come from GET_BSS, one access point per request, with every
++element the radio heard (the module's own `nw_bss_info` records stop at 384
++bytes, mid-element, which hid RSN from wifid). Elements are copied whole, in
++order, up to 1024 bytes: SSID, rates, DS, TIM, country, BSS load, HT/VHT/HE,
++RSN, extended capabilities and the WPA/WMM vendor elements are kept first and
++the rest while room remains. A failing GET_BSS falls back to the module
++records. The first two scans log one line per access point (frequency, RSSI,
++element sizes, RSN suites, printable SSID) and never a key.
++
++`join` picks the named network (or BSSID) heard best, scanning for it first if
++it was not heard in the last 20 s. It checks the RSN element: WPA2-Personal
++needs AKM 00-0F-AC:2, pairwise CCMP and a CCMP or TKIP group cipher; MFP
++required is refused, MFP capable joins without it. The worker then runs
++AUTHENTICATE (open system), ASSOCIATE with its own RSN element, the four-way
++handshake through `fuxi_wifi_wpa.c` over RX_EAPOL/TX_EAPOL (fresh
++`read_random` nonce), SET_KEY pairwise and group, SET_PORT and SET_OPERSTATE,
++and only then raises carrier. Received frames arrive through the module's
++`rx` event callback; `nw_wifi_tx` sends. Errors: authentication or
++association refused `ECONNREFUSED`, no answer `ETIMEDOUT`, the access point
++leaving or going silent after message 2 `EAUTH` (wrong passphrase), a module
++refusal its own status. Every failure sends DEAUTHENTICATE unless the access
++point already left; the 20 s join budget sits inside the 30 s operation
++limit. Group rekeys are answered and installed while joined; loss lowers
++carrier and calls `fuxi_wifi_sta_lost(ECONNRESET)`. The PMK is wiped when the
++link comes up, request buffers after each send.
++
++`fuxiwifitest=2 fuxiwifitestssid=<name>` joins that network once with a
++made-up passphrase 15 s after publication: authentication, association and
++message 1 → 2 prove the path, and `EAUTH` (key refused) is the expected
++result. Real passphrases never appear in boot arguments or logs.
+ 
+ The fake backend reports **Fuxi Loopback**, an open BSS on channel 1, RSSI
+ −42 dBm. It honors SSID/channel scan filters, accepts only that BSS, rejects
 diff --git a/docs-lanes/wlan-ath12k.md b/docs-lanes/wlan-ath12k.md
 new file mode 100644
-index 0000000..37f4d6e
+index 0000000..41ed1f8
 --- /dev/null
 +++ b/docs-lanes/wlan-ath12k.md
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,134 @@
 +# Fuxi ath12k board adapter
 +
 +The existing WLAN diagnostic reached FW_READY, INI, CFG and a successful
@@ -3874,9 +3914,18 @@ index 0000000..37f4d6e
 +publication and keeps its DMA ownership. The optional `fuxiwifitest=1` runs
 +two power-off/on and station-scan rounds on a separate caller thread. Host
 +tests cover repeated power generations, directed frequency filters, event
-+ordering, stale replies and timeouts. Device validation of this bridge is
-+pending. Authentication, association and Ethernet traffic are unsupported
-+and cannot raise carrier.
++ordering, stale replies and timeouts.
++
++Since 2026-11-17 the bridge also joins open and WPA2-Personal networks over
++the same control channel (AUTHENTICATE, ASSOCIATE, RX/TX_EAPOL, SET_KEY,
++SET_PORT, SET_OPERSTATE; see `wifi-ios.md`), reads scan results through
++GET_BSS with every element instead of the 384-byte module records, and moves
++Ethernet frames with the module's exported `nw_wifi_set_events` (rx) and
++`nw_wifi_tx`. Both symbols are in the link gate's entry points. The worker no
++longer sleeps between steps while `nw_wifi_step` reports moving frames (at
++most 64 rounds in a row). `fuxiwifitest=2 fuxiwifitestssid=<name>` tries one
++join with a made-up passphrase. All of this is host-tested; device validation
++is pending.
 +
 +The firmware callback provides `wlan_mac.bin` from the existing valid
 +`/chosen/mac-address-wifi0` identity so the native interface and MobileGestalt
@@ -5151,7 +5200,7 @@ index efb83f1..745d165 100644
          uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
 diff --git a/tools/ci/ath12k-link.py b/tools/ci/ath12k-link.py
 new file mode 100644
-index 0000000..68e9f49
+index 0000000..e94fbf6
 --- /dev/null
 +++ b/tools/ci/ath12k-link.py
 @@ -0,0 +1,136 @@
@@ -5170,7 +5219,7 @@ index 0000000..68e9f49
 +    '_nw_wifi_bss_get', '_nw_wifi_stats',
 +    '_nw_wifi_set_platform', '_nw_wifi_control_transport_set',
 +    '_nw_wifi_control_attach', '_nw_wifi_control_receive',
-+    '_nw_wifi_power',
++    '_nw_wifi_power', '_nw_wifi_set_events', '_nw_wifi_tx',
 +)
 +IMPORTS = {
 +    '_bzero', '_memcmp', '_memcpy', '_memmove', '_memset', '_snprintf',
@@ -16022,10 +16071,10 @@ index 12e012d..1ee5575 100755
  def wpa_test(directory):
 diff --git a/tools/test-fuxi-wlan-ath12k.py b/tools/test-fuxi-wlan-ath12k.py
 new file mode 100644
-index 0000000..d85a6c2
+index 0000000..63d210d
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ath12k.py
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,313 @@
 +import argparse
 +import json
 +import os
@@ -16236,11 +16285,14 @@ index 0000000..d85a6c2
 +    'nw_bss_info': ('bssid', 'ssid_len', 'ssid', 'freq_mhz', 'signal_dbm', 'caps',
 +                    'beacon_int', 'age_ms', 'ie_len', 'ie'),
 +    'nw_control_transport': ('context', 'send', 'wake'),
++    'nw_wifi_events': ('scan_done', 'connect_done', 'link_lost', 'rx', 'rx_flush',
++                       'rx_packet', 'link_update'),
 +}
 +ABI_SYMBOLS = ('nw_wifi_start', 'nw_wifi_step', 'nw_wifi_stop', 'nw_wifi_poll',
 +               'nw_wifi_irq_mode', 'nw_wifi_scan', 'nw_wifi_bss_count', 'nw_wifi_bss_get',
 +               'nw_wifi_set_platform', 'nw_wifi_control_transport_set',
-+               'nw_wifi_control_attach', 'nw_wifi_control_receive', 'nw_wifi_power')
++               'nw_wifi_control_attach', 'nw_wifi_control_receive', 'nw_wifi_power',
++               'nw_wifi_set_events', 'nw_wifi_tx')
 +
 +
 +def abi_source(reference):
@@ -16266,7 +16318,7 @@ index 0000000..d85a6c2
 +    for name in ('lx_platform', 'nw_board', 'nw_control_transport'):
 +        lines += [f'local_{name}.{field} = upstream_{name}.{field};' for field in ABI_FIELDS[name]]
 +    lines += ['if (fwa_config_offset(0, 4, 0, &offset)) return 1;',
-+              'puts("PASS pinned module ABI: five structure sizes/alignments, all field offsets and platform/control callbacks");',
++              'puts("PASS pinned module ABI: six structure sizes/alignments, all field offsets and platform/control callbacks");',
 +              'return 0;', '}']
 +    return '\n'.join(lines) + '\n'
 +
@@ -17063,10 +17115,12 @@ index 0000000..cea2fab
 +}
 diff --git a/tools/test-fuxi-wlan-ios.py b/tools/test-fuxi-wlan-ios.py
 new file mode 100644
-index 0000000..e71ea69
+index 0000000..40c96da
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ios.py
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,620 @@
++import hashlib
++import hmac
 +import os
 +from pathlib import Path
 +import re
@@ -17076,6 +17130,10 @@ index 0000000..e71ea69
 +ROOT = Path(__file__).resolve().parents[1]
 +SOURCE = ROOT / 'xnu/fuxi-wlan'
 +IOS = ROOT / 'xnu/fuxi-wifi-ios'
++# RFC 3394 AES key wrap of the group key KDE (dd 16 00 0f ac 01 01 00 + bytes 0..15) under the KEK of
++# the vectors below, made once by an independent implementation (python cryptography, as in
++# tools/test-fuxi-wifi-ios.py). The bridge's WPA code has to unwrap it and pass the integrity check.
++WRAPPED = bytes.fromhex('0e6dd8c03700d3cc86d5782a84027cba9ac4a2a20343701481c88897eb4e2eaa')
 +
 +MODEL = r'''
 +#include <assert.h>
@@ -17105,27 +17163,42 @@ index 0000000..e71ea69
 +typedef int wait_result_t;
 +#define KERN_SUCCESS 0
 +#define THREAD_CONTINUE_NULL NULL
-+static uint64_t wla_now_ms(void) { return 1; }
++static uint64_t fake_now = 1;
++static uint64_t wla_now_ms(void) { return fake_now; }
 +static void wl_sleep(unsigned milliseconds) { (void)milliseconds; }
 +static int thread_terminate(thread_t thread) { (void)thread; return 0; }
 +static thread_t current_thread(void) { return NULL; }
 +static void thread_block(void *continuation) { (void)continuation; }
 +static void thread_deallocate(thread_t thread) { (void)thread; }
++static unsigned threads_started;
 +static int kernel_thread_start(void (*entry)(void *,int),void *context,thread_t *thread) {
-+    (void)entry; (void)context; *thread=NULL; return 0;
++    (void)entry; (void)context; *thread=NULL; threads_started++; return 0;
 +}
++static int test_mode;
++static char test_ssid[33];
 +static int PE_parse_boot_argn(const char *name,void *value,int length) {
-+    assert(!strcmp(name,"fuxiwifitest") && length==4); *(int *)value=0; return 0;
++    if (!strcmp(name,"fuxiwifitest")) { assert(length==4); *(int *)value=test_mode; return 1; }
++    assert(!strcmp(name,"fuxiwifitestssid") && length==32);
++    memcpy(value,test_ssid,32); return test_ssid[0]!=0;
++}
++static void read_random(void *buffer,unsigned length) {
++    for (unsigned index=0;index<length;index++) ((uint8_t *)buffer)[index]=(uint8_t)index;
 +}
 +bool fuxi_wifi_sta_busy(void) { return false; }
 +bool fuxi_wifi_sta_powered(void) { return true; }
 +int fuxi_wifi_sta_ask_power(bool on) { (void)on; return 0; }
 +struct fuxi_wifi_sta_scan;
 +struct fuxi_wifi_sta_bss;
++struct fuxi_wifi_sta_join;
 +int fuxi_wifi_sta_ask_scan(const struct fuxi_wifi_sta_scan *scan) { (void)scan; return 0; }
++int fuxi_wifi_sta_ask_join(const struct fuxi_wifi_sta_join *join) { (void)join; return 0; }
++int fuxi_wifi_sta_ask_leave(void) { return 0; }
 +bool fuxi_wifi_sta_heard(unsigned index,struct fuxi_wifi_sta_bss *bss) {
 +    (void)index; (void)bss; return false;
 +}
++static unsigned lost_calls;
++static int lost_error;
++void fuxi_wifi_sta_lost(int error) { lost_calls++; lost_error=error; }
 +static pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
 +static bool timeout_once;
 +static void thread_wakeup(event_t event) { (void)event; pthread_cond_broadcast(&condition); }
@@ -17142,7 +17215,7 @@ index 0000000..e71ea69
 +}
 +#include "fuxi_wlan_ath12k.h"
 +#include "fuxi_wlan_control.h"
-+static uint8_t captured[352];
++static uint8_t captured[2048];
 +static size_t captured_length;
 +static unsigned attachments, power_calls, requested_power;
 +static bool ready = true;
@@ -17162,23 +17235,41 @@ index 0000000..e71ea69
 +    out->signal_dbm = -56; out->ie_len = 4; out->ie[0] = 1; out->ie[1] = 2;
 +    out->caps = 0x11; out->beacon_int = 100; return 0;
 +}
++static const struct nw_wifi_events *events;
++void nw_wifi_set_events(const struct nw_wifi_events *installed) { events = installed; }
++static unsigned tx_calls;
++static int tx_status;
++int nw_wifi_tx(const uint8_t *frame, size_t length) {
++    assert(frame && length >= 14 && length <= 2000); tx_calls++; return tx_status;
++}
 +bool fuxi_wifi_ios_native_ready(void) { return ready; }
 +'''
 +
 +TEST = r'''
++enum { MESSAGE = 2048 };
++static const uint8_t station[6]={2,0x46,0x55,0x58,0x49,1};
++static const uint8_t ap[6]={2,0x46,0x55,0x58,0x49,2}, open_ap[6]={2,0x46,0x55,0x58,0x49,3};
++static const uint8_t sae_ap[6]={2,0x46,0x55,0x58,0x49,4}, mfp_ap[6]={2,0x46,0x55,0x58,0x49,5};
++static const uint8_t far_ap[6]={2,0x46,0x55,0x58,0x49,6}, weak_ap[6]={2,0x46,0x55,0x58,0x49,7};
++static const uint8_t own_rsn[22]={48,20,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,2,0,0};
++static unsigned rx_frames, link_ups, link_downs;
++static void input_rx(const uint8_t *frame,size_t length) { assert(frame && length>=14); rx_frames++; }
++static void input_link(bool up) { if (up) link_ups++; else link_downs++; }
++static const struct fuxi_wifi_input input={input_rx,input_link};
 +bool fuxi_wifi_ios_attach(const struct fuxi_wifi_backend *backend) {
-+    assert(backend == &wli_backend && backend->station.address[0] == 2);
-+    assert(wli.info && wli.channels && !wli_state.last_error);
-+    attachments++; return true;
++    assert(backend == &wli_backend && !memcmp(backend->station.address,station,6));
++    assert(wli.info && wli.channels && !wli_state.last_error && backend->station.join==wli_join);
++    attachments++; backend->start(&input); return true;
 +}
 +static void reset_peer(void) {
++    wli_forget();
 +    memset(&wli,0,sizeof(wli)); memset(&wli_state,0,sizeof(wli_state));
-+    memset(&wli_backend,0,sizeof(wli_backend));
-+    wli.session = 9; wli_bss_count = wli_channel_count = 0;
-+    captured_length = 0; power_calls = attachments = 0;
++    memset(&wli_backend,0,sizeof(wli_backend)); memset(&wli_target,0,sizeof(wli_target));
++    wli.session = 9; wli_bss_count = wli_channel_count = 0; wli_input = NULL; events = NULL;
++    captured_length = 0; power_calls = attachments = 0; fake_now = 1;
 +}
 +static size_t header(uint8_t *bytes, unsigned kind, unsigned operation, uint64_t generation) {
-+    memset(bytes,0,256);
++    memset(bytes,0,MESSAGE);
 +    fwc_write(bytes,0x3143574e,4); fwc_write(bytes+4,1,2);
 +    fwc_write(bytes+6,kind,2); fwc_write(bytes+8,operation,2);
 +    fwc_write(bytes+12,kind==2?wli.pending_sequence:0,4);
@@ -17187,12 +17278,15 @@ index 0000000..e71ea69
 +static int deliver(uint8_t *bytes,size_t length) {
 +    fwc_write(bytes+16,length,4); return wli_receive(NULL,9,bytes,length);
 +}
++static size_t put32(uint8_t *bytes,size_t offset,unsigned attribute,uint32_t value) {
++    uint8_t encoded[4]; fwc_write(encoded,value,4); return wli_put(bytes,offset,attribute,encoded,4);
++}
 +static void bootstrap(void) {
-+    uint8_t bytes[256], power[4]={1}, mac[6]={2,1,2,3,4,5};
++    uint8_t bytes[MESSAGE], power[4]={1};
 +    reset_peer();
 +    assert(!wli_step(1) && fwc_read16(captured+8)==1);
 +    size_t length=header(bytes,2,1,2);
-+    length=wli_put(bytes,length,2,mac,6); length=wli_put(bytes,length,32,power,4);
++    length=wli_put(bytes,length,2,station,6); length=wli_put(bytes,length,32,power,4);
 +    assert(!deliver(bytes,length) && wli.info && wli.generation==2);
 +    assert(!wli_step(2) && fwc_read16(captured+8)==11);
 +    uint8_t channels[64]={0};
@@ -17207,48 +17301,342 @@ index 0000000..e71ea69
 +    assert(wli_channels[1].flags==FUXI_WIFI_STA_CHANNEL_RADAR);
 +    ready=false; assert(!wli_step(3) && !attachments);
 +    ready=true; assert(!wli_step(4) && attachments==1);
++    assert(events && events->rx && !events->rx_packet && wli_input==&input);
 +}
 +static atomic_bool caller_done;
 +static int caller_result;
 +static unsigned caller_operation;
 +static bool caller_on;
 +static struct fuxi_wifi_sta_scan caller_scan;
++static struct fuxi_wifi_sta_join caller_join;
 +static void *caller(void *context) {
 +    (void)context;
-+    caller_result=caller_operation==1?wli_power(caller_on):wli_scan(&caller_scan);
++    switch (caller_operation) {
++    case 1: caller_result=wli_power(caller_on); break;
++    case 2: caller_result=wli_scan(&caller_scan); break;
++    case 3: caller_result=wli_join(&caller_join); break;
++    default: caller_result=wli_leave(); break;
++    }
 +    atomic_store(&caller_done,true); return NULL;
 +}
-+static pthread_t begin(unsigned operation,bool on) {
-+    caller_operation=operation; caller_on=on; atomic_store(&caller_done,false);
-+    pthread_t thread; assert(!pthread_create(&thread,NULL,caller,NULL));
-+    for(unsigned attempt=0;attempt<2000;attempt++) {
-+        pthread_mutex_lock(&wli_lock); bool busy=wli.busy; pthread_mutex_unlock(&wli_lock);
-+        if(busy) return thread;
++static void wait_busy(unsigned operation) {
++    for(unsigned attempt=0;attempt<5000;attempt++) {
++        pthread_mutex_lock(&wli_lock);
++        bool busy=wli.busy && wli.operation==operation && !wli.submitted;
++        pthread_mutex_unlock(&wli_lock);
++        if(busy) return;
 +        struct timespec pause={.tv_nsec=1000000}; nanosleep(&pause,NULL);
 +    }
-+    assert(!"request not queued"); return thread;
++    assert(!"request not queued");
++}
++static pthread_t start_caller(unsigned operation,bool on) {
++    caller_operation=operation; caller_on=on; atomic_store(&caller_done,false);
++    pthread_t thread; assert(!pthread_create(&thread,NULL,caller,NULL)); return thread;
++}
++static pthread_t begin(unsigned operation,bool on) {
++    pthread_t thread=start_caller(operation,on); wait_busy(operation); return thread;
++}
++static uint64_t now=100;
++static void step(void) { assert(!wli_step(++now)); }
++static void expect_request(unsigned operation) {
++    assert(wli.pending_operation==operation && fwc_read16(captured+8)==operation);
++}
++static const uint8_t *request_attribute(unsigned attribute,size_t *size) {
++    return fwc_attribute(captured,captured_length,attribute,size);
++}
++static uint32_t request_u32(unsigned attribute) {
++    size_t size; const uint8_t *value=request_attribute(attribute,&size);
++    assert(value && size==4); return fwc_read32(value);
++}
++static void request_bytes(unsigned attribute,const void *expected,size_t length) {
++    size_t size; const uint8_t *value=request_attribute(attribute,&size);
++    assert(value && size==length && !memcmp(value,expected,length));
++}
++static void respond(unsigned operation,unsigned status) {
++    uint8_t bytes[MESSAGE]; size_t length=header(bytes,2,operation,wli.generation);
++    fwc_write(bytes+20,status,4); assert(!deliver(bytes,length));
 +}
 +static void power_test(bool on,uint64_t generation) {
-+    uint8_t bytes[256], value[4]={0}; pthread_t thread=begin(1,on);
-+    assert(!wli_step(5) && requested_power==on && !atomic_load(&caller_done));
++    uint8_t bytes[MESSAGE], value[4]={0}; pthread_t thread=begin(1,on);
++    step(); assert(requested_power==on && !atomic_load(&caller_done));
 +    size_t length=header(bytes,3,0x10a,generation); fwc_write(value,on,4);
 +    length=wli_put(bytes,length,32,value,4);
 +    assert(!deliver(bytes,length)); assert(!pthread_join(thread,NULL));
 +    assert(!caller_result && wli.generation==generation);
 +    assert(wli_state.phase==(on?FUXI_WIFI_STA_IDLE:FUXI_WIFI_STA_OFF));
 +}
-+static void scan_test(bool event_first) {
-+    uint8_t reply[256],event[256]; pthread_t thread=begin(2,false);
-+    assert(!wli_step(10) && fwc_read16(captured+8)==2);
-+    assert(captured_length==340 && captured[44]==4);
++
++/* Access points as GET_BSS describes them: every element the radio heard. */
++struct fixture { const uint8_t *bssid; uint32_t frequency; int32_t signal; uint32_t caps; uint8_t elements[1600]; size_t length; };
++static struct fixture fixtures[6];
++static size_t element(uint8_t *out,size_t at,unsigned id,const void *body,size_t length) {
++    out[at]=(uint8_t)id; out[at+1]=(uint8_t)length; memcpy(out+at+2,body,length); return at+2+length;
++}
++static void make_fixture(struct fixture *fixture,const uint8_t *bssid,const char *ssid,uint32_t frequency,
++                         int32_t signal,unsigned caps,int akm,unsigned rsn_caps,bool crowded) {
++    memset(fixture,0,sizeof(*fixture));
++    fixture->bssid=bssid; fixture->frequency=frequency; fixture->signal=signal; fixture->caps=caps;
++    uint8_t *out=fixture->elements;
++    size_t at=element(out,0,0,ssid,strlen(ssid));
++    static const uint8_t rates[8]={0x8c,0x12,0x98,0x24,0xb0,0x48,0x60,0x6c};
++    at=element(out,at,1,rates,8);
++    uint8_t channel=36; at=element(out,at,3,&channel,1);
++    if (crowded) {
++        uint8_t vendor[250]; memset(vendor,0x5a,sizeof(vendor));
++        vendor[0]=0x00; vendor[1]=0x10; vendor[2]=0x18; vendor[3]=0x02;
++        for (unsigned index=0;index<4;index++) at=element(out,at,221,vendor,sizeof(vendor));
++    }
++    if (akm>=0) {
++        uint8_t rsn[20]={1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,(uint8_t)akm,
++                         (uint8_t)rsn_caps,(uint8_t)(rsn_caps>>8)};
++        at=element(out,at,48,rsn,sizeof(rsn));
++    }
++    uint8_t ht[26]={0}; at=element(out,at,45,ht,sizeof(ht));
++    static const uint8_t wmm[7]={0x00,0x50,0xf2,0x02,0x01,0x01,0x00}; at=element(out,at,221,wmm,7);
++    uint8_t he[21]={35}; at=element(out,at,255,he,sizeof(he));
++    if (crowded) { out[at]=221; out[at+1]=40; at+=10; }       /* a last element cut short */
++    fixture->length=at;
++}
++static void make_fixtures(void) {
++    make_fixture(&fixtures[0],ap,"IEEE",5200,-60,0x11,2,0,true);
++    make_fixture(&fixtures[1],open_ap,"open",2412,-45,0x01,-1,0,false);
++    make_fixture(&fixtures[2],sae_ap,"sae",5180,-50,0x11,8,0,false);
++    make_fixture(&fixtures[3],mfp_ap,"mfp",5180,-50,0x11,2,0xc0,false);
++    make_fixture(&fixtures[4],far_ap,"far",5955,-40,0x11,2,0,false);
++    make_fixture(&fixtures[5],weak_ap,"IEEE",2437,-70,0x11,2,0,false);
++}
++/* The scan request has been sent: its reply and SCAN_DONE, in either order. */
++static void scan_accept(bool event_first) {
++    uint8_t reply[MESSAGE],event[MESSAGE];
 +    size_t length=header(reply,2,2,wli.generation);
 +    size_t event_length=header(event,3,0x102,wli.generation);
-+    if(event_first) { assert(!deliver(event,event_length)); assert(!wli_step(11)); }
-+    else { assert(!deliver(reply,length)); assert(!wli_step(11)); }
-+    assert(!atomic_load(&caller_done));
++    if(event_first) assert(!deliver(event,event_length)); else assert(!deliver(reply,length));
++    step(); assert(!atomic_load(&caller_done) && !wli.fetching);
 +    if(event_first) assert(!deliver(reply,length)); else assert(!deliver(event,event_length));
-+    assert(!wli_step(12)); assert(!pthread_join(thread,NULL));
-+    assert(!caller_result && wli_bss_count==2 && wli_bss[0].rssi==-56);
++}
++static void serve_bss(unsigned count,unsigned refuse) {
++    for (unsigned index=0;;index++) {
++        step(); expect_request(3); assert(request_u32(21)==index);
++        uint8_t bytes[MESSAGE]; size_t length=header(bytes,2,3,wli.generation);
++        if (refuse || index==count) {
++            fwc_write(bytes+20,refuse?refuse:8,4); assert(!deliver(bytes,length)); return;
++        }
++        const struct fixture *fixture=&fixtures[index];
++        length=wli_put(bytes,length,3,fixture->bssid,6); length=put32(bytes,length,5,fixture->frequency);
++        length=put32(bytes,length,22,(uint32_t)fixture->signal); length=put32(bytes,length,23,fixture->caps);
++        length=put32(bytes,length,24,100); length=put32(bytes,length,25,0);
++        length=wli_put(bytes,length,6,fixture->elements,fixture->length);
++        assert(!deliver(bytes,length));
++    }
++}
++static void scan_test(bool event_first) {
++    pthread_t thread=begin(2,false);
++    step(); expect_request(2);
++    assert(captured_length==340 && captured[44]==4);
++    scan_accept(event_first);
++    serve_bss(6,0); assert(!pthread_join(thread,NULL));
++    assert(!caller_result && wli_bss_count==5 && wli_state.phase==FUXI_WIFI_STA_IDLE && wli.scanned_at==fake_now);
++    const struct fuxi_wifi_sta_bss *bss=&wli_bss[0];
++    assert(bss->ssid_length==4 && !memcmp(bss->ssid,"IEEE",4) && !memcmp(bss->bssid,ap,6));
++    assert(bss->frequency==5200 && bss->rssi==-60 && bss->capability==0x11 && bss->beacon_interval==100);
++    /* 1119 bytes heard: one vendor element and the cut-off tail dropped, essentials and order kept */
++    assert(bss->elements_length==857 && bss->elements[0]==0 && bss->elements[bss->elements_length-23]==255);
++    struct wli_rsn rsn; wli_rsn_parse(bss->elements,bss->elements_length,&rsn);
++    assert(rsn.complete && rsn.akm==(1u<<2) && rsn.pairwise==(1u<<4) && rsn.group==4 && !rsn.caps);
++    for (unsigned index=0;index<wli_bss_count;index++) assert(wli_bss[index].frequency!=5955);
++}
++static void fallback_test(void) {
++    pthread_t thread=begin(2,false);
++    step(); expect_request(2); scan_accept(true);
++    serve_bss(6,6); assert(!pthread_join(thread,NULL));
++    assert(!caller_result && wli_bss_count==2 && wli_bss[0].rssi==-56 && wli_bss[0].ssid_length==4);
++    assert(!memcmp(wli_bss[0].ssid,"real",4) && wli_bss[0].elements_length==4 && !wli.fatal);
++}
++
++/* Events from the module about the join. */
++static void event_auth(const uint8_t *bssid,unsigned status) {
++    uint8_t bytes[MESSAGE], frame[30]={0xb0};
++    memcpy(frame+16,bssid,6); fwc_write(frame+26,2,2); fwc_write(frame+28,status,2);
++    size_t length=header(bytes,3,0x103,wli.generation);
++    length=wli_put(bytes,length,3,bssid,6); length=wli_put(bytes,length,26,frame,sizeof(frame));
++    assert(!deliver(bytes,length));
++}
++static void event_assoc(const uint8_t *bssid,unsigned status) {
++    uint8_t bytes[MESSAGE]; size_t length=header(bytes,3,0x104,wli.generation);
++    length=wli_put(bytes,length,3,bssid,6); length=put32(bytes,length,18,status);
++    assert(!deliver(bytes,length));
++}
++static void event_eapol(const uint8_t *bssid,const uint8_t *message,size_t size) {
++    uint8_t bytes[MESSAGE]; size_t length=header(bytes,3,0x106,wli.generation);
++    length=wli_put(bytes,length,3,bssid,6); length=put32(bytes,length,16,1);
++    length=wli_put(bytes,length,15,message,size); assert(!deliver(bytes,length));
++}
++static void event_lost(const uint8_t *bssid,unsigned reason,unsigned local) {
++    uint8_t bytes[MESSAGE]; size_t length=header(bytes,3,0x105,wli.generation);
++    length=wli_put(bytes,length,3,bssid,6); length=put32(bytes,length,8,reason);
++    length=put32(bytes,length,39,local); assert(!deliver(bytes,length));
++}
++static void ask_join(const char *ssid,const char *passphrase,int security) {
++    memset(&caller_join,0,sizeof(caller_join));
++    caller_join.ssid_length=(uint8_t)strlen(ssid); memcpy(caller_join.ssid,ssid,caller_join.ssid_length);
++    caller_join.security=security;
++    if (passphrase) {
++        caller_join.passphrase_length=(uint8_t)strlen(passphrase);
++        memcpy(caller_join.passphrase,passphrase,caller_join.passphrase_length);
++    }
++}
++/* The access point's side of the handshake, from the same inputs: what the bridge has to send. */
++static struct fuxi_wifi_wpa model;
++static void model_reset(void) {
++    memset(&model,0,sizeof(model));
++    memcpy(model.pmk,pmk,32); memcpy(model.own,station,6); memcpy(model.peer,ap,6);
++    memcpy(model.own_nonce,snonce,32); model.rsn=own_rsn; model.rsn_length=sizeof(own_rsn);
++}
++static unsigned model_reply(const uint8_t *message,size_t length,int kind,uint8_t *reply) {
++    const char *why=""; unsigned reply_length=0;
++    assert(fuxi_wifi_wpa_message(&model,message,(unsigned)length,reply,&reply_length,&why)==kind);
++    return reply_length;
++}
++static void through_association(void) {
++    step(); expect_request(4);
++    request_bytes(4,"IEEE",4); request_bytes(3,ap,6); assert(request_u32(5)==5200 && request_u32(7)==0);
++    assert(wli_state.phase==FUXI_WIFI_STA_JOINING);
++    respond(4,0); step(); assert(wlj.step==WLJ_AUTH_WAIT);
++    event_auth(weak_ap,0); event_auth(ap,0); step(); assert(wlj.step==WLJ_ASSOC);
++    step(); expect_request(5); request_bytes(6,own_rsn,sizeof(own_rsn)); request_bytes(3,ap,6);
++    assert(request_u32(34)==0x000fac04 && request_u32(35)==0x000fac04 && request_u32(36)==0x000fac02);
++    assert(request_u32(37)==0);
++    respond(5,0); event_assoc(ap,0);
++}
++static void message_two(bool right_key) {
++    uint8_t reply[256];
++    model_reset();
++    unsigned length=model_reply(m1,sizeof(m1),1,reply);
++    event_eapol(ap,m1,sizeof(m1)); step(); expect_request(9);
++    if (right_key) request_bytes(15,reply,length);
++    else { size_t size; assert(request_attribute(15,&size) && size==length); }
++    request_bytes(3,ap,6); assert(request_u32(40)==0x888e && request_u32(16)==1);
++    assert(wlj.step==WLJ_KEYS_WAIT && wlj.answered==1); respond(9,0);
++}
++static void keys_and_port(void) {
++    uint8_t reply[256];
++    unsigned length=model_reply(m3,sizeof(m3),2,reply);
++    event_eapol(ap,m3,sizeof(m3)); step(); expect_request(9);
++    request_bytes(15,reply,length); assert(request_u32(16)==1); respond(9,0);
++    step(); expect_request(7); request_bytes(3,ap,6); request_bytes(12,tk,16);
++    assert(request_u32(10)==0 && request_u32(11)==1 && request_u32(9)==0x000fac04); respond(7,0);
++    step(); expect_request(7); request_bytes(12,gtk,16);
++    assert(request_u32(10)==1 && request_u32(11)==0 && request_u32(9)==0x000fac04);
++    size_t size; assert(!request_attribute(3,&size) && request_attribute(13,&size) && size==6); respond(7,0);
++    step(); expect_request(8); assert(request_u32(14)==1); respond(8,0);
++    step(); expect_request(10); assert(request_u32(32)==1); respond(10,0);
++    assert(!__atomic_load_n(&wli_link,__ATOMIC_ACQUIRE));
++    step();
++}
++static void full_join(void) {
++    unsigned ups=link_ups;
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); pthread_t thread=begin(3,false);
++    through_association(); message_two(true); keys_and_port();
++    assert(!pthread_join(thread,NULL) && !caller_result);
++    assert(wli_state.phase==FUXI_WIFI_STA_JOINED && link_ups==ups+1 && __atomic_load_n(&wli_link,__ATOMIC_ACQUIRE));
++    assert(wli_state.security==FUXI_WIFI_STA_WPA2_PSK && !memcmp(wli_state.bss.bssid,ap,6));
++    for (unsigned index=0;index<32;index++) assert(!wlj.wpa.pmk[index] && !wli_target.pmk[index] && !wli_asked.pmk[index]);
++}
++static int failed_join(pthread_t thread) {
++    assert(!pthread_join(thread,NULL));
++    assert(wli_state.phase==FUXI_WIFI_STA_IDLE && wlj.step==WLJ_NONE && !wli.fatal);
++    assert(wli_state.last_error==caller_result); return caller_result;
++}
++static void join_tests(void) {
++    uint8_t frame[60]={0}, reply[256];
++    pthread_t thread;
++    /* what cannot be joined is turned away before the radio is asked */
++    ask_join("sae","password",FUXI_WIFI_STA_WPA2_PSK); assert(wli_join(&caller_join)==EOPNOTSUPP);
++    ask_join("mfp","password",FUXI_WIFI_STA_WPA2_PSK); assert(wli_join(&caller_join)==EOPNOTSUPP);
++    ask_join("open","password",FUXI_WIFI_STA_WPA2_PSK); assert(wli_join(&caller_join)==EINVAL);
++    ask_join("IEEE",NULL,FUXI_WIFI_STA_OPEN); assert(wli_join(&caller_join)==EINVAL);
++    ask_join("IEEE","short",FUXI_WIFI_STA_WPA2_PSK); assert(wli_join(&caller_join)==EINVAL);
++    assert(wli_join(NULL)==EINVAL && wli_state.last_error==EINVAL && !wli_tx(frame,60));
++    assert(captured_length && fwc_read16(captured+8)==3);
++    /* WPA2-PSK: authentication, association, four-way handshake, keys, port, frames, group rekey */
++    full_join();
++    assert(wli_tx(frame,60) && tx_calls==1);
++    assert(!wli_tx(frame,13) && !wli_tx(frame,2001) && !wli_tx(NULL,60) && tx_calls==1);
++    tx_status=1; assert(!wli_tx(frame,60)); tx_status=0;
++    events->rx(frame,60); events->rx(frame,13); assert(rx_frames==1);
++    unsigned length=model_reply(g1,sizeof(g1),3,reply);
++    event_eapol(ap,g1,sizeof(g1)); step(); expect_request(9);
++    request_bytes(15,reply,length); assert(request_u32(16)==0); respond(9,0);
++    step(); expect_request(7); request_bytes(12,gtk,16); respond(7,0);
++    step(); assert(wlj.rekeys==1 && wlj.step==WLJ_JOINED && wli_state.phase==FUXI_WIFI_STA_JOINED);
++    /* the access point lets go */
++    unsigned downs=link_downs;
++    event_lost(weak_ap,7,0); step(); assert(wli_state.phase==FUXI_WIFI_STA_JOINED);
++    event_lost(ap,7,0); step();
++    assert(lost_calls==1 && lost_error==ECONNRESET && wli_state.phase==FUXI_WIFI_STA_IDLE);
++    assert(link_downs==downs+1 && !wli_tx(frame,60) && wlj.step==WLJ_NONE);
++    events->rx(frame,60); assert(rx_frames==1);
++    /* leaving when asked: DEAUTHENTICATE, the module's own note of it ignored */
++    full_join();
++    thread=begin(4,false); step(); expect_request(6); request_bytes(3,ap,6); assert(request_u32(8)==3);
++    assert(!__atomic_load_n(&wli_link,__ATOMIC_ACQUIRE));
++    event_lost(ap,3,1); respond(6,0); step();
++    assert(!pthread_join(thread,NULL) && !caller_result && wli_state.phase==FUXI_WIFI_STA_IDLE && lost_calls==1);
++    /* a wrong passphrase: message 2 goes out, the access point leaves */
++    ask_join("IEEE","not-the-passphrase",FUXI_WIFI_STA_WPA2_PSK); thread=begin(3,false);
++    through_association(); message_two(false);
++    event_lost(ap,15,0); step(); step();
++    assert(failed_join(thread)==EAUTH && link_ups==2);
++    /* authentication refused */
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=begin(3,false);
++    step(); expect_request(4); respond(4,0); event_auth(ap,17); step();
++    step(); expect_request(6); request_bytes(3,ap,6); respond(6,0); step();
++    assert(failed_join(thread)==ECONNREFUSED);
++    /* association refused */
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=begin(3,false);
++    step(); respond(4,0); event_auth(ap,0); step(); step(); expect_request(5); respond(5,0);
++    event_assoc(ap,17); step(); step(); expect_request(6); respond(6,0); step();
++    assert(failed_join(thread)==ECONNREFUSED);
++    /* the module turns a request down: not fatal */
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=begin(3,false);
++    step(); expect_request(4); respond(4,8); step(); expect_request(6); respond(6,0); step();
++    assert(failed_join(thread)==ENOENT);
++    /* nothing heard in time */
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=begin(3,false);
++    step(); expect_request(4); respond(4,0); now+=20001; step(); expect_request(6); respond(6,0); step();
++    assert(failed_join(thread)==ETIMEDOUT);
++    /* message 1 answered but nothing more */
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=begin(3,false);
++    through_association(); message_two(true); now+=20001; step(); expect_request(6); respond(6,0); step();
++    assert(failed_join(thread)==EAUTH);
++    /* an open network */
++    ask_join("open",NULL,FUXI_WIFI_STA_OPEN); thread=begin(3,false);
++    step(); expect_request(4); request_bytes(4,"open",4); respond(4,0); event_auth(open_ap,0); step();
++    step(); expect_request(5); size_t size; assert(!request_attribute(6,&size));
++    assert(request_u32(34)==0 && request_u32(35)==0 && request_u32(36)==0); respond(5,0);
++    event_assoc(open_ap,0); step(); assert(wlj.step==WLJ_PORT);
++    step(); expect_request(8); respond(8,0); step(); expect_request(10); respond(10,0); step();
++    assert(!pthread_join(thread,NULL) && !caller_result && wli_state.phase==FUXI_WIFI_STA_JOINED);
++    assert(wli_tx(frame,60));
++    thread=begin(4,false); step(); expect_request(6); respond(6,0); step();
++    assert(!pthread_join(thread,NULL) && !caller_result && wli_state.phase==FUXI_WIFI_STA_IDLE);
++    /* not heard: a directed scan first, then the answer */
++    ask_join("gone","password",FUXI_WIFI_STA_WPA2_PSK); thread=start_caller(3,false); wait_busy(2);
++    step(); expect_request(2); assert(captured[44]==4 && !memcmp(captured+45,"gone",4));
++    scan_accept(true); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && caller_result==ENOENT && wli_state.last_error==ENOENT);
++    /* heard too long ago: scanned again, then joined */
++    fake_now+=WLI_FRESH_MS+1;
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=start_caller(3,false); wait_busy(2);
++    step(); expect_request(2); scan_accept(false); serve_bss(6,0);
++    wait_busy(3); step(); expect_request(4); respond(4,8); step(); expect_request(6); respond(6,0); step();
++    assert(failed_join(thread)==ENOENT);
++    /* joined, then the radio is switched off: the join is forgotten */
++    full_join();
++    power_test(false,wli.generation+1);
++    assert(!__atomic_load_n(&wli_link,__ATOMIC_ACQUIRE) && wlj.step==WLJ_NONE && !wli_tx(frame,60));
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); assert(wli_join(&caller_join)==ENETDOWN);
++    power_test(true,wli.generation+1);
 +}
 +int main(void) {
 +    unsigned config_offset;
@@ -17258,15 +17646,19 @@ index 0000000..e71ea69
 +    assert(fwa_mac_text(address,5,text) && fwa_mac_text(NULL,6,text));
 +    address[0]=1; assert(fwa_mac_text(address,6,text));
 +    memset(address,0,6); assert(fwa_mac_text(address,6,text));
++    make_fixtures();
 +    bootstrap(); power_test(false,3); power_test(true,4); power_test(true,4);
 +    memset(&caller_scan,0,sizeof(caller_scan)); caller_scan.ssid_length=4;
 +    memcpy(caller_scan.ssid,"real",4); caller_scan.frequency_count=64;
 +    for(unsigned index=0;index<64;index++) caller_scan.frequencies[index]=2412;
++    fallback_test();
 +    scan_test(true); scan_test(false);
-+    assert(!wli_tx((const uint8_t *)"anything",8) && wli_join(NULL)==EOPNOTSUPP);
++    join_tests();
 +    bootstrap();
-+    uint8_t bytes[256]; size_t length=header(bytes,3,0x102,2);
++    uint8_t bytes[MESSAGE]; size_t length=header(bytes,3,0x102,2);
 +    assert(deliver(bytes,length)==2 && wli.fatal==EPROTO);
++    bootstrap(); length=header(bytes,3,0x104,1); length=put32(bytes,length,18,0);
++    assert(!deliver(bytes,length) && !wli.fatal);
 +    bootstrap(); pthread_t thread=begin(1,false); assert(!wli_step(20));
 +    length=header(bytes,3,0x10a,3); uint8_t wrong[4]={1};
 +    length=wli_put(bytes,length,32,wrong,4);
@@ -17285,9 +17677,46 @@ index 0000000..e71ea69
 +        assert(!fwc_message_valid(9,bytes,short_length));
 +    assert(!fwc_message_valid(10,bytes,length));
 +    fwc_write(bytes+16,44,4); assert(!fwc_message_valid(9,bytes,length));
-+    puts("PASS native bridge: real power acknowledgements, repeated generations, directed scans, reply/event ordering, timeouts and stale rejection");
++    test_mode=2; memcpy(test_ssid,"fcb",4); unsigned started=threads_started; bootstrap();
++    assert(threads_started==started+1 && wli_test_join.ssid_length==3 && !memcmp(wli_test_join.ssid,"fcb",3));
++    test_ssid[0]=0; bootstrap(); assert(threads_started==started+1); test_mode=0;
++    puts("PASS native bridge: power acknowledgements, generations, directed scans with every element "
++         "(trimmed whole), module-record fallback, WPA2-PSK and open joins with the four-way and group "
++         "handshakes, keys, port, frames both ways, refusals, timeouts, loss, leave and stale rejection");
 +}
 +'''
++
++
++def vectors():
++    # The same independent IEEE PRF/HMAC peer as tools/test-fuxi-wifi-ios.py: station 02:46:55:58:49:01,
++    # access point ...:02, station nonce 0..31 (the model's read_random), access point nonce 32..63.
++    pmk = hashlib.pbkdf2_hmac('sha1', b'password', b'IEEE', 4096, 32)
++    own, peer = bytes.fromhex('024655584901'), bytes.fromhex('024655584902')
++    snonce, anonce = bytes(range(32)), bytes(range(32, 64))
++    data = min(own, peer) + max(own, peer) + min(snonce, anonce) + max(snonce, anonce)
++    ptk = b''.join(hmac.digest(pmk, b'Pairwise key expansion\0' + data + bytes([i]), 'sha1')
++                   for i in range(3))[:48]
++
++    def message(info, counter, payload=b'', signed=False):
++        out = bytearray(99 + len(payload))
++        out[:4] = bytes([2, 3]) + (len(out) - 4).to_bytes(2, 'big')
++        out[4] = 2
++        out[5:7] = info.to_bytes(2, 'big')
++        out[9:17] = counter.to_bytes(8, 'big')
++        out[17:49] = anonce
++        out[97:99] = len(payload).to_bytes(2, 'big')
++        out[99:] = payload
++        if signed:
++            out[81:97] = hmac.digest(ptk[:16], out, 'sha1')[:16]
++        return bytes(out)
++
++    def array(name, value):
++        return f'static const unsigned char {name}[]={{' + ','.join(map(str, value)) + '};\n'
++
++    return ''.join(array(name, value) for name, value in [
++        ('pmk', pmk), ('snonce', snonce), ('tk', ptk[32:]), ('gtk', bytes(range(16))),
++        ('m1', message(0x8a, 1)), ('m3', message(0x13ca, 2, WRAPPED, True)),
++        ('g1', message(0x1382, 3, WRAPPED, True))])
 +
 +
 +def stripped(path):
@@ -17296,7 +17725,8 @@ index 0000000..e71ea69
 +
 +def main():
 +    code = MODEL + stripped(IOS / 'fuxi_wifi_sta.h') + stripped(IOS / 'fuxi_wifi_ios.h')
-+    code += stripped(SOURCE / 'fuxi_wlan_ios.inc') + TEST
++    code += stripped(IOS / 'fuxi_wifi_wpa.h')
++    code += stripped(SOURCE / 'fuxi_wlan_ios.inc') + stripped(IOS / 'fuxi_wifi_wpa.c') + vectors() + TEST
 +    with tempfile.TemporaryDirectory(prefix='fuxi-wlan-ios-') as directory:
 +        source = Path(directory) / 'bridge.c'
 +        binary = Path(directory) / 'bridge'
@@ -17304,7 +17734,7 @@ index 0000000..e71ea69
 +        subprocess.run([os.environ.get('CC', 'clang'), '-std=gnu11', '-O1', '-g',
 +                        '-Wall', '-Wextra', '-Werror', '-pthread', '-fsanitize=address,undefined',
 +                        '-I', str(SOURCE), str(source), '-o', str(binary)], check=True)
-+        subprocess.run([str(binary)], check=True, timeout=30)
++        subprocess.run([str(binary)], check=True, timeout=60)
 +
 +
 +if __name__ == '__main__':
@@ -28291,7 +28721,7 @@ index 0000000..8491c6b
 +
 +#endif
 diff --git a/xnu/fuxi-h1/fuxi_keys.c b/xnu/fuxi-h1/fuxi_keys.c
-index 8f1d60f..2fff4c5 100644
+index 8f1d60f..5c714b2 100644
 --- a/xnu/fuxi-h1/fuxi_keys.c
 +++ b/xnu/fuxi-h1/fuxi_keys.c
 @@ -39,6 +39,7 @@
@@ -28314,7 +28744,36 @@ index 8f1d60f..2fff4c5 100644
  			break;
  		}
  		if (i == 1) {
-@@ -575,6 +579,26 @@ fk_taps_nums(const char *p, long *out, int max, int *count)
+@@ -289,10 +293,25 @@ fk_rtc_set_clock(void)
+ 		return;
+ 	}
+ 	unsigned offset = 0;
+-	(void)PE_parse_boot_argn("fuxirtcoffset", &offset, sizeof(offset));
++	const char *from = "none";
++	if (PE_parse_boot_argn("fuxirtcoffset", &offset, sizeof(offset))) {
++		from = "boot-arg";
++	} else {
++		/* 日常命令列已滿 607 字元：同一個量測值改放 ADT /chosen（4-byte little-endian）。 */
++		DTEntry chosen;
++		void *property = NULL;
++		unsigned length = 0;
++		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++		    SecureDTGetProperty(chosen, "fuxi,rtc-offset", &property, &length) == kSuccess &&
++		    property && length == sizeof(uint32_t)) {
++			const uint8_t *b = property;
++			offset = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++			from = "adt";
++		}
++	}
+ 	uint64_t epoch = (uint64_t)secs + (uint64_t)offset;
+-	printf("FUXI RTC: apid=%u/ee%u raw %02x %02x %02x %02x counter=%u offset=%u epoch=%llu\n",
+-	    apid, owner, raw[0], raw[1], raw[2], raw[3], secs, offset,
++	printf("FUXI RTC: apid=%u/ee%u raw %02x %02x %02x %02x counter=%u offset=%u (%s) epoch=%llu\n",
++	    apid, owner, raw[0], raw[1], raw[2], raw[3], secs, offset, from,
+ 	    (unsigned long long)epoch);
+ 	/* 2023-11 .. 2039-09: a blank or bogus RTC must not move the clock. */
+ 	if (epoch < 1700000000ull || epoch > 2200000000ull) {
+@@ -575,6 +594,26 @@ fk_taps_nums(const char *p, long *out, int max, int *count)
  	return p;
  }
  
@@ -28341,7 +28800,7 @@ index 8f1d60f..2fff4c5 100644
  static void
  fk_taps(void *arg, wait_result_t wr)
  {
-@@ -584,7 +608,7 @@ fk_taps(void *arg, wait_result_t wr)
+@@ -584,7 +623,7 @@ fk_taps(void *arg, wait_result_t wr)
  	char cmds[400]; /* fuxitapcmd=@1: page 2, open Settings (row 1 col 1 there), scroll it, go home, back to page 1 (a user's session); @2: the slow home drag; @3: open Settings from home page 1 (row 2 col 1, the default layout) */ static const char *const fk_taps_presets[] = {"s540,2390,540,999,99;s900,1200,180,1200,300;t148,285;w800;s540,1900,540,700,300;s540,1900,540,700,300;s540,700,540,1900,300;s540,1900,540,700,300;s540,2390,540,999,99;s180,1200,900,1200,300", "s540,2390,540,999,99;s900,999,180,999,8000;s180,999,900,999,8000", "s540,2390,540,999,99;t148,570;w800;s540,1900,540,700,300;s540,1900,540,700,300;s540,700,540,1900,300;s540,1900,540,700,300;s540,2390,540,999,99;s900,1200,180,1200,300;s180,1200,900,1200,300"};
  
  	(void)wr;
@@ -28350,7 +28809,7 @@ index 8f1d60f..2fff4c5 100644
  		printf("FUXI TAPS: fuxitapcmd missing\n");
  		(void)thread_terminate(current_thread());
  		thread_block(THREAD_CONTINUE_NULL);
-@@ -668,6 +692,8 @@ fk_taps(void *arg, wait_result_t wr)
+@@ -668,6 +707,8 @@ fk_taps(void *arg, wait_result_t wr)
   * the General and About rows in Settings. Device tests only (synthetic touch).
   */
  static unsigned fk_tour_hold = 45, fk_tour_general = 2100, fk_tour_about = 400;
@@ -28359,7 +28818,7 @@ index 8f1d60f..2fff4c5 100644
  
  static void
  fk_tap(int x, int y)
-@@ -739,6 +765,34 @@ fk_tour(void *arg, wait_result_t wr)
+@@ -739,6 +780,34 @@ fk_tour(void *arg, wait_result_t wr)
  	fk_swipe(1000, 10, 1000, 1100, 250);    /* Control Center */
  	fk_script_sleep(2000);
  	fk_tour_shot(&shot, "control-center");
@@ -28394,7 +28853,7 @@ index 8f1d60f..2fff4c5 100644
  	/* A home gesture on another page only returns to page 1 the second time. */
  	fk_tour_home();
  	fk_tour_home();
-@@ -759,6 +813,16 @@ fk_tour(void *arg, wait_result_t wr)
+@@ -759,6 +828,16 @@ fk_tour(void *arg, wait_result_t wr)
  	fk_tour_home();
  	fk_tour_app(&shot, 670, 860, "photos");
  	fk_tour_home();
@@ -31732,10 +32191,10 @@ index 0000000..b8e3263
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.h b/xnu/fuxi-wlan/fuxi_wlan_ath12k.h
 new file mode 100644
-index 0000000..ab078d9
+index 0000000..ad01d60
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.h
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,109 @@
 +#ifndef FUXI_WLAN_ATH12K_H
 +#define FUXI_WLAN_ATH12K_H
 +#include <stdint.h>
@@ -31788,7 +32247,21 @@ index 0000000..ab078d9
 +	int (*send)(void *context, uint64_t session, const void *bytes, size_t length);
 +	void (*wake)(void *context);
 +};
++struct nw_wifi_status;
++/* Frames for the host stack: with only rx set, the module hands over each frame whole, on its worker. */
++struct nw_wifi_events {
++	void (*scan_done)(void);
++	void (*connect_done)(int result);
++	void (*link_lost)(int reason);
++	void (*rx)(const uint8_t *eth, size_t length);
++	void (*rx_flush)(void);
++	void (*rx_packet)(void *context, size_t length, int (*reader)(void *, size_t, void *, size_t));
++	void (*link_update)(const struct nw_wifi_status *status);
++};
 +extern void nw_wifi_set_platform(const struct lx_platform *);
++extern void nw_wifi_set_events(const struct nw_wifi_events *);
++/* 0: queued (copied); only while the port opened by SET_PORT is up. 14..2000 bytes, Ethernet framed. */
++extern int nw_wifi_tx(const uint8_t *, size_t);
 +extern int nw_wifi_control_transport_set(const struct nw_control_transport *);
 +extern int nw_wifi_control_attach(uint64_t *);
 +extern int nw_wifi_control_receive(uint64_t, size_t, int (*)(void *, void *, size_t), void *);
@@ -31833,10 +32306,10 @@ index 0000000..ab078d9
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
 new file mode 100644
-index 0000000..3d52969
+index 0000000..a37d565
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,434 @@
 +#include "fuxi_wlan_arena.h"
 +#include "fuxi_wlan_ath12k.h"
 +#include "fuxi_wlan_control.h"
@@ -32201,10 +32674,12 @@ index 0000000..3d52969
 +	int error = nw_wifi_start(&platform, &board);
 +	bool attached = false, completed = false;
 +	uint64_t started = wla_now_ms(), report = started;
++	unsigned spins = 0;
 +	while (!error && !fw_faults && !wla_failed && !wla_control.error &&
 +	    ((ios && wli.published) || wla_now_ms() - started < 90000)) {
 +		wla_control_awake = 0;
-+		(void)nw_wifi_step();
++		/* nonzero while frames move: go round again without sleeping, but not for ever */
++		int moving = nw_wifi_step();
 +		uint64_t now = wla_now_ms();
 +		if (!attached && nw_wifi_stats.stage >= 4) {
 +			error = nw_wifi_control_attach(ios ? &wli.session : &wla_control.session);
@@ -32235,7 +32710,10 @@ index 0000000..3d52969
 +			    nw_wifi_stats.scans, nw_wifi_stats.bss_seen, nw_wifi_stats.last_err);
 +			if (wl_smmu_fault(0) || wl_rc_check()) { error = -1; break; }
 +		}
-+		if (!wla_control_awake) { wl_sleep(1); }
++		if (!wla_control_awake && (!moving || ++spins >= 64)) {
++			spins = 0;
++			wl_sleep(1);
++		}
 +	}
 +	if (ios) { wli_fail(error ? error : EIO); }
 +	if (!error && wla_control.error) {
@@ -32436,16 +32914,58 @@ index 0000000..e0b7465
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ios.inc b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
 new file mode 100644
-index 0000000..8372cb7
+index 0000000..26779a7
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,1237 @@
 +#include <sys/fuxi_wifi_ios.h>
++#include <sys/fuxi_wifi_wpa.h>
 +#include <sys/errno.h>
++#include <sys/random.h>
 +#include <kern/locks.h>
++
++/*
++ * The iOS station over the pinned ath12k module's cfg80211 control channel.
++ *
++ * Every control request, reply and event is handled on the WLAN worker thread (wl_ath_run): the
++ * replies and events reach wli_receive() from inside nw_wifi_step()/nw_wifi_control_receive().
++ * Callers on the station thread hand one operation at a time to the worker through wli_submit()
++ * and sleep until it is over. The join state (wlj) and the request buffer are the worker's alone.
++ *
++ * Joining: AUTHENTICATE, ASSOCIATE with our own RSN element, the four-way handshake in
++ * fuxi_wifi_wpa.c over RX_EAPOL/TX_EAPOL, the pairwise and group keys, then the port. Only
++ * WPA2-Personal (AKM 00-0F-AC:2, pairwise CCMP) and open networks; a network that requires
++ * management frame protection or offers only SAE (WPA3) is refused with EOPNOTSUPP.
++ * Neither keys, passphrases nor EAPOL payloads are ever logged.
++ */
 +
 +#define WLI_BSS_MAX 128
 +#define WLI_CHANNEL_MAX 96
++#define WLI_REQUEST_MOST 1536
++#define WLI_EAPOL_MOST 1024
++#define WLI_JOIN_MS 20000
++#define WLI_FRESH_MS 20000
++#define WLI_DIAG_SCANS 2
++#define WLI_DIAG_LINES 48
++
++enum { WLI_POWER = 1, WLI_SCAN, WLI_JOIN, WLI_LEAVE };
++enum {
++	WLJ_NONE, WLJ_AUTH, WLJ_AUTH_WAIT, WLJ_ASSOC, WLJ_ASSOC_WAIT, WLJ_KEYS_WAIT,
++	WLJ_PAIRWISE, WLJ_GROUP, WLJ_PORT, WLJ_OPERSTATE, WLJ_UP, WLJ_JOINED, WLJ_REKEY,
++	WLJ_ABORT, WLJ_FAILED, WLJ_LEAVE_WAIT
++};
++#define WLI_SUITE(type) (0x000fac00u | (type))
++
++struct wli_target {
++	struct fuxi_wifi_sta_bss bss;
++	uint8_t pmk[32];
++	int security;
++	uint32_t group;
++};
++
++struct wli_rsn {
++	unsigned present, complete, group, pairwise, akm, caps;
++};
 +
 +static LCK_GRP_DECLARE(wli_group, "fuxi-wlan-ios");
 +static LCK_MTX_DECLARE(wli_lock, &wli_group);
@@ -32456,13 +32976,38 @@ index 0000000..8372cb7
 +static struct fuxi_wifi_sta_channel wli_channels[WLI_CHANNEL_MAX];
 +static unsigned wli_bss_count, wli_channel_count;
 +static struct {
-+	uint64_t session, generation, deadline;
++	uint64_t session, generation, deadline, scanned_at;
 +	uint32_t sequence, pending_sequence;
 +	unsigned pending_operation, info, channels, published, busy, submitted;
 +	unsigned operation, power_on, power_waiting, scan_accepted, scan_done;
++	unsigned fetching, fetch_index, scan_reports, diag_lines;
 +	int result, fatal;
 +	struct fuxi_wifi_sta_scan scan;
 +} wli;
++/* What a join asks for: written by wli_submit() under wli_lock, taken by the worker when it begins. */
++static struct wli_target wli_target;
++/* The station thread's own copy while it prepares a join (join() calls never overlap). */
++static struct wli_target wli_asked;
++/* Frames may pass: set by the worker, read by the transmit path. */
++static unsigned wli_link;
++/* The join and the link: the worker's alone. */
++static struct {
++	struct fuxi_wifi_sta_bss bss;
++	struct fuxi_wifi_wpa wpa;
++	uint8_t rsn[22];
++	uint64_t deadline;
++	uint32_t group;
++	unsigned step, security, joined, leaving, answered, auth_seen, assoc_seen, timed_out;
++	unsigned lost, lost_reason, eapol_ready, rekeys;
++	int auth_status, assoc_status, error;
++	size_t eapol_length;
++	uint8_t eapol[WLI_EAPOL_MOST];
++	uint8_t reply[FUXI_WIFI_WPA_REPLY_MOST];
++} wlj;
++static struct fuxi_wifi_sta_bss wli_fetched;
++static uint8_t wli_out[WLI_REQUEST_MOST];
++static size_t wli_out_length;
++static unsigned wli_out_overflow;
 +
 +static int
 +wli_status(unsigned status)
@@ -32479,14 +33024,24 @@ index 0000000..8372cb7
 +	wli.result = error;
 +	wli_state.last_error = error;
 +	if (wli_state.phase == FUXI_WIFI_STA_SCANNING) { wli_state.phase = FUXI_WIFI_STA_IDLE; }
-+	wli.busy = wli.submitted = wli.power_waiting = 0;
++	wli.busy = wli.submitted = wli.power_waiting = wli.fetching = 0;
 +	lck_mtx_unlock(&wli_lock);
 +	thread_wakeup((event_t)&wli.busy);
++}
++
++/* Forget the join and the keys; the radio side is not told (callers do that first, if needed). */
++static void
++wli_forget(void)
++{
++	__atomic_store_n(&wli_link, 0, __ATOMIC_RELEASE);
++	memset(&wlj, 0, sizeof(wlj));
 +}
 +
 +static void
 +wli_fail(int error)
 +{
++	bool linked = wlj.joined;
++	wli_forget();
 +	lck_mtx_lock(&wli_lock);
 +	wli.fatal = error;
 +	wli_state.phase = FUXI_WIFI_STA_OFF;
@@ -32494,10 +33049,11 @@ index 0000000..8372cb7
 +	lck_mtx_unlock(&wli_lock);
 +	wli_complete(error);
 +	if (wli_input) { wli_input->link_state(false); }
++	if (linked) { fuxi_wifi_sta_lost(error); }
 +}
 +
 +static int
-+wli_submit(unsigned operation, bool on, const struct fuxi_wifi_sta_scan *scan)
++wli_submit(unsigned operation, bool on, const struct fuxi_wifi_sta_scan *scan, const struct wli_target *target)
 +{
 +	lck_mtx_lock(&wli_lock);
 +	if (wli.fatal || !wli.published || wli.busy) {
@@ -32508,6 +33064,7 @@ index 0000000..8372cb7
 +	wli.operation = operation;
 +	wli.power_on = on;
 +	if (scan) { wli.scan = *scan; }
++	if (target) { wli_target = *target; }
 +	wli.busy = 1;
 +	wli.submitted = 0;
 +	wli.result = EINPROGRESS;
@@ -32531,7 +33088,7 @@ index 0000000..8372cb7
 +static int
 +wli_power(bool on)
 +{
-+	return wli_submit(1, on, NULL);
++	return wli_submit(WLI_POWER, on, NULL, NULL);
 +}
 +
 +static int
@@ -32540,7 +33097,7 @@ index 0000000..8372cb7
 +	if (!scan || scan->ssid_length > 32 || scan->frequency_count > 64 ||
 +	    (scan->passive && scan->ssid_length)) { return EINVAL; }
 +	if (scan->dwell_ms) { return EOPNOTSUPP; }
-+	return wli_submit(2, false, scan);
++	return wli_submit(WLI_SCAN, false, scan, NULL);
 +}
 +
 +static void
@@ -32557,21 +33114,140 @@ index 0000000..8372cb7
 +	}
 +}
 +
-+static int
-+wli_join(const struct fuxi_wifi_sta_join *join)
++/* The RSN element of a list of elements: what it offers, as bit masks of 00-0F-AC suite types. */
++static void
++wli_rsn_parse(const uint8_t *elements, size_t length, struct wli_rsn *rsn)
 +{
-+	(void)join;
++	memset(rsn, 0, sizeof(*rsn));
++	for (size_t at = 0; at + 2 <= length && at + 2 + elements[at + 1] <= length; at += 2 + elements[at + 1]) {
++		if (elements[at] != 48) { continue; }
++		const uint8_t *body = elements + at + 2;
++		size_t size = elements[at + 1], position = 6;
++		rsn->present = 1;
++		if (size < 6 || body[0] != 1 || body[1] != 0) { return; }
++		rsn->group = body[2] == 0 && body[3] == 0x0f && body[4] == 0xac ? body[5] : 0xff;
++		for (unsigned list = 0; list < 2; list++) {
++			if (position + 2 > size) { return; }
++			unsigned count = body[position] | (unsigned)body[position + 1] << 8;
++			position += 2;
++			if (count > 16 || position + 4 * count > size) { return; }
++			for (unsigned index = 0; index < count; index++, position += 4) {
++				const uint8_t *suite = body + position;
++				if (suite[0] || suite[1] != 0x0f || suite[2] != 0xac || suite[3] >= 32) { continue; }
++				if (list) { rsn->akm |= 1u << suite[3]; } else { rsn->pairwise |= 1u << suite[3]; }
++			}
++		}
++		if (position + 2 <= size) { rsn->caps = body[position] | (unsigned)body[position + 1] << 8; }
++		rsn->complete = 1;
++		return;
++	}
++}
++
++/* Whether a join of this kind can be made to this network; its group cipher on success. */
++static int
++wli_security(const struct fuxi_wifi_sta_bss *bss, int security, uint32_t *group)
++{
++	struct wli_rsn rsn;
++	wli_rsn_parse(bss->elements, bss->elements_length, &rsn);
++	*group = 0;
++	if (security == FUXI_WIFI_STA_OPEN) {
++		return rsn.present || (bss->capability & 0x10) ? EINVAL : 0;
++	}
++	if (!rsn.present) { return (bss->capability & 0x10) ? EOPNOTSUPP : EINVAL; }
++	if (!rsn.complete || !(rsn.pairwise & (1u << 4)) || !(rsn.akm & (1u << 2)) ||
++	    (rsn.group != 4 && rsn.group != 2) || (rsn.caps & 0x40)) { return EOPNOTSUPP; }
++	*group = WLI_SUITE(rsn.group);
++	return 0;
++}
++
++/* The access point to join: the given one, or the one of that name heard best. */
++static int
++wli_pick(const struct fuxi_wifi_sta_join *join, struct wli_target *target)
++{
++	static const uint8_t none[6];
++	bool given = memcmp(join->bssid, none, 6) != 0;
++	int best = -1;
 +	lck_mtx_lock(&wli_lock);
-+	wli_state.last_error = EOPNOTSUPP;
++	uint64_t age = wla_now_ms() - wli.scanned_at;
++	for (unsigned index = 0; index < wli_bss_count; index++) {
++		const struct fuxi_wifi_sta_bss *bss = &wli_bss[index];
++		if (bss->ssid_length != join->ssid_length || memcmp(bss->ssid, join->ssid, join->ssid_length) ||
++		    (given && memcmp(bss->bssid, join->bssid, 6))) { continue; }
++		if (best < 0 || bss->rssi > wli_bss[best].rssi) { best = (int)index; }
++	}
++	int error = best < 0 ? ENOENT : age + wli_bss[best].age_ms > WLI_FRESH_MS ? ESTALE : 0;
++	if (!error) { target->bss = wli_bss[best]; }
 +	lck_mtx_unlock(&wli_lock);
-+	return EOPNOTSUPP;
++	return error;
++}
++
++static void
++wli_note_error(int error)
++{
++	lck_mtx_lock(&wli_lock);
++	wli_state.last_error = error;
++	lck_mtx_unlock(&wli_lock);
 +}
 +
 +static int
 +wli_leave(void)
 +{
++	lck_mtx_lock(&wli_lock);
++	bool off = wli_state.phase == FUXI_WIFI_STA_OFF;
++	lck_mtx_unlock(&wli_lock);
++	int error = off ? 0 : wli_submit(WLI_LEAVE, false, NULL, NULL);
 +	if (wli_input) { wli_input->link_state(false); }
-+	return 0;
++	return error;
++}
++
++static int
++wli_join(const struct fuxi_wifi_sta_join *join)
++{
++	if (!join || !join->ssid_length || join->ssid_length > 32 ||
++	    (join->security != FUXI_WIFI_STA_OPEN && join->security != FUXI_WIFI_STA_WPA2_PSK) ||
++	    (join->passphrase_length && (join->passphrase_length < 8 || join->passphrase_length > 63))) {
++		wli_note_error(EINVAL);
++		return EINVAL;
++	}
++	lck_mtx_lock(&wli_lock);
++	enum fuxi_wifi_sta_phase phase = wli_state.phase;
++	lck_mtx_unlock(&wli_lock);
++	if (phase == FUXI_WIFI_STA_OFF) {
++		wli_note_error(ENETDOWN);
++		return ENETDOWN;
++	}
++	if (phase == FUXI_WIFI_STA_JOINED || phase == FUXI_WIFI_STA_JOINING) { (void)wli_leave(); }
++	struct wli_target *target = &wli_asked;
++	memset(target, 0, sizeof(*target));
++	target->security = join->security;
++	if (join->security == FUXI_WIFI_STA_WPA2_PSK) {
++		if (join->passphrase_length) {
++			fuxi_wifi_wpa_pmk(join->passphrase, join->passphrase_length, join->ssid, join->ssid_length,
++			    target->pmk);
++		} else {
++			memcpy(target->pmk, join->pmk, sizeof(target->pmk));
++		}
++	}
++	int error = wli_pick(join, target);
++	if (error == ENOENT || error == ESTALE) {
++		struct fuxi_wifi_sta_scan scan;
++		memset(&scan, 0, sizeof(scan));
++		memcpy(scan.ssid, join->ssid, join->ssid_length);
++		scan.ssid_length = join->ssid_length;
++		printf("FUXI WIFI IOS: join needs a fresh scan (%s)\n", error == ENOENT ? "not heard" : "too old");
++		error = wli_submit(WLI_SCAN, false, &scan, NULL);
++		if (!error) { error = wli_pick(join, target); }
++	}
++	if (!error) { error = wli_security(&target->bss, join->security, &target->group); }
++	if (!error) {
++		printf("FUXI WIFI IOS: join %s at %u MHz %d dBm\n",
++		    join->security == FUXI_WIFI_STA_OPEN ? "open" : "WPA2-PSK", target->bss.frequency, target->bss.rssi);
++		error = wli_submit(WLI_JOIN, false, NULL, target);
++	}
++	memset(target, 0, sizeof(*target));
++	if (error) { wli_note_error(error); }
++	printf("FUXI WIFI IOS: join finished %d\n", error);
++	return error;
 +}
 +
 +static void
@@ -32595,15 +33271,323 @@ index 0000000..8372cb7
 +static bool
 +wli_tx(const uint8_t *frame, size_t length)
 +{
-+	(void)frame;
-+	(void)length;
-+	return false;
++	return frame && length >= 14 && length <= 2000 && __atomic_load_n(&wli_link, __ATOMIC_ACQUIRE) &&
++	       nw_wifi_tx(frame, length) == 0;
 +}
++
++/* A frame from the radio for the host stack, on the worker thread: Ethernet header and payload. */
++static void
++wli_rx(const uint8_t *frame, size_t length)
++{
++	if (frame && length >= 14 && __atomic_load_n(&wli_link, __ATOMIC_ACQUIRE) && wli_input) {
++		wli_input->rx_frame(frame, length);
++	}
++}
++
++static const struct nw_wifi_events wli_events = { .rx = wli_rx };
 +
 +static void
 +wli_start(const struct fuxi_wifi_input *input)
 +{
 +	wli_input = input;
++}
++
++/* Elements an iOS scan record cannot do without; the rest is kept while there is room. */
++static bool
++wli_essential(const uint8_t *element)
++{
++	switch (element[0]) {
++	case 0: case 1: case 3: case 5: case 7: case 11: case 45: case 48: case 50: case 61: case 127:
++	case 191: case 192:
++		return true;
++	case 221:
++		return element[1] >= 4 && element[2] == 0x00 && element[3] == 0x50 && element[4] == 0xf2 &&
++		       (element[5] == 1 || element[5] == 2);
++	case 255:
++		return element[1] >= 1 && (element[2] == 35 || element[2] == 36);
++	default:
++		return false;
++	}
++}
++
++/* Copy whole elements only, in their order, at most FUXI_WIFI_STA_ELEMENTS_MOST bytes. */
++static unsigned
++wli_trim(const uint8_t *elements, size_t length, struct fuxi_wifi_sta_bss *bss)
++{
++	size_t whole = 0, needed = 0, out = 0;
++	unsigned dropped = 0;
++	for (size_t at = 0; at + 2 <= length && at + 2 + elements[at + 1] <= length; at += 2 + elements[at + 1]) {
++		whole = at + 2 + elements[at + 1];
++		if (wli_essential(elements + at)) { needed += 2 + elements[at + 1]; }
++	}
++	size_t spare = needed < FUXI_WIFI_STA_ELEMENTS_MOST ? FUXI_WIFI_STA_ELEMENTS_MOST - needed : 0;
++	for (size_t at = 0; at < whole; at += 2 + elements[at + 1]) {
++		size_t size = 2 + elements[at + 1];
++		if (!wli_essential(elements + at)) {
++			if (size > spare) { dropped++; continue; }
++			spare -= size;
++		}
++		if (out + size > FUXI_WIFI_STA_ELEMENTS_MOST) { dropped++; continue; }
++		memcpy(bss->elements + out, elements + at, size);
++		out += size;
++		if (elements[at] == 0 && elements[at + 1] <= 32 && !bss->ssid_length) {
++			memcpy(bss->ssid, elements + at + 2, elements[at + 1]);
++			bss->ssid_length = elements[at + 1];
++		}
++	}
++	bss->elements_length = (uint16_t)out;
++	return dropped + (whole < length);
++}
++
++static void
++wli_diag(const struct fuxi_wifi_sta_bss *bss, size_t heard, unsigned dropped)
++{
++	if (wli.scan_reports >= WLI_DIAG_SCANS || wli.diag_lines >= WLI_DIAG_LINES) { return; }
++	wli.diag_lines++;
++	struct wli_rsn rsn;
++	wli_rsn_parse(bss->elements, bss->elements_length, &rsn);
++	char name[33];
++	for (unsigned index = 0; index < bss->ssid_length; index++) {
++		uint8_t character = bss->ssid[index];
++		name[index] = character >= 0x20 && character < 0x7f && character != '"' ? (char)character : '?';
++	}
++	name[bss->ssid_length] = 0;
++	printf("FUXI WIFI IOS: heard %u MHz %d dBm cap %#x IE %u kept %u dropped %u RSN %u akm %#x pairwise %#x "
++	    "group %u caps %#x \"%s\"\n", bss->frequency, bss->rssi, bss->capability, (unsigned)heard,
++	    bss->elements_length, dropped, rsn.present, rsn.akm, rsn.pairwise, rsn.group, rsn.caps, name);
++}
++
++/* The module's own (truncated) records: only when GET_BSS fails. */
++static void
++wli_cache_scan(void)
++{
++	int count = nw_wifi_bss_count();
++	lck_mtx_lock(&wli_lock);
++	wli_bss_count = 0;
++	lck_mtx_unlock(&wli_lock);
++	for (int index = 0; index < count && index < WLI_BSS_MAX; index++) {
++		struct nw_bss_info source;
++		if (nw_wifi_bss_get(index, &source) || source.ssid_len > 32 || source.ie_len > sizeof(source.ie) ||
++		    source.freq_mhz < 2412 || source.freq_mhz > 5900) { continue; }
++		struct fuxi_wifi_sta_bss *bss = &wli_fetched;
++		memset(bss, 0, sizeof(*bss));
++		memcpy(bss->bssid, source.bssid, 6);
++		bss->frequency = (uint16_t)source.freq_mhz;
++		bss->rssi = source.signal_dbm;
++		bss->beacon_interval = source.beacon_int;
++		bss->capability = source.caps;
++		bss->age_ms = source.age_ms;
++		unsigned dropped = wli_trim(source.ie, source.ie_len, bss);
++		if (!bss->ssid_length) {
++			memcpy(bss->ssid, source.ssid, source.ssid_len);
++			bss->ssid_length = source.ssid_len;
++		}
++		wli_diag(bss, source.ie_len, dropped);
++		lck_mtx_lock(&wli_lock);
++		wli_bss[wli_bss_count++] = *bss;
++		lck_mtx_unlock(&wli_lock);
++	}
++	wli.scanned_at = wla_now_ms();
++	wli.scan_reports++;
++	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu (module records)\n", wli_bss_count,
++	    (unsigned long long)wli.generation);
++	wli_complete(0);
++}
++
++static void
++wli_scan_finish(void)
++{
++	wli.scanned_at = wla_now_ms();
++	wli.scan_reports++;
++	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu\n", wli_bss_count,
++	    (unsigned long long)wli.generation);
++	wli_complete(0);
++}
++
++/* One GET_BSS reply: the access point with every element it sent. */
++static void
++wli_bss_reply(unsigned status, const uint8_t *bytes, size_t length)
++{
++	if (!wli.fetching) { return; }
++	if (status == 8) {
++		wli_scan_finish();
++		return;
++	}
++	if (status) {
++		printf("FUXI WIFI IOS: GET_BSS %u refused %u; module records instead\n", wli.fetch_index, status);
++		wli.fetching = 0;
++		wli_cache_scan();
++		return;
++	}
++	size_t size, ie_size;
++	const uint8_t *value, *bssid = fwc_attribute(bytes, length, 3, &size);
++	const uint8_t *elements = fwc_attribute(bytes, length, 6, &ie_size);
++	struct fuxi_wifi_sta_bss *bss = &wli_fetched;
++	memset(bss, 0, sizeof(*bss));
++	value = fwc_attribute(bytes, length, 5, &size);
++	uint32_t frequency = value && size == 4 ? fwc_read32(value) : 0;
++	if (bssid && elements && frequency >= 2412 && frequency <= 5900) {
++		memcpy(bss->bssid, bssid, 6);
++		bss->frequency = (uint16_t)frequency;
++		value = fwc_attribute(bytes, length, 22, &size);
++		int32_t signal = value && size == 4 ? (int32_t)fwc_read32(value) : -100;
++		bss->rssi = (int16_t)(signal < -127 ? -127 : signal > 0 ? 0 : signal);
++		value = fwc_attribute(bytes, length, 23, &size);
++		bss->capability = value && size == 4 ? (uint16_t)fwc_read32(value) : 0;
++		value = fwc_attribute(bytes, length, 24, &size);
++		bss->beacon_interval = value && size == 4 ? (uint16_t)fwc_read32(value) : 100;
++		value = fwc_attribute(bytes, length, 25, &size);
++		bss->age_ms = value && size == 4 ? fwc_read32(value) : 0;
++		unsigned dropped = wli_trim(elements, ie_size, bss);
++		wli_diag(bss, ie_size, dropped);
++		lck_mtx_lock(&wli_lock);
++		if (wli_bss_count < WLI_BSS_MAX) { wli_bss[wli_bss_count++] = *bss; }
++		lck_mtx_unlock(&wli_lock);
++	}
++	if (++wli.fetch_index >= 256 || wli_bss_count >= WLI_BSS_MAX) { wli_scan_finish(); }
++}
++
++static size_t
++wli_put(uint8_t *bytes, size_t offset, unsigned attribute, const void *value, size_t size)
++{
++	fwc_write(bytes + offset, attribute, 2);
++	fwc_write(bytes + offset + 2, size + 4, 2);
++	if (size) { memcpy(bytes + offset + 4, value, size); }
++	return offset + ((size + 7u) & ~(size_t)3u);
++}
++
++static void
++wli_add(unsigned attribute, const void *value, size_t size)
++{
++	if (size > 0xfff0 || wli_out_length + ((size + 7u) & ~(size_t)3u) > sizeof(wli_out)) {
++		wli_out_overflow = 1;
++		return;
++	}
++	wli_out_length = wli_put(wli_out, wli_out_length, attribute, value, size);
++}
++
++static void
++wli_put32(unsigned attribute, uint32_t value)
++{
++	uint8_t bytes[4];
++	fwc_write(bytes, value, 4);
++	wli_add(attribute, bytes, sizeof(bytes));
++}
++
++static void
++wli_begin(void)
++{
++	memset(wli_out, 0, sizeof(wli_out));
++	wli_out_length = 40;
++	wli_out_overflow = 0;
++}
++
++static int
++wli_send(unsigned operation)
++{
++	if (wli_out_overflow) { return EMSGSIZE; }
++	if (wli.sequence + 1u == 0) { return EOVERFLOW; }
++	uint8_t *bytes = wli_out;
++	size_t length = wli_out_length;
++	fwc_write(bytes, 0x3143574e, 4);
++	fwc_write(bytes + 4, 1, 2);
++	fwc_write(bytes + 6, 1, 2);
++	fwc_write(bytes + 8, operation, 2);
++	fwc_write(bytes + 12, ++wli.sequence, 4);
++	fwc_write(bytes + 16, length, 4);
++	fwc_write(bytes + 24, wli.session, 8);
++	fwc_write(bytes + 32, wli.generation, 8);
++	wli.pending_sequence = wli.sequence;
++	wli.pending_operation = operation;
++	int status = nw_wifi_control_receive(wli.session, length, wla_control_read, bytes);
++	/* The module has its copy: keys and EAPOL do not stay here. */
++	memset(wli_out, 0, length);
++	if (status) { wli.pending_operation = 0; }
++	return wli_status(status);
++}
++
++static int
++wli_request(unsigned operation)
++{
++	wli_begin();
++	if (operation == 2) {
++		if (!wli.scan.passive) {
++			uint8_t ssid[33] = {0};
++			ssid[0] = wli.scan.ssid_length;
++			memcpy(ssid + 1, wli.scan.ssid, ssid[0]);
++			wli_add(19, ssid, sizeof(ssid));
++		}
++		if (wli.scan.frequency_count) {
++			uint8_t frequencies[256];
++			for (unsigned index = 0; index < wli.scan.frequency_count; index++) {
++				fwc_write(frequencies + index * 4, wli.scan.frequencies[index], 4);
++			}
++			wli_add(20, frequencies, wli.scan.frequency_count * 4);
++		}
++	} else if (operation == 3) {
++		wli_put32(21, wli.fetch_index);
++	}
++	return wli_send(operation);
++}
++
++/* An event of the join or the link: noted here, acted on by wli_join_step(). */
++static void
++wli_join_event(unsigned operation, const uint8_t *bytes, size_t length)
++{
++	size_t size;
++	const uint8_t *value, *bssid = fwc_attribute(bytes, length, 3, &size);
++	bool ours = bssid && size == 6 && !memcmp(bssid, wlj.bss.bssid, 6);
++	if (wlj.step == WLJ_NONE) { return; }
++	switch (operation) {
++	case 0x103:
++		value = fwc_attribute(bytes, length, 26, &size);
++		if (wlj.step != WLJ_AUTH_WAIT || !value || size < 30 || memcmp(value + 16, wlj.bss.bssid, 6) ||
++		    fwc_read16(value + 24) != 0 || fwc_read16(value + 26) != 2) { return; }
++		wlj.auth_status = fwc_read16(value + 28);
++		wlj.auth_seen = 1;
++		return;
++	case 0x104:
++		if (wlj.step != WLJ_ASSOC_WAIT || (bssid && !ours)) { return; }
++		value = fwc_attribute(bytes, length, 18, &size);
++		wlj.assoc_status = value && size == 4 ? (int)fwc_read32(value) : 0xffff;
++		wlj.assoc_seen = 1;
++		return;
++	case 0x105:
++		if (bssid && !ours) { return; }
++		value = fwc_attribute(bytes, length, 8, &size);
++		wlj.lost_reason = value && size == 4 ? fwc_read32(value) : 0;
++		wlj.lost = 1;
++		return;
++	case 0x106:
++		value = fwc_attribute(bytes, length, 15, &size);
++		if (wlj.step < WLJ_ASSOC_WAIT || wlj.step >= WLJ_ABORT || !ours || !value || size < 4 ||
++		    size > sizeof(wlj.eapol)) { return; }
++		memcpy(wlj.eapol, value, size);
++		wlj.eapol_length = size;
++		wlj.eapol_ready = 1;
++		return;
++	case 0x10c:
++	case 0x10d:
++		if ((operation == 0x10c && wlj.step == WLJ_AUTH_WAIT) ||
++		    (operation == 0x10d && wlj.step == WLJ_ASSOC_WAIT)) { wlj.timed_out = 1; }
++		return;
++	default:
++		return;
++	}
++}
++
++/* A reply to a request of the join or the link (the reply's status is not OK). */
++static void
++wli_join_refused(unsigned operation, unsigned status)
++{
++	printf("FUXI WIFI IOS: request %u of join step %u refused %u\n", operation, wlj.step, status);
++	if (operation == 6 || wlj.step == WLJ_NONE || wlj.step >= WLJ_ABORT) { return; }
++	if (wlj.step >= WLJ_JOINED) {
++		wlj.lost = 1;
++		return;
++	}
++	if (!wlj.error) { wlj.error = status == 4 ? EAUTH : status == 8 ? ENOENT : wli_status(status); }
++	wlj.step = WLJ_ABORT;
 +}
 +
 +static int
@@ -32625,22 +33609,23 @@ index 0000000..8372cb7
 +			    fwc_read32(value) != wli.power_on || generation < wli.generation ||
 +			    generation - wli.generation > 1) { goto invalid; }
 +			wli.generation = generation;
++			wli_forget();
 +			lck_mtx_lock(&wli_lock);
 +			wli_state.phase = wli.power_on ? FUXI_WIFI_STA_IDLE : FUXI_WIFI_STA_OFF;
 +			wli_bss_count = 0;
 +			lck_mtx_unlock(&wli_lock);
 +			if (wli_input) { wli_input->link_state(false); }
 +			wli_complete(0);
-+		} else {
++		} else if (operation == 0x101 || operation == 0x102) {
 +			if (generation != wli.generation) { goto invalid; }
-+			if (operation == 0x101 || operation == 0x102) {
-+				lck_mtx_lock(&wli_lock);
-+				bool scanning = wli.busy && wli.submitted && wli.operation == 2;
-+				lck_mtx_unlock(&wli_lock);
-+				if (!scanning) { goto invalid; }
-+				if (status) { wli_fail(wli_status(status)); }
-+				if (operation == 0x102) { wli.scan_done = 1; }
-+			}
++			lck_mtx_lock(&wli_lock);
++			bool scanning = wli.busy && wli.submitted && wli.operation == WLI_SCAN && !wli.fetching;
++			lck_mtx_unlock(&wli_lock);
++			if (!scanning) { goto invalid; }
++			if (status) { wli_fail(wli_status(status)); }
++			if (operation == 0x102) { wli.scan_done = 1; }
++		} else if (generation == wli.generation) {
++			wli_join_event(operation, bytes, length);
 +		}
 +		return 0;
 +	}
@@ -32648,6 +33633,14 @@ index 0000000..8372cb7
 +	    fwc_read32(bytes + 12) != wli.pending_sequence ||
 +	    (operation != 1 && generation != wli.generation)) { goto invalid; }
 +	wli.pending_operation = 0;
++	if (operation == 3) {
++		wli_bss_reply(status, bytes, length);
++		return 0;
++	}
++	if (operation >= 4 && operation != 11) {
++		if (status) { wli_join_refused(operation, status); }
++		return 0;
++	}
 +	if (status) {
 +		if (operation == 2) { wli_complete(wli_status(status)); }
 +		else { wli_fail(wli_status(status)); }
@@ -32688,79 +33681,276 @@ index 0000000..8372cb7
 +	return 2;
 +}
 +
-+static size_t
-+wli_put(uint8_t *bytes, size_t offset, unsigned attribute, const void *value, size_t size)
++static void
++wli_join_begin(uint64_t now)
 +{
-+	fwc_write(bytes + offset, attribute, 2);
-+	fwc_write(bytes + offset + 2, size + 4, 2);
-+	if (size) { memcpy(bytes + offset + 4, value, size); }
-+	return offset + ((size + 7u) & ~(size_t)3u);
-+}
-+
-+static int
-+wli_request(unsigned operation)
-+{
-+	uint8_t bytes[352] = {0};
-+	size_t length = 40;
-+	if (operation == 2) {
-+		if (!wli.scan.passive) {
-+			uint8_t ssid[33] = {0};
-+			ssid[0] = wli.scan.ssid_length;
-+			memcpy(ssid + 1, wli.scan.ssid, ssid[0]);
-+			length = wli_put(bytes, length, 19, ssid, sizeof(ssid));
-+		}
-+		if (wli.scan.frequency_count) {
-+			uint8_t frequencies[256];
-+			for (unsigned index = 0; index < wli.scan.frequency_count; index++) {
-+				fwc_write(frequencies + index * 4, wli.scan.frequencies[index], 4);
-+			}
-+			length = wli_put(bytes, length, 20, frequencies, wli.scan.frequency_count * 4);
-+		}
-+	}
-+	if (wli.sequence + 1u == 0) { return EOVERFLOW; }
-+	fwc_write(bytes, 0x3143574e, 4);
-+	fwc_write(bytes + 4, 1, 2);
-+	fwc_write(bytes + 6, 1, 2);
-+	fwc_write(bytes + 8, operation, 2);
-+	fwc_write(bytes + 12, ++wli.sequence, 4);
-+	fwc_write(bytes + 16, length, 4);
-+	fwc_write(bytes + 24, wli.session, 8);
-+	fwc_write(bytes + 32, wli.generation, 8);
-+	wli.pending_sequence = wli.sequence;
-+	wli.pending_operation = operation;
-+	int status = nw_wifi_control_receive(wli.session, length, wla_control_read, bytes);
-+	return wli_status(status);
++	static const uint8_t rsn[] = {
++		48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0
++	};
++	memcpy(wlj.rsn, rsn, sizeof(rsn));
++	wlj.rsn[7] = (uint8_t)(wlj.group & 0xff);
++	memcpy(wlj.wpa.own, wli_backend.station.address, 6);
++	memcpy(wlj.wpa.peer, wlj.bss.bssid, 6);
++	read_random(wlj.wpa.own_nonce, sizeof(wlj.wpa.own_nonce));
++	wlj.wpa.rsn = wlj.rsn;
++	wlj.wpa.rsn_length = sizeof(wlj.rsn);
++	wlj.deadline = now + WLI_JOIN_MS;
++	wlj.step = WLJ_AUTH;
 +}
 +
 +static void
-+wli_cache_scan(void)
++wli_join_stop(int error, const char *why)
 +{
-+	int count = nw_wifi_bss_count();
-+	lck_mtx_lock(&wli_lock);
-+	wli_bss_count = 0;
-+	lck_mtx_unlock(&wli_lock);
-+	for (int index = 0; index < count && index < WLI_BSS_MAX; index++) {
-+		struct nw_bss_info source;
-+		if (nw_wifi_bss_get(index, &source) || source.ssid_len > 32 || source.ie_len > sizeof(source.ie) ||
-+		    source.freq_mhz < 2412 || source.freq_mhz > 5900) { continue; }
-+		lck_mtx_lock(&wli_lock);
-+		struct fuxi_wifi_sta_bss *bss = &wli_bss[wli_bss_count++];
-+		memset(bss, 0, sizeof(*bss));
-+		memcpy(bss->bssid, source.bssid, 6);
-+		memcpy(bss->ssid, source.ssid, source.ssid_len);
-+		bss->ssid_length = source.ssid_len;
-+		bss->frequency = (uint16_t)source.freq_mhz;
-+		bss->rssi = source.signal_dbm;
-+		bss->beacon_interval = source.beacon_int;
-+		bss->capability = source.caps;
-+		bss->age_ms = source.age_ms;
-+		bss->elements_length = source.ie_len;
-+		memcpy(bss->elements, source.ie, source.ie_len);
-+		lck_mtx_unlock(&wli_lock);
++	if (!wlj.error) { wlj.error = error; }
++	printf("FUXI WIFI IOS: join stopped at step %u: %s, error %d\n", wlj.step, why, wlj.error);
++	wlj.step = wlj.lost ? WLJ_FAILED : WLJ_ABORT;
++}
++
++static int
++wli_join_send(unsigned operation)
++{
++	int error = wli_send(operation);
++	if (error) {
++		printf("FUXI WIFI IOS: request %u of join step %u not sent, error %d\n", operation, wlj.step, error);
 +	}
-+	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu\n", wli_bss_count,
-+	    (unsigned long long)wli.generation);
-+	wli_complete(0);
++	return error;
++}
++
++static void
++wli_tx_eapol(unsigned length, bool clear)
++{
++	wli_begin();
++	wli_add(3, wlj.bss.bssid, 6);
++	wli_add(15, wlj.reply, length);
++	wli_put32(40, 0x888e);
++	wli_put32(16, clear);
++	memset(wlj.reply, 0, sizeof(wlj.reply));
++	if (wli_join_send(9) && wlj.step < WLJ_JOINED) { wli_join_stop(EIO, "EAPOL not sent"); }
++}
++
++static void
++wli_set_key(bool pairwise)
++{
++	uint8_t sequence[6] = {0};
++	wli_begin();
++	if (pairwise) {
++		wli_add(3, wlj.bss.bssid, 6);
++		wli_put32(10, 0);
++		wli_put32(11, 1);
++		wli_put32(9, WLI_SUITE(4));
++		wli_add(12, wlj.wpa.pairwise, 16);
++	} else {
++		memcpy(sequence, wlj.wpa.group_counter, sizeof(sequence));
++		wli_put32(10, wlj.wpa.group_index);
++		wli_put32(11, 0);
++		wli_put32(9, wlj.group);
++		wli_add(12, wlj.wpa.group, wlj.wpa.group_length);
++	}
++	wli_add(13, sequence, sizeof(sequence));
++	if (wli_join_send(7)) {
++		if (wlj.step < WLJ_JOINED) { wli_join_stop(EIO, "key not installed"); } else { wlj.lost = 1; }
++	}
++}
++
++/* A message of the four-way or group handshake. */
++static void
++wli_eapol(void)
++{
++	unsigned length = 0;
++	const char *why = "";
++	wlj.eapol_ready = 0;
++	int kind = fuxi_wifi_wpa_message(&wlj.wpa, wlj.eapol, (unsigned)wlj.eapol_length, wlj.reply, &length, &why);
++	memset(wlj.eapol, 0, sizeof(wlj.eapol));
++	if (kind == FUXI_WIFI_WPA_BAD) {
++		printf("FUXI WIFI IOS: EAPOL message at step %u not answered: %s\n", wlj.step, why);
++		return;
++	}
++	if (kind == FUXI_WIFI_WPA_NOTHING) { return; }
++	if (kind == FUXI_WIFI_WPA_ANSWER && wlj.step == WLJ_KEYS_WAIT) {
++		wlj.answered++;
++		printf("FUXI WIFI IOS: handshake message 1 (%u), answering\n", wlj.answered);
++		wli_tx_eapol(length, true);
++	} else if (kind == FUXI_WIFI_WPA_KEYS && wlj.step == WLJ_KEYS_WAIT) {
++		printf("FUXI WIFI IOS: handshake message 3 verified, group key %u of %u bytes\n",
++		    wlj.wpa.group_index, wlj.wpa.group_length);
++		wlj.step = WLJ_PAIRWISE;
++		wli_tx_eapol(length, true);
++	} else if (kind == FUXI_WIFI_WPA_GROUP && wlj.step == WLJ_JOINED) {
++		wlj.rekeys++;
++		printf("FUXI WIFI IOS: group key renewed (%u), index %u\n", wlj.rekeys, wlj.wpa.group_index);
++		wlj.step = WLJ_REKEY;
++		wli_tx_eapol(length, false);
++	} else {
++		printf("FUXI WIFI IOS: EAPOL kind %d at step %u ignored\n", kind, wlj.step);
++		memset(wlj.reply, 0, sizeof(wlj.reply));
++	}
++}
++
++static void
++wli_link_lost(void)
++{
++	unsigned reason = wlj.lost_reason;
++	wli_forget();
++	lck_mtx_lock(&wli_lock);
++	if (wli_state.phase == FUXI_WIFI_STA_JOINED) { wli_state.phase = FUXI_WIFI_STA_IDLE; }
++	wli_state.last_error = ECONNRESET;
++	lck_mtx_unlock(&wli_lock);
++	printf("FUXI WIFI IOS: the network was lost, reason %u\n", reason);
++	if (wli_input) { wli_input->link_state(false); }
++	fuxi_wifi_sta_lost(ECONNRESET);
++}
++
++/* The join and the link, one request at a time; called while no request is pending. */
++static void
++wli_join_step(uint64_t now)
++{
++	if (wlj.step > WLJ_NONE && wlj.step < WLJ_UP && now >= wlj.deadline) {
++		wli_join_stop(wlj.answered ? EAUTH : ETIMEDOUT, "no answer in time");
++	}
++	switch (wlj.step) {
++	case WLJ_AUTH:
++		wli_begin();
++		wli_add(4, wlj.bss.ssid, wlj.bss.ssid_length);
++		wli_add(3, wlj.bss.bssid, 6);
++		wli_put32(5, wlj.bss.frequency);
++		wli_put32(7, 0);
++		wlj.step = WLJ_AUTH_WAIT;
++		if (wli_join_send(4)) { wli_join_stop(EIO, "authentication not sent"); }
++		return;
++	case WLJ_AUTH_WAIT:
++		if (wlj.auth_seen) {
++			if (wlj.auth_status) {
++				printf("FUXI WIFI IOS: authentication status %d\n", wlj.auth_status);
++				wli_join_stop(ECONNREFUSED, "authentication refused");
++			} else {
++				wlj.step = WLJ_ASSOC;
++			}
++		} else if (wlj.timed_out || wlj.lost) {
++			wli_join_stop(wlj.timed_out ? ETIMEDOUT : ECONNREFUSED, "authentication failed");
++		}
++		return;
++	case WLJ_ASSOC: {
++		bool secure = wlj.security == FUXI_WIFI_STA_WPA2_PSK;
++		wli_begin();
++		wli_add(4, wlj.bss.ssid, wlj.bss.ssid_length);
++		wli_add(3, wlj.bss.bssid, 6);
++		wli_put32(5, wlj.bss.frequency);
++		if (secure) { wli_add(6, wlj.rsn, sizeof(wlj.rsn)); }
++		wli_put32(34, secure ? WLI_SUITE(4) : 0);
++		wli_put32(35, secure ? wlj.group : 0);
++		wli_put32(36, secure ? WLI_SUITE(2) : 0);
++		wli_put32(37, 0);
++		wlj.step = WLJ_ASSOC_WAIT;
++		if (wli_join_send(5)) { wli_join_stop(EIO, "association not sent"); }
++		return;
++	}
++	case WLJ_ASSOC_WAIT:
++		if (wlj.assoc_seen) {
++			if (wlj.assoc_status) {
++				printf("FUXI WIFI IOS: association status %d\n", wlj.assoc_status);
++				wli_join_stop(ECONNREFUSED, "association refused");
++			} else {
++				printf("FUXI WIFI IOS: associated\n");
++				wlj.step = wlj.security == FUXI_WIFI_STA_WPA2_PSK ? WLJ_KEYS_WAIT : WLJ_PORT;
++				if (wlj.eapol_ready && wlj.step == WLJ_KEYS_WAIT) { wli_eapol(); }
++			}
++		} else if (wlj.timed_out || wlj.lost) {
++			wli_join_stop(wlj.timed_out ? ETIMEDOUT : ECONNREFUSED, "association failed");
++		}
++		return;
++	case WLJ_KEYS_WAIT:
++		if (wlj.eapol_ready) {
++			wli_eapol();
++		} else if (wlj.lost) {
++			printf("FUXI WIFI IOS: access point left during the handshake, reason %u\n", wlj.lost_reason);
++			wli_join_stop(wlj.answered ? EAUTH : ECONNRESET, "handshake failed");
++		}
++		return;
++	case WLJ_PAIRWISE:
++		if (wlj.lost) { wli_join_stop(EAUTH, "lost before the keys"); return; }
++		wlj.step = WLJ_GROUP;
++		wli_set_key(true);
++		return;
++	case WLJ_GROUP:
++		if (wlj.lost) { wli_join_stop(ECONNRESET, "lost before the group key"); return; }
++		wlj.step = WLJ_PORT;
++		wli_set_key(false);
++		return;
++	case WLJ_PORT:
++		if (wlj.lost) { wli_join_stop(ECONNRESET, "lost before the port"); return; }
++		wli_begin();
++		wli_put32(14, 1);
++		wlj.step = WLJ_OPERSTATE;
++		if (wli_join_send(8)) { wli_join_stop(EIO, "port not opened"); }
++		return;
++	case WLJ_OPERSTATE:
++		if (wlj.lost) { wli_join_stop(ECONNRESET, "lost before the link"); return; }
++		wli_begin();
++		wli_put32(32, 1);
++		wlj.step = WLJ_UP;
++		if (wli_join_send(10)) { wli_join_stop(EIO, "link not up"); }
++		return;
++	case WLJ_UP:
++		if (wlj.lost) { wli_join_stop(ECONNRESET, "lost as the link came up"); return; }
++		wlj.step = WLJ_JOINED;
++		wlj.joined = 1;
++		memset(wlj.wpa.pmk, 0, sizeof(wlj.wpa.pmk));
++		__atomic_store_n(&wli_link, 1, __ATOMIC_RELEASE);
++		lck_mtx_lock(&wli_lock);
++		wli_state.phase = FUXI_WIFI_STA_JOINED;
++		wli_state.bss = wlj.bss;
++		wli_state.security = wlj.security;
++		lck_mtx_unlock(&wli_lock);
++		printf("FUXI WIFI IOS: joined at %u MHz\n", wlj.bss.frequency);
++		if (wli_input) { wli_input->link_state(true); }
++		wli_complete(0);
++		return;
++	case WLJ_JOINED:
++		if (wlj.leaving) {
++			wli_begin();
++			wli_add(3, wlj.bss.bssid, 6);
++			wli_put32(8, 3);
++			wlj.step = WLJ_LEAVE_WAIT;
++			__atomic_store_n(&wli_link, 0, __ATOMIC_RELEASE);
++			(void)wli_join_send(6);
++		} else if (wlj.lost) {
++			wli_link_lost();
++		} else if (wlj.eapol_ready) {
++			wli_eapol();
++		}
++		return;
++	case WLJ_REKEY:
++		wlj.step = WLJ_JOINED;
++		wli_set_key(false);
++		return;
++	case WLJ_ABORT:
++		wli_begin();
++		wli_add(3, wlj.bss.bssid, 6);
++		wli_put32(8, 3);
++		wlj.step = WLJ_FAILED;
++		(void)wli_join_send(6);
++		return;
++	case WLJ_FAILED: {
++		int error = wlj.error ? wlj.error : EIO;
++		wli_forget();
++		lck_mtx_lock(&wli_lock);
++		if (wli_state.phase == FUXI_WIFI_STA_JOINING) { wli_state.phase = FUXI_WIFI_STA_IDLE; }
++		lck_mtx_unlock(&wli_lock);
++		wli_complete(error);
++		return;
++	}
++	case WLJ_LEAVE_WAIT:
++		wli_forget();
++		lck_mtx_lock(&wli_lock);
++		if (wli_state.phase == FUXI_WIFI_STA_JOINED) { wli_state.phase = FUXI_WIFI_STA_IDLE; }
++		lck_mtx_unlock(&wli_lock);
++		printf("FUXI WIFI IOS: left the network\n");
++		if (wli_input) { wli_input->link_state(false); }
++		wli_complete(0);
++		return;
++	default:
++		return;
++	}
 +}
 +
 +static int
@@ -32801,14 +33991,63 @@ index 0000000..8372cb7
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
 +
++/*
++ * fuxiwifitest=2: join the network named by fuxiwifitestssid with a made-up passphrase. The
++ * radio path is proved when authentication and association succeed, message 1 is answered,
++ * and the access point turns the made-up key away (EAUTH). No real key is ever used here.
++ */
++static struct fuxi_wifi_sta_join wli_test_join;
++
++static void
++wli_test_join_thread(void *context, wait_result_t result)
++{
++	(void)context;
++	(void)result;
++	static const char dummy[] = "fuxi-selftest-not-a-key";
++	wl_sleep(15000);
++	int error = wli_test_wait();
++	if (!error && !fuxi_wifi_sta_powered()) {
++		error = fuxi_wifi_sta_ask_power(true);
++		if (!error) { error = wli_test_wait(); }
++	}
++	wli_test_join.security = FUXI_WIFI_STA_WPA2_PSK;
++	wli_test_join.passphrase_length = sizeof(dummy) - 1;
++	memcpy(wli_test_join.passphrase, dummy, sizeof(dummy) - 1);
++	if (!error) { error = fuxi_wifi_sta_ask_join(&wli_test_join); }
++	if (!error) { error = wli_test_wait(); }
++	lck_mtx_lock(&wli_lock);
++	int last = wli_state.last_error;
++	unsigned phase = wli_state.phase;
++	lck_mtx_unlock(&wli_lock);
++	printf("FUXI WIFI IOS: selftest join with a made-up key: wait %d, join error %d, phase %u (%s)\n",
++	    error, last, phase, !error && last == EAUTH ? "PASS: key refused by the access point" : "see above");
++	if (phase == FUXI_WIFI_STA_JOINED) { (void)fuxi_wifi_sta_ask_leave(); }
++	memset(&wli_test_join, 0, sizeof(wli_test_join));
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
 +static void
 +wli_test_start(void)
 +{
 +	int test = 0;
 +	PE_parse_boot_argn("fuxiwifitest", &test, sizeof(test));
++	thread_t thread;
 +	if (test == 1) {
-+		thread_t thread;
 +		if (kernel_thread_start(wli_test_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	} else if (test == 2) {
++		char name[33];
++		memset(name, 0, sizeof(name));
++		if (!PE_parse_boot_argn("fuxiwifitestssid", name, sizeof(name) - 1) || !name[0]) {
++			printf("FUXI WIFI IOS: selftest join needs fuxiwifitestssid\n");
++			return;
++		}
++		memset(&wli_test_join, 0, sizeof(wli_test_join));
++		wli_test_join.ssid_length = (uint8_t)strlen(name);
++		memcpy(wli_test_join.ssid, name, wli_test_join.ssid_length);
++		if (kernel_thread_start(wli_test_join_thread, NULL, &thread) == KERN_SUCCESS) {
 +			thread_deallocate(thread);
 +		}
 +	}
@@ -32844,31 +34083,75 @@ index 0000000..8372cb7
 +		wli.published = 1;
 +		lck_mtx_unlock(&wli_lock);
 +		if (!fuxi_wifi_ios_attach(&wli_backend)) { return ENXIO; }
-+		printf("FUXI WIFI IOS: native backend published channels %u; power/scan ready, association unavailable\n",
-+		    wli_channel_count);
++		nw_wifi_set_events(&wli_events);
++		printf("FUXI WIFI IOS: native backend published channels %u; power/scan/join ready "
++		    "(open, WPA2-PSK CCMP; full scan elements)\n", wli_channel_count);
 +		wli_test_start();
 +	}
 +	lck_mtx_lock(&wli_lock);
 +	bool begin = wli.busy && !wli.submitted;
 +	unsigned operation = wli.operation, power_on = wli.power_on;
++	bool leave_now = false;
 +	if (begin) {
 +		wli.submitted = 1;
 +		wli.deadline = now + 30000;
-+		wli.scan_accepted = wli.scan_done = 0;
-+		if (operation == 2) { wli_state.phase = FUXI_WIFI_STA_SCANNING; wli_bss_count = 0; }
++		wli.scan_accepted = wli.scan_done = wli.fetching = 0;
++		if (operation == WLI_SCAN) {
++			if (wli_state.phase == FUXI_WIFI_STA_IDLE) { wli_state.phase = FUXI_WIFI_STA_SCANNING; }
++			wli_bss_count = 0;
++		} else if (operation == WLI_JOIN) {
++			memset(&wlj, 0, sizeof(wlj));
++			wlj.bss = wli_target.bss;
++			memcpy(wlj.wpa.pmk, wli_target.pmk, sizeof(wlj.wpa.pmk));
++			wlj.security = (unsigned)wli_target.security;
++			wlj.group = wli_target.group;
++			memset(&wli_target, 0, sizeof(wli_target));
++			wli_state.phase = FUXI_WIFI_STA_JOINING;
++			wli_state.bss = wlj.bss;
++			wli_state.security = (int)wlj.security;
++			wli_state.last_error = 0;
++		} else if (operation == WLI_LEAVE) {
++			leave_now = wlj.step != WLJ_JOINED && wlj.step != WLJ_REKEY;
++			wlj.leaving = 1;
++		}
 +	}
 +	bool busy = wli.busy;
 +	lck_mtx_unlock(&wli_lock);
 +	if (begin) {
-+		if (operation == 1) {
++		if (operation == WLI_POWER) {
 +			wli.power_waiting = 1;
 +			nw_wifi_power(power_on);
-+		} else {
++		} else if (operation == WLI_SCAN) {
 +			int error = wli_request(2);
 +			if (error) { return error; }
++		} else if (operation == WLI_JOIN) {
++			wli_join_begin(now);
++		} else if (leave_now) {
++			wli_forget();
++			wli_complete(0);
++			busy = false;
 +		}
 +	}
-+	if (busy && operation == 2 && wli.scan_accepted && wli.scan_done) { wli_cache_scan(); }
++	if (busy && operation == WLI_SCAN && wli.scan_accepted && wli.scan_done && !wli.fetching) {
++		wli.fetching = 1;
++		wli.fetch_index = 0;
++		wli.diag_lines = 0;
++	}
++	if (!wli.pending_operation) {
++		if (wli.fetching) {
++			int error = wli_request(3);
++			if (error) {
++				printf("FUXI WIFI IOS: GET_BSS not sent, error %d; module records instead\n", error);
++				wli.fetching = 0;
++				wli_cache_scan();
++			}
++		} else if (wlj.step != WLJ_NONE) {
++			wli_join_step(now);
++		}
++	}
++	lck_mtx_lock(&wli_lock);
++	busy = wli.busy;
++	lck_mtx_unlock(&wli_lock);
 +	if (busy && now >= wli.deadline) { return ETIMEDOUT; }
 +	return 0;
 +}
@@ -33035,7 +34318,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..2a8bf9f 100644
+index d21bf85..3fdff64 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -33506,7 +34789,7 @@ index d21bf85..2a8bf9f 100644
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,1267 @@
+@@ -5899,3 +6092,2091 @@
  + }
  + r[3] = 0;
  +}
@@ -33646,7 +34929,7 @@ index d21bf85..2a8bf9f 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ath12k.h
-+@@ -0,0 +1,95 @@
++@@ -0,0 +1,109 @@
 ++#ifndef FUXI_WLAN_ATH12K_H
 ++#define FUXI_WLAN_ATH12K_H
 ++#include <stdint.h>
@@ -33699,7 +34982,21 @@ index d21bf85..2a8bf9f 100644
 ++	int (*send)(void *context, uint64_t session, const void *bytes, size_t length);
 ++	void (*wake)(void *context);
 ++};
+++struct nw_wifi_status;
+++/* Frames for the host stack: with only rx set, the module hands over each frame whole, on its worker. */
+++struct nw_wifi_events {
+++	void (*scan_done)(void);
+++	void (*connect_done)(int result);
+++	void (*link_lost)(int reason);
+++	void (*rx)(const uint8_t *eth, size_t length);
+++	void (*rx_flush)(void);
+++	void (*rx_packet)(void *context, size_t length, int (*reader)(void *, size_t, void *, size_t));
+++	void (*link_update)(const struct nw_wifi_status *status);
+++};
 ++extern void nw_wifi_set_platform(const struct lx_platform *);
+++extern void nw_wifi_set_events(const struct nw_wifi_events *);
+++/* 0: queued (copied); only while the port opened by SET_PORT is up. 14..2000 bytes, Ethernet framed. */
+++extern int nw_wifi_tx(const uint8_t *, size_t);
 ++extern int nw_wifi_control_transport_set(const struct nw_control_transport *);
 ++extern int nw_wifi_control_attach(uint64_t *);
 ++extern int nw_wifi_control_receive(uint64_t, size_t, int (*)(void *, void *, size_t), void *);
@@ -33744,7 +35041,7 @@ index d21bf85..2a8bf9f 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ath12k.inc
-+@@ -0,0 +1,429 @@
++@@ -0,0 +1,434 @@
 ++#include "fuxi_wlan_arena.h"
 ++#include "fuxi_wlan_ath12k.h"
 ++#include "fuxi_wlan_control.h"
@@ -34109,10 +35406,12 @@ index d21bf85..2a8bf9f 100644
 ++	int error = nw_wifi_start(&platform, &board);
 ++	bool attached = false, completed = false;
 ++	uint64_t started = wla_now_ms(), report = started;
+++	unsigned spins = 0;
 ++	while (!error && !fw_faults && !wla_failed && !wla_control.error &&
 ++	    ((ios && wli.published) || wla_now_ms() - started < 90000)) {
 ++		wla_control_awake = 0;
-++		(void)nw_wifi_step();
+++		/* nonzero while frames move: go round again without sleeping, but not for ever */
+++		int moving = nw_wifi_step();
 ++		uint64_t now = wla_now_ms();
 ++		if (!attached && nw_wifi_stats.stage >= 4) {
 ++			error = nw_wifi_control_attach(ios ? &wli.session : &wla_control.session);
@@ -34143,7 +35442,10 @@ index d21bf85..2a8bf9f 100644
 ++			    nw_wifi_stats.scans, nw_wifi_stats.bss_seen, nw_wifi_stats.last_err);
 ++			if (wl_smmu_fault(0) || wl_rc_check()) { error = -1; break; }
 ++		}
-++		if (!wla_control_awake) { wl_sleep(1); }
+++		if (!wla_control_awake && (!moving || ++spins >= 64)) {
+++			spins = 0;
+++			wl_sleep(1);
+++		}
 ++	}
 ++	if (ios) { wli_fail(error ? error : EIO); }
 ++	if (!error && wla_control.error) {
@@ -34341,13 +35643,55 @@ index d21bf85..2a8bf9f 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ios.inc
-+@@ -0,0 +1,432 @@
++@@ -0,0 +1,1237 @@
 ++#include <sys/fuxi_wifi_ios.h>
+++#include <sys/fuxi_wifi_wpa.h>
 ++#include <sys/errno.h>
+++#include <sys/random.h>
 ++#include <kern/locks.h>
+++
+++/*
+++ * The iOS station over the pinned ath12k module's cfg80211 control channel.
+++ *
+++ * Every control request, reply and event is handled on the WLAN worker thread (wl_ath_run): the
+++ * replies and events reach wli_receive() from inside nw_wifi_step()/nw_wifi_control_receive().
+++ * Callers on the station thread hand one operation at a time to the worker through wli_submit()
+++ * and sleep until it is over. The join state (wlj) and the request buffer are the worker's alone.
+++ *
+++ * Joining: AUTHENTICATE, ASSOCIATE with our own RSN element, the four-way handshake in
+++ * fuxi_wifi_wpa.c over RX_EAPOL/TX_EAPOL, the pairwise and group keys, then the port. Only
+++ * WPA2-Personal (AKM 00-0F-AC:2, pairwise CCMP) and open networks; a network that requires
+++ * management frame protection or offers only SAE (WPA3) is refused with EOPNOTSUPP.
+++ * Neither keys, passphrases nor EAPOL payloads are ever logged.
+++ */
 ++
 ++#define WLI_BSS_MAX 128
 ++#define WLI_CHANNEL_MAX 96
+++#define WLI_REQUEST_MOST 1536
+++#define WLI_EAPOL_MOST 1024
+++#define WLI_JOIN_MS 20000
+++#define WLI_FRESH_MS 20000
+++#define WLI_DIAG_SCANS 2
+++#define WLI_DIAG_LINES 48
+++
+++enum { WLI_POWER = 1, WLI_SCAN, WLI_JOIN, WLI_LEAVE };
+++enum {
+++	WLJ_NONE, WLJ_AUTH, WLJ_AUTH_WAIT, WLJ_ASSOC, WLJ_ASSOC_WAIT, WLJ_KEYS_WAIT,
+++	WLJ_PAIRWISE, WLJ_GROUP, WLJ_PORT, WLJ_OPERSTATE, WLJ_UP, WLJ_JOINED, WLJ_REKEY,
+++	WLJ_ABORT, WLJ_FAILED, WLJ_LEAVE_WAIT
+++};
+++#define WLI_SUITE(type) (0x000fac00u | (type))
+++
+++struct wli_target {
+++	struct fuxi_wifi_sta_bss bss;
+++	uint8_t pmk[32];
+++	int security;
+++	uint32_t group;
+++};
+++
+++struct wli_rsn {
+++	unsigned present, complete, group, pairwise, akm, caps;
+++};
 ++
 ++static LCK_GRP_DECLARE(wli_group, "fuxi-wlan-ios");
 ++static LCK_MTX_DECLARE(wli_lock, &wli_group);
@@ -34358,13 +35702,38 @@ index d21bf85..2a8bf9f 100644
 ++static struct fuxi_wifi_sta_channel wli_channels[WLI_CHANNEL_MAX];
 ++static unsigned wli_bss_count, wli_channel_count;
 ++static struct {
-++	uint64_t session, generation, deadline;
+++	uint64_t session, generation, deadline, scanned_at;
 ++	uint32_t sequence, pending_sequence;
 ++	unsigned pending_operation, info, channels, published, busy, submitted;
 ++	unsigned operation, power_on, power_waiting, scan_accepted, scan_done;
+++	unsigned fetching, fetch_index, scan_reports, diag_lines;
 ++	int result, fatal;
 ++	struct fuxi_wifi_sta_scan scan;
 ++} wli;
+++/* What a join asks for: written by wli_submit() under wli_lock, taken by the worker when it begins. */
+++static struct wli_target wli_target;
+++/* The station thread's own copy while it prepares a join (join() calls never overlap). */
+++static struct wli_target wli_asked;
+++/* Frames may pass: set by the worker, read by the transmit path. */
+++static unsigned wli_link;
+++/* The join and the link: the worker's alone. */
+++static struct {
+++	struct fuxi_wifi_sta_bss bss;
+++	struct fuxi_wifi_wpa wpa;
+++	uint8_t rsn[22];
+++	uint64_t deadline;
+++	uint32_t group;
+++	unsigned step, security, joined, leaving, answered, auth_seen, assoc_seen, timed_out;
+++	unsigned lost, lost_reason, eapol_ready, rekeys;
+++	int auth_status, assoc_status, error;
+++	size_t eapol_length;
+++	uint8_t eapol[WLI_EAPOL_MOST];
+++	uint8_t reply[FUXI_WIFI_WPA_REPLY_MOST];
+++} wlj;
+++static struct fuxi_wifi_sta_bss wli_fetched;
+++static uint8_t wli_out[WLI_REQUEST_MOST];
+++static size_t wli_out_length;
+++static unsigned wli_out_overflow;
 ++
 ++static int
 ++wli_status(unsigned status)
@@ -34381,14 +35750,24 @@ index d21bf85..2a8bf9f 100644
 ++	wli.result = error;
 ++	wli_state.last_error = error;
 ++	if (wli_state.phase == FUXI_WIFI_STA_SCANNING) { wli_state.phase = FUXI_WIFI_STA_IDLE; }
-++	wli.busy = wli.submitted = wli.power_waiting = 0;
+++	wli.busy = wli.submitted = wli.power_waiting = wli.fetching = 0;
 ++	lck_mtx_unlock(&wli_lock);
 ++	thread_wakeup((event_t)&wli.busy);
+++}
+++
+++/* Forget the join and the keys; the radio side is not told (callers do that first, if needed). */
+++static void
+++wli_forget(void)
+++{
+++	__atomic_store_n(&wli_link, 0, __ATOMIC_RELEASE);
+++	memset(&wlj, 0, sizeof(wlj));
 ++}
 ++
 ++static void
 ++wli_fail(int error)
 ++{
+++	bool linked = wlj.joined;
+++	wli_forget();
 ++	lck_mtx_lock(&wli_lock);
 ++	wli.fatal = error;
 ++	wli_state.phase = FUXI_WIFI_STA_OFF;
@@ -34396,10 +35775,11 @@ index d21bf85..2a8bf9f 100644
 ++	lck_mtx_unlock(&wli_lock);
 ++	wli_complete(error);
 ++	if (wli_input) { wli_input->link_state(false); }
+++	if (linked) { fuxi_wifi_sta_lost(error); }
 ++}
 ++
 ++static int
-++wli_submit(unsigned operation, bool on, const struct fuxi_wifi_sta_scan *scan)
+++wli_submit(unsigned operation, bool on, const struct fuxi_wifi_sta_scan *scan, const struct wli_target *target)
 ++{
 ++	lck_mtx_lock(&wli_lock);
 ++	if (wli.fatal || !wli.published || wli.busy) {
@@ -34410,6 +35790,7 @@ index d21bf85..2a8bf9f 100644
 ++	wli.operation = operation;
 ++	wli.power_on = on;
 ++	if (scan) { wli.scan = *scan; }
+++	if (target) { wli_target = *target; }
 ++	wli.busy = 1;
 ++	wli.submitted = 0;
 ++	wli.result = EINPROGRESS;
@@ -34433,7 +35814,7 @@ index d21bf85..2a8bf9f 100644
 ++static int
 ++wli_power(bool on)
 ++{
-++	return wli_submit(1, on, NULL);
+++	return wli_submit(WLI_POWER, on, NULL, NULL);
 ++}
 ++
 ++static int
@@ -34442,7 +35823,7 @@ index d21bf85..2a8bf9f 100644
 ++	if (!scan || scan->ssid_length > 32 || scan->frequency_count > 64 ||
 ++	    (scan->passive && scan->ssid_length)) { return EINVAL; }
 ++	if (scan->dwell_ms) { return EOPNOTSUPP; }
-++	return wli_submit(2, false, scan);
+++	return wli_submit(WLI_SCAN, false, scan, NULL);
 ++}
 ++
 ++static void
@@ -34459,21 +35840,140 @@ index d21bf85..2a8bf9f 100644
 ++	}
 ++}
 ++
-++static int
-++wli_join(const struct fuxi_wifi_sta_join *join)
+++/* The RSN element of a list of elements: what it offers, as bit masks of 00-0F-AC suite types. */
+++static void
+++wli_rsn_parse(const uint8_t *elements, size_t length, struct wli_rsn *rsn)
 ++{
-++	(void)join;
+++	memset(rsn, 0, sizeof(*rsn));
+++	for (size_t at = 0; at + 2 <= length && at + 2 + elements[at + 1] <= length; at += 2 + elements[at + 1]) {
+++		if (elements[at] != 48) { continue; }
+++		const uint8_t *body = elements + at + 2;
+++		size_t size = elements[at + 1], position = 6;
+++		rsn->present = 1;
+++		if (size < 6 || body[0] != 1 || body[1] != 0) { return; }
+++		rsn->group = body[2] == 0 && body[3] == 0x0f && body[4] == 0xac ? body[5] : 0xff;
+++		for (unsigned list = 0; list < 2; list++) {
+++			if (position + 2 > size) { return; }
+++			unsigned count = body[position] | (unsigned)body[position + 1] << 8;
+++			position += 2;
+++			if (count > 16 || position + 4 * count > size) { return; }
+++			for (unsigned index = 0; index < count; index++, position += 4) {
+++				const uint8_t *suite = body + position;
+++				if (suite[0] || suite[1] != 0x0f || suite[2] != 0xac || suite[3] >= 32) { continue; }
+++				if (list) { rsn->akm |= 1u << suite[3]; } else { rsn->pairwise |= 1u << suite[3]; }
+++			}
+++		}
+++		if (position + 2 <= size) { rsn->caps = body[position] | (unsigned)body[position + 1] << 8; }
+++		rsn->complete = 1;
+++		return;
+++	}
+++}
+++
+++/* Whether a join of this kind can be made to this network; its group cipher on success. */
+++static int
+++wli_security(const struct fuxi_wifi_sta_bss *bss, int security, uint32_t *group)
+++{
+++	struct wli_rsn rsn;
+++	wli_rsn_parse(bss->elements, bss->elements_length, &rsn);
+++	*group = 0;
+++	if (security == FUXI_WIFI_STA_OPEN) {
+++		return rsn.present || (bss->capability & 0x10) ? EINVAL : 0;
+++	}
+++	if (!rsn.present) { return (bss->capability & 0x10) ? EOPNOTSUPP : EINVAL; }
+++	if (!rsn.complete || !(rsn.pairwise & (1u << 4)) || !(rsn.akm & (1u << 2)) ||
+++	    (rsn.group != 4 && rsn.group != 2) || (rsn.caps & 0x40)) { return EOPNOTSUPP; }
+++	*group = WLI_SUITE(rsn.group);
+++	return 0;
+++}
+++
+++/* The access point to join: the given one, or the one of that name heard best. */
+++static int
+++wli_pick(const struct fuxi_wifi_sta_join *join, struct wli_target *target)
+++{
+++	static const uint8_t none[6];
+++	bool given = memcmp(join->bssid, none, 6) != 0;
+++	int best = -1;
 ++	lck_mtx_lock(&wli_lock);
-++	wli_state.last_error = EOPNOTSUPP;
+++	uint64_t age = wla_now_ms() - wli.scanned_at;
+++	for (unsigned index = 0; index < wli_bss_count; index++) {
+++		const struct fuxi_wifi_sta_bss *bss = &wli_bss[index];
+++		if (bss->ssid_length != join->ssid_length || memcmp(bss->ssid, join->ssid, join->ssid_length) ||
+++		    (given && memcmp(bss->bssid, join->bssid, 6))) { continue; }
+++		if (best < 0 || bss->rssi > wli_bss[best].rssi) { best = (int)index; }
+++	}
+++	int error = best < 0 ? ENOENT : age + wli_bss[best].age_ms > WLI_FRESH_MS ? ESTALE : 0;
+++	if (!error) { target->bss = wli_bss[best]; }
 ++	lck_mtx_unlock(&wli_lock);
-++	return EOPNOTSUPP;
+++	return error;
+++}
+++
+++static void
+++wli_note_error(int error)
+++{
+++	lck_mtx_lock(&wli_lock);
+++	wli_state.last_error = error;
+++	lck_mtx_unlock(&wli_lock);
 ++}
 ++
 ++static int
 ++wli_leave(void)
 ++{
+++	lck_mtx_lock(&wli_lock);
+++	bool off = wli_state.phase == FUXI_WIFI_STA_OFF;
+++	lck_mtx_unlock(&wli_lock);
+++	int error = off ? 0 : wli_submit(WLI_LEAVE, false, NULL, NULL);
 ++	if (wli_input) { wli_input->link_state(false); }
-++	return 0;
+++	return error;
+++}
+++
+++static int
+++wli_join(const struct fuxi_wifi_sta_join *join)
+++{
+++	if (!join || !join->ssid_length || join->ssid_length > 32 ||
+++	    (join->security != FUXI_WIFI_STA_OPEN && join->security != FUXI_WIFI_STA_WPA2_PSK) ||
+++	    (join->passphrase_length && (join->passphrase_length < 8 || join->passphrase_length > 63))) {
+++		wli_note_error(EINVAL);
+++		return EINVAL;
+++	}
+++	lck_mtx_lock(&wli_lock);
+++	enum fuxi_wifi_sta_phase phase = wli_state.phase;
+++	lck_mtx_unlock(&wli_lock);
+++	if (phase == FUXI_WIFI_STA_OFF) {
+++		wli_note_error(ENETDOWN);
+++		return ENETDOWN;
+++	}
+++	if (phase == FUXI_WIFI_STA_JOINED || phase == FUXI_WIFI_STA_JOINING) { (void)wli_leave(); }
+++	struct wli_target *target = &wli_asked;
+++	memset(target, 0, sizeof(*target));
+++	target->security = join->security;
+++	if (join->security == FUXI_WIFI_STA_WPA2_PSK) {
+++		if (join->passphrase_length) {
+++			fuxi_wifi_wpa_pmk(join->passphrase, join->passphrase_length, join->ssid, join->ssid_length,
+++			    target->pmk);
+++		} else {
+++			memcpy(target->pmk, join->pmk, sizeof(target->pmk));
+++		}
+++	}
+++	int error = wli_pick(join, target);
+++	if (error == ENOENT || error == ESTALE) {
+++		struct fuxi_wifi_sta_scan scan;
+++		memset(&scan, 0, sizeof(scan));
+++		memcpy(scan.ssid, join->ssid, join->ssid_length);
+++		scan.ssid_length = join->ssid_length;
+++		printf("FUXI WIFI IOS: join needs a fresh scan (%s)\n", error == ENOENT ? "not heard" : "too old");
+++		error = wli_submit(WLI_SCAN, false, &scan, NULL);
+++		if (!error) { error = wli_pick(join, target); }
+++	}
+++	if (!error) { error = wli_security(&target->bss, join->security, &target->group); }
+++	if (!error) {
+++		printf("FUXI WIFI IOS: join %s at %u MHz %d dBm\n",
+++		    join->security == FUXI_WIFI_STA_OPEN ? "open" : "WPA2-PSK", target->bss.frequency, target->bss.rssi);
+++		error = wli_submit(WLI_JOIN, false, NULL, target);
+++	}
+++	memset(target, 0, sizeof(*target));
+++	if (error) { wli_note_error(error); }
+++	printf("FUXI WIFI IOS: join finished %d\n", error);
+++	return error;
 ++}
 ++
 ++static void
@@ -34497,15 +35997,323 @@ index d21bf85..2a8bf9f 100644
 ++static bool
 ++wli_tx(const uint8_t *frame, size_t length)
 ++{
-++	(void)frame;
-++	(void)length;
-++	return false;
+++	return frame && length >= 14 && length <= 2000 && __atomic_load_n(&wli_link, __ATOMIC_ACQUIRE) &&
+++	       nw_wifi_tx(frame, length) == 0;
 ++}
+++
+++/* A frame from the radio for the host stack, on the worker thread: Ethernet header and payload. */
+++static void
+++wli_rx(const uint8_t *frame, size_t length)
+++{
+++	if (frame && length >= 14 && __atomic_load_n(&wli_link, __ATOMIC_ACQUIRE) && wli_input) {
+++		wli_input->rx_frame(frame, length);
+++	}
+++}
+++
+++static const struct nw_wifi_events wli_events = { .rx = wli_rx };
 ++
 ++static void
 ++wli_start(const struct fuxi_wifi_input *input)
 ++{
 ++	wli_input = input;
+++}
+++
+++/* Elements an iOS scan record cannot do without; the rest is kept while there is room. */
+++static bool
+++wli_essential(const uint8_t *element)
+++{
+++	switch (element[0]) {
+++	case 0: case 1: case 3: case 5: case 7: case 11: case 45: case 48: case 50: case 61: case 127:
+++	case 191: case 192:
+++		return true;
+++	case 221:
+++		return element[1] >= 4 && element[2] == 0x00 && element[3] == 0x50 && element[4] == 0xf2 &&
+++		       (element[5] == 1 || element[5] == 2);
+++	case 255:
+++		return element[1] >= 1 && (element[2] == 35 || element[2] == 36);
+++	default:
+++		return false;
+++	}
+++}
+++
+++/* Copy whole elements only, in their order, at most FUXI_WIFI_STA_ELEMENTS_MOST bytes. */
+++static unsigned
+++wli_trim(const uint8_t *elements, size_t length, struct fuxi_wifi_sta_bss *bss)
+++{
+++	size_t whole = 0, needed = 0, out = 0;
+++	unsigned dropped = 0;
+++	for (size_t at = 0; at + 2 <= length && at + 2 + elements[at + 1] <= length; at += 2 + elements[at + 1]) {
+++		whole = at + 2 + elements[at + 1];
+++		if (wli_essential(elements + at)) { needed += 2 + elements[at + 1]; }
+++	}
+++	size_t spare = needed < FUXI_WIFI_STA_ELEMENTS_MOST ? FUXI_WIFI_STA_ELEMENTS_MOST - needed : 0;
+++	for (size_t at = 0; at < whole; at += 2 + elements[at + 1]) {
+++		size_t size = 2 + elements[at + 1];
+++		if (!wli_essential(elements + at)) {
+++			if (size > spare) { dropped++; continue; }
+++			spare -= size;
+++		}
+++		if (out + size > FUXI_WIFI_STA_ELEMENTS_MOST) { dropped++; continue; }
+++		memcpy(bss->elements + out, elements + at, size);
+++		out += size;
+++		if (elements[at] == 0 && elements[at + 1] <= 32 && !bss->ssid_length) {
+++			memcpy(bss->ssid, elements + at + 2, elements[at + 1]);
+++			bss->ssid_length = elements[at + 1];
+++		}
+++	}
+++	bss->elements_length = (uint16_t)out;
+++	return dropped + (whole < length);
+++}
+++
+++static void
+++wli_diag(const struct fuxi_wifi_sta_bss *bss, size_t heard, unsigned dropped)
+++{
+++	if (wli.scan_reports >= WLI_DIAG_SCANS || wli.diag_lines >= WLI_DIAG_LINES) { return; }
+++	wli.diag_lines++;
+++	struct wli_rsn rsn;
+++	wli_rsn_parse(bss->elements, bss->elements_length, &rsn);
+++	char name[33];
+++	for (unsigned index = 0; index < bss->ssid_length; index++) {
+++		uint8_t character = bss->ssid[index];
+++		name[index] = character >= 0x20 && character < 0x7f && character != '"' ? (char)character : '?';
+++	}
+++	name[bss->ssid_length] = 0;
+++	printf("FUXI WIFI IOS: heard %u MHz %d dBm cap %#x IE %u kept %u dropped %u RSN %u akm %#x pairwise %#x "
+++	    "group %u caps %#x \"%s\"\n", bss->frequency, bss->rssi, bss->capability, (unsigned)heard,
+++	    bss->elements_length, dropped, rsn.present, rsn.akm, rsn.pairwise, rsn.group, rsn.caps, name);
+++}
+++
+++/* The module's own (truncated) records: only when GET_BSS fails. */
+++static void
+++wli_cache_scan(void)
+++{
+++	int count = nw_wifi_bss_count();
+++	lck_mtx_lock(&wli_lock);
+++	wli_bss_count = 0;
+++	lck_mtx_unlock(&wli_lock);
+++	for (int index = 0; index < count && index < WLI_BSS_MAX; index++) {
+++		struct nw_bss_info source;
+++		if (nw_wifi_bss_get(index, &source) || source.ssid_len > 32 || source.ie_len > sizeof(source.ie) ||
+++		    source.freq_mhz < 2412 || source.freq_mhz > 5900) { continue; }
+++		struct fuxi_wifi_sta_bss *bss = &wli_fetched;
+++		memset(bss, 0, sizeof(*bss));
+++		memcpy(bss->bssid, source.bssid, 6);
+++		bss->frequency = (uint16_t)source.freq_mhz;
+++		bss->rssi = source.signal_dbm;
+++		bss->beacon_interval = source.beacon_int;
+++		bss->capability = source.caps;
+++		bss->age_ms = source.age_ms;
+++		unsigned dropped = wli_trim(source.ie, source.ie_len, bss);
+++		if (!bss->ssid_length) {
+++			memcpy(bss->ssid, source.ssid, source.ssid_len);
+++			bss->ssid_length = source.ssid_len;
+++		}
+++		wli_diag(bss, source.ie_len, dropped);
+++		lck_mtx_lock(&wli_lock);
+++		wli_bss[wli_bss_count++] = *bss;
+++		lck_mtx_unlock(&wli_lock);
+++	}
+++	wli.scanned_at = wla_now_ms();
+++	wli.scan_reports++;
+++	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu (module records)\n", wli_bss_count,
+++	    (unsigned long long)wli.generation);
+++	wli_complete(0);
+++}
+++
+++static void
+++wli_scan_finish(void)
+++{
+++	wli.scanned_at = wla_now_ms();
+++	wli.scan_reports++;
+++	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu\n", wli_bss_count,
+++	    (unsigned long long)wli.generation);
+++	wli_complete(0);
+++}
+++
+++/* One GET_BSS reply: the access point with every element it sent. */
+++static void
+++wli_bss_reply(unsigned status, const uint8_t *bytes, size_t length)
+++{
+++	if (!wli.fetching) { return; }
+++	if (status == 8) {
+++		wli_scan_finish();
+++		return;
+++	}
+++	if (status) {
+++		printf("FUXI WIFI IOS: GET_BSS %u refused %u; module records instead\n", wli.fetch_index, status);
+++		wli.fetching = 0;
+++		wli_cache_scan();
+++		return;
+++	}
+++	size_t size, ie_size;
+++	const uint8_t *value, *bssid = fwc_attribute(bytes, length, 3, &size);
+++	const uint8_t *elements = fwc_attribute(bytes, length, 6, &ie_size);
+++	struct fuxi_wifi_sta_bss *bss = &wli_fetched;
+++	memset(bss, 0, sizeof(*bss));
+++	value = fwc_attribute(bytes, length, 5, &size);
+++	uint32_t frequency = value && size == 4 ? fwc_read32(value) : 0;
+++	if (bssid && elements && frequency >= 2412 && frequency <= 5900) {
+++		memcpy(bss->bssid, bssid, 6);
+++		bss->frequency = (uint16_t)frequency;
+++		value = fwc_attribute(bytes, length, 22, &size);
+++		int32_t signal = value && size == 4 ? (int32_t)fwc_read32(value) : -100;
+++		bss->rssi = (int16_t)(signal < -127 ? -127 : signal > 0 ? 0 : signal);
+++		value = fwc_attribute(bytes, length, 23, &size);
+++		bss->capability = value && size == 4 ? (uint16_t)fwc_read32(value) : 0;
+++		value = fwc_attribute(bytes, length, 24, &size);
+++		bss->beacon_interval = value && size == 4 ? (uint16_t)fwc_read32(value) : 100;
+++		value = fwc_attribute(bytes, length, 25, &size);
+++		bss->age_ms = value && size == 4 ? fwc_read32(value) : 0;
+++		unsigned dropped = wli_trim(elements, ie_size, bss);
+++		wli_diag(bss, ie_size, dropped);
+++		lck_mtx_lock(&wli_lock);
+++		if (wli_bss_count < WLI_BSS_MAX) { wli_bss[wli_bss_count++] = *bss; }
+++		lck_mtx_unlock(&wli_lock);
+++	}
+++	if (++wli.fetch_index >= 256 || wli_bss_count >= WLI_BSS_MAX) { wli_scan_finish(); }
+++}
+++
+++static size_t
+++wli_put(uint8_t *bytes, size_t offset, unsigned attribute, const void *value, size_t size)
+++{
+++	fwc_write(bytes + offset, attribute, 2);
+++	fwc_write(bytes + offset + 2, size + 4, 2);
+++	if (size) { memcpy(bytes + offset + 4, value, size); }
+++	return offset + ((size + 7u) & ~(size_t)3u);
+++}
+++
+++static void
+++wli_add(unsigned attribute, const void *value, size_t size)
+++{
+++	if (size > 0xfff0 || wli_out_length + ((size + 7u) & ~(size_t)3u) > sizeof(wli_out)) {
+++		wli_out_overflow = 1;
+++		return;
+++	}
+++	wli_out_length = wli_put(wli_out, wli_out_length, attribute, value, size);
+++}
+++
+++static void
+++wli_put32(unsigned attribute, uint32_t value)
+++{
+++	uint8_t bytes[4];
+++	fwc_write(bytes, value, 4);
+++	wli_add(attribute, bytes, sizeof(bytes));
+++}
+++
+++static void
+++wli_begin(void)
+++{
+++	memset(wli_out, 0, sizeof(wli_out));
+++	wli_out_length = 40;
+++	wli_out_overflow = 0;
+++}
+++
+++static int
+++wli_send(unsigned operation)
+++{
+++	if (wli_out_overflow) { return EMSGSIZE; }
+++	if (wli.sequence + 1u == 0) { return EOVERFLOW; }
+++	uint8_t *bytes = wli_out;
+++	size_t length = wli_out_length;
+++	fwc_write(bytes, 0x3143574e, 4);
+++	fwc_write(bytes + 4, 1, 2);
+++	fwc_write(bytes + 6, 1, 2);
+++	fwc_write(bytes + 8, operation, 2);
+++	fwc_write(bytes + 12, ++wli.sequence, 4);
+++	fwc_write(bytes + 16, length, 4);
+++	fwc_write(bytes + 24, wli.session, 8);
+++	fwc_write(bytes + 32, wli.generation, 8);
+++	wli.pending_sequence = wli.sequence;
+++	wli.pending_operation = operation;
+++	int status = nw_wifi_control_receive(wli.session, length, wla_control_read, bytes);
+++	/* The module has its copy: keys and EAPOL do not stay here. */
+++	memset(wli_out, 0, length);
+++	if (status) { wli.pending_operation = 0; }
+++	return wli_status(status);
+++}
+++
+++static int
+++wli_request(unsigned operation)
+++{
+++	wli_begin();
+++	if (operation == 2) {
+++		if (!wli.scan.passive) {
+++			uint8_t ssid[33] = {0};
+++			ssid[0] = wli.scan.ssid_length;
+++			memcpy(ssid + 1, wli.scan.ssid, ssid[0]);
+++			wli_add(19, ssid, sizeof(ssid));
+++		}
+++		if (wli.scan.frequency_count) {
+++			uint8_t frequencies[256];
+++			for (unsigned index = 0; index < wli.scan.frequency_count; index++) {
+++				fwc_write(frequencies + index * 4, wli.scan.frequencies[index], 4);
+++			}
+++			wli_add(20, frequencies, wli.scan.frequency_count * 4);
+++		}
+++	} else if (operation == 3) {
+++		wli_put32(21, wli.fetch_index);
+++	}
+++	return wli_send(operation);
+++}
+++
+++/* An event of the join or the link: noted here, acted on by wli_join_step(). */
+++static void
+++wli_join_event(unsigned operation, const uint8_t *bytes, size_t length)
+++{
+++	size_t size;
+++	const uint8_t *value, *bssid = fwc_attribute(bytes, length, 3, &size);
+++	bool ours = bssid && size == 6 && !memcmp(bssid, wlj.bss.bssid, 6);
+++	if (wlj.step == WLJ_NONE) { return; }
+++	switch (operation) {
+++	case 0x103:
+++		value = fwc_attribute(bytes, length, 26, &size);
+++		if (wlj.step != WLJ_AUTH_WAIT || !value || size < 30 || memcmp(value + 16, wlj.bss.bssid, 6) ||
+++		    fwc_read16(value + 24) != 0 || fwc_read16(value + 26) != 2) { return; }
+++		wlj.auth_status = fwc_read16(value + 28);
+++		wlj.auth_seen = 1;
+++		return;
+++	case 0x104:
+++		if (wlj.step != WLJ_ASSOC_WAIT || (bssid && !ours)) { return; }
+++		value = fwc_attribute(bytes, length, 18, &size);
+++		wlj.assoc_status = value && size == 4 ? (int)fwc_read32(value) : 0xffff;
+++		wlj.assoc_seen = 1;
+++		return;
+++	case 0x105:
+++		if (bssid && !ours) { return; }
+++		value = fwc_attribute(bytes, length, 8, &size);
+++		wlj.lost_reason = value && size == 4 ? fwc_read32(value) : 0;
+++		wlj.lost = 1;
+++		return;
+++	case 0x106:
+++		value = fwc_attribute(bytes, length, 15, &size);
+++		if (wlj.step < WLJ_ASSOC_WAIT || wlj.step >= WLJ_ABORT || !ours || !value || size < 4 ||
+++		    size > sizeof(wlj.eapol)) { return; }
+++		memcpy(wlj.eapol, value, size);
+++		wlj.eapol_length = size;
+++		wlj.eapol_ready = 1;
+++		return;
+++	case 0x10c:
+++	case 0x10d:
+++		if ((operation == 0x10c && wlj.step == WLJ_AUTH_WAIT) ||
+++		    (operation == 0x10d && wlj.step == WLJ_ASSOC_WAIT)) { wlj.timed_out = 1; }
+++		return;
+++	default:
+++		return;
+++	}
+++}
+++
+++/* A reply to a request of the join or the link (the reply's status is not OK). */
+++static void
+++wli_join_refused(unsigned operation, unsigned status)
+++{
+++	printf("FUXI WIFI IOS: request %u of join step %u refused %u\n", operation, wlj.step, status);
+++	if (operation == 6 || wlj.step == WLJ_NONE || wlj.step >= WLJ_ABORT) { return; }
+++	if (wlj.step >= WLJ_JOINED) {
+++		wlj.lost = 1;
+++		return;
+++	}
+++	if (!wlj.error) { wlj.error = status == 4 ? EAUTH : status == 8 ? ENOENT : wli_status(status); }
+++	wlj.step = WLJ_ABORT;
 ++}
 ++
 ++static int
@@ -34527,22 +36335,23 @@ index d21bf85..2a8bf9f 100644
 ++			    fwc_read32(value) != wli.power_on || generation < wli.generation ||
 ++			    generation - wli.generation > 1) { goto invalid; }
 ++			wli.generation = generation;
+++			wli_forget();
 ++			lck_mtx_lock(&wli_lock);
 ++			wli_state.phase = wli.power_on ? FUXI_WIFI_STA_IDLE : FUXI_WIFI_STA_OFF;
 ++			wli_bss_count = 0;
 ++			lck_mtx_unlock(&wli_lock);
 ++			if (wli_input) { wli_input->link_state(false); }
 ++			wli_complete(0);
-++		} else {
+++		} else if (operation == 0x101 || operation == 0x102) {
 ++			if (generation != wli.generation) { goto invalid; }
-++			if (operation == 0x101 || operation == 0x102) {
-++				lck_mtx_lock(&wli_lock);
-++				bool scanning = wli.busy && wli.submitted && wli.operation == 2;
-++				lck_mtx_unlock(&wli_lock);
-++				if (!scanning) { goto invalid; }
-++				if (status) { wli_fail(wli_status(status)); }
-++				if (operation == 0x102) { wli.scan_done = 1; }
-++			}
+++			lck_mtx_lock(&wli_lock);
+++			bool scanning = wli.busy && wli.submitted && wli.operation == WLI_SCAN && !wli.fetching;
+++			lck_mtx_unlock(&wli_lock);
+++			if (!scanning) { goto invalid; }
+++			if (status) { wli_fail(wli_status(status)); }
+++			if (operation == 0x102) { wli.scan_done = 1; }
+++		} else if (generation == wli.generation) {
+++			wli_join_event(operation, bytes, length);
 ++		}
 ++		return 0;
 ++	}
@@ -34550,6 +36359,14 @@ index d21bf85..2a8bf9f 100644
 ++	    fwc_read32(bytes + 12) != wli.pending_sequence ||
 ++	    (operation != 1 && generation != wli.generation)) { goto invalid; }
 ++	wli.pending_operation = 0;
+++	if (operation == 3) {
+++		wli_bss_reply(status, bytes, length);
+++		return 0;
+++	}
+++	if (operation >= 4 && operation != 11) {
+++		if (status) { wli_join_refused(operation, status); }
+++		return 0;
+++	}
 ++	if (status) {
 ++		if (operation == 2) { wli_complete(wli_status(status)); }
 ++		else { wli_fail(wli_status(status)); }
@@ -34590,79 +36407,276 @@ index d21bf85..2a8bf9f 100644
 ++	return 2;
 ++}
 ++
-++static size_t
-++wli_put(uint8_t *bytes, size_t offset, unsigned attribute, const void *value, size_t size)
+++static void
+++wli_join_begin(uint64_t now)
 ++{
-++	fwc_write(bytes + offset, attribute, 2);
-++	fwc_write(bytes + offset + 2, size + 4, 2);
-++	if (size) { memcpy(bytes + offset + 4, value, size); }
-++	return offset + ((size + 7u) & ~(size_t)3u);
-++}
-++
-++static int
-++wli_request(unsigned operation)
-++{
-++	uint8_t bytes[352] = {0};
-++	size_t length = 40;
-++	if (operation == 2) {
-++		if (!wli.scan.passive) {
-++			uint8_t ssid[33] = {0};
-++			ssid[0] = wli.scan.ssid_length;
-++			memcpy(ssid + 1, wli.scan.ssid, ssid[0]);
-++			length = wli_put(bytes, length, 19, ssid, sizeof(ssid));
-++		}
-++		if (wli.scan.frequency_count) {
-++			uint8_t frequencies[256];
-++			for (unsigned index = 0; index < wli.scan.frequency_count; index++) {
-++				fwc_write(frequencies + index * 4, wli.scan.frequencies[index], 4);
-++			}
-++			length = wli_put(bytes, length, 20, frequencies, wli.scan.frequency_count * 4);
-++		}
-++	}
-++	if (wli.sequence + 1u == 0) { return EOVERFLOW; }
-++	fwc_write(bytes, 0x3143574e, 4);
-++	fwc_write(bytes + 4, 1, 2);
-++	fwc_write(bytes + 6, 1, 2);
-++	fwc_write(bytes + 8, operation, 2);
-++	fwc_write(bytes + 12, ++wli.sequence, 4);
-++	fwc_write(bytes + 16, length, 4);
-++	fwc_write(bytes + 24, wli.session, 8);
-++	fwc_write(bytes + 32, wli.generation, 8);
-++	wli.pending_sequence = wli.sequence;
-++	wli.pending_operation = operation;
-++	int status = nw_wifi_control_receive(wli.session, length, wla_control_read, bytes);
-++	return wli_status(status);
+++	static const uint8_t rsn[] = {
+++		48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0
+++	};
+++	memcpy(wlj.rsn, rsn, sizeof(rsn));
+++	wlj.rsn[7] = (uint8_t)(wlj.group & 0xff);
+++	memcpy(wlj.wpa.own, wli_backend.station.address, 6);
+++	memcpy(wlj.wpa.peer, wlj.bss.bssid, 6);
+++	read_random(wlj.wpa.own_nonce, sizeof(wlj.wpa.own_nonce));
+++	wlj.wpa.rsn = wlj.rsn;
+++	wlj.wpa.rsn_length = sizeof(wlj.rsn);
+++	wlj.deadline = now + WLI_JOIN_MS;
+++	wlj.step = WLJ_AUTH;
 ++}
 ++
 ++static void
-++wli_cache_scan(void)
+++wli_join_stop(int error, const char *why)
 ++{
-++	int count = nw_wifi_bss_count();
-++	lck_mtx_lock(&wli_lock);
-++	wli_bss_count = 0;
-++	lck_mtx_unlock(&wli_lock);
-++	for (int index = 0; index < count && index < WLI_BSS_MAX; index++) {
-++		struct nw_bss_info source;
-++		if (nw_wifi_bss_get(index, &source) || source.ssid_len > 32 || source.ie_len > sizeof(source.ie) ||
-++		    source.freq_mhz < 2412 || source.freq_mhz > 5900) { continue; }
-++		lck_mtx_lock(&wli_lock);
-++		struct fuxi_wifi_sta_bss *bss = &wli_bss[wli_bss_count++];
-++		memset(bss, 0, sizeof(*bss));
-++		memcpy(bss->bssid, source.bssid, 6);
-++		memcpy(bss->ssid, source.ssid, source.ssid_len);
-++		bss->ssid_length = source.ssid_len;
-++		bss->frequency = (uint16_t)source.freq_mhz;
-++		bss->rssi = source.signal_dbm;
-++		bss->beacon_interval = source.beacon_int;
-++		bss->capability = source.caps;
-++		bss->age_ms = source.age_ms;
-++		bss->elements_length = source.ie_len;
-++		memcpy(bss->elements, source.ie, source.ie_len);
-++		lck_mtx_unlock(&wli_lock);
+++	if (!wlj.error) { wlj.error = error; }
+++	printf("FUXI WIFI IOS: join stopped at step %u: %s, error %d\n", wlj.step, why, wlj.error);
+++	wlj.step = wlj.lost ? WLJ_FAILED : WLJ_ABORT;
+++}
+++
+++static int
+++wli_join_send(unsigned operation)
+++{
+++	int error = wli_send(operation);
+++	if (error) {
+++		printf("FUXI WIFI IOS: request %u of join step %u not sent, error %d\n", operation, wlj.step, error);
 ++	}
-++	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu\n", wli_bss_count,
-++	    (unsigned long long)wli.generation);
-++	wli_complete(0);
+++	return error;
+++}
+++
+++static void
+++wli_tx_eapol(unsigned length, bool clear)
+++{
+++	wli_begin();
+++	wli_add(3, wlj.bss.bssid, 6);
+++	wli_add(15, wlj.reply, length);
+++	wli_put32(40, 0x888e);
+++	wli_put32(16, clear);
+++	memset(wlj.reply, 0, sizeof(wlj.reply));
+++	if (wli_join_send(9) && wlj.step < WLJ_JOINED) { wli_join_stop(EIO, "EAPOL not sent"); }
+++}
+++
+++static void
+++wli_set_key(bool pairwise)
+++{
+++	uint8_t sequence[6] = {0};
+++	wli_begin();
+++	if (pairwise) {
+++		wli_add(3, wlj.bss.bssid, 6);
+++		wli_put32(10, 0);
+++		wli_put32(11, 1);
+++		wli_put32(9, WLI_SUITE(4));
+++		wli_add(12, wlj.wpa.pairwise, 16);
+++	} else {
+++		memcpy(sequence, wlj.wpa.group_counter, sizeof(sequence));
+++		wli_put32(10, wlj.wpa.group_index);
+++		wli_put32(11, 0);
+++		wli_put32(9, wlj.group);
+++		wli_add(12, wlj.wpa.group, wlj.wpa.group_length);
+++	}
+++	wli_add(13, sequence, sizeof(sequence));
+++	if (wli_join_send(7)) {
+++		if (wlj.step < WLJ_JOINED) { wli_join_stop(EIO, "key not installed"); } else { wlj.lost = 1; }
+++	}
+++}
+++
+++/* A message of the four-way or group handshake. */
+++static void
+++wli_eapol(void)
+++{
+++	unsigned length = 0;
+++	const char *why = "";
+++	wlj.eapol_ready = 0;
+++	int kind = fuxi_wifi_wpa_message(&wlj.wpa, wlj.eapol, (unsigned)wlj.eapol_length, wlj.reply, &length, &why);
+++	memset(wlj.eapol, 0, sizeof(wlj.eapol));
+++	if (kind == FUXI_WIFI_WPA_BAD) {
+++		printf("FUXI WIFI IOS: EAPOL message at step %u not answered: %s\n", wlj.step, why);
+++		return;
+++	}
+++	if (kind == FUXI_WIFI_WPA_NOTHING) { return; }
+++	if (kind == FUXI_WIFI_WPA_ANSWER && wlj.step == WLJ_KEYS_WAIT) {
+++		wlj.answered++;
+++		printf("FUXI WIFI IOS: handshake message 1 (%u), answering\n", wlj.answered);
+++		wli_tx_eapol(length, true);
+++	} else if (kind == FUXI_WIFI_WPA_KEYS && wlj.step == WLJ_KEYS_WAIT) {
+++		printf("FUXI WIFI IOS: handshake message 3 verified, group key %u of %u bytes\n",
+++		    wlj.wpa.group_index, wlj.wpa.group_length);
+++		wlj.step = WLJ_PAIRWISE;
+++		wli_tx_eapol(length, true);
+++	} else if (kind == FUXI_WIFI_WPA_GROUP && wlj.step == WLJ_JOINED) {
+++		wlj.rekeys++;
+++		printf("FUXI WIFI IOS: group key renewed (%u), index %u\n", wlj.rekeys, wlj.wpa.group_index);
+++		wlj.step = WLJ_REKEY;
+++		wli_tx_eapol(length, false);
+++	} else {
+++		printf("FUXI WIFI IOS: EAPOL kind %d at step %u ignored\n", kind, wlj.step);
+++		memset(wlj.reply, 0, sizeof(wlj.reply));
+++	}
+++}
+++
+++static void
+++wli_link_lost(void)
+++{
+++	unsigned reason = wlj.lost_reason;
+++	wli_forget();
+++	lck_mtx_lock(&wli_lock);
+++	if (wli_state.phase == FUXI_WIFI_STA_JOINED) { wli_state.phase = FUXI_WIFI_STA_IDLE; }
+++	wli_state.last_error = ECONNRESET;
+++	lck_mtx_unlock(&wli_lock);
+++	printf("FUXI WIFI IOS: the network was lost, reason %u\n", reason);
+++	if (wli_input) { wli_input->link_state(false); }
+++	fuxi_wifi_sta_lost(ECONNRESET);
+++}
+++
+++/* The join and the link, one request at a time; called while no request is pending. */
+++static void
+++wli_join_step(uint64_t now)
+++{
+++	if (wlj.step > WLJ_NONE && wlj.step < WLJ_UP && now >= wlj.deadline) {
+++		wli_join_stop(wlj.answered ? EAUTH : ETIMEDOUT, "no answer in time");
+++	}
+++	switch (wlj.step) {
+++	case WLJ_AUTH:
+++		wli_begin();
+++		wli_add(4, wlj.bss.ssid, wlj.bss.ssid_length);
+++		wli_add(3, wlj.bss.bssid, 6);
+++		wli_put32(5, wlj.bss.frequency);
+++		wli_put32(7, 0);
+++		wlj.step = WLJ_AUTH_WAIT;
+++		if (wli_join_send(4)) { wli_join_stop(EIO, "authentication not sent"); }
+++		return;
+++	case WLJ_AUTH_WAIT:
+++		if (wlj.auth_seen) {
+++			if (wlj.auth_status) {
+++				printf("FUXI WIFI IOS: authentication status %d\n", wlj.auth_status);
+++				wli_join_stop(ECONNREFUSED, "authentication refused");
+++			} else {
+++				wlj.step = WLJ_ASSOC;
+++			}
+++		} else if (wlj.timed_out || wlj.lost) {
+++			wli_join_stop(wlj.timed_out ? ETIMEDOUT : ECONNREFUSED, "authentication failed");
+++		}
+++		return;
+++	case WLJ_ASSOC: {
+++		bool secure = wlj.security == FUXI_WIFI_STA_WPA2_PSK;
+++		wli_begin();
+++		wli_add(4, wlj.bss.ssid, wlj.bss.ssid_length);
+++		wli_add(3, wlj.bss.bssid, 6);
+++		wli_put32(5, wlj.bss.frequency);
+++		if (secure) { wli_add(6, wlj.rsn, sizeof(wlj.rsn)); }
+++		wli_put32(34, secure ? WLI_SUITE(4) : 0);
+++		wli_put32(35, secure ? wlj.group : 0);
+++		wli_put32(36, secure ? WLI_SUITE(2) : 0);
+++		wli_put32(37, 0);
+++		wlj.step = WLJ_ASSOC_WAIT;
+++		if (wli_join_send(5)) { wli_join_stop(EIO, "association not sent"); }
+++		return;
+++	}
+++	case WLJ_ASSOC_WAIT:
+++		if (wlj.assoc_seen) {
+++			if (wlj.assoc_status) {
+++				printf("FUXI WIFI IOS: association status %d\n", wlj.assoc_status);
+++				wli_join_stop(ECONNREFUSED, "association refused");
+++			} else {
+++				printf("FUXI WIFI IOS: associated\n");
+++				wlj.step = wlj.security == FUXI_WIFI_STA_WPA2_PSK ? WLJ_KEYS_WAIT : WLJ_PORT;
+++				if (wlj.eapol_ready && wlj.step == WLJ_KEYS_WAIT) { wli_eapol(); }
+++			}
+++		} else if (wlj.timed_out || wlj.lost) {
+++			wli_join_stop(wlj.timed_out ? ETIMEDOUT : ECONNREFUSED, "association failed");
+++		}
+++		return;
+++	case WLJ_KEYS_WAIT:
+++		if (wlj.eapol_ready) {
+++			wli_eapol();
+++		} else if (wlj.lost) {
+++			printf("FUXI WIFI IOS: access point left during the handshake, reason %u\n", wlj.lost_reason);
+++			wli_join_stop(wlj.answered ? EAUTH : ECONNRESET, "handshake failed");
+++		}
+++		return;
+++	case WLJ_PAIRWISE:
+++		if (wlj.lost) { wli_join_stop(EAUTH, "lost before the keys"); return; }
+++		wlj.step = WLJ_GROUP;
+++		wli_set_key(true);
+++		return;
+++	case WLJ_GROUP:
+++		if (wlj.lost) { wli_join_stop(ECONNRESET, "lost before the group key"); return; }
+++		wlj.step = WLJ_PORT;
+++		wli_set_key(false);
+++		return;
+++	case WLJ_PORT:
+++		if (wlj.lost) { wli_join_stop(ECONNRESET, "lost before the port"); return; }
+++		wli_begin();
+++		wli_put32(14, 1);
+++		wlj.step = WLJ_OPERSTATE;
+++		if (wli_join_send(8)) { wli_join_stop(EIO, "port not opened"); }
+++		return;
+++	case WLJ_OPERSTATE:
+++		if (wlj.lost) { wli_join_stop(ECONNRESET, "lost before the link"); return; }
+++		wli_begin();
+++		wli_put32(32, 1);
+++		wlj.step = WLJ_UP;
+++		if (wli_join_send(10)) { wli_join_stop(EIO, "link not up"); }
+++		return;
+++	case WLJ_UP:
+++		if (wlj.lost) { wli_join_stop(ECONNRESET, "lost as the link came up"); return; }
+++		wlj.step = WLJ_JOINED;
+++		wlj.joined = 1;
+++		memset(wlj.wpa.pmk, 0, sizeof(wlj.wpa.pmk));
+++		__atomic_store_n(&wli_link, 1, __ATOMIC_RELEASE);
+++		lck_mtx_lock(&wli_lock);
+++		wli_state.phase = FUXI_WIFI_STA_JOINED;
+++		wli_state.bss = wlj.bss;
+++		wli_state.security = wlj.security;
+++		lck_mtx_unlock(&wli_lock);
+++		printf("FUXI WIFI IOS: joined at %u MHz\n", wlj.bss.frequency);
+++		if (wli_input) { wli_input->link_state(true); }
+++		wli_complete(0);
+++		return;
+++	case WLJ_JOINED:
+++		if (wlj.leaving) {
+++			wli_begin();
+++			wli_add(3, wlj.bss.bssid, 6);
+++			wli_put32(8, 3);
+++			wlj.step = WLJ_LEAVE_WAIT;
+++			__atomic_store_n(&wli_link, 0, __ATOMIC_RELEASE);
+++			(void)wli_join_send(6);
+++		} else if (wlj.lost) {
+++			wli_link_lost();
+++		} else if (wlj.eapol_ready) {
+++			wli_eapol();
+++		}
+++		return;
+++	case WLJ_REKEY:
+++		wlj.step = WLJ_JOINED;
+++		wli_set_key(false);
+++		return;
+++	case WLJ_ABORT:
+++		wli_begin();
+++		wli_add(3, wlj.bss.bssid, 6);
+++		wli_put32(8, 3);
+++		wlj.step = WLJ_FAILED;
+++		(void)wli_join_send(6);
+++		return;
+++	case WLJ_FAILED: {
+++		int error = wlj.error ? wlj.error : EIO;
+++		wli_forget();
+++		lck_mtx_lock(&wli_lock);
+++		if (wli_state.phase == FUXI_WIFI_STA_JOINING) { wli_state.phase = FUXI_WIFI_STA_IDLE; }
+++		lck_mtx_unlock(&wli_lock);
+++		wli_complete(error);
+++		return;
+++	}
+++	case WLJ_LEAVE_WAIT:
+++		wli_forget();
+++		lck_mtx_lock(&wli_lock);
+++		if (wli_state.phase == FUXI_WIFI_STA_JOINED) { wli_state.phase = FUXI_WIFI_STA_IDLE; }
+++		lck_mtx_unlock(&wli_lock);
+++		printf("FUXI WIFI IOS: left the network\n");
+++		if (wli_input) { wli_input->link_state(false); }
+++		wli_complete(0);
+++		return;
+++	default:
+++		return;
+++	}
 ++}
 ++
 ++static int
@@ -34703,14 +36717,63 @@ index d21bf85..2a8bf9f 100644
 ++	thread_block(THREAD_CONTINUE_NULL);
 ++}
 ++
+++/*
+++ * fuxiwifitest=2: join the network named by fuxiwifitestssid with a made-up passphrase. The
+++ * radio path is proved when authentication and association succeed, message 1 is answered,
+++ * and the access point turns the made-up key away (EAUTH). No real key is ever used here.
+++ */
+++static struct fuxi_wifi_sta_join wli_test_join;
+++
+++static void
+++wli_test_join_thread(void *context, wait_result_t result)
+++{
+++	(void)context;
+++	(void)result;
+++	static const char dummy[] = "fuxi-selftest-not-a-key";
+++	wl_sleep(15000);
+++	int error = wli_test_wait();
+++	if (!error && !fuxi_wifi_sta_powered()) {
+++		error = fuxi_wifi_sta_ask_power(true);
+++		if (!error) { error = wli_test_wait(); }
+++	}
+++	wli_test_join.security = FUXI_WIFI_STA_WPA2_PSK;
+++	wli_test_join.passphrase_length = sizeof(dummy) - 1;
+++	memcpy(wli_test_join.passphrase, dummy, sizeof(dummy) - 1);
+++	if (!error) { error = fuxi_wifi_sta_ask_join(&wli_test_join); }
+++	if (!error) { error = wli_test_wait(); }
+++	lck_mtx_lock(&wli_lock);
+++	int last = wli_state.last_error;
+++	unsigned phase = wli_state.phase;
+++	lck_mtx_unlock(&wli_lock);
+++	printf("FUXI WIFI IOS: selftest join with a made-up key: wait %d, join error %d, phase %u (%s)\n",
+++	    error, last, phase, !error && last == EAUTH ? "PASS: key refused by the access point" : "see above");
+++	if (phase == FUXI_WIFI_STA_JOINED) { (void)fuxi_wifi_sta_ask_leave(); }
+++	memset(&wli_test_join, 0, sizeof(wli_test_join));
+++	(void)thread_terminate(current_thread());
+++	thread_block(THREAD_CONTINUE_NULL);
+++}
+++
 ++static void
 ++wli_test_start(void)
 ++{
 ++	int test = 0;
 ++	PE_parse_boot_argn("fuxiwifitest", &test, sizeof(test));
+++	thread_t thread;
 ++	if (test == 1) {
-++		thread_t thread;
 ++		if (kernel_thread_start(wli_test_thread, NULL, &thread) == KERN_SUCCESS) {
+++			thread_deallocate(thread);
+++		}
+++	} else if (test == 2) {
+++		char name[33];
+++		memset(name, 0, sizeof(name));
+++		if (!PE_parse_boot_argn("fuxiwifitestssid", name, sizeof(name) - 1) || !name[0]) {
+++			printf("FUXI WIFI IOS: selftest join needs fuxiwifitestssid\n");
+++			return;
+++		}
+++		memset(&wli_test_join, 0, sizeof(wli_test_join));
+++		wli_test_join.ssid_length = (uint8_t)strlen(name);
+++		memcpy(wli_test_join.ssid, name, wli_test_join.ssid_length);
+++		if (kernel_thread_start(wli_test_join_thread, NULL, &thread) == KERN_SUCCESS) {
 ++			thread_deallocate(thread);
 ++		}
 ++	}
@@ -34746,36 +36809,80 @@ index d21bf85..2a8bf9f 100644
 ++		wli.published = 1;
 ++		lck_mtx_unlock(&wli_lock);
 ++		if (!fuxi_wifi_ios_attach(&wli_backend)) { return ENXIO; }
-++		printf("FUXI WIFI IOS: native backend published channels %u; power/scan ready, association unavailable\n",
-++		    wli_channel_count);
+++		nw_wifi_set_events(&wli_events);
+++		printf("FUXI WIFI IOS: native backend published channels %u; power/scan/join ready "
+++		    "(open, WPA2-PSK CCMP; full scan elements)\n", wli_channel_count);
 ++		wli_test_start();
 ++	}
 ++	lck_mtx_lock(&wli_lock);
 ++	bool begin = wli.busy && !wli.submitted;
 ++	unsigned operation = wli.operation, power_on = wli.power_on;
+++	bool leave_now = false;
 ++	if (begin) {
 ++		wli.submitted = 1;
 ++		wli.deadline = now + 30000;
-++		wli.scan_accepted = wli.scan_done = 0;
-++		if (operation == 2) { wli_state.phase = FUXI_WIFI_STA_SCANNING; wli_bss_count = 0; }
+++		wli.scan_accepted = wli.scan_done = wli.fetching = 0;
+++		if (operation == WLI_SCAN) {
+++			if (wli_state.phase == FUXI_WIFI_STA_IDLE) { wli_state.phase = FUXI_WIFI_STA_SCANNING; }
+++			wli_bss_count = 0;
+++		} else if (operation == WLI_JOIN) {
+++			memset(&wlj, 0, sizeof(wlj));
+++			wlj.bss = wli_target.bss;
+++			memcpy(wlj.wpa.pmk, wli_target.pmk, sizeof(wlj.wpa.pmk));
+++			wlj.security = (unsigned)wli_target.security;
+++			wlj.group = wli_target.group;
+++			memset(&wli_target, 0, sizeof(wli_target));
+++			wli_state.phase = FUXI_WIFI_STA_JOINING;
+++			wli_state.bss = wlj.bss;
+++			wli_state.security = (int)wlj.security;
+++			wli_state.last_error = 0;
+++		} else if (operation == WLI_LEAVE) {
+++			leave_now = wlj.step != WLJ_JOINED && wlj.step != WLJ_REKEY;
+++			wlj.leaving = 1;
+++		}
 ++	}
 ++	bool busy = wli.busy;
 ++	lck_mtx_unlock(&wli_lock);
 ++	if (begin) {
-++		if (operation == 1) {
+++		if (operation == WLI_POWER) {
 ++			wli.power_waiting = 1;
 ++			nw_wifi_power(power_on);
-++		} else {
+++		} else if (operation == WLI_SCAN) {
 ++			int error = wli_request(2);
 ++			if (error) { return error; }
+++		} else if (operation == WLI_JOIN) {
+++			wli_join_begin(now);
+++		} else if (leave_now) {
+++			wli_forget();
+++			wli_complete(0);
+++			busy = false;
 ++		}
 ++	}
-++	if (busy && operation == 2 && wli.scan_accepted && wli.scan_done) { wli_cache_scan(); }
+++	if (busy && operation == WLI_SCAN && wli.scan_accepted && wli.scan_done && !wli.fetching) {
+++		wli.fetching = 1;
+++		wli.fetch_index = 0;
+++		wli.diag_lines = 0;
+++	}
+++	if (!wli.pending_operation) {
+++		if (wli.fetching) {
+++			int error = wli_request(3);
+++			if (error) {
+++				printf("FUXI WIFI IOS: GET_BSS not sent, error %d; module records instead\n", error);
+++				wli.fetching = 0;
+++				wli_cache_scan();
+++			}
+++		} else if (wlj.step != WLJ_NONE) {
+++			wli_join_step(now);
+++		}
+++	}
+++	lck_mtx_lock(&wli_lock);
+++	busy = wli.busy;
+++	lck_mtx_unlock(&wli_lock);
 ++	if (busy && now >= wli.deadline) { return ETIMEDOUT; }
 ++	return 0;
 ++}
 diff --git a/xnu/patches/0103-fuxi-kernel-h1.patch b/xnu/patches/0103-fuxi-kernel-h1.patch
-index 39be642..e5c754d 100644
+index 39be642..40ce125 100644
 --- a/xnu/patches/0103-fuxi-kernel-h1.patch
 +++ b/xnu/patches/0103-fuxi-kernel-h1.patch
 @@ -65,7 +65,7 @@
@@ -34845,7 +36952,7 @@ index 39be642..e5c754d 100644
   	    fk_read(fk_gpio_apid, 0x41, &vin) &&
   	    fk_read(fk_gpio_apid, 0x42, &pull) &&
 -@@ -154,6 +234,80 @@
-+@@ -154,6 +235,83 @@
++@@ -154,6 +235,98 @@
   	thread_block(THREAD_CONTINUE_NULL);
   }
   
@@ -34861,34 +36968,63 @@ index 39be642..e5c754d 100644
  +			break;
  +		}
  +		if (i == 1) {
-@@ -306,7 +310,7 @@
+@@ -284,10 +288,25 @@
+ +		return;
+ +	}
+ +	unsigned offset = 0;
+-+	(void)PE_parse_boot_argn("fuxirtcoffset", &offset, sizeof(offset));
+++	const char *from = "none";
+++	if (PE_parse_boot_argn("fuxirtcoffset", &offset, sizeof(offset))) {
+++		from = "boot-arg";
+++	} else {
+++		/* 日常命令列已滿 607 字元：同一個量測值改放 ADT /chosen（4-byte little-endian）。 */
+++		DTEntry chosen;
+++		void *property = NULL;
+++		unsigned length = 0;
+++		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+++		    SecureDTGetProperty(chosen, "fuxi,rtc-offset", &property, &length) == kSuccess &&
+++		    property && length == sizeof(uint32_t)) {
+++			const uint8_t *b = property;
+++			offset = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+++			from = "adt";
+++		}
+++	}
+ +	uint64_t epoch = (uint64_t)secs + (uint64_t)offset;
+-+	printf("FUXI RTC: apid=%u/ee%u raw %02x %02x %02x %02x counter=%u offset=%u epoch=%llu\n",
+-+	    apid, owner, raw[0], raw[1], raw[2], raw[3], secs, offset,
+++	printf("FUXI RTC: apid=%u/ee%u raw %02x %02x %02x %02x counter=%u offset=%u (%s) epoch=%llu\n",
+++	    apid, owner, raw[0], raw[1], raw[2], raw[3], secs, offset, from,
+ +	    (unsigned long long)epoch);
+ +	/* 2023-11 .. 2039-09: a blank or bogus RTC must not move the clock. */
+ +	if (epoch < 1700000000ull || epoch > 2200000000ull) {
+@@ -306,7 +325,7 @@
   static bool
   fk_setup(void)
   {
 -@@ -172,12 +326,13 @@
-+@@ -172,12 +330,13 @@
++@@ -172,12 +345,13 @@
   		    version, count);
   		return false;
   	}
-@@ -322,7 +326,7 @@
+@@ -322,7 +341,7 @@
   	    fk_read(fk_pon_apid, FK_PON_RT, &pon);
   	printf("FUXI KEYS: arb=%#x apids=%u pon-apid=%u/ee%u gpio6-apid=%u/ee%u pon ok=%d type=%#x subtype=%#x rt=%#x st=%#x\n",
   	    version, count, fk_pon_apid, pon_owner, fk_gpio_apid, gpio_owner,
 -@@ -226,8 +381,7 @@
-+@@ -226,8 +385,7 @@
++@@ -226,8 +400,7 @@
   static void
   fk_thread(void *arg, wait_result_t result)
   {
-@@ -332,7 +336,7 @@
+@@ -332,7 +351,7 @@
   	unsigned errors = 0;
   	(void)arg;
   	(void)result;
 -@@ -236,38 +390,435 @@
-+@@ -236,38 +394,495 @@
++@@ -236,38 +409,495 @@
   	}
   	for (;;) {
   		uint8_t pon = 0, gpio = 1;
-@@ -539,6 +543,26 @@
+@@ -539,6 +558,26 @@
  +	return p;
  +}
  +
@@ -34915,7 +37051,7 @@ index 39be642..e5c754d 100644
  +static void
  +fk_taps(void *arg, wait_result_t wr)
  +{
-@@ -548,7 +572,7 @@
+@@ -548,7 +587,7 @@
  +	char cmds[400]; /* fuxitapcmd=@1: page 2, open Settings (row 1 col 1 there), scroll it, go home, back to page 1 (a user's session); @2: the slow home drag; @3: open Settings from home page 1 (row 2 col 1, the default layout) */ static const char *const fk_taps_presets[] = {"s540,2390,540,999,99;s900,1200,180,1200,300;t148,285;w800;s540,1900,540,700,300;s540,1900,540,700,300;s540,700,540,1900,300;s540,1900,540,700,300;s540,2390,540,999,99;s180,1200,900,1200,300", "s540,2390,540,999,99;s900,999,180,999,8000;s180,999,900,999,8000", "s540,2390,540,999,99;t148,570;w800;s540,1900,540,700,300;s540,1900,540,700,300;s540,700,540,1900,300;s540,1900,540,700,300;s540,2390,540,999,99;s900,1200,180,1200,300;s180,1200,900,1200,300"};
  +
  +	(void)wr;
@@ -34924,7 +37060,7 @@ index 39be642..e5c754d 100644
  +		printf("FUXI TAPS: fuxitapcmd missing\n");
  +		(void)thread_terminate(current_thread());
  +		thread_block(THREAD_CONTINUE_NULL);
-@@ -632,6 +656,8 @@
+@@ -632,6 +671,8 @@
  + * the General and About rows in Settings. Device tests only (synthetic touch).
  + */
  +static unsigned fk_tour_hold = 45, fk_tour_general = 2100, fk_tour_about = 400;
@@ -34933,7 +37069,7 @@ index 39be642..e5c754d 100644
  +
  +static void
  +fk_tap(int x, int y)
-@@ -703,6 +729,34 @@
+@@ -703,6 +744,34 @@
  +	fk_swipe(1000, 10, 1000, 1100, 250);    /* Control Center */
  +	fk_script_sleep(2000);
  +	fk_tour_shot(&shot, "control-center");
@@ -34968,7 +37104,7 @@ index 39be642..e5c754d 100644
  +	/* A home gesture on another page only returns to page 1 the second time. */
  +	fk_tour_home();
  +	fk_tour_home();
-@@ -723,6 +777,16 @@
+@@ -723,6 +792,16 @@
  +	fk_tour_home();
  +	fk_tour_app(&shot, 670, 860, "photos");
  +	fk_tour_home();
@@ -34985,12 +37121,12 @@ index 39be642..e5c754d 100644
  +	printf("FUXI TOUR: done\n");
  +	(void)thread_terminate(current_thread());
  +	thread_block(THREAD_CONTINUE_NULL);
-@@ -786,7 +850,7 @@
+@@ -786,7 +865,7 @@
   }
   
   void
 -@@ -289,5 +840,227 @@
-+@@ -289,5 +904,227 @@
++@@ -289,5 +919,227 @@
   	} else {
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
