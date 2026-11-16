@@ -3710,10 +3710,10 @@ index 0000000000000000000000000000000000000000..21fe2c599e823e075c5e37cb2094a725
 +device; until then the torch remains unverified.
 diff --git a/docs-lanes/wlan-ath12k.md b/docs-lanes/wlan-ath12k.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..8b0b133a7d286811985de13d3e889a59f3619113
+index 0000000000000000000000000000000000000000..e2eb411c4959b81b31ba544f9284788e1d73823f
 --- /dev/null
 +++ b/docs-lanes/wlan-ath12k.md
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,77 @@
 +# Fuxi ath12k board adapter
 +
 +The existing WLAN diagnostic reached FW_READY, INI, CFG and a successful
@@ -3759,15 +3759,34 @@ index 0000000000000000000000000000000000000000..8b0b133a7d286811985de13d3e889a59
 +The module object has been built separately from pinned public sources.
 +`FUXI_ATH12K_OBJECT` optionally adds that exact verified object to the plain
 +arm64 kernel link. `tools/ci/ath12k-link.py` checks its SHA256, Mach-O header,
-+iOS 16 kernel ABI flags, source lock, imports and entry points before staging.
++kernel ABI flags, source lock, imports and entry points before staging.
++The existing iOS 16 XNU build uses the macOS 15.5 SDK build profile, so
++module objects use `arm64-apple-macos15.5`, `-mkernel` and
++`-mgeneral-regs-only`. Both input and linked kernel must have the matching
++Mach-O platform and minimum version. The initial iOS-targeted object was
++rejected at final linking; it is no longer admitted.
++
++The replacement module is pinned to CI run `43894744787`, harness commit
++`cb63de2e6b6fc4a4c63cf8f00c1710cf24f6bb84`, object SHA256
++`78178a345c8573a13aa1781221b18ea993b0b8716defb09ba4543e494ad4f6e1`.
++It contains 125 public source objects with the existing source lock and
++13 kernel imports.
++
 +The variant patch adds the object as a link dependency and retains all nine
 +board entry points. After linking, the build requires those entry points to
 +be defined in the unstripped kernel and records the object and kernel hashes
 +in `ath12k-link.json`. Other kernel targets reject the object input.
 +
-+Fourteen host checks exercised the actual bundle, altered object and report
-+rejections, unsafe path rejection, patch application and rejection of a
-+previous kernel that has no native module.
++Only the optional variant defines `FUXI_ATH12K_LINKED`. Ordinary kernels
++compile out native module calls and reject the opt-in before power writes.
++This replaces unresolved weak imports, which the static kernel link
++rejected even when WLAN was disabled at runtime. An extracted production
++test compiles and links that absent-module path without providing any
++module symbols.
++
++`tools/test-fuxi-ath12k-link.py` checks malformed or ambiguous Mach-O version
++commands and the actual pinned bundle, including wrong target, ABI flags,
++source lock, imports, exports and corrupted object rejection.
 +
 +The board adapter has not yet completed a full XNU build or a device scan.
 +Host models and an independently built object do not establish hardware
@@ -5039,10 +5058,10 @@ index efb83f1a7b85c06880b62dbcc349a5c960dc90ee..745d165560fa6e569237487e84f49261
          uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
 diff --git a/tools/ci/ath12k-link.py b/tools/ci/ath12k-link.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..02c96f0103b5054e603ddf7291f1f61d7e36d16c
+index 0000000000000000000000000000000000000000..2894867c98c3a86cfe7a34ac749fa869b0efcd79
 --- /dev/null
 +++ b/tools/ci/ath12k-link.py
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,133 @@
 +import argparse
 +import hashlib
 +import json
@@ -5050,7 +5069,7 @@ index 0000000000000000000000000000000000000000..02c96f0103b5054e603ddf7291f1f61d
 +import struct
 +import subprocess
 +
-+OBJECT_SHA256 = '9eeb3f50624e2622223d5d39774a2fb87776e0875a8e1257af3637ba816f94e0'
++OBJECT_SHA256 = '78178a345c8573a13aa1781221b18ea993b0b8716defb09ba4543e494ad4f6e1'
 +LOCK_SHA256 = 'f23882695f1c136c27b3f9cb36673bebad9ae1fc2af3fa787a98bd4add76c3c9'
 +ENTRY_POINTS = (
 +    '_nw_wifi_start', '_nw_wifi_step', '_nw_wifi_stop', '_nw_wifi_poll',
@@ -5062,6 +5081,8 @@ index 0000000000000000000000000000000000000000..02c96f0103b5054e603ddf7291f1f61d
 +    '_sscanf', '_strchr', '_strcmp', '_strlen', '_strncpy', '_strtoul',
 +    '_vsnprintf',
 +}
++KERNEL_TARGET = 'arm64-apple-macos15.5'
++KERNEL_PLATFORM = (1, 0x000f0500)
 +
 +
 +def require(condition, message):
@@ -5074,6 +5095,33 @@ index 0000000000000000000000000000000000000000..02c96f0103b5054e603ddf7291f1f61d
 +        return hashlib.file_digest(stream, 'sha256').hexdigest()
 +
 +
++def platform_version(path):
++    data = path.read_bytes()
++    require(len(data) >= 32 and struct.unpack_from('<3I', data) ==
++            (0xfeedfacf, 0x0100000c, 0), 'Expected a plain arm64 Mach-O image')
++    count, command_bytes = struct.unpack_from('<2I', data, 16)
++    require(count <= command_bytes // 8 and command_bytes <= len(data) - 32,
++            'Mach-O load command table is invalid')
++    cursor, end, versions = 32, 32 + command_bytes, []
++    for _ in range(count):
++        require(cursor + 8 <= end, 'Mach-O load command is truncated')
++        command, size = struct.unpack_from('<2I', data, cursor)
++        require(size >= 8 and not size % 8 and size <= end - cursor,
++                'Mach-O load command size is invalid')
++        if command == 0x32:
++            require(size >= 24, 'Mach-O build version is truncated')
++            platform, minimum, _, tools = struct.unpack_from('<4I', data, cursor + 8)
++            require(size == 24 + tools * 8, 'Mach-O build tool table is invalid')
++            versions.append((platform, minimum))
++        elif command in (0x24, 0x25, 0x2f, 0x30):
++            require(size == 16, 'Mach-O minimum version is invalid')
++            versions.append(({0x24: 1, 0x25: 2, 0x2f: 3, 0x30: 4}[command],
++                             struct.unpack_from('<I', data, cursor + 8)[0]))
++        cursor += size
++    require(cursor == end and len(versions) == 1, 'Mach-O platform must be unambiguous')
++    return versions[0]
++
++
 +def validate_bundle(directory):
 +    directory = Path(directory).resolve()
 +    object_path = directory / 'fuxi_ath12k.o'
@@ -5084,6 +5132,8 @@ index 0000000000000000000000000000000000000000..02c96f0103b5054e603ddf7291f1f61d
 +        header = stream.read(32)
 +    require(len(header) == 32 and struct.unpack_from('<4I', header) ==
 +            (0xfeedfacf, 0x0100000c, 0, 1), 'ath12k input must be an arm64 Mach-O object')
++    require(platform_version(object_path) == KERNEL_PLATFORM,
++            'ath12k object platform differs from the Fuxi kernel build')
 +    report_path = directory / 'fuxi_ath12k.build-report.json'
 +    report = json.loads(report_path.read_text(encoding='utf-8'))
 +    require(report.get('runtime') == 'mainline' and
@@ -5095,7 +5145,7 @@ index 0000000000000000000000000000000000000000..02c96f0103b5054e603ddf7291f1f61d
 +    flags = report.get('flags', [])
 +    require(flags.count('-target') == 1 and
 +            flags[flags.index('-target') + 1:flags.index('-target') + 2] ==
-+            ['arm64-apple-ios16.0'] and '-mkernel' in flags and
++            [KERNEL_TARGET] and '-mkernel' in flags and
 +            '-mgeneral-regs-only' in flags, 'ath12k kernel ABI flags differ')
 +    undefined = set((directory / 'fuxi_ath12k.undefined.txt').read_text().split())
 +    exports = set((directory / 'fuxi_ath12k.exports.txt').read_text().split())
@@ -5109,8 +5159,11 @@ index 0000000000000000000000000000000000000000..02c96f0103b5054e603ddf7291f1f61d
 +        'source_identity': identity,
 +        'entry_points': list(ENTRY_POINTS),
 +        'imports': sorted(IMPORTS),
-+        'source_run': 43879548709,
-+        'source_commit': '41a932d5edce22e935320b419fc35fce5ec113d3',
++        'source_run': 43894744787,
++        'source_commit': 'cb63de2e6b6fc4a4c63cf8f00c1710cf24f6bb84',
++        'kernel_build_target': KERNEL_TARGET,
++        'macho_platform': KERNEL_PLATFORM[0],
++        'minimum_os': '15.5',
 +        'hardware_verified': False,
 +    }
 +
@@ -5124,6 +5177,8 @@ index 0000000000000000000000000000000000000000..02c96f0103b5054e603ddf7291f1f61d
 +    arguments = parser.parse_args()
 +    record = validate_bundle(arguments.directory)
 +    if arguments.kernel:
++        require(platform_version(arguments.kernel) == KERNEL_PLATFORM,
++                'Linked kernel platform differs from the ath12k object')
 +        command = [str(arguments.nm)] if arguments.nm else ['xcrun', 'nm']
 +        result = subprocess.run(command + ['--defined-only', str(arguments.kernel)],
 +                                check=True, capture_output=True, text=True, timeout=90)
@@ -8187,6 +8242,111 @@ index 0000000000000000000000000000000000000000..53e3ad22c4918e33879001f179b9b40c
 +else:
 +    patch.write_text(expected, encoding='utf-8', newline='\n')
 +print('PASS: fuxi-wlan canonical source matches 0099')
+diff --git a/tools/test-fuxi-ath12k-link.py b/tools/test-fuxi-ath12k-link.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d7facbd042513747c4b1d75ee4c84b153dd0b27
+--- /dev/null
++++ b/tools/test-fuxi-ath12k-link.py
+@@ -0,0 +1,99 @@
++import argparse
++import json
++from pathlib import Path
++import runpy
++import shutil
++import struct
++import tempfile
++
++
++ROOT = Path(__file__).resolve().parents[1]
++GATE = runpy.run_path(str(ROOT / 'tools/ci/ath12k-link.py'))
++
++
++def rejected(operation):
++    try:
++        operation()
++    except ValueError:
++        return
++    raise AssertionError('Invalid ath12k link input was accepted')
++
++
++def image(commands, count=1, byte_count=None):
++    return struct.pack('<8I', 0xfeedfacf, 0x0100000c, 0, 1, count,
++                       len(commands) if byte_count is None else byte_count, 0, 0) + commands
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('bundle', nargs='?', type=Path)
++    arguments = parser.parse_args()
++    checks = 0
++    with tempfile.TemporaryDirectory(prefix='fuxi-ath12k-link-') as temporary:
++        directory = Path(temporary)
++        object_path = directory / 'platform.o'
++        version = struct.pack('<6I', 0x32, 24, 1, 0x000f0500, 0x000f0500, 0)
++        object_path.write_bytes(image(version))
++        assert GATE['platform_version'](object_path) == GATE['KERNEL_PLATFORM']
++        checks += 1
++        old_version = struct.pack('<4I', 0x24, 16, 0x000f0500, 0x000f0500)
++        object_path.write_bytes(image(old_version))
++        assert GATE['platform_version'](object_path) == GATE['KERNEL_PLATFORM']
++        checks += 1
++        bad_images = (
++            b'',
++            image(version)[:31],
++            image(version)[:-1],
++            image(version, byte_count=8),
++            image(version, count=2),
++            image(version, count=0),
++            image(version + version, count=2),
++            image(b'', count=0),
++            image(struct.pack('<2I', 0x32, 0)),
++            image(struct.pack('<2I', 0x32, 8)),
++            image(struct.pack('<6I', 0x32, 24, 1, 0x000f0500, 0x000f0500, 1)),
++            image(struct.pack('<4I', 0x24, 16, 0x000f0500, 0x000f0500) + b'\0' * 8,
++                  byte_count=24),
++        )
++        for malformed in bad_images:
++            object_path.write_bytes(malformed)
++            rejected(lambda: GATE['platform_version'](object_path))
++            checks += 1
++        if arguments.bundle:
++            record = GATE['validate_bundle'](arguments.bundle)
++            assert record['kernel_build_target'] == GATE['KERNEL_TARGET']
++            checks += 1
++            copied = directory / 'bundle'
++            shutil.copytree(arguments.bundle, copied)
++            report_path = copied / 'fuxi_ath12k.build-report.json'
++            original = report_path.read_bytes()
++            for field, value in (
++                    ('runtime', 'legacy'),
++                    ('legacy_station_linked', True),
++                    ('hardware_verified', True),
++                    ('flags', ['-target', 'arm64-apple-ios16.0', '-mkernel', '-mgeneral-regs-only']),
++                    ('flags', ['-target', GATE['KERNEL_TARGET'], '-mkernel']),
++                    ('source_identity', {'source_lock_sha256': '0' * 64})):
++                report = json.loads(original)
++                report[field] = value
++                report_path.write_text(json.dumps(report), encoding='utf-8')
++                rejected(lambda: GATE['validate_bundle'](copied))
++                checks += 1
++            report_path.write_bytes(original)
++            for filename, replacement in (
++                    ('fuxi_ath12k.o', b'broken'),
++                    ('fuxi_ath12k.undefined.txt', b'_unexpected_kernel_import\n'),
++                    ('fuxi_ath12k.exports.txt', b'')):
++                path = copied / filename
++                original = path.read_bytes()
++                path.write_bytes(replacement)
++                rejected(lambda: GATE['validate_bundle'](copied))
++                path.write_bytes(original)
++                checks += 1
++            GATE['validate_bundle'](copied)
++            checks += 1
++    print(f'PASS ath12k link inputs: {checks} platform and bundle checks')
++
++
++if __name__ == '__main__':
++    main()
 diff --git a/tools/test-fuxi-audio-prep.py b/tools/test-fuxi-audio-prep.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..d74473c30bfaf27abaaa81d5c51aa2973db239df
@@ -15733,10 +15893,10 @@ index 0000000000000000000000000000000000000000..bb751037050ba705b9423efe8b3c20e2
 +    main()
 diff --git a/tools/test-fuxi-wlan-ath12k.py b/tools/test-fuxi-wlan-ath12k.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a7933978ec455ace5f885e4c7f3837cda4178a47
+index 0000000000000000000000000000000000000000..3119c66b9e9735cbee39ceba4b1d01e3b84241cc
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ath12k.py
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,265 @@
 +import argparse
 +import json
 +import os
@@ -15965,6 +16125,15 @@ index 0000000000000000000000000000000000000000..a7933978ec455ace5f885e4c7f3837cd
 +    config = config.replace('__asm__ volatile("dsb sy" ::: "memory");', '')
 +    release = 'static void\nwl_ath_release(' + adapter.split('static void\nwl_ath_release(', 1)[1].split(
 +        'static void *\nwla_dma_alloc(', 1)[0]
++    unlinked = (
++        '#include <stdbool.h>\n#include <stdio.h>\n#include "fuxi_wlan_ath12k.h"\n' +
++        'static void\nwla_poll(' + adapter.split('static void\nwla_poll(', 1)[1].split(
++            'static void\nwla_log(', 1)[0] +
++        'static bool\nwla_available(' + adapter.split('static bool\nwla_available(', 1)[1] +
++        'int main(void) {\nunsigned offset;\n'
++        'if (wla_available() || wl_ath_run() != 1 || fwa_config_offset(0, 4, 0, &offset)) return 1;\n'
++        'wla_poll();\nputs("PASS unlinked ath12k adapter refuses start without module imports");\nreturn 0;\n}\n'
++    )
 +    with tempfile.TemporaryDirectory(prefix='ath12k-contract-') as directory:
 +        temporary = Path(directory)
 +        source = temporary / 'contracts.c'
@@ -15980,6 +16149,9 @@ index 0000000000000000000000000000000000000000..a7933978ec455ace5f885e4c7f3837cd
 +            if arguments.sanitize:
 +                flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
 +            command = compiler + flags + ['-I', str(SOURCE), str(source), '-o', str(output)]
++        subprocess.run(command, cwd=directory, env=environment, check=True, timeout=120)
++        subprocess.run([str(output)], cwd=directory, env=environment, check=True, timeout=120)
++        source.write_text(unlinked, encoding='utf-8', newline='\n')
 +        subprocess.run(command, cwd=directory, env=environment, check=True, timeout=120)
 +        subprocess.run([str(output)], cwd=directory, env=environment, check=True, timeout=120)
 +        if arguments.abi_header:
@@ -30828,19 +31000,14 @@ index 0000000000000000000000000000000000000000..83fb1204b809252e45fc563867f5a909
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.h b/xnu/fuxi-wlan/fuxi_wlan_ath12k.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..16a0938077d749c8584a7c28698eff28e9a5bc2d
+index 0000000000000000000000000000000000000000..11204ae345e78ce2c7081123feb06013bf6e2053
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,69 @@
 +#ifndef FUXI_WLAN_ATH12K_H
 +#define FUXI_WLAN_ATH12K_H
 +#include <stdint.h>
 +#include <stddef.h>
-+#if defined(__APPLE__)
-+#define FWA_WEAK __attribute__((weak_import))
-+#else
-+#define FWA_WEAK
-+#endif
 +struct lx_platform {
 +	uint64_t (*now_ms)(void);
 +	void (*sleep_ms)(unsigned ms);
@@ -30884,15 +31051,15 @@ index 0000000000000000000000000000000000000000..16a0938077d749c8584a7c28698eff28
 +	uint16_t ie_len;
 +	uint8_t ie[384];
 +};
-+extern int nw_wifi_start(const struct lx_platform *, const struct nw_board *) FWA_WEAK;
-+extern int nw_wifi_step(void) FWA_WEAK;
-+extern void nw_wifi_stop(void) FWA_WEAK;
-+extern void nw_wifi_poll(void) FWA_WEAK;
-+extern void nw_wifi_irq_mode(int) FWA_WEAK;
-+extern int nw_wifi_scan(const uint8_t *, size_t) FWA_WEAK;
-+extern int nw_wifi_bss_count(void) FWA_WEAK;
-+extern int nw_wifi_bss_get(int, struct nw_bss_info *) FWA_WEAK;
-+extern struct nw_wifi_stats nw_wifi_stats FWA_WEAK;
++extern int nw_wifi_start(const struct lx_platform *, const struct nw_board *);
++extern int nw_wifi_step(void);
++extern void nw_wifi_stop(void);
++extern void nw_wifi_poll(void);
++extern void nw_wifi_irq_mode(int);
++extern int nw_wifi_scan(const uint8_t *, size_t);
++extern int nw_wifi_bss_count(void);
++extern int nw_wifi_bss_get(int, struct nw_bss_info *);
++extern struct nw_wifi_stats nw_wifi_stats;
 +
 +static int
 +fwa_config_offset(uint32_t encoded, unsigned size, unsigned express, unsigned *offset)
@@ -30908,10 +31075,10 @@ index 0000000000000000000000000000000000000000..16a0938077d749c8584a7c28698eff28
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
 new file mode 100644
-index 0000000000000000000000000000000000000000..737e97fe2f8387a8ca68e9e3faa9e0ef7b16fa67
+index 0000000000000000000000000000000000000000..382e044b65413f6dcd52d98d1b5481a1b117ee8e
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,329 @@
 +#include "fuxi_wlan_arena.h"
 +#include "fuxi_wlan_ath12k.h"
 +
@@ -31121,8 +31288,10 @@ index 0000000000000000000000000000000000000000..737e97fe2f8387a8ca68e9e3faa9e0ef
 +static void
 +wla_poll(void)
 +{
++#if defined(FUXI_ATH12K_LINKED)
 +	nw_wifi_irq_mode(0);
 +	nw_wifi_poll();
++#endif
 +}
 +
 +static void
@@ -31148,13 +31317,17 @@ index 0000000000000000000000000000000000000000..737e97fe2f8387a8ca68e9e3faa9e0ef
 +static bool
 +wla_available(void)
 +{
-+	return nw_wifi_start && nw_wifi_step && nw_wifi_stop && nw_wifi_poll && nw_wifi_irq_mode &&
-+	       nw_wifi_scan && nw_wifi_bss_count && nw_wifi_bss_get && &nw_wifi_stats;
++#if defined(FUXI_ATH12K_LINKED)
++	return true;
++#else
++	return false;
++#endif
 +}
 +
 +static int
 +wl_ath_run(void)
 +{
++#if defined(FUXI_ATH12K_LINKED)
 +	static const struct lx_platform platform = {
 +		wla_now_ms, wl_sleep, wla_poll, wla_log, wla_halt, wla_alloc, wla_free,
 +		wla_dma_alloc, wla_dma_free, wla_dma_map, wla_dma_sync, wla_fw_get,
@@ -31231,6 +31404,9 @@ index 0000000000000000000000000000000000000000..737e97fe2f8387a8ca68e9e3faa9e0ef
 +	bool success = !error && completed && count > 0 && !wla_failed && !fw_faults;
 +	printf("FUXI ATH12K: diagnostic %s; common containment follows\n", success ? "scan observed" : "incomplete");
 +	return success ? 0 : 5;
++#else
++	return 1;
++#endif
 +}
 diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
 index 0ca28384a623fc36e987daa43e85e29b84c11540..0d215ede6b71c5c85a3bca7ccfcac02c1b1dce16 100644
@@ -31395,7 +31571,7 @@ index 0ca28384a623fc36e987daa43e85e29b84c11540..0d215ede6b71c5c85a3bca7ccfcac02c
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..4b5f0c8c98d19fd2455087d171ed4ce5ff4ac2d3 100644
+index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..ad0a432d36b1b9c4055845b4be71e4ac81dab877 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -31866,7 +32042,7 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..4b5f0c8c98d19fd2455087d171ed4ce5
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,524 @@
+@@ -5899,3 +6092,528 @@
  + }
  + r[3] = 0;
  +}
@@ -31993,16 +32169,11 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..4b5f0c8c98d19fd2455087d171ed4ce5
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ath12k.h
-+@@ -0,0 +1,74 @@
++@@ -0,0 +1,69 @@
 ++#ifndef FUXI_WLAN_ATH12K_H
 ++#define FUXI_WLAN_ATH12K_H
 ++#include <stdint.h>
 ++#include <stddef.h>
-++#if defined(__APPLE__)
-++#define FWA_WEAK __attribute__((weak_import))
-++#else
-++#define FWA_WEAK
-++#endif
 ++struct lx_platform {
 ++	uint64_t (*now_ms)(void);
 ++	void (*sleep_ms)(unsigned ms);
@@ -32046,15 +32217,15 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..4b5f0c8c98d19fd2455087d171ed4ce5
 ++	uint16_t ie_len;
 ++	uint8_t ie[384];
 ++};
-++extern int nw_wifi_start(const struct lx_platform *, const struct nw_board *) FWA_WEAK;
-++extern int nw_wifi_step(void) FWA_WEAK;
-++extern void nw_wifi_stop(void) FWA_WEAK;
-++extern void nw_wifi_poll(void) FWA_WEAK;
-++extern void nw_wifi_irq_mode(int) FWA_WEAK;
-++extern int nw_wifi_scan(const uint8_t *, size_t) FWA_WEAK;
-++extern int nw_wifi_bss_count(void) FWA_WEAK;
-++extern int nw_wifi_bss_get(int, struct nw_bss_info *) FWA_WEAK;
-++extern struct nw_wifi_stats nw_wifi_stats FWA_WEAK;
+++extern int nw_wifi_start(const struct lx_platform *, const struct nw_board *);
+++extern int nw_wifi_step(void);
+++extern void nw_wifi_stop(void);
+++extern void nw_wifi_poll(void);
+++extern void nw_wifi_irq_mode(int);
+++extern int nw_wifi_scan(const uint8_t *, size_t);
+++extern int nw_wifi_bss_count(void);
+++extern int nw_wifi_bss_get(int, struct nw_bss_info *);
+++extern struct nw_wifi_stats nw_wifi_stats;
 ++
 ++static int
 ++fwa_config_offset(uint32_t encoded, unsigned size, unsigned express, unsigned *offset)
@@ -32070,7 +32241,7 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..4b5f0c8c98d19fd2455087d171ed4ce5
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ath12k.inc
-+@@ -0,0 +1,320 @@
++@@ -0,0 +1,329 @@
 ++#include "fuxi_wlan_arena.h"
 ++#include "fuxi_wlan_ath12k.h"
 ++
@@ -32280,8 +32451,10 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..4b5f0c8c98d19fd2455087d171ed4ce5
 ++static void
 ++wla_poll(void)
 ++{
+++#if defined(FUXI_ATH12K_LINKED)
 ++	nw_wifi_irq_mode(0);
 ++	nw_wifi_poll();
+++#endif
 ++}
 ++
 ++static void
@@ -32307,13 +32480,17 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..4b5f0c8c98d19fd2455087d171ed4ce5
 ++static bool
 ++wla_available(void)
 ++{
-++	return nw_wifi_start && nw_wifi_step && nw_wifi_stop && nw_wifi_poll && nw_wifi_irq_mode &&
-++	       nw_wifi_scan && nw_wifi_bss_count && nw_wifi_bss_get && &nw_wifi_stats;
+++#if defined(FUXI_ATH12K_LINKED)
+++	return true;
+++#else
+++	return false;
+++#endif
 ++}
 ++
 ++static int
 ++wl_ath_run(void)
 ++{
+++#if defined(FUXI_ATH12K_LINKED)
 ++	static const struct lx_platform platform = {
 ++		wla_now_ms, wl_sleep, wla_poll, wla_log, wla_halt, wla_alloc, wla_free,
 ++		wla_dma_alloc, wla_dma_free, wla_dma_map, wla_dma_sync, wla_fw_get,
@@ -32390,6 +32567,9 @@ index d21bf85cedbcdad3adf257ec4adbd7f262f3d8a8..4b5f0c8c98d19fd2455087d171ed4ce5
 ++	bool success = !error && completed && count > 0 && !wla_failed && !fw_faults;
 ++	printf("FUXI ATH12K: diagnostic %s; common containment follows\n", success ? "scan observed" : "incomplete");
 ++	return success ? 0 : 5;
+++#else
+++	return 1;
+++#endif
 ++}
 diff --git a/xnu/patches/0103-fuxi-kernel-h1.patch b/xnu/patches/0103-fuxi-kernel-h1.patch
 index 39be64213fb3f55d852669cc749480ab13282a19..e5c754dec6d8bcf6b54c989c4412fc5f73b86013 100644
@@ -41128,10 +41308,10 @@ index 0000000000000000000000000000000000000000..34f1acfd51923932b41f74175f5617fd
 ++}
 diff --git a/xnu/variants/ath12k-link.patch b/xnu/variants/ath12k-link.patch
 new file mode 100644
-index 0000000000000000000000000000000000000000..ab89526cbd65b67c616f67d2a18f5187b35e6197
+index 0000000000000000000000000000000000000000..1b30fd1893e53950bc9d90635c82df4dc227a97d
 --- /dev/null
 +++ b/xnu/variants/ath12k-link.patch
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,26 @@
 +--- a/makedefs/MakeInc.def
 ++++ b/makedefs/MakeInc.def
 +@@ -854,6 +854,15 @@
@@ -41150,6 +41330,14 @@ index 0000000000000000000000000000000000000000..ab89526cbd65b67c616f67d2a18f5187
 + #
 + # Default runtime libraries to be linked with the kernel
 + #
++--- a/bsd/dev/fuxi_wlan_ath12k.h
+++++ b/bsd/dev/fuxi_wlan_ath12k.h
++@@ -1,4 +1,5 @@
++ #ifndef FUXI_WLAN_ATH12K_H
++ #define FUXI_WLAN_ATH12K_H
+++#define FUXI_ATH12K_LINKED 1
++ #include <stdint.h>
++ #include <stddef.h>
 diff --git a/xnu/variants/ram9g.patch b/xnu/variants/ram9g.patch
 new file mode 100644
 index 0000000000000000000000000000000000000000..a22cc1a2b63a9f9bdb5070857b8828b5a8759081

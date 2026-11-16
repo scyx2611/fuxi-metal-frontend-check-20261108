@@ -1,4 +1,4 @@
-name: Build opt-in Fuxi ath12k 9 GiB kernel
+name: Build opt-in Fuxi ath12k 9 GiB kernel with verified module platform
 on:
   workflow_dispatch:
   push:

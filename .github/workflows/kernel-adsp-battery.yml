@@ -146,13 +146,14 @@ jobs:
         with:
           name: fuxi-ath12k-objects
           path: ath12k-out
-          run-id: 43879548709
+          run-id: 43894744787
           github-token: ${{ github.token }}
       - name: Verify the optional ath12k link input
         if: ${{ inputs.ath12k }}
         shell: bash
         run: |
           set -euo pipefail
+          python3 source/tools/test-fuxi-ath12k-link.py ath12k-out
           python3 source/tools/ci/ath12k-link.py ath12k-out
           (cd source && python3 tools/test-fuxi-wlan-ath12k.py --sanitize)
           echo "FUXI_ATH12K_OBJECT=$PWD/ath12k-out/fuxi_ath12k.o" >> "$GITHUB_ENV"
