@@ -1,9 +1,9 @@
 diff --git a/docs-lanes/adsp.md b/docs-lanes/adsp.md
 new file mode 100644
-index 0000000..1831310
+index 0000000..4cbbb91
 --- /dev/null
 +++ b/docs-lanes/adsp.md
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,116 @@
 +# Audio DSP and battery manager (`fuxiadsp`)
 +
 +Patch 0117 (`tools/sync-fuxi-adsp.py`, canonical sources `xnu/fuxi-adsp/`) starts the audio DSP (ADSP, LPASS) from XNU
@@ -102,6 +102,24 @@ index 0000000..1831310
 +`FUXI AMP: amp B@0x40 answers devid=0x35a40 (CS35L41) ...` and `FUXI AMP: bring-up stopped at step 6 ...`. Step numbers:
 +1 clocks did not run, 2 pins set, 3 engine is not I2C, 4 no 19.2 MHz level / engine programmed, 5 GIC mask or FIFO refused
 +(GSI only), 6 both amplifiers read.
++
++## Flash and haptics PMIC
++
++`fuxipmic=N`, or ADT `/chosen` u32 `fuxi,pmic`, is independent of the DSP switch and defaults to off.
++Mode 1 only reads the v7 observer channels. Hardware run `native-hw000provider-ram9g-pmic-boot-1`
++identified flash SID 1/0xee00, APID 591 owned by EE 0, type 0x18/subtype 7 (four channels);
++haptics configuration/pattern SID 7/0xf000 and 0xf100 are APIDs 631/632 owned by EE 0.
++The haptics boost at 0xf200 is APID 556 owned by EE 3; no ownership change or boost write is attempted.
++
++Mode 2 also requests one flash-channel-0 torch pulse: 40 mA, 80 ms, with a 100 ms hardware timer
++programmed and read back before enabling. It refuses an active module, active channels, faults,
++an unexpected peripheral type, or a write channel not owned by EE 0. Only timer, current, resolution,
++strobe, module-enable and channel-enable registers are writable. The routine disables the output
++and restores all six saved registers; a timeout quarantines the channel. This is an opt-in hardware
++diagnostic, not an iOS flashlight implementation or proof of visible light.
++
++`tools/test-fuxi-torch-pulse.py` compiles the exact sequence against a register model, including
++read/write failures, dropped writes, timeout quarantine, timer ordering and saved-state restoration.
 diff --git a/shim/fuxi-probe/probe.c b/shim/fuxi-probe/probe.c
 index efb83f1..745d165 100644
 --- a/shim/fuxi-probe/probe.c
@@ -300,7 +318,7 @@ index c7d2b39..22b499a 100644
          if args.root_extents:
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..f0593b4
+index 0000000..c5915ef
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
 @@ -0,0 +1,142 @@
@@ -327,7 +345,7 @@ index 0000000..f0593b4
 +SOURCES = ('fuxi_adsp.c', 'fuxi_adsp_fw.c', 'fuxi_adsp_battery.c', 'fuxi_amp.c', 'fuxi_pmic.c', 'fuxi_rpmh_shared.c', 'QcomSmem.c', 'QcomSmp2p.c', 'QcomGlink.c',
 +           'QcomMdt.c', 'QcomQmp.c', 'QcomRpmh.c', 'QcomQrtr.c', 'FatVolume.c', 'ShengBattmgr.c', 'ShengQrtr.c', 'GeniI2c.c')
 +HEADERS = ('QcomSmem.h', 'QcomSmp2p.h', 'QcomGlink.h', 'QcomMdt.h', 'QcomQmp.h', 'QcomRpmh.h', 'QcomScm.h', 'QcomQrtr.h',
-+           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h', 'fuxi_adsp_battery.h', 'fuxi_rpmh_shared.h', 'GeniI2c.h')
++           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h', 'fuxi_adsp_battery.h', 'fuxi_rpmh_shared.h', 'fuxi_torch_pulse.h', 'GeniI2c.h')
 +MODIFIED = {'iokit/Kernel/arm/SweetBattery.cpp': ('0062-sweet-touch-power-battery.patch', 'SweetBattery.cpp')}
 +# bsd/dev/LICENSE.UniXNU-sheng already comes with 0098 (the GPU fence interrupt is adapted from sheng too); --check
 +# verifies that the local copy is the same text.
@@ -672,6 +690,118 @@ index 0000000..e360b63
 +    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-g', '-Wall', '-Wextra', '-Werror',
 +                    '-pthread', '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
 +                    '-I' + str(sources), str(cfile), str(sources / 'QcomRpmh.c'), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
+diff --git a/tools/test-fuxi-torch-pulse.py b/tools/test-fuxi-torch-pulse.py
+new file mode 100644
+index 0000000..e9344e6
+--- /dev/null
++++ b/tools/test-fuxi-torch-pulse.py
+@@ -0,0 +1,106 @@
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[1]
++source = r'''
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "fuxi_torch_pulse.h"
++struct model {
++    uint8_t registers[256], original[256];
++    unsigned reads, writes, fail_read, fail_write, drop_write, quarantine, dead, fault;
++    unsigned now, start, pulses, peak_current, expired;
++    uint64_t drop_mask;
++};
++static int active(struct model *state) {
++    return (state->registers[0x46]&0x80) && (state->registers[0x4e]&1) && !state->expired;
++}
++static int read_register(void *context, unsigned offset, uint8_t *value) {
++    struct model *state=context;
++    assert(offset<256);
++    if(++state->reads==state->fail_read) return -1;
++    if(state->fault && state->pulses && offset==6) {*value=1; return 0;}
++    *value=state->registers[offset];
++    return 0;
++}
++static int write_register(void *context, unsigned offset, uint8_t value) {
++    struct model *state=context;
++    assert(offset==0x3e || offset==0x42 || offset==0x49 || offset==0x4a || offset==0x46 || offset==0x4e);
++    state->writes++;
++    if(state->dead) return -1;
++    if(state->writes==state->fail_write && !state->quarantine) return -1;
++    if(state->writes!=state->drop_write && !(state->drop_mask&(1ull<<state->writes))) {
++        if(active(state) && offset!=0x46 && offset!=0x4e) assert(0);
++        if(offset==0x4e && value) {
++            assert(value==1 && state->registers[0x3e]==0x8a && (state->registers[0x49]&1));
++            assert((state->registers[0x4a]&7)==1 && state->registers[0x42]==7);
++            assert(state->registers[0x46]&0x80);
++            state->start=state->now; state->pulses++; state->expired=0; state->peak_current=40;
++        }
++        state->registers[offset]=value;
++    }
++    if(state->writes==state->fail_write) {state->dead=1; return -1;}
++    return 0;
++}
++static void wait_us(void *context, unsigned microseconds) {
++    struct model *state=context;
++    state->now+=microseconds;
++    if(state->pulses && (state->registers[0x3e]&0x80) &&
++       state->now-state->start>=(state->registers[0x3e]&0x7f)*10000u) state->expired=1;
++}
++static void fixture(struct model *state) {
++    memset(state,0,sizeof(*state));
++    state->registers[4]=0x18; state->registers[5]=7;
++    state->registers[0x3e]=11; state->registers[0x42]=23;
++    state->registers[0x49]=0x0a; state->registers[0x4a]=1; state->registers[0x46]=0x20;
++    memcpy(state->original,state->registers,256);
++}
++static int run(struct model *state) {
++    FuxiTorchIo io={state,read_register,write_register,wait_us};
++    int result=fuxi_torch_pulse(&io);
++    assert(!active(state) && state->pulses<=1 && state->peak_current<=40);
++    return result;
++}
++int main(void) {
++    struct model state;
++    fixture(&state); assert(!run(&state));
++    assert(state.pulses==1 && state.now==80000 && state.writes==12);
++    assert(!memcmp(state.registers,state.original,256));
++    unsigned reads=state.reads;
++    fixture(&state); state.registers[4]=0; assert(run(&state)<0 && !state.writes);
++    fixture(&state); state.registers[5]=4; assert(run(&state)<0 && !state.writes);
++    fixture(&state); state.registers[0x46]|=0x80;
++    FuxiTorchIo busy={&state,read_register,write_register,wait_us};
++    assert(fuxi_torch_pulse(&busy)==-2 && !state.writes);
++    fixture(&state); state.registers[0x4e]=2; assert(run(&state)==-2 && !state.writes);
++    fixture(&state); state.registers[6]=1; assert(run(&state)==-2 && !state.writes);
++    for(unsigned index=1;index<=reads;index++) {
++        fixture(&state); state.fail_read=index; assert(run(&state)<0);
++    }
++    for(unsigned index=1;index<=12;index++) {
++        fixture(&state); state.fail_write=index; assert(run(&state)<0);
++    }
++    for(unsigned index=1;index<=12;index++) {
++        fixture(&state); state.drop_write=index; run(&state);
++        fixture(&state); state.fail_write=index; state.quarantine=1; assert(run(&state)<0);
++    }
++    fixture(&state); state.drop_mask=(1ull<<7)|(1ull<<8);
++    assert(run(&state)==-6 && state.expired && state.now==190000);
++    assert(state.registers[0x3e]==0x8a && state.writes==8);
++    fixture(&state); state.fault=1; assert(run(&state)==-5);
++    assert(!memcmp(state.registers,state.original,256));
++    puts("PASS: real torch pulse, 40mA limit, 80ms duration, timer-before-enable, busy/fault checks, failure cleanup and register restore");
++    return 0;
++}
++'''
++with tempfile.TemporaryDirectory(prefix='fuxi-torch-pulse-') as temporary:
++    directory = Path(temporary)
++    cfile, binary = directory / 'pulse.c', directory / 'pulse'
++    cfile.write_text(source)
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-g', '-Wall', '-Wextra', '-Werror',
++                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
++                    '-I' + str(root / 'xnu/fuxi-adsp'), str(cfile), '-o', str(binary)], check=True)
 +    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-wlan-m6i.py b/tools/test-fuxi-wlan-m6i.py
 index 12293f1..dbd7876 100755
@@ -6244,10 +6374,10 @@ index 0000000..09ce08d
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_pmic.c b/xnu/fuxi-adsp/fuxi_pmic.c
 new file mode 100644
-index 0000000..b70b9b0
+index 0000000..1cb54fe
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_pmic.c
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,221 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
@@ -6259,6 +6389,7 @@ index 0000000..b70b9b0
 +#include <pexpert/device_tree.h>
 +#include <vm/vm_kern.h>
 +#include <vm/pmap.h>
++#include "fuxi_torch_pulse.h"
 +
 +extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
 +    unsigned, void *);
@@ -6278,6 +6409,7 @@ index 0000000..b70b9b0
 +static unsigned fp_apids;
 +static uint8_t fp_poisoned[1024];
 +static unsigned fp_started;
++static struct fp_window fp_flash_channel;
 +
 +static kern_return_t fp_map(struct fp_window *window)
 +{
@@ -6370,6 +6502,71 @@ index 0000000..b70b9b0
 +    }
 +}
 +
++static int fp_flash_read(void *context, unsigned offset, uint8_t *value)
++{
++    (void)context;
++    if (offset > 0xff) return -1;
++    return fp_read(1, 0xee00 + offset, value);
++}
++
++static int fp_flash_write(void *context, unsigned offset, uint8_t value)
++{
++    (void)context;
++    if (offset != 0x3e && offset != 0x42 && offset != 0x46 &&
++        offset != 0x49 && offset != 0x4a && offset != 0x4e) return -1;
++    unsigned owner = 7;
++    int result = -1;
++    lck_mtx_lock(&fp_lock);
++    int apid = fp_find(1, 0xee, &owner);
++    if (apid < 0 || owner != 0 || fp_poisoned[apid] || !fp_flash_channel.address) goto done;
++    uint64_t physical = 0x0c500000ull + (unsigned)apid * 0x1000u;
++    if ((physical & ~(uint64_t)PAGE_MASK) != fp_flash_channel.physical) goto done;
++    unsigned channel = physical & PAGE_MASK;
++    fp_write32(&fp_flash_channel, channel + 0x10, value);
++    fp_write32(&fp_flash_channel, channel, offset << 4);
++    for (unsigned poll = 0; poll < 1000; poll++) {
++        uint32_t status = fp_read32(&fp_flash_channel, channel + 8);
++        if (status & 1u) {
++            result = status & 0x0eu ? -1 : 0;
++            goto done;
++        }
++        delay(1);
++    }
++    fp_poisoned[apid] = 1;
++    printf("FUXI PMIC: flash write timeout +%02x APID=%d; channel disabled\n", offset, apid);
++done:
++    lck_mtx_unlock(&fp_lock);
++    return result;
++}
++
++static void fp_flash_wait(void *context, unsigned microseconds)
++{
++    (void)context;
++    delay(microseconds);
++}
++
++static void fp_flash_pulse(void)
++{
++    unsigned owner = 7;
++    int apid = fp_find(1, 0xee, &owner);
++    if (apid < 0 || owner != 0) {
++        printf("FUXI PMIC: flash pulse refused APID=%d owner=%u\n", apid, owner);
++        return;
++    }
++    uint64_t channel = 0x0c500000ull + (unsigned)apid * 0x1000u;
++    fp_flash_channel.physical = channel & ~(uint64_t)PAGE_MASK;
++    fp_flash_channel.size = PAGE_SIZE;
++    if (fp_map(&fp_flash_channel) != KERN_SUCCESS) {
++        printf("FUXI PMIC: flash channel mapping failed\n");
++        return;
++    }
++    FuxiTorchIo io = {NULL, fp_flash_read, fp_flash_write, fp_flash_wait};
++    printf("FUXI PMIC: flash pulse begin channel=0 current=40mA duration=80ms hardware-timer=100ms\n");
++    int result = fuxi_torch_pulse(&io);
++    printf("FUXI PMIC: flash pulse result=%d%s\n", result,
++        result == 0 ? " registers restored; visible light needs observation" : " failed; not accepted");
++}
++
 +void fuxi_pmic_init(void)
 +{
 +    uint32_t mode = 0;
@@ -6382,7 +6579,7 @@ index 0000000..b70b9b0
 +        memcpy(&mode, property, sizeof(mode));
 +    }
 +    if (!mode || __atomic_exchange_n(&fp_started, 1u, __ATOMIC_ACQ_REL)) return;
-+    if (mode != 1) {
++    if (mode != 1 && mode != 2) {
 +        printf("FUXI PMIC: unsupported mode=%u; hardware untouched\n", mode);
 +        return;
 +    }
@@ -6393,12 +6590,13 @@ index 0000000..b70b9b0
 +    }
 +    uint32_t version = fp_read32(&fp_core, 0);
 +    fp_apids = fp_read32(&fp_core, 4) & 0x7ffu;
-+    printf("FUXI PMIC: arbiter=%#x APIDs=%u mode=1\n", version, fp_apids);
++    printf("FUXI PMIC: arbiter=%#x APIDs=%u mode=%u\n", version, fp_apids, mode);
 +    if (version < 0x70000000u || version >= 0x80000000u || !fp_apids || fp_apids > 1024) return;
 +    fp_survey(1, 0xee00, "flash");
 +    fp_survey(7, 0xf000, "haptic-config");
 +    fp_survey(7, 0xf100, "haptic-pattern");
 +    fp_survey(7, 0xf200, "haptic-boost");
++    if (mode == 2) fp_flash_pulse();
 +}
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_rpmh_shared.c b/xnu/fuxi-adsp/fuxi_rpmh_shared.c
@@ -6444,6 +6642,82 @@ index 0000000..fd499b2
 +int fuxi_rpmh_acquire(void);
 +void fuxi_rpmh_release(int healthy);
 +
++#endif
+diff --git a/xnu/fuxi-adsp/fuxi_torch_pulse.h b/xnu/fuxi-adsp/fuxi_torch_pulse.h
+new file mode 100644
+index 0000000..48cd2d2
+--- /dev/null
++++ b/xnu/fuxi-adsp/fuxi_torch_pulse.h
+@@ -0,0 +1,70 @@
++#ifndef FUXI_TORCH_PULSE_H
++#define FUXI_TORCH_PULSE_H
++#include <stdint.h>
++
++typedef struct {
++    void *context;
++    int (*read)(void *, unsigned, uint8_t *);
++    int (*write)(void *, unsigned, uint8_t);
++    void (*wait_us)(void *, unsigned);
++} FuxiTorchIo;
++
++static inline int fuxi_torch_pulse(const FuxiTorchIo *io)
++{
++    static const unsigned registers[] = {0x3e, 0x42, 0x49, 0x4a, 0x46, 0x4e};
++    uint8_t saved[6], value = 0, type = 0, subtype = 0;
++    int result = -1, enabled = 0, restored = 1, disabled = 1;
++    if (!io || !io->read || !io->write || !io->wait_us) return -1;
++    if (io->read(io->context, 4, &type) || io->read(io->context, 5, &subtype) ||
++        type != 0x18 || subtype != 7) return -1;
++    for (unsigned index = 0; index < 6; index++) {
++        if (io->read(io->context, registers[index], &saved[index])) return -1;
++    }
++    if ((saved[4] & 0x80) || saved[5]) return -2;
++    for (unsigned index = 0; index < 3; index++) {
++        const unsigned status[] = {6, 7, 9};
++        if (io->read(io->context, status[index], &value) || value) return -2;
++    }
++    const uint8_t setup[] = {0x8a, 7, (uint8_t)(saved[2] | 1), (uint8_t)((saved[3] & ~7u) | 1)};
++    for (unsigned index = 0; index < 4; index++) {
++        if (io->write(io->context, registers[index], setup[index]) ||
++            io->read(io->context, registers[index], &value) || value != setup[index]) {
++            result = -3;
++            goto cleanup;
++        }
++    }
++    if (io->write(io->context, 0x46, saved[4] | 0x80) ||
++        io->read(io->context, 0x46, &value) || value != (uint8_t)(saved[4] | 0x80)) {
++        result = -4;
++        goto cleanup;
++    }
++    enabled = 1;
++    if (io->write(io->context, 0x4e, 1) ||
++        io->read(io->context, 0x4e, &value) || value != 1) {
++        result = -4;
++        goto cleanup;
++    }
++    io->wait_us(io->context, 80000);
++    result = 0;
++    for (unsigned index = 0; index < 3; index++) {
++        const unsigned status[] = {6, 7, 9};
++        if (io->read(io->context, status[index], &value) || value) result = -5;
++    }
++cleanup:
++    if (io->write(io->context, 0x4e, 0)) restored = 0;
++    if (io->write(io->context, 0x46, saved[4])) restored = 0;
++    if (io->read(io->context, 0x4e, &value) || value) disabled = 0;
++    if (io->read(io->context, 0x46, &value) || value != saved[4]) disabled = 0;
++    if (!disabled) {
++        if (enabled) io->wait_us(io->context, 110000);
++        return -6;
++    }
++    for (unsigned index = 0; index < 4; index++) {
++        if (io->write(io->context, registers[index], saved[index])) restored = 0;
++    }
++    for (unsigned index = 0; index < 6; index++) {
++        if (io->read(io->context, registers[index], &value) || value != saved[index]) restored = 0;
++    }
++    return restored ? result : -6;
++}
 +#endif
 diff --git a/xnu/fuxi-h1/fuxi_keys.c b/xnu/fuxi-h1/fuxi_keys.c
 index 8f1d60f..e71e7c2 100644
@@ -7761,10 +8035,10 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..cfaaaf6
+index 0000000..8bcab41
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,5208 @@
+@@ -0,0 +1,5349 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,23 @@
@@ -9474,7 +9748,7 @@ index 0000000..cfaaaf6
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_pmic.c
-+@@ -0,0 +1,153 @@
++@@ -0,0 +1,221 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
@@ -9486,6 +9760,7 @@ index 0000000..cfaaaf6
 ++#include <pexpert/device_tree.h>
 ++#include <vm/vm_kern.h>
 ++#include <vm/pmap.h>
+++#include "fuxi_torch_pulse.h"
 ++
 ++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
 ++    unsigned, void *);
@@ -9505,6 +9780,7 @@ index 0000000..cfaaaf6
 ++static unsigned fp_apids;
 ++static uint8_t fp_poisoned[1024];
 ++static unsigned fp_started;
+++static struct fp_window fp_flash_channel;
 ++
 ++static kern_return_t fp_map(struct fp_window *window)
 ++{
@@ -9597,6 +9873,71 @@ index 0000000..cfaaaf6
 ++    }
 ++}
 ++
+++static int fp_flash_read(void *context, unsigned offset, uint8_t *value)
+++{
+++    (void)context;
+++    if (offset > 0xff) return -1;
+++    return fp_read(1, 0xee00 + offset, value);
+++}
+++
+++static int fp_flash_write(void *context, unsigned offset, uint8_t value)
+++{
+++    (void)context;
+++    if (offset != 0x3e && offset != 0x42 && offset != 0x46 &&
+++        offset != 0x49 && offset != 0x4a && offset != 0x4e) return -1;
+++    unsigned owner = 7;
+++    int result = -1;
+++    lck_mtx_lock(&fp_lock);
+++    int apid = fp_find(1, 0xee, &owner);
+++    if (apid < 0 || owner != 0 || fp_poisoned[apid] || !fp_flash_channel.address) goto done;
+++    uint64_t physical = 0x0c500000ull + (unsigned)apid * 0x1000u;
+++    if ((physical & ~(uint64_t)PAGE_MASK) != fp_flash_channel.physical) goto done;
+++    unsigned channel = physical & PAGE_MASK;
+++    fp_write32(&fp_flash_channel, channel + 0x10, value);
+++    fp_write32(&fp_flash_channel, channel, offset << 4);
+++    for (unsigned poll = 0; poll < 1000; poll++) {
+++        uint32_t status = fp_read32(&fp_flash_channel, channel + 8);
+++        if (status & 1u) {
+++            result = status & 0x0eu ? -1 : 0;
+++            goto done;
+++        }
+++        delay(1);
+++    }
+++    fp_poisoned[apid] = 1;
+++    printf("FUXI PMIC: flash write timeout +%02x APID=%d; channel disabled\n", offset, apid);
+++done:
+++    lck_mtx_unlock(&fp_lock);
+++    return result;
+++}
+++
+++static void fp_flash_wait(void *context, unsigned microseconds)
+++{
+++    (void)context;
+++    delay(microseconds);
+++}
+++
+++static void fp_flash_pulse(void)
+++{
+++    unsigned owner = 7;
+++    int apid = fp_find(1, 0xee, &owner);
+++    if (apid < 0 || owner != 0) {
+++        printf("FUXI PMIC: flash pulse refused APID=%d owner=%u\n", apid, owner);
+++        return;
+++    }
+++    uint64_t channel = 0x0c500000ull + (unsigned)apid * 0x1000u;
+++    fp_flash_channel.physical = channel & ~(uint64_t)PAGE_MASK;
+++    fp_flash_channel.size = PAGE_SIZE;
+++    if (fp_map(&fp_flash_channel) != KERN_SUCCESS) {
+++        printf("FUXI PMIC: flash channel mapping failed\n");
+++        return;
+++    }
+++    FuxiTorchIo io = {NULL, fp_flash_read, fp_flash_write, fp_flash_wait};
+++    printf("FUXI PMIC: flash pulse begin channel=0 current=40mA duration=80ms hardware-timer=100ms\n");
+++    int result = fuxi_torch_pulse(&io);
+++    printf("FUXI PMIC: flash pulse result=%d%s\n", result,
+++        result == 0 ? " registers restored; visible light needs observation" : " failed; not accepted");
+++}
+++
 ++void fuxi_pmic_init(void)
 ++{
 ++    uint32_t mode = 0;
@@ -9609,7 +9950,7 @@ index 0000000..cfaaaf6
 ++        memcpy(&mode, property, sizeof(mode));
 ++    }
 ++    if (!mode || __atomic_exchange_n(&fp_started, 1u, __ATOMIC_ACQ_REL)) return;
-++    if (mode != 1) {
+++    if (mode != 1 && mode != 2) {
 ++        printf("FUXI PMIC: unsupported mode=%u; hardware untouched\n", mode);
 ++        return;
 ++    }
@@ -9620,12 +9961,13 @@ index 0000000..cfaaaf6
 ++    }
 ++    uint32_t version = fp_read32(&fp_core, 0);
 ++    fp_apids = fp_read32(&fp_core, 4) & 0x7ffu;
-++    printf("FUXI PMIC: arbiter=%#x APIDs=%u mode=1\n", version, fp_apids);
+++    printf("FUXI PMIC: arbiter=%#x APIDs=%u mode=%u\n", version, fp_apids, mode);
 ++    if (version < 0x70000000u || version >= 0x80000000u || !fp_apids || fp_apids > 1024) return;
 ++    fp_survey(1, 0xee00, "flash");
 ++    fp_survey(7, 0xf000, "haptic-config");
 ++    fp_survey(7, 0xf100, "haptic-pattern");
 ++    fp_survey(7, 0xf200, "haptic-boost");
+++    if (mode == 2) fp_flash_pulse();
 ++}
 ++#endif
 +--- /dev/null
@@ -12588,6 +12930,79 @@ index 0000000..cfaaaf6
 ++int fuxi_rpmh_acquire(void);
 ++void fuxi_rpmh_release(int healthy);
 ++
+++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_torch_pulse.h
++@@ -0,0 +1,70 @@
+++#ifndef FUXI_TORCH_PULSE_H
+++#define FUXI_TORCH_PULSE_H
+++#include <stdint.h>
+++
+++typedef struct {
+++    void *context;
+++    int (*read)(void *, unsigned, uint8_t *);
+++    int (*write)(void *, unsigned, uint8_t);
+++    void (*wait_us)(void *, unsigned);
+++} FuxiTorchIo;
+++
+++static inline int fuxi_torch_pulse(const FuxiTorchIo *io)
+++{
+++    static const unsigned registers[] = {0x3e, 0x42, 0x49, 0x4a, 0x46, 0x4e};
+++    uint8_t saved[6], value = 0, type = 0, subtype = 0;
+++    int result = -1, enabled = 0, restored = 1, disabled = 1;
+++    if (!io || !io->read || !io->write || !io->wait_us) return -1;
+++    if (io->read(io->context, 4, &type) || io->read(io->context, 5, &subtype) ||
+++        type != 0x18 || subtype != 7) return -1;
+++    for (unsigned index = 0; index < 6; index++) {
+++        if (io->read(io->context, registers[index], &saved[index])) return -1;
+++    }
+++    if ((saved[4] & 0x80) || saved[5]) return -2;
+++    for (unsigned index = 0; index < 3; index++) {
+++        const unsigned status[] = {6, 7, 9};
+++        if (io->read(io->context, status[index], &value) || value) return -2;
+++    }
+++    const uint8_t setup[] = {0x8a, 7, (uint8_t)(saved[2] | 1), (uint8_t)((saved[3] & ~7u) | 1)};
+++    for (unsigned index = 0; index < 4; index++) {
+++        if (io->write(io->context, registers[index], setup[index]) ||
+++            io->read(io->context, registers[index], &value) || value != setup[index]) {
+++            result = -3;
+++            goto cleanup;
+++        }
+++    }
+++    if (io->write(io->context, 0x46, saved[4] | 0x80) ||
+++        io->read(io->context, 0x46, &value) || value != (uint8_t)(saved[4] | 0x80)) {
+++        result = -4;
+++        goto cleanup;
+++    }
+++    enabled = 1;
+++    if (io->write(io->context, 0x4e, 1) ||
+++        io->read(io->context, 0x4e, &value) || value != 1) {
+++        result = -4;
+++        goto cleanup;
+++    }
+++    io->wait_us(io->context, 80000);
+++    result = 0;
+++    for (unsigned index = 0; index < 3; index++) {
+++        const unsigned status[] = {6, 7, 9};
+++        if (io->read(io->context, status[index], &value) || value) result = -5;
+++    }
+++cleanup:
+++    if (io->write(io->context, 0x4e, 0)) restored = 0;
+++    if (io->write(io->context, 0x46, saved[4])) restored = 0;
+++    if (io->read(io->context, 0x4e, &value) || value) disabled = 0;
+++    if (io->read(io->context, 0x46, &value) || value != saved[4]) disabled = 0;
+++    if (!disabled) {
+++        if (enabled) io->wait_us(io->context, 110000);
+++        return -6;
+++    }
+++    for (unsigned index = 0; index < 4; index++) {
+++        if (io->write(io->context, registers[index], saved[index])) restored = 0;
+++    }
+++    for (unsigned index = 0; index < 6; index++) {
+++        if (io->read(io->context, registers[index], &value) || value != saved[index]) restored = 0;
+++    }
+++    return restored ? result : -6;
+++}
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/GeniI2c.h
