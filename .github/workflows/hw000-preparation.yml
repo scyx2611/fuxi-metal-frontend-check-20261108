@@ -11,6 +11,49 @@ on:
 permissions:
   contents: read
 jobs:
+  wlan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CC: clang
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare pinned public source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source remote add origin https://github.com/zgl97/ios-fuxi.git
+          git -C source fetch --no-tags --depth=1 origin 979e2f08c704677bb75934ae96d4686ba9d1692b
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = 979e2f08c704677bb75934ae96d4686ba9d1692b
+          for patch in surface-stride bo-slots surfrow-mode2 perf-governor ib-profile perf-wide prof-live prof-inclusive swipe-pacing prof-inclusive-wait prof-edges taps-presets input-fixes taps-page2 ibprof-draws taps-page1 backlight-dsi adsp-battery; do
+            git -C source apply --check "../harness/patches/kernel-$patch.patch"
+            git -C source apply "../harness/patches/kernel-$patch.patch"
+          done
+          if test -s harness/patches/hw000-preparation.patch; then
+            git -C source apply --check ../harness/patches/hw000-preparation.patch
+            git -C source apply ../harness/patches/hw000-preparation.patch
+          fi
+      - name: Verify 64-bit production WLAN and RTC peers
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang --version
+          python3 tools/sync-fuxi-wlan.py --check
+          python3 tools/sync-fuxi-h1.py --check
+          python3 tools/test-fuxi-wlan-m6i.py
+          python3 tools/test-fuxi-wlan-rails.py
+          python3 tools/test-fuxi-wlan-w18.py
+          python3 tools/test-fuxi-rtc-read.py
   host:
     runs-on: macos-15
     timeout-minutes: 15
