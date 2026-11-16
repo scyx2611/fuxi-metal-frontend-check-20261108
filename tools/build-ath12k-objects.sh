@@ -31,6 +31,17 @@ fi
 [[ -x $prefix/opt/llvm/bin/llvm-objcopy ]] || { echo 'no Homebrew llvm with llvm-objcopy' >&2; exit 1; }
 export UNIXNU_XNU_ARCH=arm64 UNIXNU_IOS_VERSION=16.0
 export PYTHONPATH=$work/UniXNU/scripts${PYTHONPATH:+:$PYTHONPATH}
+python3 - "$work/Ath12kWifi/tools/fetch-sources.py" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+old = '"sparse-checkout", "add", *source["paths"]'
+new = '"sparse-checkout", "add", "--skip-checks", *paths'
+if text.count(old) != 1:
+    raise SystemExit("pinned sparse-checkout fetcher changed")
+path.write_text(text.replace(old, new))
+PY
 python3 "$work/UniXNU-sheng/scripts/build-ath12k-wifi.py" "$work/Ath12kWifi" "$work/objects" > "$work/objects.txt"
 sed -n 's/^OBJ //p' "$work/objects.txt" > "$work/objects.list"
 test "$(wc -l < "$work/objects.list")" -gt 50
