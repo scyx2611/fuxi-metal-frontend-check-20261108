@@ -50,10 +50,16 @@ jobs:
         run: |
           set -euo pipefail
           python3 tools/test-fuxi-bt-geni-fifo.py --sanitize
+          python3 tools/test-fuxi-bt-clock.py --sanitize
           python3 tools/test-fuxi-haptic-fifo.py --cc clang
           python3 tools/test-fuxi-haptic-fifo.py --cc clang --syntax-only
           clang -target arm64-apple-darwin -ffreestanding -mgeneral-regs-only -std=c11 -Wall -Wextra -Werror -fsyntax-only -I xnu/fuxi-bluetooth xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.c
+          clang -target arm64-apple-darwin -ffreestanding -mgeneral-regs-only -std=c11 -Wall -Wextra -Werror -fsyntax-only -I xnu/fuxi-bt-clock-prep xnu/fuxi-bt-clock-prep/fuxi_bt_clock_ledger.c
           python3 tools/test-fuxi-ram-admission.py
+          python3 tools/test-fuxi-ram-bank.py --synthetic-only --sanitize
+          python3 tools/test-fuxi-htc-prep.py --arm64-compiler "$(xcrun --find clang)"
+          python3 tools/test-fuxi-wlan-bdf-inventory.py
+          python3 tools/test-fuxi-battery-pause.py --sanitize
           python3 tools/test-fuxi-charge-evidence.py
           python3 tools/inspect-fuxi-bluetooth-abi.py --self-test
       - name: Verify default-off gates
