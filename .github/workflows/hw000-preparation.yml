@@ -40,8 +40,10 @@ jobs:
             git -C source apply --check "../harness/patches/kernel-$patch.patch"
             git -C source apply "../harness/patches/kernel-$patch.patch"
           done
-          git -C source apply --check ../harness/patches/hw000-preparation.patch
-          git -C source apply ../harness/patches/hw000-preparation.patch
+          if test -s harness/patches/hw000-preparation.patch; then
+            git -C source apply --check ../harness/patches/hw000-preparation.patch
+            git -C source apply ../harness/patches/hw000-preparation.patch
+          fi
       - name: Verify bounded production helpers
         working-directory: source
         shell: bash
