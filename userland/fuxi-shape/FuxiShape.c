@@ -14,10 +14,14 @@
  * (default 300 x 98 pixels): the clusters move inward by a quarter of the width given back, and down by
  * the height added. Any other shape (another screen type) is returned unchanged.
  *
- * The kernel inserts the library into SpringBoard with boot-arg fxinj=2 (xnu patch 0118): launchd drops
- * DYLD_ variables from com.apple jobs. Boot-arg fuxisbshape=W,H (pixels, 1125 space) sets the size;
- * fuxisbshape=0 leaves SpringBoard alone. Lines go to stderr (the kernel log while SpringBoard is in sweetnull).
+ * The kernel inserts the library into SpringBoard with ADT /chosen u32 "fuxi,inject"=2 (or boot-arg fxinj=2,
+ * xnu patch 0118): launchd drops DYLD_ variables from com.apple jobs. ADT /chosen u32 "fuxi,sbshape" = W * 1000 + H
+ * (pixels, 1125 space; 30..627 x 30..150) sets the size, "fuxi,sbshape"=0 leaves SpringBoard alone; the daily
+ * loader's boot-args field is full, so both are ADT properties (IODeviceTree:/chosen). Lines go to stderr
+ * (the kernel log while SpringBoard is in sweetnull).
  */
+#include <CoreFoundation/CoreFoundation.h>
+#include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -26,8 +30,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/sysctl.h>
 #include <unistd.h>
+
+/* IOKit.framework ships without headers in the iPhoneOS SDK: the three calls used here */
+typedef mach_port_t fx_io_object_t;
+extern fx_io_object_t IORegistryEntryFromPath(mach_port_t main_port, const char *path);
+extern CFTypeRef IORegistryEntryCreateCFProperty(fx_io_object_t entry, CFStringRef key, CFAllocatorRef allocator,
+    uint32_t options);
+extern kern_return_t IOObjectRelease(fx_io_object_t object);
 
 #define SHAPE_CLASS     "UISDisplaySingleRectShape"
 #define SHAPE_SELECTOR  "sb_displayShapeForScreenType:"
@@ -112,48 +122,46 @@ shape_for_screen_type(id self, SEL selector, long type)
 }
 
 /*
- * kern.bootargs "fuxisbshape=...": 0 when absent, 1 when "=0" (off), 2 when "=W,H" read into *w, *h.
- * A value that does not parse, or lies outside 30..627 x 30..150, counts as absent.
+ * ADT /chosen u32 "fuxi,sbshape" (IODeviceTree:/chosen, a 4-byte CFData): 0 when absent, 1 when 0 (off),
+ * 2 when W * 1000 + H, read into *w, *h. A value outside 30..627 x 30..150 counts as absent.
  */
 static int
-boot_arg_shape(double *w, double *h)
+adt_shape(double *w, double *h)
 {
-	static const char word[] = "fuxisbshape=";
-	char args[1024];
-	size_t size = sizeof(args) - 1, length = sizeof(word) - 1;
-	const char *p;
-	char *end;
-	double a, b;
+	fx_io_object_t chosen = IORegistryEntryFromPath(MACH_PORT_NULL, "IODeviceTree:/chosen");
+	CFTypeRef value;
+	uint32_t v = 0;
+	bool got = false;
+	unsigned a, b;
 
-	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
+	if (chosen == MACH_PORT_NULL) {
 		return 0;
 	}
-	args[size < sizeof(args) ? size : sizeof(args) - 1] = '\0';
-	for (p = args; (p = strstr(p, word)) != NULL; p += length) {
-		if (p != args && p[-1] != ' ') {
-			continue;
-		}
-		p += length;
-		if (p[0] == '0' && (p[1] == '\0' || p[1] == ' ')) {
-			return 1;
-		}
-		a = strtod(p, &end);
-		if (end == p || *end != ',') {
-			return 0;
-		}
-		p = end + 1;
-		b = strtod(p, &end);
-		if (end == p || (*end != '\0' && *end != ' ')) {
-			return 0;
-		}
-		if (a < 30.0 || a > 627.0 || b < 30.0 || b > 150.0) {
-			return 0;
-		}
-		*w = a;
-		*h = b;
-		return 2;
+	value = IORegistryEntryCreateCFProperty(chosen, CFSTR("fuxi,sbshape"), kCFAllocatorDefault, 0);
+	(void)IOObjectRelease(chosen);
+	if (value == NULL) {
+		return 0;
 	}
-	return 0;
+	if (CFGetTypeID(value) == CFDataGetTypeID() && CFDataGetLength((CFDataRef)value) == (CFIndex)sizeof(v)) {
+		memcpy(&v, CFDataGetBytePtr((CFDataRef)value), sizeof(v));
+		got = true;
+	}
+	CFRelease(value);
+	if (!got) {
+		return 0;
+	}
+	if (v == 0) {
+		return 1;
+	}
+	a = v / 1000;
+	b = v % 1000;
+	if (a < 30 || a > 627 || b < 30 || b > 150) {
+		say("fuxi: SpringBoard: fuxi,sbshape=%u out of range; default size\n", v);
+		return 0;
+	}
+	*w = a;
+	*h = b;
+	return 2;
 }
 
 /* Replace the class method once SpringBoard's category is there. True when done. */
@@ -204,9 +212,9 @@ fuxi_shape_init(void)
 	if (name == NULL || strcmp(name, "SpringBoard") != 0) {
 		return;
 	}
-	arg = boot_arg_shape(&shape_w, &shape_h);
+	arg = adt_shape(&shape_w, &shape_h);
 	if (arg == 1) {
-		say("fuxi: SpringBoard: fuxisbshape=0, status-bar cut-out unchanged\n");
+		say("fuxi: SpringBoard: fuxi,sbshape=0, status-bar cut-out unchanged\n");
 		return;
 	}
 	if (!try_hook()) {

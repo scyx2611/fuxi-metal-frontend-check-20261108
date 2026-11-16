@@ -5753,12 +5753,12 @@ index 8f1d60f..e71e7c2 100644
  	thread_block(THREAD_CONTINUE_NULL);
 diff --git a/xnu/fuxi-inject/fuxi_exec_inject.h b/xnu/fuxi-inject/fuxi_exec_inject.h
 new file mode 100644
-index 0000000..207e305
+index 0000000..a7bc35a
 --- /dev/null
 +++ b/xnu/fuxi-inject/fuxi_exec_inject.h
 @@ -0,0 +1,67 @@
 +/*
-+ * fxinj=N (FUXI): DYLD_INSERT_LIBRARIES added by the kernel at exec, for some programs (patch 0118).
++ * fxinj=N, or ADT /chosen u32 "fuxi,inject"=N (FUXI): DYLD_INSERT_LIBRARIES added by the kernel at exec, for some programs (patch 0118).
 + *
 + * launchd (20H392) drops every DYLD_ variable except DYLD_PRINT_* from a job's EnvironmentVariables
 + * ("Disallowing environment variable: %s") and lets them through only for a job whose label does not start
@@ -11846,28 +11846,45 @@ index 0000000..031c394
 + 		}
 diff --git a/xnu/patches/0118-fuxi-exec-inject.patch b/xnu/patches/0118-fuxi-exec-inject.patch
 new file mode 100644
-index 0000000..17423e4
+index 0000000..34f1acf
 --- /dev/null
 +++ b/xnu/patches/0118-fuxi-exec-inject.patch
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,158 @@
 +--- a/bsd/kern/kern_exec.c
 ++++ b/bsd/kern/kern_exec.c
-+@@ -5649,6 +5649,37 @@
++@@ -5649,6 +5649,54 @@
 +  * Note:	The argument and environment vectors are user space pointers
 +  *		to arrays of user space pointers.
 +  */
 ++#if defined(ARM64_BOARD_CONFIG_SWEET)
+++#include <pexpert/device_tree.h>
 ++#include "fuxi_exec_inject.h"
-++/* Boot-arg fxinj (fuxi_exec_inject.h), read on every exec: nothing cached, nothing to race on. */
+++/*
+++ * Boot-arg fxinj, else ADT /chosen u32 "fuxi,inject" (the daily loader's boot-args field is full), read once:
+++ * neither changes after boot, and two first readers agree.
+++ */
 ++static unsigned
 ++fuxi_inject_mode(void)
 ++{
+++	static volatile SInt32 cached = -1;
 ++	unsigned mode = 0;
+++	DTEntry chosen;
+++	void const *prop;
+++	unsigned int bytes;
 ++
+++	if (cached >= 0) {
+++		return (unsigned)cached;
+++	}
 ++	if (!PE_parse_boot_argn("fxinj", &mode, sizeof(mode))) {
 ++		mode = 0;
+++		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+++		    SecureDTGetProperty(chosen, "fuxi,inject", &prop, &bytes) == kSuccess && bytes == sizeof(uint32_t)) {
+++			memcpy(&mode, prop, sizeof(mode));
+++		}
 ++	}
-++	return mode & FUXI_INJECT_ALL;
+++	mode &= FUXI_INJECT_ALL;
+++	cached = (SInt32)mode;
+++	return mode;
 ++}
 ++
 ++/* The mode once, then the first programs that get a library. */
@@ -11890,7 +11907,7 @@ index 0000000..17423e4
 + __attribute__((noinline))
 + static int
 + exec_extract_strings(struct image_params *imgp)
-+@@ -5822,6 +5853,30 @@
++@@ -5822,6 +5870,30 @@
 + 		imgp->ip_envc++;
 + 	}
 + 
@@ -11925,7 +11942,7 @@ index 0000000..17423e4
 ++++ b/bsd/kern/fuxi_exec_inject.h
 +@@ -0,0 +1,67 @@
 ++/*
-++ * fxinj=N (FUXI): DYLD_INSERT_LIBRARIES added by the kernel at exec, for some programs (patch 0118).
+++ * fxinj=N, or ADT /chosen u32 "fuxi,inject"=N (FUXI): DYLD_INSERT_LIBRARIES added by the kernel at exec, for some programs (patch 0118).
 ++ *
 ++ * launchd (20H392) drops every DYLD_ variable except DYLD_PRINT_* from a job's EnvironmentVariables
 ++ * ("Disallowing environment variable: %s") and lets them through only for a job whose label does not start
