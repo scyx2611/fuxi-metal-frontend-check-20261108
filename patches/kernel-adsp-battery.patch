@@ -34519,7 +34519,7 @@ index 0000000..b028004
 +	return 0;
 +}
 diff --git a/xnu/patches/0038-sweet-applekeystore.patch b/xnu/patches/0038-sweet-applekeystore.patch
-index ebe463a..bfec295 100644
+index ebe463a..791422b 100644
 --- a/xnu/patches/0038-sweet-applekeystore.patch
 +++ b/xnu/patches/0038-sweet-applekeystore.patch
 @@ -21,7 +21,7 @@
@@ -34558,9 +34558,9 @@ index ebe463a..bfec295 100644
  +/* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
  +enum {
  +	kAKSOpen             = 0,
-@@ -71,6 +84,19 @@
- +	kAKSNotifyStateSet   = 102,
- +};
+@@ -184,6 +197,88 @@
+ +	return sweet_aks_struct_out(args, buf, n);
+ +}
  +
 ++/*
 ++ * Wrap: scalars {bag handle, key class}, a 32-byte key in; the class out and a
@@ -34575,13 +34575,6 @@ index ebe463a..bfec295 100644
 ++
 ++static const char sweet_aks_seed[] = "SWEET AKS fuxi class keys, v1";
 ++
- +/* The system (device) bag handle. */
- +#define SWEET_AKS_SYSTEM_HANDLE 0
- +
-@@ -184,6 +210,75 @@
- +	return sweet_aks_struct_out(args, buf, n);
- +}
- +
 ++/* HMAC-SHA256(seed, label || class || data) */
 ++static void
 ++sweet_aks_mac(const char label[4], uint32_t key_class, const uint8_t *data, uint32_t length,
