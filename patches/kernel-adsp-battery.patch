@@ -31541,7 +31541,7 @@ index c8376e4..d363e22 100644
  int sweet_ufs_rootdev(dev_t *dev);
  
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
-index b09ac72..6b16ae9 100644
+index b09ac72..f09517f 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
 @@ -37,8 +37,10 @@
@@ -31619,10 +31619,36 @@ index b09ac72..6b16ae9 100644
  		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give_network(request, &state->bss);
  		break;
  	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-@@ -513,6 +537,76 @@ post(uint32_t code, const void *data, uint32_t length)
- 	kev_post_msg(&message);
- }
+@@ -496,12 +520,14 @@ set(const struct apple80211req *request, char *said, size_t said_size)
  
+ /* ---- events -------------------------------------------------------------------------------------------- */
+ 
+-static void
++static int
+ post(uint32_t code, const void *data, uint32_t length)
+ {
+ 	struct kev_msg message = { .vendor_code = KEV_VENDOR_APPLE, .kev_class = KEV_IEEE80211_CLASS, .kev_subclass = 1,
+ 		                   .event_code = code };
++	static unsigned failed;
+ 	char name[16];
++	int error;
+ 
+ 	memcpy(name, interface_name, sizeof(name));
+ 	message.dv[0].data_length = sizeof(name);
+@@ -510,7 +536,90 @@ post(uint32_t code, const void *data, uint32_t length)
+ 		message.dv[1].data_length = length;
+ 		message.dv[1].data_ptr = __DECONST(void *, data);
+ 	}
+-	kev_post_msg(&message);
++	error = kev_post_msg(&message);
++	/* (an event that cannot be posted is never seen by wifid: say so, a few times) */
++	if (error != 0 && failed < 20) {
++		failed++;
++		printf("FUXI WIFI IOS: apple80211: event %u of %u bytes not posted: error %d\n", code, length, error);
++	}
++	return error;
++}
++
 +/*
 + * How strongly the network joined is heard, as a driver says it of itself every few seconds: wifid
 + * reads no strength of its own accord, and without it the status bar shows a joined network with
@@ -31644,8 +31670,15 @@ index b09ac72..6b16ae9 100644
 +			                                .per_core = { (int8_t)state->bss.rssi, (int8_t)state->bss.rssi }, .snr_known = 1,
 +			                                .snr = (int16_t)(state->bss.rssi - NOISE_FLOOR), .noise_known = 1,
 +			                                .noise = NOISE_FLOOR };
++		static unsigned told;
++		int error = post(EVENT_RSSI_CHANGED, &rssi, sizeof(rssi));
 +
-+		post(EVENT_RSSI_CHANGED, &rssi, sizeof(rssi));
++		/* (the first few are said, so a run shows that wifid was told at all) */
++		if (told < 3) {
++			told++;
++			printf("FUXI WIFI IOS: apple80211: RSSI_CHANGED %d dBm (noise %d) posted: error %d\n", state->bss.rssi,
++			    NOISE_FLOOR, error);
++		}
 +	}
 +	kfree_data(state, sizeof(*state));
 +	return joined;
@@ -31691,12 +31724,10 @@ index b09ac72..6b16ae9 100644
 +		rssi_again();
 +	}
 +	lck_mtx_unlock(&apple80211_lock);
-+}
-+
+ }
+ 
  /* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
- void
- fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
-@@ -548,11 +642,20 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
+@@ -548,11 +657,20 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
  		if (state != NULL) {
  			fuxi_wifi_sta_state(state);
  			link.rssi = status == 1 ? state->bss.rssi : 0;
@@ -34487,6 +34518,153 @@ index 0000000..b028004
 +	if (busy && now >= wli.deadline) { return ETIMEDOUT; }
 +	return 0;
 +}
+diff --git a/xnu/patches/0038-sweet-applekeystore.patch b/xnu/patches/0038-sweet-applekeystore.patch
+index ebe463a..bfec295 100644
+--- a/xnu/patches/0038-sweet-applekeystore.patch
++++ b/xnu/patches/0038-sweet-applekeystore.patch
+@@ -21,7 +21,7 @@
+      "     'IOClass'         = IOPanicPlatform;"
+ --- /dev/null
+ +++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+-@@ -0,0 +1,227 @@
++@@ -0,0 +1,326 @@
+ +/*
+ + * Built-in AppleKeyStore for SWEET: a device without a passcode whose
+ + * system keybag is always loaded and unlocked.
+@@ -37,6 +37,13 @@
+ + * Every call is logged (selector, caller, argument shapes, result) so the
+ + * next selectors the system needs show up on the console; unknown ones fail
+ + * with kIOReturnUnsupported.
+++ *
+++ * Key wrapping (selectors 10/11, aks_wrap_key/aks_unwrap_key) is what
+++ * securityd encrypts every keychain item key with; without it nothing can be
+++ * stored in the keychain (a joined Wi-Fi network's password among them). With
+++ * no SEP and no passcode, the class keys come from a fixed seed in the kernel:
+++ * wrapped keys survive reboots, but they protect nothing against someone who
+++ * has the disk.
+ + */
+ +#include <pexpert/arm64/board_config.h>
+ +
+@@ -49,6 +56,12 @@
+ +#include <libkern/c++/OSString.h>
+ +#include <sys/proc.h>
+ +
+++extern "C" {
+++#include <corecrypto/cc.h>
+++#include <corecrypto/cchmac.h>
+++#include <corecrypto/ccsha2.h>
+++}
+++
+ +/* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
+ +enum {
+ +	kAKSOpen             = 0,
+@@ -71,6 +84,19 @@
+ +	kAKSNotifyStateSet   = 102,
+ +};
+ +
+++/*
+++ * Wrap: scalars {bag handle, key class}, a 32-byte key in; the class out and a
+++ * 40-byte blob (the size of an RFC 3394 wrap). Blob = tag(8) || key ^ pad(32),
+++ * tag = HMAC(seed, "tag" || class || key), pad = HMAC(seed, "pad" || class ||
+++ * tag): deterministic and authenticated, so a changed blob or another class
+++ * does not unwrap.
+++ */
+++#define SWEET_AKS_KEY_BYTES     32
+++#define SWEET_AKS_TAG_BYTES     8
+++#define SWEET_AKS_BLOB_BYTES    (SWEET_AKS_TAG_BYTES + SWEET_AKS_KEY_BYTES)
+++
+++static const char sweet_aks_seed[] = "SWEET AKS fuxi class keys, v1";
+++
+ +/* The system (device) bag handle. */
+ +#define SWEET_AKS_SYSTEM_HANDLE 0
+ +
+@@ -184,6 +210,75 @@
+ +	return sweet_aks_struct_out(args, buf, n);
+ +}
+ +
+++/* HMAC-SHA256(seed, label || class || data) */
+++static void
+++sweet_aks_mac(const char label[4], uint32_t key_class, const uint8_t *data, uint32_t length,
+++    uint8_t mac[CCSHA256_OUTPUT_SIZE])
+++{
+++	uint8_t message[3 + 4 + SWEET_AKS_KEY_BYTES];
+++
+++	memcpy(message, label, 3);
+++	for (unsigned int i = 0; i < 4; i++) {
+++		message[3 + i] = (uint8_t)(key_class >> (8 * i));
+++	}
+++	memcpy(message + 7, data, length);
+++	cchmac(ccsha256_di(), sizeof(sweet_aks_seed) - 1, sweet_aks_seed, 7 + length, message, mac);
+++	cc_clear(sizeof(message), message);
+++}
+++
+++/* Selectors 10 (wrap) and 11 (unwrap). */
+++static IOReturn
+++sweet_aks_wrap(IOExternalMethodArguments *args, bool wrap)
+++{
+++	const uint32_t in_wanted = wrap ? SWEET_AKS_KEY_BYTES : SWEET_AKS_BLOB_BYTES;
+++	uint8_t in[SWEET_AKS_BLOB_BYTES], out[SWEET_AKS_BLOB_BYTES], mac[CCSHA256_OUTPUT_SIZE];
+++	uint32_t key_class;
+++	IOReturn ret;
+++
+++	if (args->scalarInputCount < 2) {
+++		return kIOReturnBadArgument;
+++	}
+++	key_class = (uint32_t)args->scalarInput[1];
+++	if (args->structureInputDescriptor != NULL) {
+++		if (args->structureInputDescriptor->getLength() != in_wanted ||
+++		    args->structureInputDescriptor->readBytes(0, in, in_wanted) != in_wanted) {
+++			return kIOReturnBadArgument;
+++		}
+++	} else if (args->structureInput == NULL || args->structureInputSize != in_wanted) {
+++		return kIOReturnBadArgument;
+++	} else {
+++		memcpy(in, args->structureInput, in_wanted);
+++	}
+++
+++	if (wrap) {
+++		sweet_aks_mac("tag", key_class, in, SWEET_AKS_KEY_BYTES, mac);
+++		memcpy(out, mac, SWEET_AKS_TAG_BYTES);
+++		sweet_aks_mac("pad", key_class, out, SWEET_AKS_TAG_BYTES, mac);
+++		for (unsigned int i = 0; i < SWEET_AKS_KEY_BYTES; i++) {
+++			out[SWEET_AKS_TAG_BYTES + i] = in[i] ^ mac[i];
+++		}
+++		ret = sweet_aks_struct_out(args, out, SWEET_AKS_BLOB_BYTES);
+++	} else {
+++		sweet_aks_mac("pad", key_class, in, SWEET_AKS_TAG_BYTES, mac);
+++		for (unsigned int i = 0; i < SWEET_AKS_KEY_BYTES; i++) {
+++			out[i] = in[SWEET_AKS_TAG_BYTES + i] ^ mac[i];
+++		}
+++		sweet_aks_mac("tag", key_class, out, SWEET_AKS_KEY_BYTES, mac);
+++		ret = cc_cmp_safe(SWEET_AKS_TAG_BYTES, mac, in) == 0 ?
+++		    sweet_aks_struct_out(args, out, SWEET_AKS_KEY_BYTES) : kIOReturnNotPermitted;
+++	}
+++	if (ret == kIOReturnSuccess) {
+++		if (args->scalarOutputCount >= 1) {
+++			args->scalarOutput[0] = key_class;
+++			args->scalarOutputCount = 1;
+++		}
+++	}
+++	cc_clear(sizeof(in), in);
+++	cc_clear(sizeof(out), out);
+++	cc_clear(sizeof(mac), mac);
+++	return ret;
+++}
+++
+ +static uint32_t
+ +sweet_aks_struct_out_size(IOExternalMethodArguments *args)
+ +{
+@@ -237,6 +332,10 @@
+ +		args->scalarOutputCount = 0;
+ +		ret = sweet_aks_device_state(args);
+ +		break;
+++	case kAKSWrapKey:
+++	case kAKSUnwrapKey:
+++		ret = sweet_aks_wrap(args, selector == kAKSWrapKey);
+++		break;
+ +	default:
+ +		ret = kIOReturnUnsupported;
+ +		break;
 diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
 index 0ca2838..0d215ed 100644
 --- a/xnu/patches/0098-fuxi-native-adreno-abi.patch
@@ -37510,7 +37688,7 @@ index 39be642..40ce125 100644
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
 diff --git a/xnu/patches/0104-fuxi-wifi-ios.patch b/xnu/patches/0104-fuxi-wifi-ios.patch
-index 179f5df..56eecd3 100644
+index 179f5df..db7dd69 100644
 --- a/xnu/patches/0104-fuxi-wifi-ios.patch
 +++ b/xnu/patches/0104-fuxi-wifi-ios.patch
 @@ -678,7 +678,7 @@
@@ -37518,7 +37696,7 @@ index 179f5df..56eecd3 100644
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_apple80211.c
 -@@ -0,0 +1,647 @@
-+@@ -0,0 +1,750 @@
++@@ -0,0 +1,765 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
@@ -37597,10 +37775,36 @@ index 179f5df..56eecd3 100644
  +		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give_network(request, &state->bss);
  +		break;
  +	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-@@ -1194,6 +1218,76 @@
- +	kev_post_msg(&message);
- +}
+@@ -1177,12 +1201,14 @@
  +
+ +/* ---- events -------------------------------------------------------------------------------------------- */
+ +
+-+static void
+++static int
+ +post(uint32_t code, const void *data, uint32_t length)
+ +{
+ +	struct kev_msg message = { .vendor_code = KEV_VENDOR_APPLE, .kev_class = KEV_IEEE80211_CLASS, .kev_subclass = 1,
+ +		                   .event_code = code };
+++	static unsigned failed;
+ +	char name[16];
+++	int error;
+ +
+ +	memcpy(name, interface_name, sizeof(name));
+ +	message.dv[0].data_length = sizeof(name);
+@@ -1191,7 +1217,90 @@
+ +		message.dv[1].data_length = length;
+ +		message.dv[1].data_ptr = __DECONST(void *, data);
+ +	}
+-+	kev_post_msg(&message);
+++	error = kev_post_msg(&message);
+++	/* (an event that cannot be posted is never seen by wifid: say so, a few times) */
+++	if (error != 0 && failed < 20) {
+++		failed++;
+++		printf("FUXI WIFI IOS: apple80211: event %u of %u bytes not posted: error %d\n", code, length, error);
+++	}
+++	return error;
+++}
+++
 ++/*
 ++ * How strongly the network joined is heard, as a driver says it of itself every few seconds: wifid
 ++ * reads no strength of its own accord, and without it the status bar shows a joined network with
@@ -37622,8 +37826,15 @@ index 179f5df..56eecd3 100644
 ++			                                .per_core = { (int8_t)state->bss.rssi, (int8_t)state->bss.rssi }, .snr_known = 1,
 ++			                                .snr = (int16_t)(state->bss.rssi - NOISE_FLOOR), .noise_known = 1,
 ++			                                .noise = NOISE_FLOOR };
+++		static unsigned told;
+++		int error = post(EVENT_RSSI_CHANGED, &rssi, sizeof(rssi));
 ++
-++		post(EVENT_RSSI_CHANGED, &rssi, sizeof(rssi));
+++		/* (the first few are said, so a run shows that wifid was told at all) */
+++		if (told < 3) {
+++			told++;
+++			printf("FUXI WIFI IOS: apple80211: RSSI_CHANGED %d dBm (noise %d) posted: error %d\n", state->bss.rssi,
+++			    NOISE_FLOOR, error);
+++		}
 ++	}
 ++	kfree_data(state, sizeof(*state));
 ++	return joined;
@@ -37669,12 +37880,10 @@ index 179f5df..56eecd3 100644
 ++		rssi_again();
 ++	}
 ++	lck_mtx_unlock(&apple80211_lock);
-++}
-++
+ +}
+ +
  +/* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
- +void
- +fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
-@@ -1229,11 +1323,20 @@
+@@ -1229,11 +1338,20 @@
  +		if (state != NULL) {
  +			fuxi_wifi_sta_state(state);
  +			link.rssi = status == 1 ? state->bss.rssi : 0;
@@ -37695,7 +37904,7 @@ index 179f5df..56eecd3 100644
  +		break;
  +	}
  +	}
-@@ -1328,7 +1431,7 @@
+@@ -1328,7 +1446,7 @@
  +#endif /* FUXI */
  --- /dev/null
  +++ b/bsd/sys/fuxi_wifi_apple80211.h
@@ -37704,7 +37913,7 @@ index 179f5df..56eecd3 100644
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
  + * Fuxi, 2026-10-23: shared diagnostic ABI; 16.7 payloads UNVERIFIED.
-@@ -1445,6 +1548,28 @@
+@@ -1445,6 +1563,28 @@
  +	uint8_t unused_3[4];
  +};
  +
@@ -37733,7 +37942,7 @@ index 179f5df..56eecd3 100644
  +_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
  +    "the association request as iOS 16.5 has it");
  +_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
-@@ -1463,7 +1588,7 @@
+@@ -1463,7 +1603,7 @@
  +#endif
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_ios.c
@@ -37742,7 +37951,7 @@ index 179f5df..56eecd3 100644
  +/* Fuxi Wi-Fi iOS shim entry and synthetic Ethernet link. No radio access. */
  +#if defined(FUXI)
  +#include <sys/param.h>
-@@ -1477,6 +1602,18 @@
+@@ -1477,6 +1617,18 @@
  +extern void FuxiNetworkStackStart(void);
  +static const struct fuxi_wifi_backend *backend;
  +static bool enabled;
@@ -37761,7 +37970,7 @@ index 179f5df..56eecd3 100644
  +
  +static bool
  +transmit(mbuf_t packet, size_t length)
-@@ -1504,6 +1641,7 @@
+@@ -1504,6 +1656,7 @@
  +		return false;
  +	}
  +	backend = ops;
@@ -37769,7 +37978,7 @@ index 179f5df..56eecd3 100644
  +	memcpy(link.address, ops->station.address, sizeof(link.address));
  +	ops->start(&input);
  +	fuxi_wifi_sta_attach(&ops->station);
-@@ -1659,17 +1797,24 @@
+@@ -1659,17 +1812,24 @@
  +{
  +	int on = 0;
  +	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
@@ -37796,7 +38005,7 @@ index 179f5df..56eecd3 100644
  +/* Fuxi Wi-Fi iOS shim: boot-lifetime backend boundary. */
  +#ifndef FUXI_WIFI_IOS_H
  +#define FUXI_WIFI_IOS_H
-@@ -1704,6 +1849,7 @@
+@@ -1704,6 +1864,7 @@
  +#ifdef KERNEL
  +bool fuxi_wifi_ios_attach(const struct fuxi_wifi_backend *backend);
  +void fuxi_wifi_ios_init(void);
@@ -37804,7 +38013,7 @@ index 179f5df..56eecd3 100644
  +#endif
  +#endif
  --- /dev/null
-@@ -2158,14 +2304,13 @@
+@@ -2158,14 +2319,13 @@
  +			}
  +			error = ops->power(power_on);
  +			lck_mtx_lock(&sta_lock);
@@ -37822,7 +38031,7 @@ index 179f5df..56eecd3 100644
  +		} else if (leave) {
  +			ops->leave();
  +			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
-@@ -2224,10 +2369,12 @@
+@@ -2224,10 +2384,12 @@
  +	}
  +	lck_mtx_lock(&sta_lock);
  +	sta_ops = ops;
@@ -37837,7 +38046,7 @@ index 179f5df..56eecd3 100644
  +}
  +
  +void
-@@ -2277,7 +2424,6 @@
+@@ -2277,7 +2439,6 @@
  +		lck_mtx_unlock(&sta_lock);
  +		return ENXIO;
  +	}
@@ -37845,7 +38054,7 @@ index 179f5df..56eecd3 100644
  +	asked_power = true;
  +	asked_power_on = on;
  +	if (!on) {
-@@ -2297,7 +2443,7 @@
+@@ -2297,7 +2458,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
@@ -37854,7 +38063,7 @@ index 179f5df..56eecd3 100644
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
-@@ -2317,7 +2463,7 @@
+@@ -2317,7 +2478,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
