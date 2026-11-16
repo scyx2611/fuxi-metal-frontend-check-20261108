@@ -57,7 +57,7 @@ jobs:
           python3 tools/test-fuxi-rtc-read.py
           python3 tools/test-fuxi-torch-steady.py --sanitize
   host:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 15
     env:
       CC: clang

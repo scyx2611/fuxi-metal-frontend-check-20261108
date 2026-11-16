@@ -16,3 +16,4 @@ jobs:
     with:
       ram_layout: 9g
       artifact_name: fuxi-kernel-adsp-ram9g
+      runner_label: macos-15-intel
