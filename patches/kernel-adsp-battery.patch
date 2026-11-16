@@ -1,9 +1,9 @@
 diff --git a/docs-lanes/adsp.md b/docs-lanes/adsp.md
 new file mode 100644
-index 0000000..4cbbb91
+index 0000000..7349474
 --- /dev/null
 +++ b/docs-lanes/adsp.md
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,134 @@
 +# Audio DSP and battery manager (`fuxiadsp`)
 +
 +Patch 0117 (`tools/sync-fuxi-adsp.py`, canonical sources `xnu/fuxi-adsp/`) starts the audio DSP (ADSP, LPASS) from XNU
@@ -120,6 +120,24 @@ index 0000000..4cbbb91
 +
 +`tools/test-fuxi-torch-pulse.py` compiles the exact sequence against a register model, including
 +read/write failures, dropped writes, timeout quarantine, timer ordering and saved-state restoration.
++
++## Allocated high-memory check
++
++ADT `/chosen` u32 `fuxi,ramtest=1` starts one test worker, independently of the DSP mode.
++It accepts only the 9 GiB layout (`dram-size=0x23e000000`, GPU scratch
++`0xafe000000+0x2000000`) and otherwise leaves memory alone. The default is off.
++Twenty seconds after starting, the worker asks XNU for a 128 MiB data allocation without
++waiting for free pages. It validates every allocated physical page against the usable RAM
++aperture before writing, and requires at least one page above the old 5 GiB boundary.
++It never writes to arbitrary physical addresses, firmware carveouts or the GPU scratch region.
++
++Four address-dependent 64-bit patterns are filled, cleaned and invalidated from the data cache,
++then checked after a short delay. Each pass reports its actual high-memory coverage; the first
++mismatch stops the test. The allocation is released on every path after a successful allocation.
++This is an allocated-memory sample, not a test of all 9 GiB or a long-duration pressure test.
++`tools/test-fuxi-ramtest.py` checks the production range gate and injects every single-bit error
++in a non-power-of-two buffer, plus a word-alias corruption. Kernel compilation and device
++results are recorded separately.
 diff --git a/shim/fuxi-probe/probe.c b/shim/fuxi-probe/probe.c
 index efb83f1..745d165 100644
 --- a/shim/fuxi-probe/probe.c
@@ -318,7 +336,7 @@ index c7d2b39..22b499a 100644
          if args.root_extents:
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..c5915ef
+index 0000000..0d61bd6
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
 @@ -0,0 +1,142 @@
@@ -342,10 +360,10 @@ index 0000000..c5915ef
 +ROOT = Path(__file__).resolve().parents[1]
 +SRC = ROOT / 'xnu/fuxi-adsp'
 +PATCH = ROOT / 'xnu/patches/0117-fuxi-adsp.patch'
-+SOURCES = ('fuxi_adsp.c', 'fuxi_adsp_fw.c', 'fuxi_adsp_battery.c', 'fuxi_amp.c', 'fuxi_pmic.c', 'fuxi_rpmh_shared.c', 'QcomSmem.c', 'QcomSmp2p.c', 'QcomGlink.c',
++SOURCES = ('fuxi_adsp.c', 'fuxi_adsp_fw.c', 'fuxi_adsp_battery.c', 'fuxi_amp.c', 'fuxi_pmic.c', 'fuxi_ramtest.c', 'fuxi_rpmh_shared.c', 'QcomSmem.c', 'QcomSmp2p.c', 'QcomGlink.c',
 +           'QcomMdt.c', 'QcomQmp.c', 'QcomRpmh.c', 'QcomQrtr.c', 'FatVolume.c', 'ShengBattmgr.c', 'ShengQrtr.c', 'GeniI2c.c')
 +HEADERS = ('QcomSmem.h', 'QcomSmp2p.h', 'QcomGlink.h', 'QcomMdt.h', 'QcomQmp.h', 'QcomRpmh.h', 'QcomScm.h', 'QcomQrtr.h',
-+           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h', 'fuxi_adsp_battery.h', 'fuxi_rpmh_shared.h', 'fuxi_torch_pulse.h', 'GeniI2c.h')
++           'FatVolume.h', 'ShengBattmgr.h', 'ShengAdsp.h', 'fuxi_adsp_battery.h', 'fuxi_rpmh_shared.h', 'fuxi_torch_pulse.h', 'fuxi_ramtest_pattern.h', 'GeniI2c.h')
 +MODIFIED = {'iokit/Kernel/arm/SweetBattery.cpp': ('0062-sweet-touch-power-battery.patch', 'SweetBattery.cpp')}
 +# bsd/dev/LICENSE.UniXNU-sheng already comes with 0098 (the GPU fence interrupt is adapted from sheng too); --check
 +# verifies that the local copy is the same text.
@@ -557,6 +575,62 @@ index 0000000..a4f5a47
 +else:
 +    raise AssertionError('unsupported geometry accepted')
 +print('PASS: adjacent banks, gaps, overflow, 5g/9g scratch separation and preserved root mapping')
+diff --git a/tools/test-fuxi-ramtest.py b/tools/test-fuxi-ramtest.py
+new file mode 100644
+index 0000000..5a95541
+--- /dev/null
++++ b/tools/test-fuxi-ramtest.py
+@@ -0,0 +1,50 @@
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[1]
++source = r'''
++#include <assert.h>
++#include <stdio.h>
++#include "fuxi_ramtest_pattern.h"
++int main(void) {
++    uint64_t memory[1031], previous[1031];
++    assert(!fuxi_ramtest_page_allowed(0x8bfffc000ull,16384));
++    assert(fuxi_ramtest_page_allowed(0x8c0000000ull,16384));
++    assert(fuxi_ramtest_page_allowed(0xa00000000ull,16384));
++    assert(fuxi_ramtest_page_allowed(0xafdffc000ull,16384));
++    assert(!fuxi_ramtest_page_allowed(0xafe000000ull,16384));
++    assert(!fuxi_ramtest_page_allowed(0xaffffc000ull,16384));
++    assert(!fuxi_ramtest_page_allowed(UINT64_MAX,16384));
++    assert(!fuxi_ramtest_page_allowed(0x8c0000001ull,16384));
++    assert(!fuxi_ramtest_page_allowed(0x8c0000000ull,0));
++    assert(!fuxi_ramtest_page_allowed(0x8c0000000ull,16383));
++    assert(!fuxi_ramtest_verify(memory,0,0));
++    for(unsigned pass=0;pass<4;pass++) {
++        fuxi_ramtest_fill(memory,1031,pass);
++        assert(fuxi_ramtest_verify(memory,1031,pass)==1031);
++        for(size_t index=0;index<1031;index++) {
++            if(pass) assert(previous[index]!=memory[index]);
++            previous[index]=memory[index];
++            for(unsigned bit=0;bit<64;bit++) {
++                memory[index]^=1ull<<bit;
++                assert(fuxi_ramtest_verify(memory,1031,pass)==index);
++                memory[index]^=1ull<<bit;
++            }
++        }
++        memory[1030]=memory[0];
++        assert(fuxi_ramtest_verify(memory,1031,pass)==1030);
++    }
++    puts("PASS: real RAM patterns detect every injected bit flip and alias; range gate excludes reserved GPU and overflow");
++    return 0;
++}
++'''
++with tempfile.TemporaryDirectory(prefix='fuxi-ramtest-') as temporary:
++    directory = Path(temporary)
++    cfile, binary = directory / 'ramtest.c', directory / 'ramtest'
++    cfile.write_text(source)
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-g', '-Wall', '-Wextra', '-Werror',
++                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
++                    '-I' + str(root / 'xnu/fuxi-adsp'), str(cfile), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-rpmh-shared.py b/tools/test-fuxi-rpmh-shared.py
 new file mode 100644
 index 0000000..e360b63
@@ -4644,10 +4718,10 @@ index 0000000..4be20a9
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp.c b/xnu/fuxi-adsp/fuxi_adsp.c
 new file mode 100644
-index 0000000..5d7916f
+index 0000000..cc1bb8b
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp.c
-@@ -0,0 +1,896 @@
+@@ -0,0 +1,898 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 + *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -4718,6 +4792,7 @@ index 0000000..5d7916f
 +extern void fuxi_adsp_battery_start(int publish);
 +extern void fuxi_amp_init(void);
 +extern void fuxi_pmic_init(void);
++extern void fuxi_ramtest_init(void);
 +extern volatile int32_t native_qrtr_stats[16];
 +extern char native_qrtr_text[96];
 +void fuxi_adsp_init(void);
@@ -5526,6 +5601,7 @@ index 0000000..5d7916f
 +    const unsigned asked = fa_mode(), run = fuxi_adsp_mode();
 +    thread_t thread = NULL;
 +    fuxi_pmic_init();
++    fuxi_ramtest_init();
 +    fuxi_amp_init(); /* the speaker amplifiers' own switch (fuxi_amp.c, fuxiamp / ADT fuxi,amp), independent of fuxiadsp */
 +    if (!run || gStarted) return;
 +    if (asked >= 2 && run < 2) {
@@ -6597,6 +6673,172 @@ index 0000000..1cb54fe
 +    fp_survey(7, 0xf100, "haptic-pattern");
 +    fp_survey(7, 0xf200, "haptic-boost");
 +    if (mode == 2) fp_flash_pulse();
++}
++#endif
+diff --git a/xnu/fuxi-adsp/fuxi_ramtest.c b/xnu/fuxi-adsp/fuxi_ramtest.c
+new file mode 100644
+index 0000000..a4bee26
+--- /dev/null
++++ b/xnu/fuxi-adsp/fuxi_ramtest.c
+@@ -0,0 +1,119 @@
++#include <pexpert/arm64/board_config.h>
++#if defined(FUXI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++#include "fuxi_ramtest_pattern.h"
++
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t thread_terminate(thread_t);
++extern void thread_deallocate(thread_t);
++extern wait_result_t thread_block(thread_continue_t);
++extern void IOSleep(unsigned milliseconds);
++void fuxi_ramtest_init(void);
++
++static unsigned fr_started;
++
++static void fr_evict(vm_offset_t address, vm_size_t size)
++{
++    uint64_t cache_type;
++    __asm__ volatile("mrs %0, ctr_el0" : "=r"(cache_type));
++    vm_size_t line = 4ull << ((cache_type >> 16) & 15u);
++    __asm__ volatile("dsb ish" ::: "memory");
++    for (vm_size_t offset = 0; offset < size; offset += line) {
++        __asm__ volatile("dc civac, %0" :: "r"(address + offset) : "memory");
++    }
++    __asm__ volatile("dsb ish" ::: "memory");
++}
++
++static void fr_worker(void *argument, wait_result_t wait_result)
++{
++    (void)argument;
++    (void)wait_result;
++    vm_offset_t address = 0;
++    const vm_size_t size = 128ull * 1024 * 1024;
++    const size_t words = size / sizeof(uint64_t);
++    unsigned high_pages = 0, completed = 0;
++    uint64_t lowest = UINT64_MAX, highest = 0;
++    IOSleep(20000);
++    kern_return_t result = kmem_alloc(kernel_map, &address, size,
++        KMA_DATA | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
++    if (result != KERN_SUCCESS) {
++        printf("FUXI RAMTEST: allocation refused rc=%d bytes=%llu\n", result, (uint64_t)size);
++        goto done;
++    }
++    for (vm_size_t offset = 0; offset < size; offset += PAGE_SIZE) {
++        uint64_t physical = (uint64_t)pmap_find_phys(kernel_pmap, address + offset) << PAGE_SHIFT;
++        if (!fuxi_ramtest_page_allowed(physical, PAGE_SIZE)) {
++            printf("FUXI RAMTEST: refused physical=%#llx offset=%#llx; no pattern written\n",
++                physical, (uint64_t)offset);
++            goto release;
++        }
++        if (physical < lowest) lowest = physical;
++        if (physical > highest) highest = physical;
++        if (physical >= 0xa00000000ull) high_pages++;
++    }
++    printf("FUXI RAMTEST: allocated bytes=%llu pages=%llu high-pages=%u physical=%#llx..%#llx\n",
++        (uint64_t)size, (uint64_t)(size / PAGE_SIZE), high_pages, lowest, highest);
++    if (!high_pages) {
++        printf("FUXI RAMTEST: no pages above old 5GiB aperture; coverage not accepted\n");
++        goto release;
++    }
++    for (unsigned pass = 0; pass < 4; pass++) {
++        fuxi_ramtest_fill((volatile uint64_t *)address, words, pass);
++        fr_evict(address, size);
++        IOSleep(50);
++        size_t bad = fuxi_ramtest_verify((const volatile uint64_t *)address, words, pass);
++        if (bad != words) {
++            printf("FUXI RAMTEST: FAIL pass=%u word=%llu physical=%#llx expected=%#llx actual=%#llx\n",
++                pass, (uint64_t)bad,
++                ((uint64_t)pmap_find_phys(kernel_pmap, address + bad * sizeof(uint64_t)) << PAGE_SHIFT) |
++                    ((bad * sizeof(uint64_t)) & PAGE_MASK),
++                fuxi_ramtest_word(bad, pass), ((volatile uint64_t *)address)[bad]);
++            goto release;
++        }
++        completed++;
++        printf("FUXI RAMTEST: pass=%u bytes=%llu high-bytes=%llu cache-evicted verified\n",
++            pass, (uint64_t)size, (uint64_t)high_pages * PAGE_SIZE);
++    }
++release:
++    kmem_free(kernel_map, address, size);
++    printf("FUXI RAMTEST: released bytes=%llu completed=%u/4 coverage=allocated-sample\n",
++        (uint64_t)size, completed);
++done:
++    (void)thread_terminate(current_thread());
++    thread_block(THREAD_CONTINUE_NULL);
++}
++
++void fuxi_ramtest_init(void)
++{
++    DTEntry chosen;
++    const void *property = NULL;
++    unsigned bytes = 0, mode = 0;
++    uint64_t ram = 0, gpu[2] = {0};
++    if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++        SecureDTGetProperty(chosen, "fuxi,ramtest", &property, &bytes) != kSuccess || bytes != sizeof(mode)) return;
++    memcpy(&mode, property, sizeof(mode));
++    if (mode != 1 || __atomic_exchange_n(&fr_started, 1u, __ATOMIC_ACQ_REL)) return;
++    if (SecureDTGetProperty(chosen, "dram-size", &property, &bytes) != kSuccess || bytes != sizeof(ram)) return;
++    memcpy(&ram, property, sizeof(ram));
++    if (SecureDTGetProperty(chosen, "fuxi-gpu-memory", &property, &bytes) != kSuccess || bytes != sizeof(gpu)) return;
++    memcpy(gpu, property, sizeof(gpu));
++    if (ram != 0x23e000000ull || gpu[0] != 0xafe000000ull || gpu[1] != 0x2000000) {
++        printf("FUXI RAMTEST: refused layout dram=%#llx gpu=%#llx/%#llx\n", ram, gpu[0], gpu[1]);
++        return;
++    }
++    thread_t thread = NULL;
++    if (kernel_thread_start(fr_worker, NULL, &thread) != KERN_SUCCESS) {
++        printf("FUXI RAMTEST: worker could not start\n");
++        return;
++    }
++    thread_deallocate(thread);
++}
++#endif
+diff --git a/xnu/fuxi-adsp/fuxi_ramtest_pattern.h b/xnu/fuxi-adsp/fuxi_ramtest_pattern.h
+new file mode 100644
+index 0000000..ccffd28
+--- /dev/null
++++ b/xnu/fuxi-adsp/fuxi_ramtest_pattern.h
+@@ -0,0 +1,35 @@
++#ifndef FUXI_RAMTEST_PATTERN_H
++#define FUXI_RAMTEST_PATTERN_H
++#include <stddef.h>
++#include <stdint.h>
++
++static inline int fuxi_ramtest_page_allowed(uint64_t physical, uint64_t page_size)
++{
++    return page_size && !(page_size & (page_size - 1)) &&
++        !(physical & (page_size - 1)) && physical >= 0x8c0000000ull &&
++        physical < 0xafe000000ull && page_size <= 0xafe000000ull - physical;
++}
++
++static inline uint64_t fuxi_ramtest_word(size_t index, unsigned pass)
++{
++    static const uint64_t seeds[] = {
++        0, UINT64_MAX, 0xaaaaaaaaaaaaaaaaull, 0x5555555555555555ull
++    };
++    return ((uint64_t)index + 1) * 0x9e3779b97f4a7c15ull ^ seeds[pass & 3u];
++}
++
++static inline void fuxi_ramtest_fill(volatile uint64_t *memory, size_t words, unsigned pass)
++{
++    for (size_t index = 0; index < words; index++) {
++        memory[index] = fuxi_ramtest_word(index, pass);
++    }
++}
++
++static inline size_t fuxi_ramtest_verify(const volatile uint64_t *memory, size_t words, unsigned pass)
++{
++    for (size_t index = 0; index < words; index++) {
++        if (memory[index] != fuxi_ramtest_word(index, pass)) return index;
++    }
++    return words;
 +}
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_rpmh_shared.c b/xnu/fuxi-adsp/fuxi_rpmh_shared.c
@@ -8035,13 +8277,13 @@ index 8349337..34b8d1c 100644
   	 */
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..8bcab41
+index 0000000..5883d6a
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,5349 @@
+@@ -0,0 +1,5512 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
-+@@ -121,6 +121,23 @@
++@@ -121,6 +121,24 @@
 + bsd/dev/sweet_rpmh.c			standard
 + bsd/dev/sweet_spmi.c			standard
 + bsd/dev/sweet_usb.c			standard
@@ -8050,6 +8292,7 @@ index 0000000..8bcab41
 ++bsd/dev/fuxi_adsp_battery.c		standard
 ++bsd/dev/fuxi_amp.c			standard
 ++bsd/dev/fuxi_pmic.c			standard
+++bsd/dev/fuxi_ramtest.c			standard
 ++bsd/dev/fuxi_rpmh_shared.c		standard
 ++bsd/dev/QcomSmem.c			standard
 ++bsd/dev/QcomSmp2p.c			standard
@@ -8067,7 +8310,7 @@ index 0000000..8bcab41
 + bsd/dev/unix_startup.c			standard
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp.c
-+@@ -0,0 +1,896 @@
++@@ -0,0 +1,898 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 ++ *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -8138,6 +8381,7 @@ index 0000000..8bcab41
 ++extern void fuxi_adsp_battery_start(int publish);
 ++extern void fuxi_amp_init(void);
 ++extern void fuxi_pmic_init(void);
+++extern void fuxi_ramtest_init(void);
 ++extern volatile int32_t native_qrtr_stats[16];
 ++extern char native_qrtr_text[96];
 ++void fuxi_adsp_init(void);
@@ -8946,6 +9190,7 @@ index 0000000..8bcab41
 ++    const unsigned asked = fa_mode(), run = fuxi_adsp_mode();
 ++    thread_t thread = NULL;
 ++    fuxi_pmic_init();
+++    fuxi_ramtest_init();
 ++    fuxi_amp_init(); /* the speaker amplifiers' own switch (fuxi_amp.c, fuxiamp / ADT fuxi,amp), independent of fuxiadsp */
 ++    if (!run || gStarted) return;
 ++    if (asked >= 2 && run < 2) {
@@ -9968,6 +10213,128 @@ index 0000000..8bcab41
 ++    fp_survey(7, 0xf100, "haptic-pattern");
 ++    fp_survey(7, 0xf200, "haptic-boost");
 ++    if (mode == 2) fp_flash_pulse();
+++}
+++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_ramtest.c
++@@ -0,0 +1,119 @@
+++#include <pexpert/arm64/board_config.h>
+++#if defined(FUXI)
+++#include <sys/param.h>
+++#include <sys/systm.h>
+++#include <kern/thread.h>
+++#include <kern/sched_prim.h>
+++#include <pexpert/pexpert.h>
+++#include <pexpert/device_tree.h>
+++#include <vm/vm_kern.h>
+++#include <vm/pmap.h>
+++#include "fuxi_ramtest_pattern.h"
+++
+++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
+++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+++extern kern_return_t thread_terminate(thread_t);
+++extern void thread_deallocate(thread_t);
+++extern wait_result_t thread_block(thread_continue_t);
+++extern void IOSleep(unsigned milliseconds);
+++void fuxi_ramtest_init(void);
+++
+++static unsigned fr_started;
+++
+++static void fr_evict(vm_offset_t address, vm_size_t size)
+++{
+++    uint64_t cache_type;
+++    __asm__ volatile("mrs %0, ctr_el0" : "=r"(cache_type));
+++    vm_size_t line = 4ull << ((cache_type >> 16) & 15u);
+++    __asm__ volatile("dsb ish" ::: "memory");
+++    for (vm_size_t offset = 0; offset < size; offset += line) {
+++        __asm__ volatile("dc civac, %0" :: "r"(address + offset) : "memory");
+++    }
+++    __asm__ volatile("dsb ish" ::: "memory");
+++}
+++
+++static void fr_worker(void *argument, wait_result_t wait_result)
+++{
+++    (void)argument;
+++    (void)wait_result;
+++    vm_offset_t address = 0;
+++    const vm_size_t size = 128ull * 1024 * 1024;
+++    const size_t words = size / sizeof(uint64_t);
+++    unsigned high_pages = 0, completed = 0;
+++    uint64_t lowest = UINT64_MAX, highest = 0;
+++    IOSleep(20000);
+++    kern_return_t result = kmem_alloc(kernel_map, &address, size,
+++        KMA_DATA | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
+++    if (result != KERN_SUCCESS) {
+++        printf("FUXI RAMTEST: allocation refused rc=%d bytes=%llu\n", result, (uint64_t)size);
+++        goto done;
+++    }
+++    for (vm_size_t offset = 0; offset < size; offset += PAGE_SIZE) {
+++        uint64_t physical = (uint64_t)pmap_find_phys(kernel_pmap, address + offset) << PAGE_SHIFT;
+++        if (!fuxi_ramtest_page_allowed(physical, PAGE_SIZE)) {
+++            printf("FUXI RAMTEST: refused physical=%#llx offset=%#llx; no pattern written\n",
+++                physical, (uint64_t)offset);
+++            goto release;
+++        }
+++        if (physical < lowest) lowest = physical;
+++        if (physical > highest) highest = physical;
+++        if (physical >= 0xa00000000ull) high_pages++;
+++    }
+++    printf("FUXI RAMTEST: allocated bytes=%llu pages=%llu high-pages=%u physical=%#llx..%#llx\n",
+++        (uint64_t)size, (uint64_t)(size / PAGE_SIZE), high_pages, lowest, highest);
+++    if (!high_pages) {
+++        printf("FUXI RAMTEST: no pages above old 5GiB aperture; coverage not accepted\n");
+++        goto release;
+++    }
+++    for (unsigned pass = 0; pass < 4; pass++) {
+++        fuxi_ramtest_fill((volatile uint64_t *)address, words, pass);
+++        fr_evict(address, size);
+++        IOSleep(50);
+++        size_t bad = fuxi_ramtest_verify((const volatile uint64_t *)address, words, pass);
+++        if (bad != words) {
+++            printf("FUXI RAMTEST: FAIL pass=%u word=%llu physical=%#llx expected=%#llx actual=%#llx\n",
+++                pass, (uint64_t)bad,
+++                ((uint64_t)pmap_find_phys(kernel_pmap, address + bad * sizeof(uint64_t)) << PAGE_SHIFT) |
+++                    ((bad * sizeof(uint64_t)) & PAGE_MASK),
+++                fuxi_ramtest_word(bad, pass), ((volatile uint64_t *)address)[bad]);
+++            goto release;
+++        }
+++        completed++;
+++        printf("FUXI RAMTEST: pass=%u bytes=%llu high-bytes=%llu cache-evicted verified\n",
+++            pass, (uint64_t)size, (uint64_t)high_pages * PAGE_SIZE);
+++    }
+++release:
+++    kmem_free(kernel_map, address, size);
+++    printf("FUXI RAMTEST: released bytes=%llu completed=%u/4 coverage=allocated-sample\n",
+++        (uint64_t)size, completed);
+++done:
+++    (void)thread_terminate(current_thread());
+++    thread_block(THREAD_CONTINUE_NULL);
+++}
+++
+++void fuxi_ramtest_init(void)
+++{
+++    DTEntry chosen;
+++    const void *property = NULL;
+++    unsigned bytes = 0, mode = 0;
+++    uint64_t ram = 0, gpu[2] = {0};
+++    if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
+++        SecureDTGetProperty(chosen, "fuxi,ramtest", &property, &bytes) != kSuccess || bytes != sizeof(mode)) return;
+++    memcpy(&mode, property, sizeof(mode));
+++    if (mode != 1 || __atomic_exchange_n(&fr_started, 1u, __ATOMIC_ACQ_REL)) return;
+++    if (SecureDTGetProperty(chosen, "dram-size", &property, &bytes) != kSuccess || bytes != sizeof(ram)) return;
+++    memcpy(&ram, property, sizeof(ram));
+++    if (SecureDTGetProperty(chosen, "fuxi-gpu-memory", &property, &bytes) != kSuccess || bytes != sizeof(gpu)) return;
+++    memcpy(gpu, property, sizeof(gpu));
+++    if (ram != 0x23e000000ull || gpu[0] != 0xafe000000ull || gpu[1] != 0x2000000) {
+++        printf("FUXI RAMTEST: refused layout dram=%#llx gpu=%#llx/%#llx\n", ram, gpu[0], gpu[1]);
+++        return;
+++    }
+++    thread_t thread = NULL;
+++    if (kernel_thread_start(fr_worker, NULL, &thread) != KERN_SUCCESS) {
+++        printf("FUXI RAMTEST: worker could not start\n");
+++        return;
+++    }
+++    thread_deallocate(thread);
 ++}
 ++#endif
 +--- /dev/null
@@ -13002,6 +13369,44 @@ index 0000000..8bcab41
 ++        if (io->read(io->context, registers[index], &value) || value != saved[index]) restored = 0;
 ++    }
 ++    return restored ? result : -6;
+++}
+++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_ramtest_pattern.h
++@@ -0,0 +1,35 @@
+++#ifndef FUXI_RAMTEST_PATTERN_H
+++#define FUXI_RAMTEST_PATTERN_H
+++#include <stddef.h>
+++#include <stdint.h>
+++
+++static inline int fuxi_ramtest_page_allowed(uint64_t physical, uint64_t page_size)
+++{
+++    return page_size && !(page_size & (page_size - 1)) &&
+++        !(physical & (page_size - 1)) && physical >= 0x8c0000000ull &&
+++        physical < 0xafe000000ull && page_size <= 0xafe000000ull - physical;
+++}
+++
+++static inline uint64_t fuxi_ramtest_word(size_t index, unsigned pass)
+++{
+++    static const uint64_t seeds[] = {
+++        0, UINT64_MAX, 0xaaaaaaaaaaaaaaaaull, 0x5555555555555555ull
+++    };
+++    return ((uint64_t)index + 1) * 0x9e3779b97f4a7c15ull ^ seeds[pass & 3u];
+++}
+++
+++static inline void fuxi_ramtest_fill(volatile uint64_t *memory, size_t words, unsigned pass)
+++{
+++    for (size_t index = 0; index < words; index++) {
+++        memory[index] = fuxi_ramtest_word(index, pass);
+++    }
+++}
+++
+++static inline size_t fuxi_ramtest_verify(const volatile uint64_t *memory, size_t words, unsigned pass)
+++{
+++    for (size_t index = 0; index < words; index++) {
+++        if (memory[index] != fuxi_ramtest_word(index, pass)) return index;
+++    }
+++    return words;
 ++}
 ++#endif
 +--- /dev/null
