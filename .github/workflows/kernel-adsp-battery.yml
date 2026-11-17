@@ -128,6 +128,8 @@ jobs:
           (cd source && CC=clang python3 tools/test-fuxi-haptic-pulse.py --syntax-only)
           (cd source && python3 tools/test-fuxi-haptic-survey.py --cc clang)
           (cd source && python3 tools/test-fuxi-haptic-survey.py --cc clang --syntax-only)
+          (cd source && CC=clang python3 tools/test-fuxi-haptic-runtime.py)
+          (cd source && CC=clang python3 tools/test-fuxi-exec-inject.py)
           (cd source && python3 tools/test-fuxi-audio-prep.py --sanitize)
           (cd source && python3 tools/test-fuxi-audio-spf.py)
           (cd source && python3 tools/test-fuxi-battery-prep.py --sanitize)

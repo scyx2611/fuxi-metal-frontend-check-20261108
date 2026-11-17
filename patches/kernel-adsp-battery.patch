@@ -8273,10 +8273,10 @@ index 90d7242..54eacf5 100644
  @@ -745,6 +745,10 @@
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..03ba302
+index 0000000..5e168e6
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,166 @@
 +#!/usr/bin/env python3
 +"""Generate/check patch 0117 (fuxi-adsp): the audio DSP owner (boot-arg fuxiadsp) and its battery manager client.
 +
@@ -8323,6 +8323,8 @@ index 0000000..03ba302
 +HEADERS += ('fuxi_torch_steady.h',)
 +SOURCES += ('fuxi_audio_spf.c', 'fuxi_audio_prep_gpr.c')
 +HEADERS += ('fuxi_audio_prep_gpr.h',)
++# HAP525 DIRECT_PLAY runtime (fuxi,haptic=2|3, sysctl kern.fuxivibrate)
++HEADERS += ('fuxi_haptic_runtime.h',)
 +SOURCE_PATHS.update({
 +    'fuxi_audio_prep_gpr.c': ROOT / 'xnu/fuxi-audio-prep/fuxi_audio_prep_gpr.c',
 +    'fuxi_audio_prep_gpr.h': ROOT / 'xnu/fuxi-audio-prep/fuxi_audio_prep_gpr.h',
@@ -13026,6 +13028,72 @@ index 0000000..172d1eb
 +
 +if __name__ == "__main__":
 +    unittest.main(verbosity=2)
+diff --git a/tools/test-fuxi-exec-inject.py b/tools/test-fuxi-exec-inject.py
+new file mode 100644
+index 0000000..4050eb8
+--- /dev/null
++++ b/tools/test-fuxi-exec-inject.py
+@@ -0,0 +1,60 @@
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++
++root = Path(__file__).resolve().parents[1]
++source = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <string.h>
++#include "fuxi_exec_inject.h"
++
++static int same(const char *a, const char *b)
++{
++    return a == b || (a && b && !strcmp(a, b));
++}
++
++int main(void)
++{
++    const char *sb = "/System/Library/CoreServices/SpringBoard.app/SpringBoard";
++    const char *media = "/usr/sbin/mediaserverd";
++    const char *app = "/Applications/MobileSafari.app/MobileSafari";
++    char env[FUXI_INJECT_ENV_MAX];
++
++    assert(FUXI_INJECT_ALL == 7u);
++    for (unsigned mode = 0; mode < 8; mode++) {
++        assert(same(fuxi_inject_library(mode, sb, "SpringBoard"), (mode & 2u) ? FUXI_INJECT_SB_LIB : NULL));
++        assert(same(fuxi_inject_library(mode, media, "mediaserverd"), (mode & 4u) ? FUXI_INJECT_SB_LIB : NULL));
++        assert(same(fuxi_inject_library(mode, app, "MobileSafari"), (mode & 1u) ? FUXI_INJECT_APP_LIB : NULL));
++        /* 別處同名的 mediaserverd 不注入 */
++        assert(!fuxi_inject_library(mode, "/var/tmp/mediaserverd", "mediaserverd"));
++        assert(!fuxi_inject_library(mode, "/usr/sbin/mediaserverd2", "mediaserverd2"));
++        assert(!fuxi_inject_library(mode, "/usr/libexec/audiomxd", "audiomxd"));
++        assert(!fuxi_inject_library(mode, NULL, "mediaserverd"));
++        assert(!fuxi_inject_library(mode, media, NULL));
++    }
++    /* SpringBoard 不會拿到 app 函式庫，.appex 與 app 內 helper 不算 app */
++    assert(same(fuxi_inject_library(1u, sb, "SpringBoard"), NULL));
++    assert(!fuxi_inject_library(1u, "/Applications/X.app/PlugIns/Y.appex/Y", "Y"));
++    assert(!fuxi_inject_library(1u, "/Applications/X.app/Helpers/H", "H"));
++    assert(!fuxi_inject_library(1u, "/.app/X", "X"));
++    assert(fuxi_inject_env(FUXI_INJECT_SB_LIB, env, sizeof(env)));
++    assert(!strcmp(env, "DYLD_INSERT_LIBRARIES=" FUXI_INJECT_SB_LIB));
++    assert(!fuxi_inject_env(NULL, env, sizeof(env)));
++    assert(!fuxi_inject_env(FUXI_INJECT_SB_LIB, env, 10));
++    assert(!fuxi_inject_env(FUXI_INJECT_SB_LIB, env, 0));
++    puts("PASS: exec injection modes 0..7: SpringBoard, /usr/sbin/mediaserverd and application executables, rejects look-alikes and short buffers");
++    return 0;
++}
++'''
++with tempfile.TemporaryDirectory(prefix='fuxi-exec-inject-') as temporary:
++    directory = Path(temporary)
++    cfile, binary = directory / 'inject.c', directory / 'inject'
++    cfile.write_text(source, encoding='utf-8')
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-g', '-Wall', '-Wextra', '-Werror',
++                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
++                    '-I' + str(root / 'xnu/fuxi-inject'), str(cfile), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-haptic-fifo.py b/tools/test-fuxi-haptic-fifo.py
 new file mode 100644
 index 0000000..84b78c0
@@ -13527,12 +13595,250 @@ index 0000000..3144cfe
 +
 +if __name__ == '__main__':
 +    main()
+diff --git a/tools/test-fuxi-haptic-runtime.py b/tools/test-fuxi-haptic-runtime.py
+new file mode 100644
+index 0000000..4e62da1
+--- /dev/null
++++ b/tools/test-fuxi-haptic-runtime.py
+@@ -0,0 +1,232 @@
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++
++root = Path(__file__).resolve().parents[1]
++source = r'''
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "fuxi_haptic_runtime.h"
++
++/* HAP525 假模型：Android 開機後留下的狀態，PLAY_EN 會讓 HPWR 變 READY，關掉後延遲幾次輪詢才回 DISABLED。 */
++typedef struct {
++    uint8_t reg[0x300];
++    unsigned owners[3];
++    unsigned disable_delay;   /* 關掉 PLAY 後還要幾次 wait 才回 0 */
++    unsigned pending;
++    int stuck;                /* 1：PLAY 關掉也不回 0；2：連關開模組都不回 0 */
++    int write_fail, verify_lie;
++    unsigned writes, waits;
++    unsigned written[64];
++} Model;
++
++static int owner(void *context, unsigned peripheral, unsigned *value)
++{
++    Model *model = context;
++    if (peripheral < 0xf0 || peripheral > 0xf2) return -1;
++    *value = model->owners[peripheral - 0xf0];
++    return 0;
++}
++
++static int rd(void *context, unsigned address, uint8_t *value)
++{
++    Model *model = context;
++    if (address < 0xf000 || address > 0xf2ff) return -1;
++    *value = model->reg[address - 0xf000];
++    return 0;
++}
++
++static int wr(void *context, unsigned address, uint8_t value)
++{
++    Model *model = context;
++    assert(fuxi_haptic_writable(address));
++    assert(address == 0xf04c || address == 0xf046);
++    if (model->writes < 64) model->written[model->writes] = address;
++    model->writes++;
++    if (model->write_fail) return -1;
++    model->reg[address - 0xf000] = model->verify_lie ? (uint8_t)(value ^ 0x40) : value;
++    if (address == 0xf04c) {
++        if (value & 0x80u) {
++            model->reg[0x0b] = 3;
++            model->pending = 0;
++        } else {
++            model->pending = model->stuck ? 1000 : model->disable_delay;
++            if (!model->pending) model->reg[0x0b] = 0;
++        }
++    } else if (address == 0xf046 && !(value & 0x80u) && model->stuck < 2) {
++        model->reg[0x0b] = 0;
++        model->pending = 0;
++        model->reg[0x4c] &= 0x7fu;
++    }
++    return 0;
++}
++
++static void wait_us(void *context, unsigned microseconds)
++{
++    Model *model = context;
++    assert(microseconds == 1000);
++    model->waits++;
++    if (model->pending && !--model->pending) model->reg[0x0b] = 0;
++}
++
++static void android(Model *model)
++{
++    memset(model, 0, sizeof(*model));
++    model->owners[2] = 3;
++    static const unsigned identities[] = {0xf001, 0xf004, 0xf005, 0xf101, 0xf104, 0xf105, 0xf200, 0xf201, 0xf204, 0xf205};
++    static const uint8_t expected[] = {4, 0x15, 0x0a, 4, 0x15, 0x0b, 2, 0, 0x31, 1};
++    for (unsigned index = 0; index < 10; index++) model->reg[identities[index] - 0xf000] = expected[index];
++    model->reg[0x46] = 0x80;  /* 模組開 */
++    model->reg[0x48] = 0x1c;  /* VMAX 1400 mV */
++    model->reg[0x4c] = 0x01;  /* DIRECT_PLAY，PLAY_EN 關 */
++    model->reg[0x63] = 0x89;  /* 自動共振開 */
++    model->reg[0x68] = 0x54;
++    model->reg[0x126] = 0xff; /* DIRECT_PLAY 振幅 */
++    model->reg[0x241] = 0xe0; /* boost 跟隨硬體 */
++    model->disable_delay = 3;
++}
++
++static FuxiHapticIo io_for(Model *model)
++{
++    FuxiHapticIo io = {model, owner, rd, wr, wait_us, 0};
++    return io;
++}
++
++int main(void)
++{
++    Model model;
++    FuxiHapticIo io;
++    unsigned polls = 0, toggled = 0;
++    uint8_t fault = 0, hpwr = 0;
++
++    /* 呼叫者 */
++    assert(fuxi_vibrate_caller_allowed(1, 0, NULL));
++    assert(fuxi_vibrate_caller_allowed(0, 1, "SpringBoard"));
++    assert(fuxi_vibrate_caller_allowed(0, 1, "mediaserverd"));
++    assert(!fuxi_vibrate_caller_allowed(0, 0, "mediaserverd"));
++    assert(!fuxi_vibrate_caller_allowed(0, 1, "mediaserver"));
++    assert(!fuxi_vibrate_caller_allowed(0, 1, "mediaserverdX"));
++    assert(!fuxi_vibrate_caller_allowed(0, 1, "SpringBoardX"));
++    assert(!fuxi_vibrate_caller_allowed(0, 1, ""));
++    assert(!fuxi_vibrate_caller_allowed(0, 1, NULL));
++
++    /* 請求：期限、覆蓋、停止、上限、溢位、鎖死 */
++    FuxiVibrateRuntime state = {0}, saved;
++    assert(!fuxi_vibrate_wanted(&state, 0));
++    assert(!fuxi_vibrate_request(&state, 15, 1000));
++    assert(fuxi_vibrate_wanted(&state, 1000));
++    assert(fuxi_vibrate_remaining_ms(&state, 1000) == 15);
++    assert(fuxi_vibrate_remaining_ms(&state, 1000 + 14000001ull) == 1);
++    assert(fuxi_vibrate_wanted(&state, 1000 + 14999999ull));
++    assert(!fuxi_vibrate_wanted(&state, 1000 + 15000000ull));
++    assert(!fuxi_vibrate_remaining_ms(&state, 1000 + 15000000ull));
++    assert(!fuxi_vibrate_request(&state, 2000, 5));
++    assert(!fuxi_vibrate_request(&state, 30, 6));
++    assert(fuxi_vibrate_remaining_ms(&state, 6) == 30);
++    assert(!fuxi_vibrate_request(&state, 0, 7));
++    assert(!fuxi_vibrate_wanted(&state, 7));
++    saved = state;
++    assert(fuxi_vibrate_request(&state, 2001, 8) < 0);
++    assert(!memcmp(&state, &saved, sizeof(state)));
++    assert(fuxi_vibrate_request(&state, 1, UINT64_MAX - 5) < 0);
++    assert(!memcmp(&state, &saved, sizeof(state)));
++    assert(!fuxi_vibrate_request(&state, 100, 9));
++    state.failed = 1;
++    assert(!fuxi_vibrate_wanted(&state, 10));
++    assert(!fuxi_vibrate_remaining_ms(&state, 10));
++    assert(fuxi_vibrate_request(&state, 10, 11) < 0);
++    assert(!fuxi_vibrate_request(&state, 0, 12));
++    assert(fuxi_vibrate_request(NULL, 0, 0) < 0);
++
++    /* Android 留下的狀態通過檢查，且檢查不寫任何暫存器 */
++    android(&model);
++    io = io_for(&model);
++    assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_OK);
++    assert(model.writes == 0);
++
++    /* 檢查拒絕：owner、身分、模組關、PLAY 不是閒置 DIRECT_PLAY、VMAX 過高、振幅 0、自動共振關、fault、忙碌 */
++    android(&model); model.owners[0] = 1; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_HARDWARE);
++    android(&model); model.owners[2] = 0; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_HARDWARE);
++    android(&model); model.reg[0x205] = 2; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_HARDWARE);
++    android(&model); model.reg[0x46] = 0; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_HARDWARE);
++    android(&model); model.reg[0x4c] = 0x02; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_HARDWARE);
++    android(&model); model.reg[0x4c] = 0x81; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_HARDWARE);
++    android(&model); model.reg[0x48] = 0x1d; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_HARDWARE);
++    android(&model); model.reg[0x48] = 0; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_HARDWARE);
++    android(&model); model.reg[0x126] = 0; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_HARDWARE);
++    android(&model); model.reg[0x63] = 0x09; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_HARDWARE);
++    android(&model); model.reg[0x0c] = 0x04; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_FAULT);
++    android(&model); model.reg[0x0b] = 3; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_BUSY);
++    android(&model); model.reg[0x241] = 0x60; assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_HARDWARE);
++    android(&model); assert(model.writes == 0);
++
++    /* 正常一下：0x81 開、READY、0x01 關、三次輪詢後 DISABLED，不動模組 */
++    android(&model);
++    assert(fuxi_vibrate_start(&io) == FUXI_HAPTIC_OK);
++    assert(model.reg[0x4c] == 0x81 && model.reg[0x0b] == 3);
++    assert(fuxi_vibrate_health(&io, &fault, &hpwr) == FUXI_HAPTIC_OK && hpwr == 3 && !fault);
++    assert(fuxi_vibrate_stop(&io, &polls, &toggled) == FUXI_HAPTIC_OK);
++    assert(polls == 3 && !toggled && model.reg[0x4c] == 0x01 && model.reg[0x46] == 0x80 && !model.reg[0x0b]);
++    assert(model.writes == 2 && model.written[0] == 0xf04c && model.written[1] == 0xf04c);
++    assert(fuxi_vibrate_check(&io) == FUXI_HAPTIC_OK);
++
++    /* 立刻 DISABLED：只輪詢一次 */
++    android(&model); model.disable_delay = 0;
++    assert(!fuxi_vibrate_start(&io));
++    assert(!fuxi_vibrate_stop(&io, &polls, &toggled) && polls == 1 && !toggled);
++
++    /* 播放中出現 fault */
++    android(&model);
++    assert(!fuxi_vibrate_start(&io));
++    model.reg[0x0c] = 0x02;
++    assert(fuxi_vibrate_health(&io, &fault, &hpwr) == FUXI_HAPTIC_FAULT && fault == 2);
++
++    /* 有 fault 就不開 */
++    android(&model); model.reg[0x0c] = 0x01;
++    assert(fuxi_vibrate_start(&io) == FUXI_HAPTIC_FAULT && model.writes == 0 && model.reg[0x4c] == 0x01);
++
++    /* HPWR 卡住：照 Linux 關開模組一次，之後回 DISABLED，模組留在開 */
++    android(&model); model.stuck = 1;
++    assert(!fuxi_vibrate_start(&io));
++    assert(fuxi_vibrate_stop(&io, &polls, &toggled) == FUXI_HAPTIC_OK);
++    assert(toggled && polls == FUXI_VIBRATE_STOP_POLLS + 1 && model.reg[0x46] == 0x80 && !model.reg[0x0b]);
++    assert(model.writes == 4 && model.written[2] == 0xf046 && model.written[3] == 0xf046);
++
++    /* 連關開模組都停不下來：回逾時，呼叫端鎖死 */
++    android(&model); model.stuck = 2;
++    assert(!fuxi_vibrate_start(&io));
++    assert(fuxi_vibrate_stop(&io, &polls, &toggled) == FUXI_HAPTIC_TIMEOUT);
++    assert(toggled && polls == 2 * FUXI_VIBRATE_STOP_POLLS);
++
++    /* 寫入讀回不符 */
++    android(&model); model.verify_lie = 1;
++    assert(fuxi_vibrate_start(&io) == FUXI_HAPTIC_VERIFY);
++
++    /* 寫入失敗時停止仍會輪詢、走退路，結果不得是 OK */
++    android(&model);
++    assert(!fuxi_vibrate_start(&io));
++    model.write_fail = 1;
++    assert(fuxi_vibrate_stop(&io, &polls, &toggled) != FUXI_HAPTIC_OK);
++
++    /* owner 改變時停止直接回硬體錯誤（不寫） */
++    android(&model);
++    assert(!fuxi_vibrate_start(&io));
++    model.owners[0] = 2;
++    unsigned before = model.writes;
++    assert(fuxi_vibrate_stop(&io, &polls, &toggled) == FUXI_HAPTIC_HARDWARE && model.writes == before);
++
++    puts("PASS: HAP525 DIRECT_PLAY runtime caller policy, lease, Android-state check, start/stop/HPWR poll, module toggle fallback, fault and verify paths");
++    return 0;
++}
++'''
++with tempfile.TemporaryDirectory(prefix='fuxi-haptic-runtime-') as temporary:
++    directory = Path(temporary)
++    cfile, binary = directory / 'runtime.c', directory / 'runtime'
++    cfile.write_text(source, encoding='utf-8')
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-g', '-Wall', '-Wextra', '-Werror',
++                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
++                    '-I' + str(root / 'xnu/fuxi-adsp'), str(cfile), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
 diff --git a/tools/test-fuxi-haptic-survey.py b/tools/test-fuxi-haptic-survey.py
 new file mode 100644
-index 0000000..b4d70a7
+index 0000000..d9e5113
 --- /dev/null
 +++ b/tools/test-fuxi-haptic-survey.py
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,318 @@
 +import argparse
 +import importlib.util
 +import os
@@ -13571,7 +13877,7 @@ index 0000000..b4d70a7
 +    unsigned mode, haptic, by_dt, reads, owner_checks, maps, legacy, flash, torch, diagnostic;
 +    unsigned observations, summaries, valid, stable, identity, attempts, observed_fifo, contradictory;
 +    unsigned fail_read, poison_failure, owner_change, apid_change, mutate_read, selector_race, selector_reads;
-+    unsigned status_reads, invalid_rows, tlra_lines;
++    unsigned status_reads, invalid_rows, tlra_lines, vibrate, vibrate_selftest;
 +} model;
 +
 +static void lck_mtx_lock(int *lock) { assert(!*lock); *lock = 1; }
@@ -13676,6 +13982,8 @@ index 0000000..b4d70a7
 +static void fp_flash_pulse(void) { model.flash++; }
 +static void fp_torch_start(void) { model.torch++; }
 +static void fp_haptic_diagnostic(void) { model.diagnostic++; }
++static unsigned fp_vibrate_selftest;
++static void fp_vibrate_runtime_start(void) { model.vibrate++; model.vibrate_selftest = fp_vibrate_selftest; }
 +'''
 +
 +TESTS = r'''
@@ -13720,7 +14028,15 @@ index 0000000..b4d70a7
 +        assert(model.flash == (unsigned)(index == 2) && model.torch == (unsigned)(index == 3));
 +    }
 +    fixture(0); model.haptic = 1; run();
-+    assert(model.diagnostic == 1 && !model.observations);
++    assert(model.diagnostic == 1 && !model.observations && !model.vibrate);
++    /* haptic=2 啟動 DIRECT_PLAY 執行期、3 另加自測、4 以上拒絕且不碰硬體 */
++    for (index = 2; index <= 3; index++) {
++        fixture(0); model.haptic = index; fp_vibrate_selftest = 7; run();
++        assert(model.vibrate == 1 && model.vibrate_selftest == (index == 3) && !model.diagnostic);
++        assert(model.maps == 3 && !model.observations && !model.flash && !model.torch);
++    }
++    fixture(0); model.haptic = 4; run();
++    assert(!model.vibrate && !model.maps && !model.legacy && !model.reads && !model.diagnostic);
 +    for (index = 1; index <= 58; index++) {
 +        fixture(1); model.fail_read = index; run();
 +        assert(model.invalid_rows && !model.valid && !model.stable && model.observations == 58);
@@ -25445,12 +25761,160 @@ index 0000000..442bfbf
 +    return result;
 +}
 +#endif
+diff --git a/xnu/fuxi-adsp/fuxi_haptic_runtime.h b/xnu/fuxi-adsp/fuxi_haptic_runtime.h
+new file mode 100644
+index 0000000..0437b93
+--- /dev/null
++++ b/xnu/fuxi-adsp/fuxi_haptic_runtime.h
+@@ -0,0 +1,142 @@
++#ifndef FUXI_HAPTIC_RUNTIME_H
++#define FUXI_HAPTIC_RUNTIME_H
++/*
++ * HAP525 DIRECT_PLAY 執行期（fuxi,haptic=2 才啟用）。
++ * 做法與 Android qcom-hv-haptics 的 constant effect 相同：
++ * 開：SPMI_PLAY(0xf04c) 寫 0x81（PLAY_EN | 來源 DIRECT_PLAY，不開 brake）；
++ * 關：寫 0x01，再輪詢 HPWR_INTF(0xf00b) 低兩位回到 0（HPWR_DISABLED）；
++ * 逾時就照 Linux 的 haptics_toggle_module_enable 關開模組一次再等。
++ * 振幅、VMAX、自動共振都沿用 Android 開機前留下的設定，這裡只檢查不改寫。
++ */
++#include <stdint.h>
++#include "fuxi_haptic_pulse.h"
++
++enum {
++    FUXI_VIBRATE_MAX_MS = 2000,   /* 單次請求上限；鈴聲 pattern 由使用端分段送 */
++    FUXI_VIBRATE_POLL_MS = 5,     /* 播放中檢查 fault 的間隔 */
++    FUXI_VIBRATE_STOP_POLLS = 30, /* 1 ms 一次；TLRA 約 5.7 ms，Linux 約等 brake 長度加一週期 */
++    FUXI_VIBRATE_PLAY = 0x81,
++    FUXI_VIBRATE_IDLE = 0x01,
++    FUXI_VIBRATE_MODULE_ON = 0x80,
++    FUXI_VIBRATE_VMAX_LIMIT = 0x1c /* 50 mV/碼，1400 mV：Android 留下的值，不接受更高 */
++};
++
++typedef struct {
++    uint64_t deadline;  /* 奈秒；now < deadline 期間要震 */
++    uint64_t requests;
++    uint64_t plays;
++    unsigned failed;
++    unsigned playing;
++    int last_error;
++} FuxiVibrateRuntime;
++
++/* 允許的呼叫者：root，或平台二進位檔名為 SpringBoard／mediaserverd。 */
++static inline int fuxi_vibrate_caller_allowed(unsigned root, unsigned platform, const char *name)
++{
++    static const char *const allowed[] = {"SpringBoard", "mediaserverd"};
++    if (root) return 1;
++    if (!platform || !name) return 0;
++    for (unsigned entry = 0; entry < sizeof(allowed) / sizeof(allowed[0]); entry++) {
++        const char *expected = allowed[entry];
++        unsigned index = 0;
++        while (expected[index] && name[index] == expected[index]) index++;
++        if (!expected[index] && !name[index]) return 1;
++    }
++    return 0;
++}
++
++/* ms=0 立即停；1..FUXI_VIBRATE_MAX_MS 從現在起震這麼久（覆蓋前一個請求）。 */
++static inline int fuxi_vibrate_request(FuxiVibrateRuntime *state, unsigned ms, uint64_t now)
++{
++    if (!state || ms > FUXI_VIBRATE_MAX_MS) return -1;
++    if (ms && (state->failed || now > UINT64_MAX - (uint64_t)FUXI_VIBRATE_MAX_MS * 1000000ull)) return -1;
++    state->deadline = ms ? now + (uint64_t)ms * 1000000ull : 0;
++    state->requests++;
++    return 0;
++}
++
++static inline unsigned fuxi_vibrate_wanted(FuxiVibrateRuntime *state, uint64_t now)
++{
++    if (state->failed) state->deadline = 0;
++    return state->deadline && now < state->deadline;
++}
++
++/* 剩下的毫秒數（無條件進位），供 sysctl 讀取。 */
++static inline unsigned fuxi_vibrate_remaining_ms(const FuxiVibrateRuntime *state, uint64_t now)
++{
++    if (state->failed || !state->deadline || now >= state->deadline) return 0;
++    return (unsigned)((state->deadline - now + 999999ull) / 1000000ull);
++}
++
++/* 開機後第一次使用前的完整檢查：身分、owner、Android 留下的 DIRECT_PLAY 設定、閒置。 */
++static inline int fuxi_vibrate_check(const FuxiHapticIo *io)
++{
++    static const unsigned identities[] = {
++        0xf001, 0xf004, 0xf005, 0xf101, 0xf104, 0xf105,
++        0xf200, 0xf201, 0xf204, 0xf205
++    };
++    static const uint8_t expected[] = {4, 0x15, 0x0a, 4, 0x15, 0x0b, 2, 0, 0x31, 1};
++    uint8_t value = 0, module = 0, play = 0, vmax = 0, amplitude = 0, autores = 0;
++    if (!io || !io->owner || !io->read || !io->write || !io->wait_us) return FUXI_HAPTIC_INVALID;
++    for (unsigned index = 0; index < 3; index++) {
++        unsigned owner = 7;
++        if (io->owner(io->context, 0xf0 + index, &owner) || owner != (index == 2 ? 3u : 0u))
++            return FUXI_HAPTIC_HARDWARE;
++    }
++    for (unsigned index = 0; index < sizeof(identities) / sizeof(identities[0]); index++) {
++        if (fuxi_haptic_read_stable(io, identities[index], &value)) return FUXI_HAPTIC_IO;
++        if (value != expected[index]) return FUXI_HAPTIC_HARDWARE;
++    }
++    if (fuxi_haptic_read_stable(io, 0xf046, &module) || fuxi_haptic_read_stable(io, 0xf04c, &play) ||
++        fuxi_haptic_read_stable(io, 0xf048, &vmax) || fuxi_haptic_read_stable(io, 0xf126, &amplitude) ||
++        fuxi_haptic_read_stable(io, 0xf063, &autores))
++        return FUXI_HAPTIC_IO;
++    if (!(module & 0x80u) || play != FUXI_VIBRATE_IDLE || !amplitude || !vmax ||
++        vmax > FUXI_VIBRATE_VMAX_LIMIT || !(autores & 0x80u))
++        return FUXI_HAPTIC_HARDWARE;
++    return fuxi_haptic_idle(io);
++}
++
++static inline int fuxi_vibrate_health(const FuxiHapticIo *io, uint8_t *fault, uint8_t *hpwr)
++{
++    if (io->read(io->context, 0xf00c, fault) || io->read(io->context, 0xf00b, hpwr)) return FUXI_HAPTIC_IO;
++    return *fault ? FUXI_HAPTIC_FAULT : FUXI_HAPTIC_OK;
++}
++
++static inline int fuxi_vibrate_start(const FuxiHapticIo *io)
++{
++    uint8_t fault = 0;
++    if (io->read(io->context, 0xf00c, &fault)) return FUXI_HAPTIC_IO;
++    if (fault) return FUXI_HAPTIC_FAULT;
++    return fuxi_haptic_write_checked(io, 0xf04c, FUXI_VIBRATE_PLAY);
++}
++
++static inline int fuxi_vibrate_wait_disabled(const FuxiHapticIo *io, unsigned *polls)
++{
++    for (unsigned poll = 0; poll < FUXI_VIBRATE_STOP_POLLS; poll++) {
++        uint8_t hpwr = 0;
++        io->wait_us(io->context, 1000);
++        (*polls)++;
++        if (!io->read(io->context, 0xf00b, &hpwr) && !(hpwr & 3u)) return FUXI_HAPTIC_OK;
++    }
++    return FUXI_HAPTIC_TIMEOUT;
++}
++
++/* 停止；*toggled 表示有沒有走關開模組的退路。回傳非 0 就要鎖死執行期。 */
++static inline int fuxi_vibrate_stop(const FuxiHapticIo *io, unsigned *polls, unsigned *toggled)
++{
++    int result = fuxi_haptic_write_checked(io, 0xf04c, FUXI_VIBRATE_IDLE);
++    *polls = 0;
++    *toggled = 0;
++    if (result == FUXI_HAPTIC_HARDWARE) return result;
++    if (!fuxi_vibrate_wait_disabled(io, polls)) return result;
++    *toggled = 1;
++    int off = fuxi_haptic_write_checked(io, 0xf046, 0);
++    int on = fuxi_haptic_write_checked(io, 0xf046, FUXI_VIBRATE_MODULE_ON);
++    int waited = fuxi_vibrate_wait_disabled(io, polls);
++    if (waited) return waited;
++    if (off) return off;
++    if (on) return on;
++    return result;
++}
++#endif
 diff --git a/xnu/fuxi-adsp/fuxi_pmic.c b/xnu/fuxi-adsp/fuxi_pmic.c
 new file mode 100644
-index 0000000..6f1b89f
+index 0000000..afdef7d
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_pmic.c
-@@ -0,0 +1,603 @@
+@@ -0,0 +1,808 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
@@ -25463,6 +25927,7 @@ index 0000000..6f1b89f
 +#include <kern/clock.h>
 +#include <kern/locks.h>
 +#include <kern/thread.h>
++#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
@@ -25473,6 +25938,7 @@ index 0000000..6f1b89f
 +#include "fuxi_torch_audit.h"
 +#include "fuxi_torch_steady.h"
 +#include "fuxi_haptic_pulse.h"
++#include "fuxi_haptic_runtime.h"
 +#include "sweet_spmi_bus.h"
 +
 +extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
@@ -25504,6 +25970,11 @@ index 0000000..6f1b89f
 +static unsigned fp_torch_audit_enabled;
 +static struct fp_window fp_haptic_channels[2];
 +static FuxiHapticState fp_haptic_state;
++static LCK_MTX_DECLARE(fp_vibrate_lock, &fp_group);
++static FuxiVibrateRuntime fp_vibrate_state;
++static unsigned fp_vibrate_ready;
++static unsigned fp_vibrate_kick;
++static unsigned fp_vibrate_selftest;
 +
 +static kern_return_t fp_map(struct fp_window *window)
 +{
@@ -25900,6 +26371,200 @@ index 0000000..6f1b89f
 +    return 0;
 +}
 +
++/* ---- HAP525 DIRECT_PLAY 執行期（fuxi,haptic=2；3 另加開機自測三下） ---- */
++static void fp_vibrate_kick_worker(void)
++{
++    __atomic_fetch_add(&fp_vibrate_kick, 1u, __ATOMIC_RELEASE);
++    thread_wakeup((event_t)&fp_vibrate_kick);
++}
++
++static int fp_vibrate_sysctl SYSCTL_HANDLER_ARGS
++{
++    (void)oidp;
++    (void)arg1;
++    (void)arg2;
++    if (!__atomic_load_n(&fp_vibrate_ready, __ATOMIC_ACQUIRE)) return ENOTSUP;
++    if (req->newptr) {
++        char name[32] = {0};
++        proc_selfname(name, sizeof(name));
++        proc_t process = proc_self();
++        int platform = process && csproc_get_platform_binary(process) != 0;
++        if (process) proc_rele(process);
++        if (!fuxi_vibrate_caller_allowed(kauth_cred_issuser(kauth_cred_get()), platform, name)) return EPERM;
++    }
++    lck_mtx_lock(&fp_vibrate_lock);
++    int value = (int)fuxi_vibrate_remaining_ms(&fp_vibrate_state, fp_torch_now());
++    int failed = fp_vibrate_state.failed;
++    lck_mtx_unlock(&fp_vibrate_lock);
++    if (failed && !req->newptr) return EIO;
++    int changed = 0;
++    int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++    if (error || !changed) return error;
++    if (value < 0 || value > FUXI_VIBRATE_MAX_MS) return EINVAL;
++    lck_mtx_lock(&fp_vibrate_lock);
++    error = fuxi_vibrate_request(&fp_vibrate_state, (unsigned)value, fp_torch_now()) ? EIO : 0;
++    lck_mtx_unlock(&fp_vibrate_lock);
++    if (!error) fp_vibrate_kick_worker();
++    return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, fuxivibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, fp_vibrate_sysctl, "I", "Fuxi HAP525 direct play ms 0..2000, platform SpringBoard/mediaserverd or root");
++
++/* 等到 deadline_ns（0 表示不限）或有新請求。 */
++static void fp_vibrate_sleep(unsigned seen, uint64_t deadline_ns)
++{
++    if (deadline_ns) {
++        uint64_t deadline = 0;
++        nanoseconds_to_absolutetime(deadline_ns, &deadline);
++        assert_wait_deadline((event_t)&fp_vibrate_kick, THREAD_UNINT, deadline);
++    } else {
++        assert_wait((event_t)&fp_vibrate_kick, THREAD_UNINT);
++    }
++    if (__atomic_load_n(&fp_vibrate_kick, __ATOMIC_ACQUIRE) != seen) {
++        clear_wait(current_thread(), THREAD_AWAKENED);
++        return;
++    }
++    thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void fp_vibrate_fail(const FuxiHapticIo *io, const char *where, int result)
++{
++    uint8_t fault = 0, hpwr = 0, play = 0, module = 0;
++    int read_result = io->read(io->context, 0xf00c, &fault) | io->read(io->context, 0xf00b, &hpwr) |
++        io->read(io->context, 0xf04c, &play) | io->read(io->context, 0xf046, &module);
++    lck_mtx_lock(&fp_vibrate_lock);
++    fp_vibrate_state.failed = 1;
++    fp_vibrate_state.deadline = 0;
++    fp_vibrate_state.last_error = result;
++    lck_mtx_unlock(&fp_vibrate_lock);
++    printf("FUXI PMIC: vibrate %s rc=%d fault=%#x hpwr=%#x play=%#x module=%#x read-rc=%d; runtime locked until reboot\n",
++        where, result, fault, hpwr, play, module, read_result);
++}
++
++static void fp_vibrate_worker(void *argument, wait_result_t wait_result)
++{
++    (void)argument;
++    (void)wait_result;
++    const FuxiHapticIo io = {NULL, fp_haptic_owner, fp_haptic_read, fp_haptic_write, fp_flash_wait, 0};
++    unsigned playing = 0, logged = 0, health_checks = 0;
++    uint8_t mid_hpwr = 0, mid_fault = 0;
++    uint64_t started_ns = 0;
++    for (;;) {
++        unsigned seen = __atomic_load_n(&fp_vibrate_kick, __ATOMIC_ACQUIRE);
++        uint64_t now = fp_torch_now();
++        lck_mtx_lock(&fp_vibrate_lock);
++        unsigned failed = fp_vibrate_state.failed;
++        unsigned want = fuxi_vibrate_wanted(&fp_vibrate_state, now);
++        uint64_t deadline = fp_vibrate_state.deadline;
++        lck_mtx_unlock(&fp_vibrate_lock);
++        if (failed && !playing) {
++            fp_vibrate_sleep(seen, 0);
++            continue;
++        }
++        if (want && !playing) {
++            int result = fuxi_vibrate_start(&io);
++            if (result) {
++                unsigned polls = 0, toggled = 0;
++                int stop_result = fuxi_vibrate_stop(&io, &polls, &toggled);
++                fp_vibrate_fail(&io, "start refused", result);
++                printf("FUXI PMIC: vibrate start cleanup rc=%d polls=%u toggled=%u\n", stop_result, polls, toggled);
++                continue;
++            }
++            playing = 1;
++            health_checks = 0;
++            mid_hpwr = mid_fault = 0;
++            started_ns = now;
++            lck_mtx_lock(&fp_vibrate_lock);
++            fp_vibrate_state.playing = 1;
++            fp_vibrate_state.plays++;
++            lck_mtx_unlock(&fp_vibrate_lock);
++            continue;
++        }
++        if (playing && (!want || failed)) {
++            unsigned polls = 0, toggled = 0;
++            uint64_t stop_ns = fp_torch_now();
++            int result = fuxi_vibrate_stop(&io, &polls, &toggled);
++            uint64_t stopped_ns = fp_torch_now();
++            playing = 0;
++            lck_mtx_lock(&fp_vibrate_lock);
++            fp_vibrate_state.playing = 0;
++            uint64_t plays = fp_vibrate_state.plays;
++            lck_mtx_unlock(&fp_vibrate_lock);
++            if (logged < 16 || result || toggled) {
++                logged++;
++                printf("FUXI PMIC: vibrate play=%llu on-us=%llu checks=%u hpwr-mid=%#x fault-mid=%#x stop-rc=%d stop-polls=%u stop-us=%llu toggled=%u\n",
++                    plays, (stop_ns - started_ns) / 1000, health_checks, mid_hpwr, mid_fault, result, polls,
++                    (stopped_ns - stop_ns) / 1000, toggled);
++            }
++            if (result) fp_vibrate_fail(&io, "stop unverified", result);
++            continue;
++        }
++        if (playing) {
++            uint8_t fault = 0, hpwr = 0;
++            int result = fuxi_vibrate_health(&io, &fault, &hpwr);
++            health_checks++;
++            mid_hpwr = hpwr; /* 停止前最後一次看到的 HPWR；播放中應為 3（READY） */
++            mid_fault |= fault;
++            if (result) {
++                unsigned polls = 0, toggled = 0;
++                int stop_result = fuxi_vibrate_stop(&io, &polls, &toggled);
++                playing = 0;
++                lck_mtx_lock(&fp_vibrate_lock);
++                fp_vibrate_state.playing = 0;
++                lck_mtx_unlock(&fp_vibrate_lock);
++                fp_vibrate_fail(&io, "fault while playing", result);
++                printf("FUXI PMIC: vibrate fault stop rc=%d polls=%u toggled=%u on-us=%llu\n", stop_result, polls, toggled,
++                    (fp_torch_now() - started_ns) / 1000);
++                continue;
++            }
++            uint64_t next = fp_torch_now() + FUXI_VIBRATE_POLL_MS * 1000000ull;
++            fp_vibrate_sleep(seen, deadline && deadline < next ? deadline : next);
++            continue;
++        }
++        fp_vibrate_sleep(seen, 0);
++    }
++}
++
++static void fp_vibrate_selftest_worker(void *argument, wait_result_t wait_result)
++{
++    (void)argument;
++    (void)wait_result;
++    static const unsigned pulses[] = {30, 100, 300};
++    IOSleep(2000);
++    for (unsigned index = 0; index < 3; index++) {
++        lck_mtx_lock(&fp_vibrate_lock);
++        int result = fuxi_vibrate_request(&fp_vibrate_state, pulses[index], fp_torch_now());
++        lck_mtx_unlock(&fp_vibrate_lock);
++        printf("FUXI PMIC: vibrate selftest pulse=%u ms=%u rc=%d\n", index + 1, pulses[index], result);
++        if (result) return;
++        fp_vibrate_kick_worker();
++        IOSleep(pulses[index] + 400);
++    }
++}
++
++static void fp_vibrate_runtime_start(void)
++{
++    if (fp_haptic_prepare()) return;
++    const FuxiHapticIo io = {NULL, fp_haptic_owner, fp_haptic_read, fp_haptic_write, fp_flash_wait, 0};
++    int result = fuxi_vibrate_check(&io);
++    if (result) {
++        printf("FUXI PMIC: vibrate runtime refused check rc=%d; writes=0\n", result);
++        return;
++    }
++    thread_t thread = NULL;
++    if (kernel_thread_start(fp_vibrate_worker, NULL, &thread) != KERN_SUCCESS) {
++        printf("FUXI PMIC: vibrate runtime worker failed\n");
++        return;
++    }
++    thread_deallocate(thread);
++    __atomic_store_n(&fp_vibrate_ready, 1u, __ATOMIC_RELEASE);
++    printf("FUXI PMIC: vibrate runtime ready; DIRECT_PLAY 0x81/0x01, sysctl kern.fuxivibrate ms<=%u, Android VMAX/amplitude kept\n",
++        (unsigned)FUXI_VIBRATE_MAX_MS);
++    if (fp_vibrate_selftest && kernel_thread_start(fp_vibrate_selftest_worker, NULL, &thread) == KERN_SUCCESS)
++        thread_deallocate(thread);
++}
++
 +static int fp_haptic_fifo_observe(unsigned round, unsigned address, uint8_t *value)
 +{
 +    if (address < 0xf000 || address >= 0xf200) return -1;
@@ -26031,7 +26696,7 @@ index 0000000..6f1b89f
 +    }
 +    fp_torch_audit_enabled = torch_audit == 1 && mode == 3;
 +    if ((!mode && !haptic) || __atomic_exchange_n(&fp_started, 1u, __ATOMIC_ACQ_REL)) return;
-+    if (mode > 3 || haptic > 1) {
++    if (mode > 3 || haptic > 3) {
 +        printf("FUXI PMIC: unsupported mode=%u haptic=%u; hardware untouched\n", mode, haptic);
 +        return;
 +    }
@@ -26050,6 +26715,10 @@ index 0000000..6f1b89f
 +    fp_survey(7, 0xf200, "haptic-boost");
 +    fp_haptic_fifo_survey(mode);
 +    if (haptic == 1) fp_haptic_diagnostic();
++    if (haptic == 2 || haptic == 3) {
++        fp_vibrate_selftest = haptic == 3;
++        fp_vibrate_runtime_start();
++    }
 +    if (mode == 2) fp_flash_pulse();
 +    if (mode == 3) fp_torch_start();
 +}
@@ -31359,10 +32028,10 @@ index 0000000..187ad59
 +#endif
 diff --git a/xnu/fuxi-inject/fuxi_exec_inject.h b/xnu/fuxi-inject/fuxi_exec_inject.h
 new file mode 100644
-index 0000000..a7bc35a
+index 0000000..ef3b7d9
 --- /dev/null
 +++ b/xnu/fuxi-inject/fuxi_exec_inject.h
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,74 @@
 +/*
 + * fxinj=N, or ADT /chosen u32 "fuxi,inject"=N (FUXI): DYLD_INSERT_LIBRARIES added by the kernel at exec, for some programs (patch 0118).
 + *
@@ -31376,6 +32045,8 @@ index 0000000..a7bc35a
 + *              /usr/local/lib/fuxi/libfuxi-app.dylib
 + *   bit 1 (2)  SpringBoard: /usr/local/lib/fuxi/libfuxi-sb.dylib (userland/fuxi-shape: the status bar
 + *              follows the punch hole instead of the iPhone X notch)
++ *   bit 2 (4)  mediaserverd: the same libfuxi-sb.dylib (its haptic server hands vibration patterns to
++ *              the HAP525 runtime, sysctl kern.fuxivibrate; the library checks which program it is in)
 + *
 + * dyld honours it because the H1 AMFI dyld policy answer (patch 0103, request 0x5a) allows everything,
 + * including a library that is missing. The variable follows the program's own environment.
@@ -31383,7 +32054,8 @@ index 0000000..a7bc35a
 + */
 +#define FUXI_INJECT_APPS        1u
 +#define FUXI_INJECT_SPRINGBOARD 2u
-+#define FUXI_INJECT_ALL         (FUXI_INJECT_APPS | FUXI_INJECT_SPRINGBOARD)
++#define FUXI_INJECT_MEDIASERVER 4u
++#define FUXI_INJECT_ALL         (FUXI_INJECT_APPS | FUXI_INJECT_SPRINGBOARD | FUXI_INJECT_MEDIASERVER)
 +#define FUXI_INJECT_APP_LIB     "/usr/local/lib/fuxi/libfuxi-app.dylib"
 +#define FUXI_INJECT_SB_LIB      "/usr/local/lib/fuxi/libfuxi-sb.dylib"
 +#define FUXI_INJECT_ENV_MAX     128
@@ -31414,6 +32086,10 @@ index 0000000..a7bc35a
 +	}
 +	if (strcmp(name, "SpringBoard") == 0) {
 +		return (mode & FUXI_INJECT_SPRINGBOARD) != 0 ? FUXI_INJECT_SB_LIB : NULL;
++	}
++	if (strcmp(name, "mediaserverd") == 0) {
++		return (mode & FUXI_INJECT_MEDIASERVER) != 0 && strcmp(path, "/usr/sbin/mediaserverd") == 0 ?
++		       FUXI_INJECT_SB_LIB : NULL;
 +	}
 +	return (mode & FUXI_INJECT_APPS) != 0 && fuxi_inject_is_app(path) ? FUXI_INJECT_APP_LIB : NULL;
 +}
@@ -39980,10 +40656,10 @@ index 8349337..ed20c83 100644
  +}
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..54e6ddf
+index 0000000..4af397a
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,8347 @@
+@@ -0,0 +1,8697 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,29 @@
@@ -41913,7 +42589,7 @@ index 0000000..54e6ddf
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_pmic.c
-+@@ -0,0 +1,603 @@
++@@ -0,0 +1,808 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
@@ -41926,6 +42602,7 @@ index 0000000..54e6ddf
 ++#include <kern/clock.h>
 ++#include <kern/locks.h>
 ++#include <kern/thread.h>
+++#include <kern/sched_prim.h>
 ++#include <machine/machine_routines.h>
 ++#include <pexpert/pexpert.h>
 ++#include <pexpert/device_tree.h>
@@ -41936,6 +42613,7 @@ index 0000000..54e6ddf
 ++#include "fuxi_torch_audit.h"
 ++#include "fuxi_torch_steady.h"
 ++#include "fuxi_haptic_pulse.h"
+++#include "fuxi_haptic_runtime.h"
 ++#include "sweet_spmi_bus.h"
 ++
 ++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
@@ -41967,6 +42645,11 @@ index 0000000..54e6ddf
 ++static unsigned fp_torch_audit_enabled;
 ++static struct fp_window fp_haptic_channels[2];
 ++static FuxiHapticState fp_haptic_state;
+++static LCK_MTX_DECLARE(fp_vibrate_lock, &fp_group);
+++static FuxiVibrateRuntime fp_vibrate_state;
+++static unsigned fp_vibrate_ready;
+++static unsigned fp_vibrate_kick;
+++static unsigned fp_vibrate_selftest;
 ++
 ++static kern_return_t fp_map(struct fp_window *window)
 ++{
@@ -42363,6 +43046,200 @@ index 0000000..54e6ddf
 ++    return 0;
 ++}
 ++
+++/* ---- HAP525 DIRECT_PLAY 執行期（fuxi,haptic=2；3 另加開機自測三下） ---- */
+++static void fp_vibrate_kick_worker(void)
+++{
+++    __atomic_fetch_add(&fp_vibrate_kick, 1u, __ATOMIC_RELEASE);
+++    thread_wakeup((event_t)&fp_vibrate_kick);
+++}
+++
+++static int fp_vibrate_sysctl SYSCTL_HANDLER_ARGS
+++{
+++    (void)oidp;
+++    (void)arg1;
+++    (void)arg2;
+++    if (!__atomic_load_n(&fp_vibrate_ready, __ATOMIC_ACQUIRE)) return ENOTSUP;
+++    if (req->newptr) {
+++        char name[32] = {0};
+++        proc_selfname(name, sizeof(name));
+++        proc_t process = proc_self();
+++        int platform = process && csproc_get_platform_binary(process) != 0;
+++        if (process) proc_rele(process);
+++        if (!fuxi_vibrate_caller_allowed(kauth_cred_issuser(kauth_cred_get()), platform, name)) return EPERM;
+++    }
+++    lck_mtx_lock(&fp_vibrate_lock);
+++    int value = (int)fuxi_vibrate_remaining_ms(&fp_vibrate_state, fp_torch_now());
+++    int failed = fp_vibrate_state.failed;
+++    lck_mtx_unlock(&fp_vibrate_lock);
+++    if (failed && !req->newptr) return EIO;
+++    int changed = 0;
+++    int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+++    if (error || !changed) return error;
+++    if (value < 0 || value > FUXI_VIBRATE_MAX_MS) return EINVAL;
+++    lck_mtx_lock(&fp_vibrate_lock);
+++    error = fuxi_vibrate_request(&fp_vibrate_state, (unsigned)value, fp_torch_now()) ? EIO : 0;
+++    lck_mtx_unlock(&fp_vibrate_lock);
+++    if (!error) fp_vibrate_kick_worker();
+++    return error;
+++}
+++
+++SYSCTL_PROC(_kern, OID_AUTO, fuxivibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+++    0, 0, fp_vibrate_sysctl, "I", "Fuxi HAP525 direct play ms 0..2000, platform SpringBoard/mediaserverd or root");
+++
+++/* 等到 deadline_ns（0 表示不限）或有新請求。 */
+++static void fp_vibrate_sleep(unsigned seen, uint64_t deadline_ns)
+++{
+++    if (deadline_ns) {
+++        uint64_t deadline = 0;
+++        nanoseconds_to_absolutetime(deadline_ns, &deadline);
+++        assert_wait_deadline((event_t)&fp_vibrate_kick, THREAD_UNINT, deadline);
+++    } else {
+++        assert_wait((event_t)&fp_vibrate_kick, THREAD_UNINT);
+++    }
+++    if (__atomic_load_n(&fp_vibrate_kick, __ATOMIC_ACQUIRE) != seen) {
+++        clear_wait(current_thread(), THREAD_AWAKENED);
+++        return;
+++    }
+++    thread_block(THREAD_CONTINUE_NULL);
+++}
+++
+++static void fp_vibrate_fail(const FuxiHapticIo *io, const char *where, int result)
+++{
+++    uint8_t fault = 0, hpwr = 0, play = 0, module = 0;
+++    int read_result = io->read(io->context, 0xf00c, &fault) | io->read(io->context, 0xf00b, &hpwr) |
+++        io->read(io->context, 0xf04c, &play) | io->read(io->context, 0xf046, &module);
+++    lck_mtx_lock(&fp_vibrate_lock);
+++    fp_vibrate_state.failed = 1;
+++    fp_vibrate_state.deadline = 0;
+++    fp_vibrate_state.last_error = result;
+++    lck_mtx_unlock(&fp_vibrate_lock);
+++    printf("FUXI PMIC: vibrate %s rc=%d fault=%#x hpwr=%#x play=%#x module=%#x read-rc=%d; runtime locked until reboot\n",
+++        where, result, fault, hpwr, play, module, read_result);
+++}
+++
+++static void fp_vibrate_worker(void *argument, wait_result_t wait_result)
+++{
+++    (void)argument;
+++    (void)wait_result;
+++    const FuxiHapticIo io = {NULL, fp_haptic_owner, fp_haptic_read, fp_haptic_write, fp_flash_wait, 0};
+++    unsigned playing = 0, logged = 0, health_checks = 0;
+++    uint8_t mid_hpwr = 0, mid_fault = 0;
+++    uint64_t started_ns = 0;
+++    for (;;) {
+++        unsigned seen = __atomic_load_n(&fp_vibrate_kick, __ATOMIC_ACQUIRE);
+++        uint64_t now = fp_torch_now();
+++        lck_mtx_lock(&fp_vibrate_lock);
+++        unsigned failed = fp_vibrate_state.failed;
+++        unsigned want = fuxi_vibrate_wanted(&fp_vibrate_state, now);
+++        uint64_t deadline = fp_vibrate_state.deadline;
+++        lck_mtx_unlock(&fp_vibrate_lock);
+++        if (failed && !playing) {
+++            fp_vibrate_sleep(seen, 0);
+++            continue;
+++        }
+++        if (want && !playing) {
+++            int result = fuxi_vibrate_start(&io);
+++            if (result) {
+++                unsigned polls = 0, toggled = 0;
+++                int stop_result = fuxi_vibrate_stop(&io, &polls, &toggled);
+++                fp_vibrate_fail(&io, "start refused", result);
+++                printf("FUXI PMIC: vibrate start cleanup rc=%d polls=%u toggled=%u\n", stop_result, polls, toggled);
+++                continue;
+++            }
+++            playing = 1;
+++            health_checks = 0;
+++            mid_hpwr = mid_fault = 0;
+++            started_ns = now;
+++            lck_mtx_lock(&fp_vibrate_lock);
+++            fp_vibrate_state.playing = 1;
+++            fp_vibrate_state.plays++;
+++            lck_mtx_unlock(&fp_vibrate_lock);
+++            continue;
+++        }
+++        if (playing && (!want || failed)) {
+++            unsigned polls = 0, toggled = 0;
+++            uint64_t stop_ns = fp_torch_now();
+++            int result = fuxi_vibrate_stop(&io, &polls, &toggled);
+++            uint64_t stopped_ns = fp_torch_now();
+++            playing = 0;
+++            lck_mtx_lock(&fp_vibrate_lock);
+++            fp_vibrate_state.playing = 0;
+++            uint64_t plays = fp_vibrate_state.plays;
+++            lck_mtx_unlock(&fp_vibrate_lock);
+++            if (logged < 16 || result || toggled) {
+++                logged++;
+++                printf("FUXI PMIC: vibrate play=%llu on-us=%llu checks=%u hpwr-mid=%#x fault-mid=%#x stop-rc=%d stop-polls=%u stop-us=%llu toggled=%u\n",
+++                    plays, (stop_ns - started_ns) / 1000, health_checks, mid_hpwr, mid_fault, result, polls,
+++                    (stopped_ns - stop_ns) / 1000, toggled);
+++            }
+++            if (result) fp_vibrate_fail(&io, "stop unverified", result);
+++            continue;
+++        }
+++        if (playing) {
+++            uint8_t fault = 0, hpwr = 0;
+++            int result = fuxi_vibrate_health(&io, &fault, &hpwr);
+++            health_checks++;
+++            mid_hpwr = hpwr; /* 停止前最後一次看到的 HPWR；播放中應為 3（READY） */
+++            mid_fault |= fault;
+++            if (result) {
+++                unsigned polls = 0, toggled = 0;
+++                int stop_result = fuxi_vibrate_stop(&io, &polls, &toggled);
+++                playing = 0;
+++                lck_mtx_lock(&fp_vibrate_lock);
+++                fp_vibrate_state.playing = 0;
+++                lck_mtx_unlock(&fp_vibrate_lock);
+++                fp_vibrate_fail(&io, "fault while playing", result);
+++                printf("FUXI PMIC: vibrate fault stop rc=%d polls=%u toggled=%u on-us=%llu\n", stop_result, polls, toggled,
+++                    (fp_torch_now() - started_ns) / 1000);
+++                continue;
+++            }
+++            uint64_t next = fp_torch_now() + FUXI_VIBRATE_POLL_MS * 1000000ull;
+++            fp_vibrate_sleep(seen, deadline && deadline < next ? deadline : next);
+++            continue;
+++        }
+++        fp_vibrate_sleep(seen, 0);
+++    }
+++}
+++
+++static void fp_vibrate_selftest_worker(void *argument, wait_result_t wait_result)
+++{
+++    (void)argument;
+++    (void)wait_result;
+++    static const unsigned pulses[] = {30, 100, 300};
+++    IOSleep(2000);
+++    for (unsigned index = 0; index < 3; index++) {
+++        lck_mtx_lock(&fp_vibrate_lock);
+++        int result = fuxi_vibrate_request(&fp_vibrate_state, pulses[index], fp_torch_now());
+++        lck_mtx_unlock(&fp_vibrate_lock);
+++        printf("FUXI PMIC: vibrate selftest pulse=%u ms=%u rc=%d\n", index + 1, pulses[index], result);
+++        if (result) return;
+++        fp_vibrate_kick_worker();
+++        IOSleep(pulses[index] + 400);
+++    }
+++}
+++
+++static void fp_vibrate_runtime_start(void)
+++{
+++    if (fp_haptic_prepare()) return;
+++    const FuxiHapticIo io = {NULL, fp_haptic_owner, fp_haptic_read, fp_haptic_write, fp_flash_wait, 0};
+++    int result = fuxi_vibrate_check(&io);
+++    if (result) {
+++        printf("FUXI PMIC: vibrate runtime refused check rc=%d; writes=0\n", result);
+++        return;
+++    }
+++    thread_t thread = NULL;
+++    if (kernel_thread_start(fp_vibrate_worker, NULL, &thread) != KERN_SUCCESS) {
+++        printf("FUXI PMIC: vibrate runtime worker failed\n");
+++        return;
+++    }
+++    thread_deallocate(thread);
+++    __atomic_store_n(&fp_vibrate_ready, 1u, __ATOMIC_RELEASE);
+++    printf("FUXI PMIC: vibrate runtime ready; DIRECT_PLAY 0x81/0x01, sysctl kern.fuxivibrate ms<=%u, Android VMAX/amplitude kept\n",
+++        (unsigned)FUXI_VIBRATE_MAX_MS);
+++    if (fp_vibrate_selftest && kernel_thread_start(fp_vibrate_selftest_worker, NULL, &thread) == KERN_SUCCESS)
+++        thread_deallocate(thread);
+++}
+++
 ++static int fp_haptic_fifo_observe(unsigned round, unsigned address, uint8_t *value)
 ++{
 ++    if (address < 0xf000 || address >= 0xf200) return -1;
@@ -42494,7 +43371,7 @@ index 0000000..54e6ddf
 ++    }
 ++    fp_torch_audit_enabled = torch_audit == 1 && mode == 3;
 ++    if ((!mode && !haptic) || __atomic_exchange_n(&fp_started, 1u, __ATOMIC_ACQ_REL)) return;
-++    if (mode > 3 || haptic > 1) {
+++    if (mode > 3 || haptic > 3) {
 ++        printf("FUXI PMIC: unsupported mode=%u haptic=%u; hardware untouched\n", mode, haptic);
 ++        return;
 ++    }
@@ -42513,6 +43390,10 @@ index 0000000..54e6ddf
 ++    fp_survey(7, 0xf200, "haptic-boost");
 ++    fp_haptic_fifo_survey(mode);
 ++    if (haptic == 1) fp_haptic_diagnostic();
+++    if (haptic == 2 || haptic == 3) {
+++        fp_vibrate_selftest = haptic == 3;
+++        fp_vibrate_runtime_start();
+++    }
 ++    if (mode == 2) fp_flash_pulse();
 ++    if (mode == 3) fp_torch_start();
 ++}
@@ -47933,6 +48814,151 @@ index 0000000..54e6ddf
 ++#endif
 ++
 ++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_haptic_runtime.h
++@@ -0,0 +1,142 @@
+++#ifndef FUXI_HAPTIC_RUNTIME_H
+++#define FUXI_HAPTIC_RUNTIME_H
+++/*
+++ * HAP525 DIRECT_PLAY 執行期（fuxi,haptic=2 才啟用）。
+++ * 做法與 Android qcom-hv-haptics 的 constant effect 相同：
+++ * 開：SPMI_PLAY(0xf04c) 寫 0x81（PLAY_EN | 來源 DIRECT_PLAY，不開 brake）；
+++ * 關：寫 0x01，再輪詢 HPWR_INTF(0xf00b) 低兩位回到 0（HPWR_DISABLED）；
+++ * 逾時就照 Linux 的 haptics_toggle_module_enable 關開模組一次再等。
+++ * 振幅、VMAX、自動共振都沿用 Android 開機前留下的設定，這裡只檢查不改寫。
+++ */
+++#include <stdint.h>
+++#include "fuxi_haptic_pulse.h"
+++
+++enum {
+++    FUXI_VIBRATE_MAX_MS = 2000,   /* 單次請求上限；鈴聲 pattern 由使用端分段送 */
+++    FUXI_VIBRATE_POLL_MS = 5,     /* 播放中檢查 fault 的間隔 */
+++    FUXI_VIBRATE_STOP_POLLS = 30, /* 1 ms 一次；TLRA 約 5.7 ms，Linux 約等 brake 長度加一週期 */
+++    FUXI_VIBRATE_PLAY = 0x81,
+++    FUXI_VIBRATE_IDLE = 0x01,
+++    FUXI_VIBRATE_MODULE_ON = 0x80,
+++    FUXI_VIBRATE_VMAX_LIMIT = 0x1c /* 50 mV/碼，1400 mV：Android 留下的值，不接受更高 */
+++};
+++
+++typedef struct {
+++    uint64_t deadline;  /* 奈秒；now < deadline 期間要震 */
+++    uint64_t requests;
+++    uint64_t plays;
+++    unsigned failed;
+++    unsigned playing;
+++    int last_error;
+++} FuxiVibrateRuntime;
+++
+++/* 允許的呼叫者：root，或平台二進位檔名為 SpringBoard／mediaserverd。 */
+++static inline int fuxi_vibrate_caller_allowed(unsigned root, unsigned platform, const char *name)
+++{
+++    static const char *const allowed[] = {"SpringBoard", "mediaserverd"};
+++    if (root) return 1;
+++    if (!platform || !name) return 0;
+++    for (unsigned entry = 0; entry < sizeof(allowed) / sizeof(allowed[0]); entry++) {
+++        const char *expected = allowed[entry];
+++        unsigned index = 0;
+++        while (expected[index] && name[index] == expected[index]) index++;
+++        if (!expected[index] && !name[index]) return 1;
+++    }
+++    return 0;
+++}
+++
+++/* ms=0 立即停；1..FUXI_VIBRATE_MAX_MS 從現在起震這麼久（覆蓋前一個請求）。 */
+++static inline int fuxi_vibrate_request(FuxiVibrateRuntime *state, unsigned ms, uint64_t now)
+++{
+++    if (!state || ms > FUXI_VIBRATE_MAX_MS) return -1;
+++    if (ms && (state->failed || now > UINT64_MAX - (uint64_t)FUXI_VIBRATE_MAX_MS * 1000000ull)) return -1;
+++    state->deadline = ms ? now + (uint64_t)ms * 1000000ull : 0;
+++    state->requests++;
+++    return 0;
+++}
+++
+++static inline unsigned fuxi_vibrate_wanted(FuxiVibrateRuntime *state, uint64_t now)
+++{
+++    if (state->failed) state->deadline = 0;
+++    return state->deadline && now < state->deadline;
+++}
+++
+++/* 剩下的毫秒數（無條件進位），供 sysctl 讀取。 */
+++static inline unsigned fuxi_vibrate_remaining_ms(const FuxiVibrateRuntime *state, uint64_t now)
+++{
+++    if (state->failed || !state->deadline || now >= state->deadline) return 0;
+++    return (unsigned)((state->deadline - now + 999999ull) / 1000000ull);
+++}
+++
+++/* 開機後第一次使用前的完整檢查：身分、owner、Android 留下的 DIRECT_PLAY 設定、閒置。 */
+++static inline int fuxi_vibrate_check(const FuxiHapticIo *io)
+++{
+++    static const unsigned identities[] = {
+++        0xf001, 0xf004, 0xf005, 0xf101, 0xf104, 0xf105,
+++        0xf200, 0xf201, 0xf204, 0xf205
+++    };
+++    static const uint8_t expected[] = {4, 0x15, 0x0a, 4, 0x15, 0x0b, 2, 0, 0x31, 1};
+++    uint8_t value = 0, module = 0, play = 0, vmax = 0, amplitude = 0, autores = 0;
+++    if (!io || !io->owner || !io->read || !io->write || !io->wait_us) return FUXI_HAPTIC_INVALID;
+++    for (unsigned index = 0; index < 3; index++) {
+++        unsigned owner = 7;
+++        if (io->owner(io->context, 0xf0 + index, &owner) || owner != (index == 2 ? 3u : 0u))
+++            return FUXI_HAPTIC_HARDWARE;
+++    }
+++    for (unsigned index = 0; index < sizeof(identities) / sizeof(identities[0]); index++) {
+++        if (fuxi_haptic_read_stable(io, identities[index], &value)) return FUXI_HAPTIC_IO;
+++        if (value != expected[index]) return FUXI_HAPTIC_HARDWARE;
+++    }
+++    if (fuxi_haptic_read_stable(io, 0xf046, &module) || fuxi_haptic_read_stable(io, 0xf04c, &play) ||
+++        fuxi_haptic_read_stable(io, 0xf048, &vmax) || fuxi_haptic_read_stable(io, 0xf126, &amplitude) ||
+++        fuxi_haptic_read_stable(io, 0xf063, &autores))
+++        return FUXI_HAPTIC_IO;
+++    if (!(module & 0x80u) || play != FUXI_VIBRATE_IDLE || !amplitude || !vmax ||
+++        vmax > FUXI_VIBRATE_VMAX_LIMIT || !(autores & 0x80u))
+++        return FUXI_HAPTIC_HARDWARE;
+++    return fuxi_haptic_idle(io);
+++}
+++
+++static inline int fuxi_vibrate_health(const FuxiHapticIo *io, uint8_t *fault, uint8_t *hpwr)
+++{
+++    if (io->read(io->context, 0xf00c, fault) || io->read(io->context, 0xf00b, hpwr)) return FUXI_HAPTIC_IO;
+++    return *fault ? FUXI_HAPTIC_FAULT : FUXI_HAPTIC_OK;
+++}
+++
+++static inline int fuxi_vibrate_start(const FuxiHapticIo *io)
+++{
+++    uint8_t fault = 0;
+++    if (io->read(io->context, 0xf00c, &fault)) return FUXI_HAPTIC_IO;
+++    if (fault) return FUXI_HAPTIC_FAULT;
+++    return fuxi_haptic_write_checked(io, 0xf04c, FUXI_VIBRATE_PLAY);
+++}
+++
+++static inline int fuxi_vibrate_wait_disabled(const FuxiHapticIo *io, unsigned *polls)
+++{
+++    for (unsigned poll = 0; poll < FUXI_VIBRATE_STOP_POLLS; poll++) {
+++        uint8_t hpwr = 0;
+++        io->wait_us(io->context, 1000);
+++        (*polls)++;
+++        if (!io->read(io->context, 0xf00b, &hpwr) && !(hpwr & 3u)) return FUXI_HAPTIC_OK;
+++    }
+++    return FUXI_HAPTIC_TIMEOUT;
+++}
+++
+++/* 停止；*toggled 表示有沒有走關開模組的退路。回傳非 0 就要鎖死執行期。 */
+++static inline int fuxi_vibrate_stop(const FuxiHapticIo *io, unsigned *polls, unsigned *toggled)
+++{
+++    int result = fuxi_haptic_write_checked(io, 0xf04c, FUXI_VIBRATE_IDLE);
+++    *polls = 0;
+++    *toggled = 0;
+++    if (result == FUXI_HAPTIC_HARDWARE) return result;
+++    if (!fuxi_vibrate_wait_disabled(io, polls)) return result;
+++    *toggled = 1;
+++    int off = fuxi_haptic_write_checked(io, 0xf046, 0);
+++    int on = fuxi_haptic_write_checked(io, 0xf046, FUXI_VIBRATE_MODULE_ON);
+++    int waited = fuxi_vibrate_wait_disabled(io, polls);
+++    if (waited) return waited;
+++    if (off) return off;
+++    if (on) return on;
+++    return result;
+++}
+++#endif
 +--- a/iokit/Kernel/arm/SweetBattery.cpp
 ++++ b/iokit/Kernel/arm/SweetBattery.cpp
 +@@ -9,12 +9,22 @@
@@ -48333,13 +49359,13 @@ index 0000000..54e6ddf
 + 	IOPMPowerSource::free();
 diff --git a/xnu/patches/0118-fuxi-exec-inject.patch b/xnu/patches/0118-fuxi-exec-inject.patch
 new file mode 100644
-index 0000000..34f1acf
+index 0000000..4a41033
 --- /dev/null
 +++ b/xnu/patches/0118-fuxi-exec-inject.patch
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,166 @@
 +--- a/bsd/kern/kern_exec.c
 ++++ b/bsd/kern/kern_exec.c
-+@@ -5649,6 +5649,54 @@
++@@ -5649,6 +5649,55 @@
 +  * Note:	The argument and environment vectors are user space pointers
 +  *		to arrays of user space pointers.
 +  */
@@ -48382,9 +49408,10 @@ index 0000000..34f1acf
 ++	SInt32 n = OSIncrementAtomic(&said);
 ++
 ++	if (n == 0) {
-++		printf("FUXI INJECT: fxinj=%u:%s%s\n", mode,
+++		printf("FUXI INJECT: fxinj=%u:%s%s%s\n", mode,
 ++		    (mode & FUXI_INJECT_APPS) ? " applications get " FUXI_INJECT_APP_LIB ";" : "",
-++		    (mode & FUXI_INJECT_SPRINGBOARD) ? " SpringBoard gets " FUXI_INJECT_SB_LIB : "");
+++		    (mode & FUXI_INJECT_SPRINGBOARD) ? " SpringBoard gets " FUXI_INJECT_SB_LIB ";" : "",
+++		    (mode & FUXI_INJECT_MEDIASERVER) ? " mediaserverd gets " FUXI_INJECT_SB_LIB : "");
 ++	}
 ++	if (n < FUXI_INJECT_SAID) {
 ++		printf("FUXI INJECT: %s <- %s\n", name, library);
@@ -48394,7 +49421,7 @@ index 0000000..34f1acf
 + __attribute__((noinline))
 + static int
 + exec_extract_strings(struct image_params *imgp)
-+@@ -5822,6 +5870,30 @@
++@@ -5822,6 +5871,30 @@
 + 		imgp->ip_envc++;
 + 	}
 + 
@@ -48427,7 +49454,7 @@ index 0000000..34f1acf
 + 		error = E2BIG;
 +--- /dev/null
 ++++ b/bsd/kern/fuxi_exec_inject.h
-+@@ -0,0 +1,67 @@
++@@ -0,0 +1,74 @@
 ++/*
 ++ * fxinj=N, or ADT /chosen u32 "fuxi,inject"=N (FUXI): DYLD_INSERT_LIBRARIES added by the kernel at exec, for some programs (patch 0118).
 ++ *
@@ -48441,6 +49468,8 @@ index 0000000..34f1acf
 ++ *              /usr/local/lib/fuxi/libfuxi-app.dylib
 ++ *   bit 1 (2)  SpringBoard: /usr/local/lib/fuxi/libfuxi-sb.dylib (userland/fuxi-shape: the status bar
 ++ *              follows the punch hole instead of the iPhone X notch)
+++ *   bit 2 (4)  mediaserverd: the same libfuxi-sb.dylib (its haptic server hands vibration patterns to
+++ *              the HAP525 runtime, sysctl kern.fuxivibrate; the library checks which program it is in)
 ++ *
 ++ * dyld honours it because the H1 AMFI dyld policy answer (patch 0103, request 0x5a) allows everything,
 ++ * including a library that is missing. The variable follows the program's own environment.
@@ -48448,7 +49477,8 @@ index 0000000..34f1acf
 ++ */
 ++#define FUXI_INJECT_APPS        1u
 ++#define FUXI_INJECT_SPRINGBOARD 2u
-++#define FUXI_INJECT_ALL         (FUXI_INJECT_APPS | FUXI_INJECT_SPRINGBOARD)
+++#define FUXI_INJECT_MEDIASERVER 4u
+++#define FUXI_INJECT_ALL         (FUXI_INJECT_APPS | FUXI_INJECT_SPRINGBOARD | FUXI_INJECT_MEDIASERVER)
 ++#define FUXI_INJECT_APP_LIB     "/usr/local/lib/fuxi/libfuxi-app.dylib"
 ++#define FUXI_INJECT_SB_LIB      "/usr/local/lib/fuxi/libfuxi-sb.dylib"
 ++#define FUXI_INJECT_ENV_MAX     128
@@ -48479,6 +49509,10 @@ index 0000000..34f1acf
 ++	}
 ++	if (strcmp(name, "SpringBoard") == 0) {
 ++		return (mode & FUXI_INJECT_SPRINGBOARD) != 0 ? FUXI_INJECT_SB_LIB : NULL;
+++	}
+++	if (strcmp(name, "mediaserverd") == 0) {
+++		return (mode & FUXI_INJECT_MEDIASERVER) != 0 && strcmp(path, "/usr/sbin/mediaserverd") == 0 ?
+++		       FUXI_INJECT_SB_LIB : NULL;
 ++	}
 ++	return (mode & FUXI_INJECT_APPS) != 0 && fuxi_inject_is_app(path) ? FUXI_INJECT_APP_LIB : NULL;
 ++}
