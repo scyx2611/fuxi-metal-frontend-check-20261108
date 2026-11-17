@@ -17819,10 +17819,10 @@ index cf82598..56f7e1a 100755
          out = Path(tmp)
          subprocess.run(['python3', str(ROOT/'tools/build-fuxi-turnip.py'), '--mesa', str(args.mesa.resolve()),
 diff --git a/tools/test-fuxi-wifi-ios.py b/tools/test-fuxi-wifi-ios.py
-index 12e012d..7904d0e 100755
+index 12e012d..c03fc63 100755
 --- a/tools/test-fuxi-wifi-ios.py
 +++ b/tools/test-fuxi-wifi-ios.py
-@@ -53,9 +53,11 @@ typedef void *event_t;
+@@ -53,14 +53,20 @@ typedef void *event_t;
  typedef int wait_result_t;
  typedef pthread_t thread_t;
  typedef const void *mbuf_t;
@@ -17836,7 +17836,17 @@ index 12e012d..7904d0e 100755
  static bool link_up;
  static unsigned received;
  static pthread_cond_t wake_cond = PTHREAD_COND_INITIALIZER;
-@@ -77,7 +79,7 @@ static int copyin(user_addr_t p,void *out,size_t n) {
++/* hold_wakeups（在 sta_lock 下讀寫）：station 執行緒被叫醒也繼續睡，用來看「要求還在排隊」時的回報 */
++static bool hold_wakeups; static unsigned sleeping;
+ static void lck_mtx_sleep(pthread_mutex_t *m, int flags, event_t e, int t) {
+- (void)flags; (void)e; (void)t; pthread_cond_wait(&wake_cond,m);
++ (void)flags; (void)e; (void)t; sleeping++;
++ do pthread_cond_wait(&wake_cond,m); while (hold_wakeups);
++ sleeping--;
+ }
+ static void thread_wakeup(event_t e) { (void)e; pthread_cond_broadcast(&wake_cond); }
+ static void thread_set_thread_name(thread_t t, const char *n) { (void)t; (void)n; }
+@@ -77,7 +83,7 @@ static int copyin(user_addr_t p,void *out,size_t n) {
  static int copyout(const void *in,user_addr_t p,size_t n) {
   if (!p || fail_copy) return EFAULT; memcpy((void *)p,in,n); return 0;
  }
@@ -17845,7 +17855,7 @@ index 12e012d..7904d0e 100755
  static void *current_proc(void) { return NULL; }
  static int proc_suser(void *p) { (void)p; return !superuser; }
  struct kev_msg { unsigned vendor_code,kev_class,kev_subclass,event_code;
-@@ -86,11 +88,41 @@ static int kev_post_msg(struct kev_msg *m) {
+@@ -86,18 +92,69 @@ static int kev_post_msg(struct kev_msg *m) {
   assert(m->kev_class==6 && m->kev_subclass==1 && m->dv[0].data_length==16);
   assert(!strcmp(m->dv[0].data_ptr,"en0"));
   if (m->event_code==4) assert(m->dv[1].data_length==32);
@@ -17872,23 +17882,39 @@ index 12e012d..7904d0e 100755
 + if (!strcmp(key,"fuxiwifitrace")) { assert(n==4); memcpy(p,&trace_opt,4); return trace_opt!=0; }
   assert(!strcmp(key,"fuxiwifiios") && n==4); memcpy(p,&opt,4); return opt!=0;
  }
-+/* ADT /chosen：只有 fuxi,wifi-rssi 一個屬性，長度可改來測錯誤長度 */
++/* ADT /chosen：fuxi,wifi-rssi 與 fuxi,wifi-ux 兩個屬性（值 0 表示沒有），長度可改來測錯誤長度 */
 +typedef const void *DTEntry;
 +#define kSuccess 0
 +#define kError (-1)
-+static uint32_t adt_rssi; static unsigned adt_rssi_bytes=4, adt_lookups;
++static uint32_t adt_rssi, adt_ux; static unsigned adt_rssi_bytes=4, adt_ux_bytes=4, adt_lookups;
 +static int SecureDTLookupEntry(const void *root,const char *path,DTEntry *entry) {
 + assert(!root && !strcmp(path,"/chosen")); adt_lookups++; *entry=&adt_rssi; return kSuccess;
 +}
 +static int SecureDTGetProperty(DTEntry entry,const char *name,void const **prop,unsigned int *bytes) {
-+ assert(entry==&adt_rssi && !strcmp(name,"fuxi,wifi-rssi"));
++ assert(entry==&adt_rssi);
++ if (!strcmp(name,"fuxi,wifi-ux")) {
++  if (!adt_ux) return kError;
++  *prop=&adt_ux; *bytes=adt_ux_bytes; return kSuccess;
++ }
++ assert(!strcmp(name,"fuxi,wifi-rssi"));
 + if (!adt_rssi) return kError;
 + *prop=&adt_rssi; *bytes=adt_rssi_bytes; return kSuccess;
 +}
  static int mbuf_copydata(mbuf_t p,size_t off,size_t n,void *out) { memcpy(out,(const char *)p+off,n);return 0; }
  static void FuxiNetworkStackStart(void) { registry++; }
  static void fuxi_wifi_net_input(const uint8_t *p,size_t n) { assert(p[12]==0x88 && n>=14); received++; }
-@@ -98,6 +130,12 @@ static void fuxi_wifi_net_link_state(bool up) { link_up=up; }
+-static void fuxi_wifi_net_link_state(bool up) { link_up=up; }
++/* link_hold：把 station 執行緒停在後端的電源切換裡（假後端切電源時會先報 link down） */
++static atomic_int link_hold, link_held;
++static void fuxi_wifi_net_link_state(bool up) {
++ link_up=up;
++ if (atomic_load(&link_hold)) {
++  struct timespec pause={.tv_nsec=1000000};
++  atomic_store(&link_held,1);
++  while (atomic_load(&link_hold)) nanosleep(&pause,NULL);
++  atomic_store(&link_held,0);
++ }
++}
  '''
  
  TEST = r'''
@@ -17901,11 +17927,40 @@ index 12e012d..7904d0e 100755
  bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *p) {
   assert(p->wireless && !p->up && p->address[0]==2); attached++; return true;
  }
-@@ -114,11 +152,39 @@ static int request(bool set,int type,void *p,unsigned n,int *val) {
+@@ -114,11 +171,68 @@ static int request(bool set,int type,void *p,unsigned n,int *val) {
   int error=fuxi_wifi_apple80211_ioctl(set?SIOCSA80211:SIOCGA80211,&req);
   if(val) *val=req.req_val; return error;
  }
 -int main(void) {
++/* station 執行緒睡著之後才擋住它，免得它還沒睡就把要求拿走 */
++static void hold_station(void) {
++ struct timespec pause = { .tv_nsec=1000000 };
++ for (unsigned i=0;i<5000;i++) {
++  pthread_mutex_lock(&sta_lock);
++  if (sleeping) { hold_wakeups=true; pthread_mutex_unlock(&sta_lock); return; }
++  pthread_mutex_unlock(&sta_lock);
++  nanosleep(&pause,NULL);
++ }
++ assert(!"station never slept");
++}
++static void release_station(void) {
++ pthread_mutex_lock(&sta_lock); hold_wakeups=false; pthread_mutex_unlock(&sta_lock);
++ thread_wakeup(NULL); settle();
++}
++static void wait_link_held(void) {
++ struct timespec pause = { .tv_nsec=1000000 };
++ for (unsigned i=0;i<5000 && !atomic_load(&link_held);i++) nanosleep(&pause,NULL);
++ assert(atomic_load(&link_held));
++}
++static bool radio_on(void) {
++ pthread_mutex_lock(&sta_lock); bool on=sta_on; pthread_mutex_unlock(&sta_lock); return on;
++}
++static void set_ux(uint32_t value,unsigned bytes) { adt_ux=value; adt_ux_bytes=bytes; wifi_ux_cached=0; }
++static uint32_t said_power(void) {
++ struct { uint32_t version,radios,state[4]; } answer={0};
++ assert(!request(false,19,&answer,sizeof(answer),NULL) && answer.version==1 && answer.radios==1);
++ return answer.state[0];
++}
 +int main(int argc,char **argv) {
 + (void)argv;
 + if(argc==2) {
@@ -17943,7 +17998,7 @@ index 12e012d..7904d0e 100755
   fuxi_wifi_ios_init(); assert(attached==1);
   assert(!fuxi_wifi_ios_attach(&fake_backend));
   assert(fuxi_wifi_sta_ask_scan(NULL)==EINVAL && fuxi_wifi_sta_ask_join(NULL)==EINVAL);
-@@ -127,6 +193,17 @@ int main(void) {
+@@ -127,6 +241,17 @@ int main(void) {
   struct apple80211req invalid={.req_if_name="ue0"};
   assert(fuxi_wifi_apple80211_ioctl(SIOCGA80211,&invalid)==ENXIO);
   assert(request(false,999,NULL,0,NULL)==EOPNOTSUPP);
@@ -17961,7 +18016,7 @@ index 12e012d..7904d0e 100755
   struct apple80211_scan_request scan={.version=1};
   assert(request(true,10,&scan,sizeof(scan)-1,NULL)==EINVAL);
   scan.ssid_length=33; assert(request(true,10,&scan,sizeof(scan),NULL)==EINVAL); scan.ssid_length=0;
-@@ -139,6 +216,7 @@ int main(void) {
+@@ -139,6 +264,7 @@ int main(void) {
   assert(request(false,11,&result,sizeof(result),NULL)==0);
   assert(result.ssid_length==13 && !memcmp(result.ssid,"Fuxi Loopback",13));
   assert(result.rssi==-42 && result.channel.channel==1 && result.elements_length==4);
@@ -17969,7 +18024,7 @@ index 12e012d..7904d0e 100755
   assert(request(false,11,&result,sizeof(result),NULL)==EIO);
   struct apple80211_channels channels;
   assert(!request(false,27,&channels,sizeof(channels),NULL) && channels.count==1);
-@@ -149,11 +227,19 @@ int main(void) {
+@@ -149,11 +275,19 @@ int main(void) {
   join.key_length=65; join.key_cipher=10; assert(request(true,20,&join,sizeof(join),NULL)==EINVAL);
   join.key_length=0; assert(!request(true,20,&join,sizeof(join),NULL)); settle();
   int val; assert(!request(false,21,NULL,0,&val) && val==1); assert(link_up);
@@ -17989,7 +18044,59 @@ index 12e012d..7904d0e 100755
   join.key_length=8;memcpy(join.key,"password",8);join.key_cipher=10;
   assert(!request(true,20,&join,sizeof(join),NULL));settle();
   assert(!request(false,21,NULL,0,&val) && val==2 && !link_up);
-@@ -181,6 +267,8 @@ def compile_run(source, directory, name):
+@@ -163,7 +297,51 @@ int main(void) {
+  assert(request(true,10,&scan,sizeof(scan),NULL)==ENETDOWN);
+  power.state[0]=1;assert(!request(true,19,&power,sizeof(power),NULL));settle();
+  assert(fuxi_wifi_sta_powered());
++ /* fuxi,wifi-ux：讀一次就記住；只留已知位元；長度不對、沒有這個屬性都當 0 */
++ assert(!fuxi_wifi_ux());
++ adt_ux=0xffffffffu; assert(!fuxi_wifi_ux());
++ set_ux(0xffffffffu,4); assert(fuxi_wifi_ux()==FUXI_WIFI_UX_ALL);
++ set_ux(1,8); assert(!fuxi_wifi_ux());
++ set_ux(6,4); assert(fuxi_wifi_ux()==(FUXI_WIFI_UX_PICK_RATE|FUXI_WIFI_UX_KEEP_LINK));
++ /* 預設（bit 0 關）：關閉還在排隊時，GET POWER 照舊回報「開」，也照收掃描（舊行為：開關會彈回約兩秒） */
++ set_ux(0,4); hold_station();
++ power.state[0]=0; assert(!request(true,19,&power,sizeof(power),NULL));
++ assert(fuxi_wifi_sta_powered() && said_power()==1);
++ assert(!request(true,10,&scan,sizeof(scan),NULL));
++ release_station(); assert(!fuxi_wifi_sta_powered() && said_power()==0);
++ /* bit 0：還在排隊的要求立刻算數；正要關就不再收掃描或加入 */
++ set_ux(1,4); hold_station();
++ power.state[0]=1; assert(!request(true,19,&power,sizeof(power),NULL));
++ assert(fuxi_wifi_sta_powered() && said_power()==1 && !radio_on());
++ assert(!request(true,10,&scan,sizeof(scan),NULL));
++ power.state[0]=0; assert(!request(true,19,&power,sizeof(power),NULL));
++ assert(!fuxi_wifi_sta_powered() && said_power()==0);
++ assert(request(true,10,&scan,sizeof(scan),NULL)==ENETDOWN);
++ join.key_length=0; join.key_cipher=0;
++ assert(request(true,20,&join,sizeof(join),NULL)==ENETDOWN);
++ release_station(); assert(!fuxi_wifi_sta_powered() && said_power()==0);
++ /* bit 0：已從佇列取出、正在切換的電源也算數；之後再要求的方向優先 */
++ atomic_store(&link_hold,1);
++ power.state[0]=1; assert(!request(true,19,&power,sizeof(power),NULL)); wait_link_held();
++ assert(fuxi_wifi_sta_powered() && said_power()==1 && !radio_on());
++ assert(!request(true,10,&scan,sizeof(scan),NULL));
++ power.state[0]=0; assert(!request(true,19,&power,sizeof(power),NULL));
++ assert(!fuxi_wifi_sta_powered() && said_power()==0);
++ assert(request(true,10,&scan,sizeof(scan),NULL)==ENETDOWN);
++ atomic_store(&link_hold,0); settle(); assert(!fuxi_wifi_sta_powered() && !radio_on());
++ power.state[0]=1; assert(!request(true,19,&power,sizeof(power),NULL)); settle();
++ assert(fuxi_wifi_sta_powered() && radio_on());
++ /* 開著的時候正在關：bit 0 回報「關」，預設回報「開」（同一個狀態，只差這個開關） */
++ atomic_store(&link_hold,1);
++ power.state[0]=0; assert(!request(true,19,&power,sizeof(power),NULL)); wait_link_held();
++ assert(!fuxi_wifi_sta_powered() && said_power()==0 && radio_on());
++ assert(request(true,20,&join,sizeof(join),NULL)==ENETDOWN);
++ set_ux(0,4); assert(fuxi_wifi_sta_powered() && said_power()==1);
++ atomic_store(&link_hold,0); settle(); assert(!fuxi_wifi_sta_powered());
++ power.state[0]=1; assert(!request(true,19,&power,sizeof(power),NULL)); settle();
++ assert(fuxi_wifi_sta_powered());
+  puts("PASS: production station, ioctl layouts/events, fake frame callbacks and gates");
++ puts("PASS: fuxi,wifi-ux bit 0 power report follows the queued and running request");
+  return 0;
+ }
+ '''
+@@ -181,6 +359,8 @@ def compile_run(source, directory, name):
                      '-Wno-unused-function', '-Wno-unused-parameter', '-fsanitize=address,undefined',
                      '-pthread', '-I', str(SRC), str(path), '-o', str(binary)], check=True)
      subprocess.run([str(binary)], check=True, timeout=30)
@@ -19044,10 +19151,10 @@ index 0000000..0e08f98
 +}
 diff --git a/tools/test-fuxi-wlan-ios.py b/tools/test-fuxi-wlan-ios.py
 new file mode 100644
-index 0000000..3131f24
+index 0000000..af8d450
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ios.py
-@@ -0,0 +1,768 @@
+@@ -0,0 +1,901 @@
 +import hashlib
 +import hmac
 +import os
@@ -19122,6 +19229,8 @@ index 0000000..3131f24
 +}
 +bool fuxi_wifi_sta_busy(void) { return false; }
 +bool fuxi_wifi_sta_powered(void) { return true; }
++static unsigned test_ux;                        /* ADT fuxi,wifi-ux；bootstrap() 時讀進 wli.ux */
++unsigned fuxi_wifi_ux(void) { return test_ux; }
 +int fuxi_wifi_sta_ask_power(bool on) { (void)on; return 0; }
 +struct fuxi_wifi_sta_scan;
 +struct fuxi_wifi_sta_bss;
@@ -19702,6 +19811,135 @@ index 0000000..3131f24
 +    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); assert(wli_join(&caller_join)==ENETDOWN);
 +    power_test(true,wli.generation+1);
 +}
++/* fuxi,wifi-ux bit 1：照估計速率選 AP。元素照 802.11 的格式直接寫進 wli_bss。 */
++static const uint8_t ap2[6]={2,0x46,0x55,0x58,0x49,8};
++static const uint8_t ht_cap[28]={45,26,0,0,0,0xff,0xff};                /* Rx MCS 0–15：2 條串流 */
++static const uint8_t ht_op40[24]={61,22,1,0x05};                         /* 次通道在上、STA 40 MHz */
++static const uint8_t vht_cap[14]={191,12,0,0,0,0,0xfa,0xff};             /* 2 條串流、MCS 0–9 */
++static const uint8_t vht_op80[7]={192,5,1,42};                           /* 80 MHz */
++static const uint8_t he_cap[24]={255,22,35,[20]=0xfa,[21]=0xff,[22]=0xfa,[23]=0xff};  /* 2 條、MCS 0–11 */
++static size_t elements_of(uint8_t *out,const uint8_t *const *parts,const size_t *sizes,unsigned count) {
++    size_t at=0;
++    for (unsigned index=0;index<count;index++) { memcpy(out+at,parts[index],sizes[index]); at+=sizes[index]; }
++    return at;
++}
++enum { HT=1, HT40=2, VHT80=4, HE=8 };
++static void put_bss(unsigned index,const uint8_t *bssid,const char *ssid,uint32_t frequency,int rssi,int akm,
++                    unsigned kinds,uint32_t age_ms) {
++    struct fuxi_wifi_sta_bss *bss=&wli_bss[index]; memset(bss,0,sizeof(*bss));
++    memcpy(bss->bssid,bssid,6); bss->ssid_length=(uint8_t)strlen(ssid); memcpy(bss->ssid,ssid,bss->ssid_length);
++    bss->frequency=(uint16_t)frequency; bss->rssi=(int16_t)rssi; bss->capability=akm>=0?0x11:0x01;
++    bss->beacon_interval=100; bss->age_ms=age_ms;
++    size_t at=element(bss->elements,0,0,ssid,strlen(ssid));
++    if (akm>=0) {
++        uint8_t rsn[20]={1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,(uint8_t)akm,0,0};
++        at=element(bss->elements,at,48,rsn,sizeof(rsn));
++    }
++    const uint8_t *parts[5]; size_t sizes[5]; unsigned count=0;
++    if (kinds&(HT|HT40)) { parts[count]=ht_cap; sizes[count++]=sizeof(ht_cap); }
++    if (kinds&HT40) { parts[count]=ht_op40; sizes[count++]=sizeof(ht_op40); }
++    if (kinds&(VHT80|HE)) { parts[count]=vht_cap; sizes[count++]=sizeof(vht_cap); }
++    if (kinds&(VHT80|HE)) { parts[count]=vht_op80; sizes[count++]=sizeof(vht_op80); }
++    if (kinds&HE) { parts[count]=he_cap; sizes[count++]=sizeof(he_cap); }
++    bss->elements_length=(uint16_t)(at+elements_of(bss->elements+at,parts,sizes,count));
++}
++static void heard_now(unsigned count) { wli_bss_count=count; wli.scanned_at=fake_now; }
++static int pick(unsigned ux,const char *ssid,const uint8_t *given,struct wli_target *target) {
++    wli.ux=ux; ask_join(ssid,"password",FUXI_WIFI_STA_WPA2_PSK);
++    if (given) memcpy(caller_join.bssid,given,6);
++    memset(target,0,sizeof(*target)); return wli_pick(&caller_join,target);
++}
++static void pick_tests(void) {
++    struct wli_target target;
++    /* 估計速率：HT20 2 條 SNR 43 → MCS7；HT40；VHT80 SNR 32 → MCS7、SNR 47 → MCS9；HE80 SNR 42 → MCS11；沒有 HT → 54 */
++    put_bss(0,weak_ap,"IEEE",2412,-46,2,HT,0);
++    put_bss(1,ap,"IEEE",5200,-60,2,HT|VHT80,0);
++    put_bss(2,open_ap,"IEEE",2412,-46,2,HT40,0);
++    put_bss(3,ap2,"IEEE",5200,-45,2,HT|VHT80,0);
++    put_bss(4,far_ap,"IEEE",5200,-50,2,HT|HE,0);
++    put_bss(5,mfp_ap,"IEEE",2412,-60,2,0,0);
++    assert(wli_rate_kbps(&wli_bss[0])==130000 && wli_rate_kbps(&wli_bss[1])==585000);
++    assert(wli_rate_kbps(&wli_bss[2])==270400 && wli_rate_kbps(&wli_bss[3])==780300);
++    assert(wli_rate_kbps(&wli_bss[4])==1201692 && wli_rate_kbps(&wli_bss[5])==54000);
++    /* 實機那一次：2.4 GHz -46 dBm 對 5 GHz VHT80 -60 dBm。舊選法挑訊號強的 2.4，bit 1 挑快的 5 GHz */
++    heard_now(2);
++    assert(!pick(0,"IEEE",NULL,&target) && !memcmp(target.bss.bssid,weak_ap,6));
++    assert(!pick(FUXI_WIFI_UX_PICK_RATE,"IEEE",NULL,&target) && !memcmp(target.bss.bssid,ap,6));
++    /* HE80 比 VHT80 強 5 dB 的那台還快：SNR 都超過 25，差距不到 7 就比速率 */
++    put_bss(0,ap2,"IEEE",5200,-45,2,HT|VHT80,0); put_bss(1,far_ap,"IEEE",5200,-50,2,HT|HE,0); heard_now(2);
++    assert(!pick(FUXI_WIFI_UX_PICK_RATE,"IEEE",NULL,&target) && !memcmp(target.bss.bssid,far_ap,6));
++    /* SNR 差 7 dB 以上就比完整 SNR，不看速率：2.4 GHz -40（49）對 5 GHz VHT80 -75（17） */
++    put_bss(0,weak_ap,"IEEE",2412,-40,2,HT,0); put_bss(1,ap,"IEEE",5200,-75,2,HT|VHT80,0); heard_now(2);
++    assert(wli_rate_kbps(&wli_bss[1])==234000 && wli_rate_kbps(&wli_bss[0])==130000);
++    assert(!pick(FUXI_WIFI_UX_PICK_RATE,"IEEE",NULL,&target) && !memcmp(target.bss.bssid,weak_ap,6));
++    /* 速率一樣（都沒有 HT、都 54）而 SNR 差不到 5：選 5 GHz；舊選法選強 2 dB 的 2.4 GHz */
++    put_bss(0,weak_ap,"IEEE",2412,-60,2,0,0); put_bss(1,ap,"IEEE",5200,-62,2,0,0); heard_now(2);
++    assert(wli_rate_kbps(&wli_bss[0])==54000 && wli_rate_kbps(&wli_bss[1])==54000);
++    assert(!pick(FUXI_WIFI_UX_PICK_RATE,"IEEE",NULL,&target) && !memcmp(target.bss.bssid,ap,6));
++    assert(!pick(0,"IEEE",NULL,&target) && !memcmp(target.bss.bssid,weak_ap,6));
++    /* 太久沒聽到的不先選：bit 1 選新鮮的 2.4 GHz；舊選法選最強的那台再回 ESTALE 去重掃 */
++    put_bss(0,ap,"IEEE",5200,-40,2,HT|VHT80,WLI_FRESH_MS+1); put_bss(1,weak_ap,"IEEE",2412,-46,2,HT,0); heard_now(2);
++    assert(!pick(FUXI_WIFI_UX_PICK_RATE,"IEEE",NULL,&target) && !memcmp(target.bss.bssid,weak_ap,6));
++    assert(pick(0,"IEEE",NULL,&target)==ESTALE && !memcmp(target.bss.bssid,ap,6));
++    /* 全都太舊：仍回 ESTALE，保留最好那台的頻道給重掃 */
++    put_bss(1,weak_ap,"IEEE",2412,-46,2,HT,WLI_FRESH_MS+1);
++    assert(pick(FUXI_WIFI_UX_PICK_RATE,"IEEE",NULL,&target)==ESTALE && target.bss.frequency==5200);
++    /* 同名但只能 WPA3（SAE）的那台跳過；舊選法選它，之後 wli_security() 才拒絕 */
++    put_bss(0,sae_ap,"IEEE",5200,-30,8,HT|VHT80,0); put_bss(1,weak_ap,"IEEE",2412,-46,2,HT,0); heard_now(2);
++    assert(!pick(FUXI_WIFI_UX_PICK_RATE,"IEEE",NULL,&target) && !memcmp(target.bss.bssid,weak_ap,6));
++    assert(!pick(0,"IEEE",NULL,&target) && !memcmp(target.bss.bssid,sae_ap,6));
++    /* 全部都不能用這種保護加入：照舊挑最強的，讓加入時說明原因 */
++    put_bss(1,ap,"IEEE",5200,-50,8,HT|VHT80,0);
++    assert(!pick(FUXI_WIFI_UX_PICK_RATE,"IEEE",NULL,&target) && !memcmp(target.bss.bssid,sae_ap,6));
++    /* 指定 BSSID：只看那一台；名稱不對、沒聽到 → ENOENT */
++    put_bss(0,weak_ap,"IEEE",2412,-46,2,HT,0); put_bss(1,ap,"IEEE",5200,-60,2,HT|VHT80,0); heard_now(2);
++    assert(!pick(FUXI_WIFI_UX_PICK_RATE,"IEEE",weak_ap,&target) && !memcmp(target.bss.bssid,weak_ap,6));
++    assert(pick(FUXI_WIFI_UX_PICK_RATE,"IEEE",ap2,&target)==ENOENT);
++    assert(pick(FUXI_WIFI_UX_PICK_RATE,"none",NULL,&target)==ENOENT);
++    wli_bss_count=0; wli.ux=0;
++    puts("PASS fuxi,wifi-ux bit 1: rate estimates, wpa_supplicant order, freshness, protection, given BSSID");
++}
++/* fuxi,wifi-ux bit 2：已連著又要求加入時，選中的是同一台就不斷線；要換才先斷再加入 */
++static void keep_tests(void) {
++    uint8_t frame[60]={0};
++    pthread_t thread;
++    test_ux=FUXI_WIFI_UX_PICK_RATE|FUXI_WIFI_UX_KEEP_LINK;
++    bootstrap(); assert(wli.ux==test_ux);
++    scan_test(true); full_join();
++    /* 同一台：不送任何要求，連線不動 */
++    unsigned downs=link_downs, lost=lost_calls; uint8_t last[MESSAGE]; size_t sent=captured_length;
++    memcpy(last,captured,sent);
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); assert(!wli_join(&caller_join));
++    assert(wli_state.phase==FUXI_WIFI_STA_JOINED && link_downs==downs && lost_calls==lost && wli_tx(frame,60));
++    assert(captured_length==sent && !memcmp(captured,last,sent) && !wli.busy);
++    for (unsigned index=0;index<32;index++) assert(!wli_asked.pmk[index]);
++    /* 太舊要重掃，連著也照掃（自己頻道、再全部）；同名卻沒再聽到：留著連線，不斷 */
++    fake_now+=WLI_FRESH_MS+1;
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=start_caller(3,false); wait_busy(2);
++    step(); expect_request(2); assert(request_u32(20)==5200);
++    scan_accept(false); serve_bss(0,0);
++    wait_busy(2); step(); expect_request(2); assert(!request_attribute(20,&(size_t){0}));
++    scan_accept(false); serve_bss(0,0);
++    assert(!pthread_join(thread,NULL) && !caller_result);
++    assert(wli_state.phase==FUXI_WIFI_STA_JOINED && link_downs==downs && wli_tx(frame,60));
++    /* 同名、有更快的另一台：先斷，再加入那一台 */
++    put_bss(0,ap,"IEEE",5200,-60,2,0,0); put_bss(1,ap2,"IEEE",5200,-45,2,HT|VHT80,0); heard_now(2);
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=start_caller(3,false); wait_busy(4);
++    step(); expect_request(6); request_bytes(3,ap,6); respond(6,0); step();
++    wait_busy(3); step(); expect_request(4); request_bytes(3,ap2,6);
++    respond(4,8); step(); expect_request(6); respond(6,0); step();
++    assert(failed_join(thread)==ENOENT && link_downs>downs);
++    /* bit 2 沒開：同一台也先斷再加入（舊行為） */
++    test_ux=FUXI_WIFI_UX_PICK_RATE;
++    bootstrap(); scan_test(true); full_join(); downs=link_downs;
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=start_caller(3,false); wait_busy(4);
++    step(); expect_request(6); request_bytes(3,ap,6); respond(6,0); step();
++    wait_busy(3); step(); expect_request(4); request_bytes(3,ap,6);
++    respond(4,8); step(); expect_request(6); respond(6,0); step();
++    assert(failed_join(thread)==ENOENT && link_downs>downs);
++    test_ux=0; wli_bss_count=0;
++    puts("PASS fuxi,wifi-ux bit 2: same access point kept, unheard rescan kept, better one switched, default leaves");
++}
 +int main(void) {
 +    unsigned config_offset;
 +    assert(!fwa_config_offset(0,4,0,&config_offset));
@@ -19721,6 +19959,8 @@ index 0000000..3131f24
 +    fallback_test();
 +    scan_test(true); scan_test(false);
 +    join_tests();
++    pick_tests();
++    keep_tests();
 +    bootstrap();
 +    uint8_t bytes[MESSAGE]; size_t length=header(bytes,3,0x102,2);
 +    assert(deliver(bytes,length)==2 && wli.fatal==EPROTO);
@@ -35037,7 +35277,7 @@ index c8376e4..d363e22 100644
  int sweet_ufs_rootdev(dev_t *dev);
  
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
-index b09ac72..c8f9f18 100644
+index b09ac72..8d05f6e 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
 @@ -37,15 +37,20 @@
@@ -35087,7 +35327,7 @@ index b09ac72..c8f9f18 100644
  	result->beacon_interval = bss->beacon_interval;
  	result->capability = bss->capability;
  	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
-@@ -180,6 +195,31 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
+@@ -180,6 +195,58 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
  
  /* ---- get ---------------------------------------------------------------------------------------------- */
  
@@ -35116,10 +35356,37 @@ index b09ac72..c8f9f18 100644
 +	return value == 1;
 +}
 +
++/* fuxi,wifi-ux 讀過之後的值；bit 31 表示已讀過（測試可清 0 重讀） */
++static uint32_t wifi_ux_cached;
++
++unsigned
++fuxi_wifi_ux(void)
++{
++	uint32_t value = __atomic_load_n(&wifi_ux_cached, __ATOMIC_ACQUIRE);
++
++	if (!(value & 0x80000000u)) {
++		DTEntry chosen;
++		void const *prop;
++		unsigned int bytes;
++		uint32_t read = 0;
++
++		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++		    SecureDTGetProperty(chosen, "fuxi,wifi-ux", &prop, &bytes) == kSuccess && bytes == sizeof(read)) {
++			memcpy(&read, prop, sizeof(read));
++		}
++		value = (read & FUXI_WIFI_UX_ALL) | 0x80000000u;
++		__atomic_store_n(&wifi_ux_cached, value, __ATOMIC_RELEASE);
++		printf("FUXI WIFI IOS: ux options 0x%x (power-asked %u, pick-rate %u, keep-link %u)\n",
++		    value & FUXI_WIFI_UX_ALL, !!(value & FUXI_WIFI_UX_POWER_ASKED), !!(value & FUXI_WIFI_UX_PICK_RATE),
++		    !!(value & FUXI_WIFI_UX_KEEP_LINK));
++	}
++	return value & FUXI_WIFI_UX_ALL;
++}
++
  static int
  get(struct apple80211req *request)
  {
-@@ -190,8 +230,9 @@ get(struct apple80211req *request)
+@@ -190,8 +257,9 @@ get(struct apple80211req *request)
  	case 43:
  	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
  		static const char name[256] = "Fuxi Wi-Fi iOS shim (synthetic backend)";
@@ -35130,7 +35397,7 @@ index b09ac72..c8f9f18 100644
  	}
  	case 12: {
  		/*
-@@ -219,6 +260,17 @@ get(struct apple80211req *request)
+@@ -219,6 +287,17 @@ get(struct apple80211req *request)
  	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
  		request->req_val = 1;
  		return 0;
@@ -35148,7 +35415,7 @@ index b09ac72..c8f9f18 100644
  	case 27:
  	case 254: {                             /* the channels the radio may tune to */
  		struct apple80211_channels *answer;
-@@ -328,7 +380,17 @@ get(struct apple80211req *request)
+@@ -328,7 +407,17 @@ get(struct apple80211req *request)
  		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
  		break;
  	}
@@ -35167,7 +35434,7 @@ index b09ac72..c8f9f18 100644
  		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give_network(request, &state->bss);
  		break;
  	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-@@ -379,6 +441,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
+@@ -379,6 +468,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
  		memcpy(what->ssid, asked->ssid, asked->ssid_length);
  	}
  	what->passive = asked->scan_type == 2;
@@ -35175,7 +35442,7 @@ index b09ac72..c8f9f18 100644
  	what->dwell_ms = asked->dwell_ms;
  	/* (more channels than there is room to name: every channel) */
  	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
-@@ -496,12 +559,14 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+@@ -496,12 +586,14 @@ set(const struct apple80211req *request, char *said, size_t said_size)
  
  /* ---- events -------------------------------------------------------------------------------------------- */
  
@@ -35191,7 +35458,7 @@ index b09ac72..c8f9f18 100644
  
  	memcpy(name, interface_name, sizeof(name));
  	message.dv[0].data_length = sizeof(name);
-@@ -510,7 +575,90 @@ post(uint32_t code, const void *data, uint32_t length)
+@@ -510,7 +602,90 @@ post(uint32_t code, const void *data, uint32_t length)
  		message.dv[1].data_length = length;
  		message.dv[1].data_ptr = __DECONST(void *, data);
  	}
@@ -35283,7 +35550,7 @@ index b09ac72..c8f9f18 100644
  }
  
  /* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
-@@ -548,11 +696,20 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
+@@ -548,11 +723,20 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
  		if (state != NULL) {
  			fuxi_wifi_sta_state(state);
  			link.rssi = status == 1 ? state->bss.rssi : 0;
@@ -35304,7 +35571,7 @@ index b09ac72..c8f9f18 100644
  		break;
  	}
  	}
-@@ -609,6 +766,33 @@ fuxi_wifi_apple80211_summary(void)
+@@ -609,6 +793,33 @@ fuxi_wifi_apple80211_summary(void)
  	}
  }
  
@@ -35338,7 +35605,7 @@ index b09ac72..c8f9f18 100644
  /* An Apple80211 request for the radio's interface, from the process that is running now. */
  errno_t
  fuxi_wifi_apple80211_ioctl(u_long command, void *data)
-@@ -641,6 +825,7 @@ fuxi_wifi_apple80211_ioctl(u_long command, void *data)
+@@ -641,6 +852,7 @@ fuxi_wifi_apple80211_ioctl(u_long command, void *data)
  			printf("error %d\n", error);
  		}
  	}
@@ -35441,10 +35708,28 @@ index eb5ac01..0eb0bce 100644
  #endif
  #endif
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.c b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.c
-index 9479206..731de98 100644
+index 9479206..9bc52dc 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.c
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.c
-@@ -113,14 +113,13 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
+@@ -42,6 +42,8 @@ static const struct fuxi_wifi_sta_ops *sta_ops;   /* the station side, while the
+ static bool sta_thread_made;
+ static bool sta_calls;                          /* the thread is in a call of the station side's */
+ static bool sta_on;                             /* the radio's power, as last asked for */
++/* fuxi,wifi-ux bit 0：電源要求已從佇列取出、正在切換時的目標 */
++static bool power_running, power_running_on;
+ 
+ /* what has been asked for and not begun */
+ static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
+@@ -86,6 +88,8 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
+ 			power = true;
+ 			power_on = asked_power_on;
+ 			asked_power = false;
++			power_running = true;
++			power_running_on = power_on;
+ 		} else if (asked_leave) {
+ 			leave = true;
+ 			asked_leave = false;
+@@ -113,14 +117,14 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
  			}
  			error = ops->power(power_on);
  			lck_mtx_lock(&sta_lock);
@@ -35452,6 +35737,7 @@ index 9479206..731de98 100644
 -				sta_on = error == 0 ? power_on : !power_on;
 -			}
 +			if (error == 0) { sta_on = power_on; }
++			power_running = false;
 +			bool confirmed_on = sta_on;
  			lck_mtx_unlock(&sta_lock);
  			if (!power_on && was_joined) {
@@ -35462,7 +35748,7 @@ index 9479206..731de98 100644
  		} else if (leave) {
  			ops->leave();
  			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
-@@ -179,10 +178,12 @@ fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops)
+@@ -179,10 +183,12 @@ fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops)
  	}
  	lck_mtx_lock(&sta_lock);
  	sta_ops = ops;
@@ -35477,7 +35763,60 @@ index 9479206..731de98 100644
  }
  
  void
-@@ -232,7 +233,6 @@ fuxi_wifi_sta_ask_power(bool on)
+@@ -203,16 +209,51 @@ fuxi_wifi_sta_present(void)
+ 	return present;
+ }
+ 
++/*
++ * fuxi,wifi-ux bit 0：還沒切完的電源要求算數。true：要關（或正在關），false：其餘。
++ * 呼叫者持有 sta_lock。
++ */
++static bool
++power_wanted(bool *on)
++{
++	if (!(fuxi_wifi_ux() & FUXI_WIFI_UX_POWER_ASKED)) {
++		return false;
++	}
++	if (asked_power) {
++		*on = asked_power_on;
++		return true;
++	}
++	if (power_running) {
++		*on = power_running_on;
++		return true;
++	}
++	return false;
++}
++
+ bool
+ fuxi_wifi_sta_powered(void)
+ {
+-	bool on;
++	bool on, wanted;
+ 	lck_mtx_lock(&sta_lock);
+ 	on = sta_ops != NULL && sta_on;
++	if (sta_ops != NULL && power_wanted(&wanted)) {
++		on = wanted;
++	}
+ 	lck_mtx_unlock(&sta_lock);
+ 	return on;
+ }
+ 
++/* 能不能再收掃描／加入：電源是開的或正要開；bit 0 打開時，正要關就不收 */
++static bool
++power_accepts(void)
++{
++	bool wanted;
++	if (power_wanted(&wanted)) {
++		return wanted;
++	}
++	return sta_on || (asked_power && asked_power_on);
++}
++
+ bool
+ fuxi_wifi_sta_busy(void)
+ {
+@@ -232,7 +273,6 @@ fuxi_wifi_sta_ask_power(bool on)
  		lck_mtx_unlock(&sta_lock);
  		return ENXIO;
  	}
@@ -35485,26 +35824,26 @@ index 9479206..731de98 100644
  	asked_power = true;
  	asked_power_on = on;
  	if (!on) {
-@@ -252,7 +252,7 @@ fuxi_wifi_sta_ask_scan(const struct fuxi_wifi_sta_scan *what)
+@@ -252,7 +292,7 @@ fuxi_wifi_sta_ask_scan(const struct fuxi_wifi_sta_scan *what)
  		return EINVAL;
  	}
  	lck_mtx_lock(&sta_lock);
 -	if (sta_ops == NULL || !sta_on) {
-+	if (sta_ops == NULL || (!sta_on && !(asked_power && asked_power_on))) {
++	if (sta_ops == NULL || !power_accepts()) {
  		lck_mtx_unlock(&sta_lock);
  		return sta_ops == NULL ? ENXIO : ENETDOWN;
  	}
-@@ -272,7 +272,7 @@ fuxi_wifi_sta_ask_join(const struct fuxi_wifi_sta_join *what)
+@@ -272,7 +312,7 @@ fuxi_wifi_sta_ask_join(const struct fuxi_wifi_sta_join *what)
  		return EINVAL;
  	}
  	lck_mtx_lock(&sta_lock);
 -	if (sta_ops == NULL || !sta_on) {
-+	if (sta_ops == NULL || (!sta_on && !(asked_power && asked_power_on))) {
++	if (sta_ops == NULL || !power_accepts()) {
  		lck_mtx_unlock(&sta_lock);
  		return sta_ops == NULL ? ENXIO : ENETDOWN;
  	}
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
-index dce1375..9ac5c41 100644
+index dce1375..8d86ada 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
 @@ -45,6 +45,7 @@ struct fuxi_wifi_sta_scan {
@@ -35515,6 +35854,29 @@ index dce1375..9ac5c41 100644
  };
  
  enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
+@@ -99,7 +100,22 @@ enum fuxi_wifi_sta_event {
+ 	                                         * an errno: it was lost (the access point showed us the door) */
+ };
+ 
++/*
++ * ADT /chosen fuxi,wifi-ux（u32 位元遮罩）：Wi-Fi 使用體驗修正，預設 0 = 舊行為，loader 逐項打開。
++ * 2026-11-17 實機（native-hw000wifi-rssiamp-boot-1）看到的三個問題各對一個位元。
++ */
++#define FUXI_WIFI_UX_POWER_ASKED   1u      /* 開關剛按下、電源還沒切完：GET POWER 就回報要求的狀態，
++                                         * 要關時不再收新的掃描／加入（原本要等進行中的掃描做完，開關會彈回約兩秒） */
++#define FUXI_WIFI_UX_PICK_RATE     2u      /* wifid 沒指定 BSSID：照 wpa_supplicant 的比較法以估計速率選 AP
++                                         * （訊號相近時 5 GHz／較寬頻道優先），只看還新鮮、能加入的那些 */
++#define FUXI_WIFI_UX_KEEP_LINK     4u      /* 已連線時再要求加入：先選好（必要時邊連邊掃）再斷線；
++                                         * 選中的就是現在這台 AP 則直接回成功，不斷線 */
++#define FUXI_WIFI_UX_ALL           7u
++
+ #ifdef KERNEL
++/* 讀一次 ADT 之後記住（ADT 開機後不變）；沒有這個屬性或長度不對都當 0 */
++unsigned fuxi_wifi_ux(void);
++
+ /* ---- the station side ---- */
+ void     fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops);         /* init only; immutable boot-lifetime backend */
+ void     fuxi_wifi_sta_lost(int error);                                   /* the network joined is gone by itself */
 diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
 index 1b46ea1..09ba683 100644
 --- a/xnu/fuxi-wlan/fuxi_wlan.c
@@ -36844,10 +37206,10 @@ index 0000000..656f494
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ios.inc b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
 new file mode 100644
-index 0000000..ebc538c
+index 0000000..613cc8a
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-@@ -0,0 +1,1403 @@
+@@ -0,0 +1,1622 @@
 +#include <sys/fuxi_wifi_ios.h>
 +#include <sys/fuxi_wifi_wpa.h>
 +#include <sys/errno.h>
@@ -36916,6 +37278,7 @@ index 0000000..ebc538c
 +	unsigned fetching, fetch_index, scan_reports, diag_lines, dwell_enabled;
 +	unsigned cache_enabled, cache_valid, cache_hits, scan_rejections;
 +	unsigned batch_enabled, scan_count, scan_limit, scan_offset;
++	unsigned ux;                            /* fuxi,wifi-ux（FUXI_WIFI_UX_*），發布時讀一次 */
 +	int result, fatal;
 +	struct fuxi_wifi_sta_scan scan;
 +} wli;
@@ -37180,25 +37543,206 @@ index 0000000..ebc538c
 +	return 0;
 +}
 +
++/*
++ * fuxi,wifi-ux bit 1：估計一台 AP 能跑多快（kbps），給 wli_compare() 用。
++ * 參考 wpa_supplicant 的 wpas_get_est_tpt() 與 wpa_scan_result_compar()（wpa_supplicant/scan.c，BSD 授權）：
++ * 雜訊沒量到時 2.4 GHz 當 -89 dBm、5 GHz 當 -92 dBm，每個 MCS 要的 SNR 在 20 MHz 的門檻上每加倍頻寬加 3 dB，
++ * 速率 = 20 MHz 單串流速率 × 頻寬倍數 × 串流數。這裡只做本機用得到的：HT／VHT／HE，20/40/80 MHz
++ * （160 MHz 保守當 80），最多 2 條串流（WCN7850 是 2x2），2.4 GHz 不算 VHT；速率表是 802.11n/ac/ax 的
++ * 長保護間隔（HE 0.8 µs）數值。只用來排先後，不是真的連線速率。
++ */
++#define WLI_NOISE_24 (-89)
++#define WLI_NOISE_5 (-92)
++#define WLI_GREAT_SNR 25
++
++static const struct { int8_t snr; uint16_t ht, he; } wli_mcs[12] = {     /* 20 MHz、單串流：Mbps×10 */
++	{ 2, 65, 86 }, { 5, 130, 172 }, { 9, 195, 258 }, { 11, 260, 344 }, { 15, 390, 516 }, { 18, 520, 688 },
++	{ 20, 585, 774 }, { 25, 650, 860 }, { 29, 780, 1032 }, { 31, 867, 1147 }, { 34, 0, 1290 }, { 36, 0, 1434 },
++};
++
++/* 第一個這種元素的內容（id 255 時再比 ext 編號，回傳的內容不含 ext 編號）；沒有就 NULL */
++static const uint8_t *
++wli_element(const struct fuxi_wifi_sta_bss *bss, unsigned id, int ext, size_t *size)
++{
++	const uint8_t *elements = bss->elements;
++	size_t length = MIN((size_t)bss->elements_length, sizeof(bss->elements));
++	for (size_t at = 0; at + 2 <= length && at + 2 + elements[at + 1] <= length; at += 2 + elements[at + 1]) {
++		const uint8_t *body = elements + at + 2;
++		size_t body_size = elements[at + 1];
++		if (elements[at] != id) { continue; }
++		if (ext >= 0) {
++			if (!body_size || body[0] != ext) { continue; }
++			body++;
++			body_size--;
++		}
++		*size = body_size;
++		return body;
++	}
++	return NULL;
++}
++
++/* VHT／HE 的 MCS map：每條串流 2 bits，3 = 不支援；回傳支援的串流數 */
++static unsigned
++wli_streams(unsigned map)
++{
++	unsigned streams = 0;
++	while (streams < 8 && ((map >> (2 * streams)) & 3) != 3) { streams++; }
++	return streams;
++}
++
++static int
++wli_snr(const struct fuxi_wifi_sta_bss *bss)
++{
++	return bss->rssi - (bss->frequency >= 5000 ? WLI_NOISE_5 : WLI_NOISE_24);
++}
++
++static uint32_t
++wli_rate_kbps(const struct fuxi_wifi_sta_bss *bss)
++{
++	bool five = bss->frequency >= 5000;
++	int snr = wli_snr(bss);
++	size_t size;
++	const uint8_t *ht = wli_element(bss, 45, -1, &size);
++	if (!ht || size < 26) {
++		/* 沒有 HT：只有 802.11a/g 的 OFDM（6–54 Mbps） */
++		static const struct { int8_t snr; uint16_t rate; } legacy[8] = {
++			{ 4, 60 }, { 5, 90 }, { 7, 120 }, { 9, 180 }, { 12, 240 }, { 16, 360 }, { 20, 480 }, { 21, 540 },
++		};
++		uint32_t rate = 0;
++		for (unsigned index = 0; index < 8; index++) {
++			if (snr >= legacy[index].snr) { rate = legacy[index].rate * 100u; }
++		}
++		return rate;
++	}
++	/* HT 能力的 Rx MCS bitmask：第 n 條串流的 MCS 8n..8n+7 在 byte 3+n */
++	unsigned streams = 0, top = 7, width = 20;
++	while (streams < 4 && ht[3 + streams]) { streams++; }
++	/* HT 操作：次通道偏移（1 上、3 下）而且 STA 頻寬位元打開 = 40 MHz */
++	const uint8_t *op = wli_element(bss, 61, -1, &size);
++	if (op && size >= 22 && (op[1] & 4) && ((op[1] & 3) == 1 || (op[1] & 3) == 3)) { width = 40; }
++	const uint8_t *cap = five ? wli_element(bss, 191, -1, &size) : NULL;
++	if (cap && size >= 12) {
++		unsigned map = fwc_read16(cap + 4), count = wli_streams(map);
++		if (count) {
++			streams = count;
++			top = 7 + MIN(map & 3, 2u);             /* 0：MCS 0–7，1：0–8，2：0–9 */
++		}
++		const uint8_t *vop = wli_element(bss, 192, -1, &size);
++		if (vop && size >= 5 && vop[0] >= 1) { width = 80; }  /* 1：80，2／3：160 或 80+80，這裡當 80 */
++	}
++	/* HE 能力（ext 35）：MAC 6 bytes、PHY 11 bytes 之後是 80 MHz 以下的 Rx HE-MCS map */
++	bool he = false;
++	cap = wli_element(bss, 255, 35, &size);
++	if (cap && size >= 19) {
++		unsigned map = fwc_read16(cap + 17), count = wli_streams(map);
++		he = true;
++		if (count) {
++			streams = count;
++			top = 7 + 2 * MIN(map & 3, 2u);         /* 0：MCS 0–7，1：0–9，2：0–11 */
++		}
++	}
++	streams = streams ? MIN(streams, 2u) : 1u;
++	top = MIN(top, he ? 11u : 9u);
++	int extra = width == 80 ? 6 : width == 40 ? 3 : 0;
++	unsigned factor = he ? (width == 80 ? 419 : width == 40 ? 200 : 100) : (width == 80 ? 450 : width == 40 ? 208 : 100);
++	uint32_t rate = 0;
++	for (unsigned index = 0; index <= top; index++) {
++		unsigned base = he ? wli_mcs[index].he : wli_mcs[index].ht;
++		if (base && snr >= wli_mcs[index].snr + extra) { rate = (uint32_t)base * factor * streams; }
++	}
++	return rate;
++}
++
++/*
++ * wpa_scan_result_compar() 的順序，>0：a 比 b 好。SNR 封頂 25 dB 之後差不到 7 dB 先比估計速率，
++ * 差不到 5 dB 再選 5 GHz，其餘比完整 SNR。
++ */
++static int
++wli_compare(const struct fuxi_wifi_sta_bss *a, uint32_t rate_a, const struct fuxi_wifi_sta_bss *b, uint32_t rate_b)
++{
++	int full_a = wli_snr(a), full_b = wli_snr(b);
++	int snr_a = MIN(full_a, WLI_GREAT_SNR), snr_b = MIN(full_b, WLI_GREAT_SNR);
++	int gap = snr_a > snr_b ? snr_a - snr_b : snr_b - snr_a;
++	bool five_a = a->frequency >= 5000, five_b = b->frequency >= 5000;
++	if (snr_a > 0 && snr_b > 0 && gap < 7 && rate_a != rate_b) { return rate_a > rate_b ? 1 : -1; }
++	if (snr_a > 0 && snr_b > 0 && gap < 5 && five_a != five_b) { return five_a ? 1 : -1; }
++	return full_a - full_b;
++}
++
++struct wli_pick_note {
++	unsigned candidates, fresh;
++	uint32_t best_rate, strongest_rate;
++	uint16_t strongest_frequency;
++	int16_t strongest_rssi;
++};
++
++/*
++ * bit 1：能用這種保護加入的那幾台裡挑；新鮮的（WLI_FRESH_MS 內聽到）優先，再照 wli_compare()。
++ * 一台都不能加入就回 -1，照舊挑訊號最強的，讓 wli_security() 說為什麼不行。呼叫者持有 wli_lock。
++ */
++static int
++wli_pick_rate(const struct fuxi_wifi_sta_join *join, bool given, uint64_t age, struct wli_pick_note *note)
++{
++	int best = -1, strongest = -1;
++	bool best_fresh = false;
++	uint32_t best_rate = 0;
++	for (unsigned index = 0; index < wli_bss_count; index++) {
++		const struct fuxi_wifi_sta_bss *bss = &wli_bss[index];
++		uint32_t group;
++		if (bss->ssid_length != join->ssid_length || memcmp(bss->ssid, join->ssid, join->ssid_length) ||
++		    (given && memcmp(bss->bssid, join->bssid, 6)) || wli_security(bss, join->security, &group)) { continue; }
++		bool fresh = age + bss->age_ms <= WLI_FRESH_MS;
++		uint32_t rate = wli_rate_kbps(bss);
++		note->candidates++;
++		note->fresh += fresh;
++		if (strongest < 0 || bss->rssi > wli_bss[strongest].rssi) {
++			strongest = (int)index;
++			note->strongest_rate = rate;
++			note->strongest_frequency = bss->frequency;
++			note->strongest_rssi = bss->rssi;
++		}
++		if (best < 0 || (fresh && !best_fresh) ||
++		    (fresh == best_fresh && wli_compare(bss, rate, &wli_bss[best], best_rate) > 0)) {
++			best = (int)index;
++			best_fresh = fresh;
++			best_rate = rate;
++		}
++	}
++	note->best_rate = best_rate;
++	return best;
++}
++
 +/* The access point to join: the given one, or the one of that name heard best. */
 +static int
 +wli_pick(const struct fuxi_wifi_sta_join *join, struct wli_target *target)
 +{
 +	static const uint8_t none[6];
 +	bool given = memcmp(join->bssid, none, 6) != 0;
++	struct wli_pick_note note;
++	memset(&note, 0, sizeof(note));
 +	int best = -1;
 +	lck_mtx_lock(&wli_lock);
 +	uint64_t age = wla_now_ms() - wli.scanned_at;
-+	for (unsigned index = 0; index < wli_bss_count; index++) {
-+		const struct fuxi_wifi_sta_bss *bss = &wli_bss[index];
-+		if (bss->ssid_length != join->ssid_length || memcmp(bss->ssid, join->ssid, join->ssid_length) ||
-+		    (given && memcmp(bss->bssid, join->bssid, 6))) { continue; }
-+		if (best < 0 || bss->rssi > wli_bss[best].rssi) { best = (int)index; }
++	bool rated = (wli.ux & FUXI_WIFI_UX_PICK_RATE) != 0;
++	if (rated) { best = wli_pick_rate(join, given, age, &note); }
++	if (best < 0) {
++		rated = false;
++		for (unsigned index = 0; index < wli_bss_count; index++) {
++			const struct fuxi_wifi_sta_bss *bss = &wli_bss[index];
++			if (bss->ssid_length != join->ssid_length || memcmp(bss->ssid, join->ssid, join->ssid_length) ||
++			    (given && memcmp(bss->bssid, join->bssid, 6))) { continue; }
++			if (best < 0 || bss->rssi > wli_bss[best].rssi) { best = (int)index; }
++		}
 +	}
 +	int error = best < 0 ? ENOENT : age + wli_bss[best].age_ms > WLI_FRESH_MS ? ESTALE : 0;
 +	/* (a stale one is kept too, for its channel: the rescan listens there first) */
 +	if (best >= 0) { target->bss = wli_bss[best]; }
 +	lck_mtx_unlock(&wli_lock);
++	if (rated && note.candidates > 1) {
++		printf("FUXI WIFI IOS: pick among %u (%u fresh): %u MHz %d dBm ~%u Mbps; strongest %u MHz %d dBm ~%u Mbps\n",
++		    note.candidates, note.fresh, target->bss.frequency, target->bss.rssi, note.best_rate / 1000,
++		    note.strongest_frequency, note.strongest_rssi, note.strongest_rate / 1000);
++	}
 +	return error;
 +}
 +
@@ -37221,6 +37765,32 @@ index 0000000..ebc538c
 +	return error;
 +}
 +
++/*
++ * fuxi,wifi-ux bit 2：已連著的時候又要求加入，選好之後決定要不要真的換。
++ * 0：留著現在的連線、回成功（選中的就是這台 AP；或是同一個網路名稱、但這次選不出能換過去的 AP：
++ * 沒再聽到、太舊、重掃失敗或保護方式不支援）。-1：要先斷線再加入（換 AP，或換到別的網路）。
++ */
++static int
++wli_kept(const struct fuxi_wifi_sta_join *join, const struct wli_target *target, int error)
++{
++	lck_mtx_lock(&wli_lock);
++	bool joined = wli_state.phase == FUXI_WIFI_STA_JOINED;
++	bool same_name = joined && wli_state.bss.ssid_length == join->ssid_length &&
++	    !memcmp(wli_state.bss.ssid, join->ssid, join->ssid_length);
++	bool same_ap = same_name && !error && !memcmp(wli_state.bss.bssid, target->bss.bssid, 6) &&
++	    wli_state.security == join->security;
++	lck_mtx_unlock(&wli_lock);
++	if (same_ap) {
++		printf("FUXI WIFI IOS: join asks for the access point already joined: link kept\n");
++		return 0;
++	}
++	if (same_name && error) {
++		printf("FUXI WIFI IOS: join of the network joined, no other access point to move to (%d): link kept\n", error);
++		return 0;
++	}
++	return -1;
++}
++
 +static int
 +wli_join(const struct fuxi_wifi_sta_join *join)
 +{
@@ -37237,7 +37807,9 @@ index 0000000..ebc538c
 +		wli_note_error(ENETDOWN);
 +		return ENETDOWN;
 +	}
-+	if (phase == FUXI_WIFI_STA_JOINED || phase == FUXI_WIFI_STA_JOINING) { (void)wli_leave(); }
++	/* bit 2：已連著就先別斷，選好（必要時邊連邊掃）再說 */
++	bool keep = (wli.ux & FUXI_WIFI_UX_KEEP_LINK) && phase == FUXI_WIFI_STA_JOINED;
++	if ((phase == FUXI_WIFI_STA_JOINED || phase == FUXI_WIFI_STA_JOINING) && !keep) { (void)wli_leave(); }
 +	struct wli_target *target = &wli_asked;
 +	memset(target, 0, sizeof(*target));
 +	target->security = join->security;
@@ -37272,6 +37844,14 @@ index 0000000..ebc538c
 +		}
 +	}
 +	if (!error) { error = wli_security(&target->bss, join->security, &target->group); }
++	if (keep) {
++		if (wli_kept(join, target, error) == 0) {
++			memset(target, 0, sizeof(*target));
++			printf("FUXI WIFI IOS: join finished 0\n");
++			return 0;
++		}
++		(void)wli_leave();
++	}
 +	if (!error) {
 +		printf("FUXI WIFI IOS: join %s at %u MHz %d dBm\n",
 +		    join->security == FUXI_WIFI_STA_OPEN ? "open" : "WPA2-PSK", target->bss.frequency, target->bss.rssi);
@@ -38158,6 +38738,7 @@ index 0000000..ebc538c
 +		PE_parse_boot_argn("fuxiwlanbatch", &batch, sizeof(batch));
 +		wli.batch_enabled = batch == 1;
 +		printf("FUXI WIFI IOS: scan batch opt-in %u budget %u ms\n", wli.batch_enabled, WLI_SCAN_BUDGET_MS);
++		wli.ux = fuxi_wifi_ux();
 +		wli_backend.station.power = wli_power;
 +		wli_backend.station.scan = wli_scan;
 +		wli_backend.station.heard = wli_heard;
@@ -38554,7 +39135,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..08c1506 100644
+index d21bf85..2cd1737 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -39025,7 +39606,7 @@ index d21bf85..08c1506 100644
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,2261 @@
+@@ -5899,3 +6092,2480 @@
  + }
  + r[3] = 0;
  +}
@@ -39883,7 +40464,7 @@ index d21bf85..08c1506 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ios.inc
-+@@ -0,0 +1,1403 @@
++@@ -0,0 +1,1622 @@
 ++#include <sys/fuxi_wifi_ios.h>
 ++#include <sys/fuxi_wifi_wpa.h>
 ++#include <sys/errno.h>
@@ -39952,6 +40533,7 @@ index d21bf85..08c1506 100644
 ++	unsigned fetching, fetch_index, scan_reports, diag_lines, dwell_enabled;
 ++	unsigned cache_enabled, cache_valid, cache_hits, scan_rejections;
 ++	unsigned batch_enabled, scan_count, scan_limit, scan_offset;
+++	unsigned ux;                            /* fuxi,wifi-ux（FUXI_WIFI_UX_*），發布時讀一次 */
 ++	int result, fatal;
 ++	struct fuxi_wifi_sta_scan scan;
 ++} wli;
@@ -40216,25 +40798,206 @@ index d21bf85..08c1506 100644
 ++	return 0;
 ++}
 ++
+++/*
+++ * fuxi,wifi-ux bit 1：估計一台 AP 能跑多快（kbps），給 wli_compare() 用。
+++ * 參考 wpa_supplicant 的 wpas_get_est_tpt() 與 wpa_scan_result_compar()（wpa_supplicant/scan.c，BSD 授權）：
+++ * 雜訊沒量到時 2.4 GHz 當 -89 dBm、5 GHz 當 -92 dBm，每個 MCS 要的 SNR 在 20 MHz 的門檻上每加倍頻寬加 3 dB，
+++ * 速率 = 20 MHz 單串流速率 × 頻寬倍數 × 串流數。這裡只做本機用得到的：HT／VHT／HE，20/40/80 MHz
+++ * （160 MHz 保守當 80），最多 2 條串流（WCN7850 是 2x2），2.4 GHz 不算 VHT；速率表是 802.11n/ac/ax 的
+++ * 長保護間隔（HE 0.8 µs）數值。只用來排先後，不是真的連線速率。
+++ */
+++#define WLI_NOISE_24 (-89)
+++#define WLI_NOISE_5 (-92)
+++#define WLI_GREAT_SNR 25
+++
+++static const struct { int8_t snr; uint16_t ht, he; } wli_mcs[12] = {     /* 20 MHz、單串流：Mbps×10 */
+++	{ 2, 65, 86 }, { 5, 130, 172 }, { 9, 195, 258 }, { 11, 260, 344 }, { 15, 390, 516 }, { 18, 520, 688 },
+++	{ 20, 585, 774 }, { 25, 650, 860 }, { 29, 780, 1032 }, { 31, 867, 1147 }, { 34, 0, 1290 }, { 36, 0, 1434 },
+++};
+++
+++/* 第一個這種元素的內容（id 255 時再比 ext 編號，回傳的內容不含 ext 編號）；沒有就 NULL */
+++static const uint8_t *
+++wli_element(const struct fuxi_wifi_sta_bss *bss, unsigned id, int ext, size_t *size)
+++{
+++	const uint8_t *elements = bss->elements;
+++	size_t length = MIN((size_t)bss->elements_length, sizeof(bss->elements));
+++	for (size_t at = 0; at + 2 <= length && at + 2 + elements[at + 1] <= length; at += 2 + elements[at + 1]) {
+++		const uint8_t *body = elements + at + 2;
+++		size_t body_size = elements[at + 1];
+++		if (elements[at] != id) { continue; }
+++		if (ext >= 0) {
+++			if (!body_size || body[0] != ext) { continue; }
+++			body++;
+++			body_size--;
+++		}
+++		*size = body_size;
+++		return body;
+++	}
+++	return NULL;
+++}
+++
+++/* VHT／HE 的 MCS map：每條串流 2 bits，3 = 不支援；回傳支援的串流數 */
+++static unsigned
+++wli_streams(unsigned map)
+++{
+++	unsigned streams = 0;
+++	while (streams < 8 && ((map >> (2 * streams)) & 3) != 3) { streams++; }
+++	return streams;
+++}
+++
+++static int
+++wli_snr(const struct fuxi_wifi_sta_bss *bss)
+++{
+++	return bss->rssi - (bss->frequency >= 5000 ? WLI_NOISE_5 : WLI_NOISE_24);
+++}
+++
+++static uint32_t
+++wli_rate_kbps(const struct fuxi_wifi_sta_bss *bss)
+++{
+++	bool five = bss->frequency >= 5000;
+++	int snr = wli_snr(bss);
+++	size_t size;
+++	const uint8_t *ht = wli_element(bss, 45, -1, &size);
+++	if (!ht || size < 26) {
+++		/* 沒有 HT：只有 802.11a/g 的 OFDM（6–54 Mbps） */
+++		static const struct { int8_t snr; uint16_t rate; } legacy[8] = {
+++			{ 4, 60 }, { 5, 90 }, { 7, 120 }, { 9, 180 }, { 12, 240 }, { 16, 360 }, { 20, 480 }, { 21, 540 },
+++		};
+++		uint32_t rate = 0;
+++		for (unsigned index = 0; index < 8; index++) {
+++			if (snr >= legacy[index].snr) { rate = legacy[index].rate * 100u; }
+++		}
+++		return rate;
+++	}
+++	/* HT 能力的 Rx MCS bitmask：第 n 條串流的 MCS 8n..8n+7 在 byte 3+n */
+++	unsigned streams = 0, top = 7, width = 20;
+++	while (streams < 4 && ht[3 + streams]) { streams++; }
+++	/* HT 操作：次通道偏移（1 上、3 下）而且 STA 頻寬位元打開 = 40 MHz */
+++	const uint8_t *op = wli_element(bss, 61, -1, &size);
+++	if (op && size >= 22 && (op[1] & 4) && ((op[1] & 3) == 1 || (op[1] & 3) == 3)) { width = 40; }
+++	const uint8_t *cap = five ? wli_element(bss, 191, -1, &size) : NULL;
+++	if (cap && size >= 12) {
+++		unsigned map = fwc_read16(cap + 4), count = wli_streams(map);
+++		if (count) {
+++			streams = count;
+++			top = 7 + MIN(map & 3, 2u);             /* 0：MCS 0–7，1：0–8，2：0–9 */
+++		}
+++		const uint8_t *vop = wli_element(bss, 192, -1, &size);
+++		if (vop && size >= 5 && vop[0] >= 1) { width = 80; }  /* 1：80，2／3：160 或 80+80，這裡當 80 */
+++	}
+++	/* HE 能力（ext 35）：MAC 6 bytes、PHY 11 bytes 之後是 80 MHz 以下的 Rx HE-MCS map */
+++	bool he = false;
+++	cap = wli_element(bss, 255, 35, &size);
+++	if (cap && size >= 19) {
+++		unsigned map = fwc_read16(cap + 17), count = wli_streams(map);
+++		he = true;
+++		if (count) {
+++			streams = count;
+++			top = 7 + 2 * MIN(map & 3, 2u);         /* 0：MCS 0–7，1：0–9，2：0–11 */
+++		}
+++	}
+++	streams = streams ? MIN(streams, 2u) : 1u;
+++	top = MIN(top, he ? 11u : 9u);
+++	int extra = width == 80 ? 6 : width == 40 ? 3 : 0;
+++	unsigned factor = he ? (width == 80 ? 419 : width == 40 ? 200 : 100) : (width == 80 ? 450 : width == 40 ? 208 : 100);
+++	uint32_t rate = 0;
+++	for (unsigned index = 0; index <= top; index++) {
+++		unsigned base = he ? wli_mcs[index].he : wli_mcs[index].ht;
+++		if (base && snr >= wli_mcs[index].snr + extra) { rate = (uint32_t)base * factor * streams; }
+++	}
+++	return rate;
+++}
+++
+++/*
+++ * wpa_scan_result_compar() 的順序，>0：a 比 b 好。SNR 封頂 25 dB 之後差不到 7 dB 先比估計速率，
+++ * 差不到 5 dB 再選 5 GHz，其餘比完整 SNR。
+++ */
+++static int
+++wli_compare(const struct fuxi_wifi_sta_bss *a, uint32_t rate_a, const struct fuxi_wifi_sta_bss *b, uint32_t rate_b)
+++{
+++	int full_a = wli_snr(a), full_b = wli_snr(b);
+++	int snr_a = MIN(full_a, WLI_GREAT_SNR), snr_b = MIN(full_b, WLI_GREAT_SNR);
+++	int gap = snr_a > snr_b ? snr_a - snr_b : snr_b - snr_a;
+++	bool five_a = a->frequency >= 5000, five_b = b->frequency >= 5000;
+++	if (snr_a > 0 && snr_b > 0 && gap < 7 && rate_a != rate_b) { return rate_a > rate_b ? 1 : -1; }
+++	if (snr_a > 0 && snr_b > 0 && gap < 5 && five_a != five_b) { return five_a ? 1 : -1; }
+++	return full_a - full_b;
+++}
+++
+++struct wli_pick_note {
+++	unsigned candidates, fresh;
+++	uint32_t best_rate, strongest_rate;
+++	uint16_t strongest_frequency;
+++	int16_t strongest_rssi;
+++};
+++
+++/*
+++ * bit 1：能用這種保護加入的那幾台裡挑；新鮮的（WLI_FRESH_MS 內聽到）優先，再照 wli_compare()。
+++ * 一台都不能加入就回 -1，照舊挑訊號最強的，讓 wli_security() 說為什麼不行。呼叫者持有 wli_lock。
+++ */
+++static int
+++wli_pick_rate(const struct fuxi_wifi_sta_join *join, bool given, uint64_t age, struct wli_pick_note *note)
+++{
+++	int best = -1, strongest = -1;
+++	bool best_fresh = false;
+++	uint32_t best_rate = 0;
+++	for (unsigned index = 0; index < wli_bss_count; index++) {
+++		const struct fuxi_wifi_sta_bss *bss = &wli_bss[index];
+++		uint32_t group;
+++		if (bss->ssid_length != join->ssid_length || memcmp(bss->ssid, join->ssid, join->ssid_length) ||
+++		    (given && memcmp(bss->bssid, join->bssid, 6)) || wli_security(bss, join->security, &group)) { continue; }
+++		bool fresh = age + bss->age_ms <= WLI_FRESH_MS;
+++		uint32_t rate = wli_rate_kbps(bss);
+++		note->candidates++;
+++		note->fresh += fresh;
+++		if (strongest < 0 || bss->rssi > wli_bss[strongest].rssi) {
+++			strongest = (int)index;
+++			note->strongest_rate = rate;
+++			note->strongest_frequency = bss->frequency;
+++			note->strongest_rssi = bss->rssi;
+++		}
+++		if (best < 0 || (fresh && !best_fresh) ||
+++		    (fresh == best_fresh && wli_compare(bss, rate, &wli_bss[best], best_rate) > 0)) {
+++			best = (int)index;
+++			best_fresh = fresh;
+++			best_rate = rate;
+++		}
+++	}
+++	note->best_rate = best_rate;
+++	return best;
+++}
+++
 ++/* The access point to join: the given one, or the one of that name heard best. */
 ++static int
 ++wli_pick(const struct fuxi_wifi_sta_join *join, struct wli_target *target)
 ++{
 ++	static const uint8_t none[6];
 ++	bool given = memcmp(join->bssid, none, 6) != 0;
+++	struct wli_pick_note note;
+++	memset(&note, 0, sizeof(note));
 ++	int best = -1;
 ++	lck_mtx_lock(&wli_lock);
 ++	uint64_t age = wla_now_ms() - wli.scanned_at;
-++	for (unsigned index = 0; index < wli_bss_count; index++) {
-++		const struct fuxi_wifi_sta_bss *bss = &wli_bss[index];
-++		if (bss->ssid_length != join->ssid_length || memcmp(bss->ssid, join->ssid, join->ssid_length) ||
-++		    (given && memcmp(bss->bssid, join->bssid, 6))) { continue; }
-++		if (best < 0 || bss->rssi > wli_bss[best].rssi) { best = (int)index; }
+++	bool rated = (wli.ux & FUXI_WIFI_UX_PICK_RATE) != 0;
+++	if (rated) { best = wli_pick_rate(join, given, age, &note); }
+++	if (best < 0) {
+++		rated = false;
+++		for (unsigned index = 0; index < wli_bss_count; index++) {
+++			const struct fuxi_wifi_sta_bss *bss = &wli_bss[index];
+++			if (bss->ssid_length != join->ssid_length || memcmp(bss->ssid, join->ssid, join->ssid_length) ||
+++			    (given && memcmp(bss->bssid, join->bssid, 6))) { continue; }
+++			if (best < 0 || bss->rssi > wli_bss[best].rssi) { best = (int)index; }
+++		}
 ++	}
 ++	int error = best < 0 ? ENOENT : age + wli_bss[best].age_ms > WLI_FRESH_MS ? ESTALE : 0;
 ++	/* (a stale one is kept too, for its channel: the rescan listens there first) */
 ++	if (best >= 0) { target->bss = wli_bss[best]; }
 ++	lck_mtx_unlock(&wli_lock);
+++	if (rated && note.candidates > 1) {
+++		printf("FUXI WIFI IOS: pick among %u (%u fresh): %u MHz %d dBm ~%u Mbps; strongest %u MHz %d dBm ~%u Mbps\n",
+++		    note.candidates, note.fresh, target->bss.frequency, target->bss.rssi, note.best_rate / 1000,
+++		    note.strongest_frequency, note.strongest_rssi, note.strongest_rate / 1000);
+++	}
 ++	return error;
 ++}
 ++
@@ -40257,6 +41020,32 @@ index d21bf85..08c1506 100644
 ++	return error;
 ++}
 ++
+++/*
+++ * fuxi,wifi-ux bit 2：已連著的時候又要求加入，選好之後決定要不要真的換。
+++ * 0：留著現在的連線、回成功（選中的就是這台 AP；或是同一個網路名稱、但這次選不出能換過去的 AP：
+++ * 沒再聽到、太舊、重掃失敗或保護方式不支援）。-1：要先斷線再加入（換 AP，或換到別的網路）。
+++ */
+++static int
+++wli_kept(const struct fuxi_wifi_sta_join *join, const struct wli_target *target, int error)
+++{
+++	lck_mtx_lock(&wli_lock);
+++	bool joined = wli_state.phase == FUXI_WIFI_STA_JOINED;
+++	bool same_name = joined && wli_state.bss.ssid_length == join->ssid_length &&
+++	    !memcmp(wli_state.bss.ssid, join->ssid, join->ssid_length);
+++	bool same_ap = same_name && !error && !memcmp(wli_state.bss.bssid, target->bss.bssid, 6) &&
+++	    wli_state.security == join->security;
+++	lck_mtx_unlock(&wli_lock);
+++	if (same_ap) {
+++		printf("FUXI WIFI IOS: join asks for the access point already joined: link kept\n");
+++		return 0;
+++	}
+++	if (same_name && error) {
+++		printf("FUXI WIFI IOS: join of the network joined, no other access point to move to (%d): link kept\n", error);
+++		return 0;
+++	}
+++	return -1;
+++}
+++
 ++static int
 ++wli_join(const struct fuxi_wifi_sta_join *join)
 ++{
@@ -40273,7 +41062,9 @@ index d21bf85..08c1506 100644
 ++		wli_note_error(ENETDOWN);
 ++		return ENETDOWN;
 ++	}
-++	if (phase == FUXI_WIFI_STA_JOINED || phase == FUXI_WIFI_STA_JOINING) { (void)wli_leave(); }
+++	/* bit 2：已連著就先別斷，選好（必要時邊連邊掃）再說 */
+++	bool keep = (wli.ux & FUXI_WIFI_UX_KEEP_LINK) && phase == FUXI_WIFI_STA_JOINED;
+++	if ((phase == FUXI_WIFI_STA_JOINED || phase == FUXI_WIFI_STA_JOINING) && !keep) { (void)wli_leave(); }
 ++	struct wli_target *target = &wli_asked;
 ++	memset(target, 0, sizeof(*target));
 ++	target->security = join->security;
@@ -40308,6 +41099,14 @@ index d21bf85..08c1506 100644
 ++		}
 ++	}
 ++	if (!error) { error = wli_security(&target->bss, join->security, &target->group); }
+++	if (keep) {
+++		if (wli_kept(join, target, error) == 0) {
+++			memset(target, 0, sizeof(*target));
+++			printf("FUXI WIFI IOS: join finished 0\n");
+++			return 0;
+++		}
+++		(void)wli_leave();
+++	}
 ++	if (!error) {
 ++		printf("FUXI WIFI IOS: join %s at %u MHz %d dBm\n",
 ++		    join->security == FUXI_WIFI_STA_OPEN ? "open" : "WPA2-PSK", target->bss.frequency, target->bss.rssi);
@@ -41194,6 +41993,7 @@ index d21bf85..08c1506 100644
 ++		PE_parse_boot_argn("fuxiwlanbatch", &batch, sizeof(batch));
 ++		wli.batch_enabled = batch == 1;
 ++		printf("FUXI WIFI IOS: scan batch opt-in %u budget %u ms\n", wli.batch_enabled, WLI_SCAN_BUDGET_MS);
+++		wli.ux = fuxi_wifi_ux();
 ++		wli_backend.station.power = wli_power;
 ++		wli_backend.station.scan = wli_scan;
 ++		wli_backend.station.heard = wli_heard;
@@ -41537,7 +42337,7 @@ index 39be642..40ce125 100644
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
 diff --git a/xnu/patches/0104-fuxi-wifi-ios.patch b/xnu/patches/0104-fuxi-wifi-ios.patch
-index 179f5df..ec9a01c 100644
+index 179f5df..29a7702 100644
 --- a/xnu/patches/0104-fuxi-wifi-ios.patch
 +++ b/xnu/patches/0104-fuxi-wifi-ios.patch
 @@ -678,7 +678,7 @@
@@ -41545,7 +42345,7 @@ index 179f5df..ec9a01c 100644
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_apple80211.c
 -@@ -0,0 +1,647 @@
-+@@ -0,0 +1,832 @@
++@@ -0,0 +1,859 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
@@ -41596,7 +42396,7 @@ index 179f5df..ec9a01c 100644
  +	result->beacon_interval = bss->beacon_interval;
  +	result->capability = bss->capability;
  +	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
-@@ -861,6 +876,31 @@
+@@ -861,6 +876,58 @@
  +
  +/* ---- get ---------------------------------------------------------------------------------------------- */
  +
@@ -41625,10 +42425,37 @@ index 179f5df..ec9a01c 100644
 ++	return value == 1;
 ++}
 ++
+++/* fuxi,wifi-ux 讀過之後的值；bit 31 表示已讀過（測試可清 0 重讀） */
+++static uint32_t wifi_ux_cached;
+++
+++unsigned
+++fuxi_wifi_ux(void)
+++{
+++	uint32_t value = __atomic_load_n(&wifi_ux_cached, __ATOMIC_ACQUIRE);
+++
+++	if (!(value & 0x80000000u)) {
+++		DTEntry chosen;
+++		void const *prop;
+++		unsigned int bytes;
+++		uint32_t read = 0;
+++
+++		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+++		    SecureDTGetProperty(chosen, "fuxi,wifi-ux", &prop, &bytes) == kSuccess && bytes == sizeof(read)) {
+++			memcpy(&read, prop, sizeof(read));
+++		}
+++		value = (read & FUXI_WIFI_UX_ALL) | 0x80000000u;
+++		__atomic_store_n(&wifi_ux_cached, value, __ATOMIC_RELEASE);
+++		printf("FUXI WIFI IOS: ux options 0x%x (power-asked %u, pick-rate %u, keep-link %u)\n",
+++		    value & FUXI_WIFI_UX_ALL, !!(value & FUXI_WIFI_UX_POWER_ASKED), !!(value & FUXI_WIFI_UX_PICK_RATE),
+++		    !!(value & FUXI_WIFI_UX_KEEP_LINK));
+++	}
+++	return value & FUXI_WIFI_UX_ALL;
+++}
+++
  +static int
  +get(struct apple80211req *request)
  +{
-@@ -871,8 +911,9 @@
+@@ -871,8 +938,9 @@
  +	case 43:
  +	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
  +		static const char name[256] = "Fuxi Wi-Fi iOS shim (synthetic backend)";
@@ -41639,7 +42466,7 @@ index 179f5df..ec9a01c 100644
  +	}
  +	case 12: {
  +		/*
-@@ -900,6 +941,17 @@
+@@ -900,6 +968,17 @@
  +	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
  +		request->req_val = 1;
  +		return 0;
@@ -41657,7 +42484,7 @@ index 179f5df..ec9a01c 100644
  +	case 27:
  +	case 254: {                             /* the channels the radio may tune to */
  +		struct apple80211_channels *answer;
-@@ -1009,7 +1061,17 @@
+@@ -1009,7 +1088,17 @@
  +		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
  +		break;
  +	}
@@ -41676,7 +42503,7 @@ index 179f5df..ec9a01c 100644
  +		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give_network(request, &state->bss);
  +		break;
  +	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-@@ -1060,6 +1122,7 @@
+@@ -1060,6 +1149,7 @@
  +		memcpy(what->ssid, asked->ssid, asked->ssid_length);
  +	}
  +	what->passive = asked->scan_type == 2;
@@ -41684,7 +42511,7 @@ index 179f5df..ec9a01c 100644
  +	what->dwell_ms = asked->dwell_ms;
  +	/* (more channels than there is room to name: every channel) */
  +	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
-@@ -1177,12 +1240,14 @@
+@@ -1177,12 +1267,14 @@
  +
  +/* ---- events -------------------------------------------------------------------------------------------- */
  +
@@ -41700,7 +42527,7 @@ index 179f5df..ec9a01c 100644
  +
  +	memcpy(name, interface_name, sizeof(name));
  +	message.dv[0].data_length = sizeof(name);
-@@ -1191,7 +1256,90 @@
+@@ -1191,7 +1283,90 @@
  +		message.dv[1].data_length = length;
  +		message.dv[1].data_ptr = __DECONST(void *, data);
  +	}
@@ -41792,7 +42619,7 @@ index 179f5df..ec9a01c 100644
  +}
  +
  +/* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
-@@ -1229,11 +1377,20 @@
+@@ -1229,11 +1404,20 @@
  +		if (state != NULL) {
  +			fuxi_wifi_sta_state(state);
  +			link.rssi = status == 1 ? state->bss.rssi : 0;
@@ -41813,7 +42640,7 @@ index 179f5df..ec9a01c 100644
  +		break;
  +	}
  +	}
-@@ -1290,6 +1447,33 @@
+@@ -1290,6 +1474,33 @@
  +	}
  +}
  +
@@ -41847,7 +42674,7 @@ index 179f5df..ec9a01c 100644
  +/* An Apple80211 request for the radio's interface, from the process that is running now. */
  +errno_t
  +fuxi_wifi_apple80211_ioctl(u_long command, void *data)
-@@ -1322,13 +1506,14 @@
+@@ -1322,13 +1533,14 @@
  +			printf("error %d\n", error);
  +		}
  +	}
@@ -41863,7 +42690,7 @@ index 179f5df..ec9a01c 100644
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
  + * Fuxi, 2026-10-23: shared diagnostic ABI; 16.7 payloads UNVERIFIED.
-@@ -1445,6 +1630,28 @@
+@@ -1445,6 +1657,28 @@
  +	uint8_t unused_3[4];
  +};
  +
@@ -41892,7 +42719,7 @@ index 179f5df..ec9a01c 100644
  +_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
  +    "the association request as iOS 16.5 has it");
  +_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
-@@ -1463,7 +1670,7 @@
+@@ -1463,7 +1697,7 @@
  +#endif
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_ios.c
@@ -41901,7 +42728,7 @@ index 179f5df..ec9a01c 100644
  +/* Fuxi Wi-Fi iOS shim entry and synthetic Ethernet link. No radio access. */
  +#if defined(FUXI)
  +#include <sys/param.h>
-@@ -1477,6 +1684,18 @@
+@@ -1477,6 +1711,18 @@
  +extern void FuxiNetworkStackStart(void);
  +static const struct fuxi_wifi_backend *backend;
  +static bool enabled;
@@ -41920,7 +42747,7 @@ index 179f5df..ec9a01c 100644
  +
  +static bool
  +transmit(mbuf_t packet, size_t length)
-@@ -1504,6 +1723,7 @@
+@@ -1504,6 +1750,7 @@
  +		return false;
  +	}
  +	backend = ops;
@@ -41928,7 +42755,7 @@ index 179f5df..ec9a01c 100644
  +	memcpy(link.address, ops->station.address, sizeof(link.address));
  +	ops->start(&input);
  +	fuxi_wifi_sta_attach(&ops->station);
-@@ -1659,17 +1879,24 @@
+@@ -1659,17 +1906,24 @@
  +{
  +	int on = 0;
  +	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
@@ -41955,7 +42782,7 @@ index 179f5df..ec9a01c 100644
  +/* Fuxi Wi-Fi iOS shim: boot-lifetime backend boundary. */
  +#ifndef FUXI_WIFI_IOS_H
  +#define FUXI_WIFI_IOS_H
-@@ -1704,6 +1931,7 @@
+@@ -1704,6 +1958,7 @@
  +#ifdef KERNEL
  +bool fuxi_wifi_ios_attach(const struct fuxi_wifi_backend *backend);
  +void fuxi_wifi_ios_init(void);
@@ -41963,7 +42790,34 @@ index 179f5df..ec9a01c 100644
  +#endif
  +#endif
  --- /dev/null
-@@ -2158,14 +2386,13 @@
+@@ -2042,7 +2297,7 @@
+ +#endif /* _SYS_FUXI_WIFI_NET_H_ */
+ --- /dev/null
+ +++ b/bsd/dev/fuxi_wifi_sta.c
+-@@ -0,0 +1,357 @@
++@@ -0,0 +1,397 @@
+ +/*
+ + * Ported from HackiOS xnu/files/bsd/dev/redwood_sta.c (APSL-2.0)
+ + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
+@@ -2087,6 +2342,8 @@
+ +static bool sta_thread_made;
+ +static bool sta_calls;                          /* the thread is in a call of the station side's */
+ +static bool sta_on;                             /* the radio's power, as last asked for */
+++/* fuxi,wifi-ux bit 0：電源要求已從佇列取出、正在切換時的目標 */
+++static bool power_running, power_running_on;
+ +
+ +/* what has been asked for and not begun */
+ +static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
+@@ -2131,6 +2388,8 @@
+ +			power = true;
+ +			power_on = asked_power_on;
+ +			asked_power = false;
+++			power_running = true;
+++			power_running_on = power_on;
+ +		} else if (asked_leave) {
+ +			leave = true;
+ +			asked_leave = false;
+@@ -2158,14 +2417,14 @@
  +			}
  +			error = ops->power(power_on);
  +			lck_mtx_lock(&sta_lock);
@@ -41971,6 +42825,7 @@ index 179f5df..ec9a01c 100644
 -+				sta_on = error == 0 ? power_on : !power_on;
 -+			}
 ++			if (error == 0) { sta_on = power_on; }
+++			power_running = false;
 ++			bool confirmed_on = sta_on;
  +			lck_mtx_unlock(&sta_lock);
  +			if (!power_on && was_joined) {
@@ -41981,7 +42836,7 @@ index 179f5df..ec9a01c 100644
  +		} else if (leave) {
  +			ops->leave();
  +			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
-@@ -2224,10 +2451,12 @@
+@@ -2224,10 +2483,12 @@
  +	}
  +	lck_mtx_lock(&sta_lock);
  +	sta_ops = ops;
@@ -41996,7 +42851,60 @@ index 179f5df..ec9a01c 100644
  +}
  +
  +void
-@@ -2277,7 +2506,6 @@
+@@ -2248,16 +2509,51 @@
+ +	return present;
+ +}
+ +
+++/*
+++ * fuxi,wifi-ux bit 0：還沒切完的電源要求算數。true：要關（或正在關），false：其餘。
+++ * 呼叫者持有 sta_lock。
+++ */
+++static bool
+++power_wanted(bool *on)
+++{
+++	if (!(fuxi_wifi_ux() & FUXI_WIFI_UX_POWER_ASKED)) {
+++		return false;
+++	}
+++	if (asked_power) {
+++		*on = asked_power_on;
+++		return true;
+++	}
+++	if (power_running) {
+++		*on = power_running_on;
+++		return true;
+++	}
+++	return false;
+++}
+++
+ +bool
+ +fuxi_wifi_sta_powered(void)
+ +{
+-+	bool on;
+++	bool on, wanted;
+ +	lck_mtx_lock(&sta_lock);
+ +	on = sta_ops != NULL && sta_on;
+++	if (sta_ops != NULL && power_wanted(&wanted)) {
+++		on = wanted;
+++	}
+ +	lck_mtx_unlock(&sta_lock);
+ +	return on;
+ +}
+ +
+++/* 能不能再收掃描／加入：電源是開的或正要開；bit 0 打開時，正要關就不收 */
+++static bool
+++power_accepts(void)
+++{
+++	bool wanted;
+++	if (power_wanted(&wanted)) {
+++		return wanted;
+++	}
+++	return sta_on || (asked_power && asked_power_on);
+++}
+++
+ +bool
+ +fuxi_wifi_sta_busy(void)
+ +{
+@@ -2277,7 +2573,6 @@
  +		lck_mtx_unlock(&sta_lock);
  +		return ENXIO;
  +	}
@@ -42004,34 +42912,34 @@ index 179f5df..ec9a01c 100644
  +	asked_power = true;
  +	asked_power_on = on;
  +	if (!on) {
-@@ -2297,7 +2525,7 @@
+@@ -2297,7 +2592,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
 -+	if (sta_ops == NULL || !sta_on) {
-++	if (sta_ops == NULL || (!sta_on && !(asked_power && asked_power_on))) {
+++	if (sta_ops == NULL || !power_accepts()) {
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
-@@ -2317,7 +2545,7 @@
+@@ -2317,7 +2612,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
 -+	if (sta_ops == NULL || !sta_on) {
-++	if (sta_ops == NULL || (!sta_on && !(asked_power && asked_power_on))) {
+++	if (sta_ops == NULL || !power_accepts()) {
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
-@@ -2402,7 +2630,7 @@
+@@ -2402,7 +2697,7 @@
  +#endif /* FUXI */
  --- /dev/null
  +++ b/bsd/sys/fuxi_wifi_sta.h
 -@@ -0,0 +1,126 @@
-+@@ -0,0 +1,127 @@
++@@ -0,0 +1,142 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/sys/redwood_sta.h (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
-@@ -2450,6 +2678,7 @@
+@@ -2450,6 +2745,7 @@
  +	uint16_t frequencies[64], frequency_count;      /* only these channels */
  +	bool passive;                           /* only listen */
  +	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
@@ -42039,6 +42947,29 @@ index 179f5df..ec9a01c 100644
  +};
  +
  +enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
+@@ -2504,7 +2800,22 @@
+ +	                                         * an errno: it was lost (the access point showed us the door) */
+ +};
+ +
+++/*
+++ * ADT /chosen fuxi,wifi-ux（u32 位元遮罩）：Wi-Fi 使用體驗修正，預設 0 = 舊行為，loader 逐項打開。
+++ * 2026-11-17 實機（native-hw000wifi-rssiamp-boot-1）看到的三個問題各對一個位元。
+++ */
+++#define FUXI_WIFI_UX_POWER_ASKED   1u      /* 開關剛按下、電源還沒切完：GET POWER 就回報要求的狀態，
+++                                         * 要關時不再收新的掃描／加入（原本要等進行中的掃描做完，開關會彈回約兩秒） */
+++#define FUXI_WIFI_UX_PICK_RATE     2u      /* wifid 沒指定 BSSID：照 wpa_supplicant 的比較法以估計速率選 AP
+++                                         * （訊號相近時 5 GHz／較寬頻道優先），只看還新鮮、能加入的那些 */
+++#define FUXI_WIFI_UX_KEEP_LINK     4u      /* 已連線時再要求加入：先選好（必要時邊連邊掃）再斷線；
+++                                         * 選中的就是現在這台 AP 則直接回成功，不斷線 */
+++#define FUXI_WIFI_UX_ALL           7u
+++
+ +#ifdef KERNEL
+++/* 讀一次 ADT 之後記住（ADT 開機後不變）；沒有這個屬性或長度不對都當 0 */
+++unsigned fuxi_wifi_ux(void);
+++
+ +/* ---- the station side ---- */
+ +void     fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops);         /* init only; immutable boot-lifetime backend */
+ +void     fuxi_wifi_sta_lost(int error);                                   /* the network joined is gone by itself */
 diff --git a/xnu/patches/0106-fuxi-unixnu.patch b/xnu/patches/0106-fuxi-unixnu.patch
 index d95faff..da02b50 100644
 --- a/xnu/patches/0106-fuxi-unixnu.patch
