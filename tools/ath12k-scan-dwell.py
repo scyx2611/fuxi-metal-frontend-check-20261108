@@ -9,6 +9,7 @@ PINS = {
     'src/nw_cfg80211_control.c': 'db58651619b8d41b5020f92e809f87923783c75c040713128ea12a72495ee9be',
 }
 LINUX_MAC_SHA256 = '6a5846b4b3bcf718cdf87226b99f90649169a3892cea2c88f677e32c02020b33'
+LINUX_RDEV_SHA256 = 'bfa4934811cbe41355ec4be5c713f31564df9432648bb65def782fd10214e06e'
 DWELL_FUNCTION = '''static void ath12k_mac_scan_dwell(struct ath12k_wmi_scan_req_arg *arg,
                                    const struct cfg80211_scan_request *req)
 {
@@ -56,6 +57,9 @@ def apply(module):
     linux_mac = module / 'deps/linux/drivers/net/wireless/ath/ath12k/mac.c'
     if sha256(linux_mac.read_bytes()) != LINUX_MAC_SHA256:
         raise ValueError('Pinned Linux scan implementation changed')
+    for relative in ('deps/linux/net/wireless/rdev-ops.h', 'out/cfg80211/rdev-ops.h'):
+        if sha256((module / relative).read_bytes()) != LINUX_RDEV_SHA256:
+            raise ValueError('Pinned Linux scan request validation changed')
     records = {}
     header = 'include/nw_control.h'
     records[header] = edit(module / header, [
@@ -66,6 +70,8 @@ def apply(module):
     ], PINS[header])
     control = 'src/nw_cfg80211_control.c'
     records[control] = edit(module / control, [
+        ('  request->req.ssids = (void *)((u8 *)request + ssid_offset);\n',
+         '  request->req.ssids = ssid_bytes ? (void *)((u8 *)request + ssid_offset) : NULL;\n'),
         ('  if (!rdev->ops->scan) return -EOPNOTSUPP;\n',
          '''  uint32_t dwell_ms = 0;
   size_t dwell_bytes;
@@ -110,11 +116,12 @@ def apply(module):
     record = {'schema': 'fuxi-ath12k-scan-dwell-v1',
               'patcher_sha256': sha256(Path(__file__).read_bytes()),
               'linux_mac_sha256': LINUX_MAC_SHA256, 'feature_bit': 1 << 31,
+              'linux_rdev_ops_sha256': LINUX_RDEV_SHA256, 'passive_ssids_null': True,
               'attribute': 46, 'maximum_requested_ms': 1000,
               'maximum_scan_budget_ms': 19000, 'hardware_verified': False,
               'files': records}
     (module / 'out/fuxi-scan-dwell.json').write_text(json.dumps(record, indent=2) + '\n')
-    print('PASS pinned scan dwell extension: control milliseconds -> cfg80211 TU -> WMI milliseconds')
+    print('PASS pinned scan dwell extension and passive SSID pointer contract')
 
 
 def main():
