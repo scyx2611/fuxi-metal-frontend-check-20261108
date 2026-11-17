@@ -26,7 +26,7 @@ static inline uint32_t fuxi_error_domain(CFStringRef domain)
 static inline const char *fuxi_error_reason(CFDictionaryRef info)
 {
     const CFStringRef keys[] = {
-        kCFErrorLocalizedDescriptionKey, kCFErrorLocalizedFailureReasonKey, kCFErrorDebugDescriptionKey
+        kCFErrorLocalizedDescriptionKey, kCFErrorLocalizedFailureReasonKey, kCFErrorDescriptionKey
     };
     for (unsigned index = 0; index < sizeof(keys) / sizeof(keys[0]); index++) {
         CFTypeRef value = CFDictionaryGetValue(info, keys[index]);
