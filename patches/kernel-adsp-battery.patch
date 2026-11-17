@@ -8690,10 +8690,10 @@ index 0000000..d74473c
 +    main()
 diff --git a/tools/test-fuxi-audio-spf.py b/tools/test-fuxi-audio-spf.py
 new file mode 100644
-index 0000000..b542507
+index 0000000..e469fd2
 --- /dev/null
 +++ b/tools/test-fuxi-audio-spf.py
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,157 @@
 +import os
 +from pathlib import Path
 +import subprocess
@@ -8804,6 +8804,9 @@ index 0000000..b542507
 +    for(unsigned index=0;index<10;index++)
 +        deliver(FUXI_AUDIO_PREP_SPF_STATE_REPLY,FUXI_SPF_TOKEN+1,1);
 +    assert(gSpf.invalid==4 && !gSpf.reply_ready);
++    assert(gSpf.rejected[0].length==28 && gSpf.rejected[0].result==FuxiAudioPrepRoute &&
++           gSpf.rejected[0].header[4]==FUXI_SPF_TOKEN+1 &&
++           gSpf.rejected[0].header[5]==FUXI_AUDIO_PREP_SPF_STATE_REPLY);
 +    uint8_t oversized[513]={0};
 +    callbacks.receive(NULL,oversized,sizeof(oversized));
 +    assert(gSpf.invalid==4);
@@ -24886,10 +24889,10 @@ index 0000000..09ce08d
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_audio_spf.c b/xnu/fuxi-adsp/fuxi_audio_spf.c
 new file mode 100644
-index 0000000..78617f5
+index 0000000..5303781
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_audio_spf.c
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,154 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/systm.h>
@@ -24907,6 +24910,10 @@ index 0000000..78617f5
 +    ShengAdspChannel *channel;
 +    uint64_t deadline;
 +    FuxiAudioPrepSpfReply reply;
++    struct {
++        uint32_t length, header[6];
++        int result;
++    } rejected[4];
 +    unsigned invalid, reported_invalid;
 +    int up, attempted, done, accepted, reported_accepted, reply_ready, disconnected;
 +} gSpf;
@@ -24940,14 +24947,21 @@ index 0000000..78617f5
 +static void channel_receive(void *context, const uint8_t *data, uint32_t length)
 +{
 +    FuxiAudioPrepSpfReply reply;
++    int result;
 +    (void)context;
 +    if (!gSpf.attempted || gSpf.done || !gSpf.up || gSpf.disconnected ||
 +        mach_absolute_time() >= gSpf.deadline)
 +        return;
-+    if (length > FUXI_SPF_INTENT_BYTES ||
-+        fuxi_audio_prep_spf_reply(data, length, FUXI_SPF_PORT, FUXI_SPF_TOKEN, &reply)) {
-+        if (gSpf.invalid < 4)
++    result = length > FUXI_SPF_INTENT_BYTES ? FuxiAudioPrepLength :
++        fuxi_audio_prep_spf_reply(data, length, FUXI_SPF_PORT, FUXI_SPF_TOKEN, &reply);
++    if (result) {
++        if (gSpf.invalid < 4) {
++            gSpf.rejected[gSpf.invalid].length = length;
++            gSpf.rejected[gSpf.invalid].result = result;
++            if (data && length >= 24 && length <= FUXI_SPF_INTENT_BYTES)
++                memcpy(gSpf.rejected[gSpf.invalid].header, data, 24);
 +            gSpf.invalid++;
++        }
 +        return;
 +    }
 +    if (reply.kind == FuxiAudioPrepSpfAccepted) {
@@ -24985,9 +24999,12 @@ index 0000000..78617f5
 +        printf("FUXI AUDIO SPF: channel closed before state reply\n");
 +        return;
 +    }
-+    if (gSpf.invalid != gSpf.reported_invalid) {
-+        gSpf.reported_invalid = gSpf.invalid;
-+        printf("FUXI AUDIO SPF: rejected replies %u\n", gSpf.invalid);
++    while (gSpf.reported_invalid < gSpf.invalid) {
++        unsigned index = gSpf.reported_invalid++;
++        const uint32_t *header = gSpf.rejected[index].header;
++        printf("FUXI AUDIO SPF: rejected reply %u error %d bytes %u header %#x route %#x ports %#x/%#x token %#x opcode %#x\n",
++            index + 1, gSpf.rejected[index].result, gSpf.rejected[index].length,
++            header[0], header[1], header[2], header[3], header[4], header[5]);
 +    }
 +    if (gSpf.accepted && !gSpf.reported_accepted) {
 +        gSpf.reported_accepted = 1;
@@ -39815,10 +39832,10 @@ index 8349337..ed20c83 100644
  +}
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..af0889c
+index 0000000..5168d93
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,8269 @@
+@@ -0,0 +1,8283 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,29 @@
@@ -45431,7 +45448,7 @@ index 0000000..af0889c
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_audio_spf.c
-+@@ -0,0 +1,140 @@
++@@ -0,0 +1,154 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/systm.h>
@@ -45449,6 +45466,10 @@ index 0000000..af0889c
 ++    ShengAdspChannel *channel;
 ++    uint64_t deadline;
 ++    FuxiAudioPrepSpfReply reply;
+++    struct {
+++        uint32_t length, header[6];
+++        int result;
+++    } rejected[4];
 ++    unsigned invalid, reported_invalid;
 ++    int up, attempted, done, accepted, reported_accepted, reply_ready, disconnected;
 ++} gSpf;
@@ -45482,14 +45503,21 @@ index 0000000..af0889c
 ++static void channel_receive(void *context, const uint8_t *data, uint32_t length)
 ++{
 ++    FuxiAudioPrepSpfReply reply;
+++    int result;
 ++    (void)context;
 ++    if (!gSpf.attempted || gSpf.done || !gSpf.up || gSpf.disconnected ||
 ++        mach_absolute_time() >= gSpf.deadline)
 ++        return;
-++    if (length > FUXI_SPF_INTENT_BYTES ||
-++        fuxi_audio_prep_spf_reply(data, length, FUXI_SPF_PORT, FUXI_SPF_TOKEN, &reply)) {
-++        if (gSpf.invalid < 4)
+++    result = length > FUXI_SPF_INTENT_BYTES ? FuxiAudioPrepLength :
+++        fuxi_audio_prep_spf_reply(data, length, FUXI_SPF_PORT, FUXI_SPF_TOKEN, &reply);
+++    if (result) {
+++        if (gSpf.invalid < 4) {
+++            gSpf.rejected[gSpf.invalid].length = length;
+++            gSpf.rejected[gSpf.invalid].result = result;
+++            if (data && length >= 24 && length <= FUXI_SPF_INTENT_BYTES)
+++                memcpy(gSpf.rejected[gSpf.invalid].header, data, 24);
 ++            gSpf.invalid++;
+++        }
 ++        return;
 ++    }
 ++    if (reply.kind == FuxiAudioPrepSpfAccepted) {
@@ -45527,9 +45555,12 @@ index 0000000..af0889c
 ++        printf("FUXI AUDIO SPF: channel closed before state reply\n");
 ++        return;
 ++    }
-++    if (gSpf.invalid != gSpf.reported_invalid) {
-++        gSpf.reported_invalid = gSpf.invalid;
-++        printf("FUXI AUDIO SPF: rejected replies %u\n", gSpf.invalid);
+++    while (gSpf.reported_invalid < gSpf.invalid) {
+++        unsigned index = gSpf.reported_invalid++;
+++        const uint32_t *header = gSpf.rejected[index].header;
+++        printf("FUXI AUDIO SPF: rejected reply %u error %d bytes %u header %#x route %#x ports %#x/%#x token %#x opcode %#x\n",
+++            index + 1, gSpf.rejected[index].result, gSpf.rejected[index].length,
+++            header[0], header[1], header[2], header[3], header[4], header[5]);
 ++    }
 ++    if (gSpf.accepted && !gSpf.reported_accepted) {
 ++        gSpf.reported_accepted = 1;
