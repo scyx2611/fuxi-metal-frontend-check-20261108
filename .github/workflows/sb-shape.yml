@@ -8,6 +8,7 @@ on:
     paths:
       - userland/fuxi-shape/**
       - tools/test-flashlight-levels.c
+      - tools/test-vibe-pattern.c
       - .github/workflows/sb-shape.yml
 permissions:
   contents: read
@@ -21,13 +22,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Check flashlight level mapping
+      - name: Check flashlight level mapping and VibePattern segments
         shell: bash
         run: |
           set -euo pipefail
           clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
               -Iuserland/fuxi-shape tools/test-flashlight-levels.c -o /tmp/fuxi-flashlight-levels
           /tmp/fuxi-flashlight-levels
+          clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+              -Iuserland/fuxi-shape tools/test-vibe-pattern.c -o /tmp/fuxi-vibe-pattern
+          /tmp/fuxi-vibe-pattern
       - name: Build, sign ad hoc, check
         shell: bash
         run: |
@@ -38,7 +42,7 @@ jobs:
           mkdir -p out
           "$cc" -target arm64-apple-ios16.0 -isysroot "$sdk" -O2 -Wall -Wextra -Werror -fstack-protector-strong \
               -dynamiclib userland/fuxi-shape/FuxiShape.c userland/fuxi-shape/FuxiFlashlight.c \
-              userland/fuxi-shape/FuxiBatteryAudit.c \
+              userland/fuxi-shape/FuxiBatteryAudit.c userland/fuxi-shape/FuxiVibrate.c \
               -lobjc -framework CoreFoundation -framework IOKit \
               -install_name /usr/local/lib/fuxi/libfuxi-sb.dylib -o out/libfuxi-sb.dylib
           codesign -f -s - out/libfuxi-sb.dylib
