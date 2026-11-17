@@ -13901,6 +13901,77 @@ index 0000000..295f9f5
 +
 +if __name__ == '__main__':
 +    main()
+diff --git a/tools/test-fuxi-prof.py b/tools/test-fuxi-prof.py
+index 5a98ede..f5b9061 100644
+--- a/tools/test-fuxi-prof.py
++++ b/tools/test-fuxi-prof.py
+@@ -56,6 +56,8 @@ static struct task task={&th,0x100000000};
+ static struct region region={0x200000};
+ static unsigned locks,schedlock,high,reads,refs,allocs,frees,starts,threadrefs,output,sleeps,blocks;
+ static unsigned boot_present,boot_value,missing,allocfail,readfail,malformed,cost,non64;
++static unsigned profile_present;
++static const char *profile_name,*process_name="backboardd";
+ static uint64_t ticks,wake,last_leeway;
+ static char logs[500][512];
+ static jmp_buf terminated;
+@@ -65,7 +67,7 @@ static int model_printf(const char *fmt,...) {
+ }
+ #define printf model_printf
+ static task_t proc_task(proc_t p){assert(p==1);return &task;}
+-static void proc_name(int pid,char *out,size_t size){assert(pid==1);snprintf(out,size,"%s",missing?"other":"backboardd");}
++static void proc_name(int pid,char *out,size_t size){assert(pid==1);snprintf(out,size,"%s",missing?"other":process_name);}
+ static int proc_pid(proc_t p){return p;}
+ static void proc_iterate(int which,int (*fn)(proc_t,void *),void *arg,void *filter,void *farg){assert(which==1 && !filter && !farg);fn(1,arg);}
+ static void task_reference(task_t t){assert(t==&task);refs++;}
+@@ -109,12 +111,17 @@ static void kfree_data(void *ptr,size_t size){assert(size && ptr && !locks);free
+ static vm_shared_region_t vm_shared_region_get(task_t t){assert(t==&task);return &region;}
+ static void vm_shared_region_deallocate(vm_shared_region_t sr){assert(sr==&region);}
+ void thread_terminate_self(void){longjmp(terminated,1);}
+-static int PE_parse_boot_argn(const char *name,void *value,unsigned size){assert(!strcmp(name,"sweetprof") && size==4);*(unsigned *)value=boot_value;return boot_present;}
++static int PE_parse_boot_argn(const char *name,void *value,unsigned size){
++ if(!strcmp(name,"sweetprof")){assert(size==4);*(unsigned *)value=boot_value;return boot_present;}
++ assert(!strcmp(name,"sweetprofname") && size==33);
++ if(!profile_present)return 0;
++ size_t length=strlen(profile_name)+1;memcpy(value,profile_name,length<size?length:size);return 1;
++}
+ static int kernel_thread_start(void (*fn)(void *,int),void *arg,thread_t *thread){assert(fn && !arg);starts++;*thread=&th;threadrefs++;return 0;}
+ static void thread_deallocate(thread_t t){assert(t==&th && threadrefs);threadrefs--;}
+ '''
+ TEST = r'''
+-static void reset(void){assert(!refs && !locks && !high && !schedlock);ticks=0;reads=allocs=frees=starts=threadrefs=output=sleeps=blocks=0;missing=allocfail=readfail=malformed=cost=non64=0;th.ss=&regs;th.state=TH_WAIT;th.oncore=0;regs.fp=0x1000;}
++static void reset(void){assert(!refs && !locks && !high && !schedlock);ticks=0;reads=allocs=frees=starts=threadrefs=output=sleeps=blocks=0;missing=allocfail=readfail=malformed=cost=non64=0;profile_present=0;profile_name=NULL;process_name="backboardd";sp_target_name="backboardd";sp_delay=60;th.ss=&regs;th.state=TH_WAIT;th.oncore=0;regs.fp=0x1000;}
+ static void worker(void){if(!setjmp(terminated))sp_worker(NULL,0);assert(!refs && !threadrefs && !locks);}
+ int main(void){
+  reset();for(unsigned present=0;present<2;present++)for(unsigned value=0;value<4;value++){
+@@ -123,6 +130,19 @@ int main(void){
+   assert(sp_delay==(present && value>1?value:60));sp_delay=60;
+  }
+  boot_present=1;boot_value=3601;{unsigned before=starts;sweet_prof_start();assert(starts==before && sp_delay==60);}
++ reset();boot_present=1;boot_value=1;profile_present=1;profile_name=process_name="coreduetd";
++ sweet_prof_start();assert(starts==1 && !strcmp(sp_target_name,"coreduetd"));worker();
++ assert(output==5 && strstr(logs[0],"PROF target coreduetd") && strstr(logs[1],"PROF backboardd[1]"));
++ assert(ticks==120ULL*NSEC_PER_SEC && allocs==1 && frees==1);
++ const char *invalid_names[]={"","a b","../x","a/b","a\nb","abcdefghijklmnopqrstuvwxyzABCDEF","abcdefghijklmnopqrstuvwxyzABCDEFGH"};
++ for(unsigned index=0;index<sizeof(invalid_names)/sizeof(invalid_names[0]);index++){
++  reset();boot_present=1;boot_value=1;profile_present=1;profile_name=invalid_names[index];
++  sweet_prof_start();assert(!starts && !allocs && !sleeps && output==1);
++ }
++ reset();boot_present=1;boot_value=0;profile_present=1;profile_name="coreduetd";
++ sweet_prof_start();assert(!starts && !output && !allocs);
++ reset();boot_present=1;boot_value=10001;sweet_prof_start();assert(starts==1 && !strcmp(sp_target_name,"SpringBoard"));
++ reset();
+  worker();assert(ticks==120ULL*NSEC_PER_SEC && sleeps==30001 && blocks==sleeps && last_leeway==100000);
+  assert(reads==240000 && allocs==1 && frees==1 && output==4);
+  assert(strstr(logs[0],"PROF backboardd[1] slide 0x200000 mh 0x100000000"));
+@@ -174,7 +194,7 @@ int main(void){
+  unsigned summaries=0;for(unsigned i=0;i<output;i++)if(strstr(logs[i]," total="))summaries++;
+  assert(summaries==SP_THREADS);free(p);
+ #undef printf
+- puts("PASS: actual profiler C: boot gate, 60+60s/2ms/leeway, no spin/catch-up/allocation/logging in sweeps, task refs, failure cleanup, states/x16, fault-safe bounded frames, aggregation/mixed/top12/overflow/400-line cap");
++ puts("PASS: actual profiler C: boot gate and named target validation, 60+60s/2ms/leeway, no spin/catch-up/allocation/logging in sweeps, task refs, failure cleanup, states/x16, fault-safe bounded frames, aggregation/mixed/top12/overflow/400-line cap");
+ }
+ '''
+ 
 diff --git a/tools/test-fuxi-ram-admission.py b/tools/test-fuxi-ram-admission.py
 new file mode 100644
 index 0000000..9de8ecd
@@ -30607,6 +30678,41 @@ index 0000000..a7bc35a
 +	n = snprintf(env, size, "DYLD_INSERT_LIBRARIES=%s", library);
 +	return n > 0 && (size_t)n < size;
 +}
+diff --git a/xnu/fuxi-prof/sweet_prof.c b/xnu/fuxi-prof/sweet_prof.c
+index 918263d..6c41976 100644
+--- a/xnu/fuxi-prof/sweet_prof.c
++++ b/xnu/fuxi-prof/sweet_prof.c
+@@ -15,6 +15,7 @@ extern void sweet_prof_task(task_t task,int pid);
+ void sweet_prof_start(void);
+ struct sp_target { task_t task; int pid; };
+ static const char *sp_target_name="backboardd";
++static char sp_named_target[32];
+ static int sp_find(proc_t p,void *arg) {
+  struct sp_target *target=arg;char name[32];proc_name(proc_pid(p),name,sizeof(name));
+  if(!target->task && !strcmp(name,sp_target_name)) {
+@@ -38,8 +39,22 @@ void sweet_prof_start(void) {
+  /* sweetprof=1: start after 60 s; sweetprof=N (2..3600): start after N s. 10000+N samples SpringBoard
+     instead; its lines keep the "PROF backboardd" prefix so the existing parsers still match. */
+  if(!PE_parse_boot_argn("sweetprof",&enabled,sizeof(enabled)) || !enabled)return;
++ sp_target_name="backboardd";sp_delay=60;
+  if(enabled>=10000 && enabled<=13600){sp_target_name="SpringBoard";enabled-=10000;if(!enabled)enabled=1;}
+  if(enabled>3600)return;
++ char requested[33]={0};
++ if(PE_parse_boot_argn("sweetprofname",requested,sizeof(requested))) {
++  size_t length=strnlen(requested,sizeof(requested));
++  if(!length || length>=sizeof(sp_named_target)){printf("PROF invalid target name\n");return;}
++  for(size_t index=0;index<length;index++) {
++   char character=requested[index];
++   if(!((character>='a' && character<='z') || (character>='A' && character<='Z') ||
++        (character>='0' && character<='9') || character=='.' || character=='_' || character=='-')) {
++    printf("PROF invalid target name\n");return;
++   }
++  }
++  memcpy(sp_named_target,requested,length+1);sp_target_name=sp_named_target;
++ }
+  if(enabled>1)sp_delay=enabled;
+  if(kernel_thread_start(sp_worker,NULL,&thread)==KERN_SUCCESS)thread_deallocate(thread);
+ }
 diff --git a/xnu/fuxi-ram-prep/fuxi_ram_bank.c b/xnu/fuxi-ram-prep/fuxi_ram_bank.c
 new file mode 100644
 index 0000000..4d7c4c3
@@ -38692,7 +38798,7 @@ index d95faff..cac8cfa 100644
  +++ b/bsd/dev/fuxi_unixnu_ufs.h
  @@ -0,0 +1,36 @@
 diff --git a/xnu/patches/0111-fuxi-user-profiler.patch b/xnu/patches/0111-fuxi-user-profiler.patch
-index 8349337..34b8d1c 100644
+index 8349337..ed20c83 100644
 --- a/xnu/patches/0111-fuxi-user-profiler.patch
 +++ b/xnu/patches/0111-fuxi-user-profiler.patch
 @@ -18,7 +18,7 @@
@@ -38704,6 +38810,46 @@ index 8349337..34b8d1c 100644
   	 * Stack sampler only, and only on request. sweet_log_start() stays off: it
   	 * would write the tail of ufsroot0, which here is the HFS image itself.
   	 */
+@@ -38,7 +38,7 @@
+  osfmk/kern/host_notify.c		standard
+ --- /dev/null
+ +++ b/bsd/dev/sweet_prof.c
+-@@ -0,0 +1,49 @@
++@@ -0,0 +1,64 @@
+ +/* Opt-in single-process profiler; osfmk owns saved state and aggregation. */
+ +#include <pexpert/arm64/board_config.h>
+ +#if defined(FUXI)
+@@ -56,6 +56,7 @@
+ +void sweet_prof_start(void);
+ +struct sp_target { task_t task; int pid; };
+ +static const char *sp_target_name="backboardd";
+++static char sp_named_target[32];
+ +static int sp_find(proc_t p,void *arg) {
+ + struct sp_target *target=arg;char name[32];proc_name(proc_pid(p),name,sizeof(name));
+ + if(!target->task && !strcmp(name,sp_target_name)) {
+@@ -79,8 +80,22 @@
+ + /* sweetprof=1: start after 60 s; sweetprof=N (2..3600): start after N s. 10000+N samples SpringBoard
+ +    instead; its lines keep the "PROF backboardd" prefix so the existing parsers still match. */
+ + if(!PE_parse_boot_argn("sweetprof",&enabled,sizeof(enabled)) || !enabled)return;
+++ sp_target_name="backboardd";sp_delay=60;
+ + if(enabled>=10000 && enabled<=13600){sp_target_name="SpringBoard";enabled-=10000;if(!enabled)enabled=1;}
+ + if(enabled>3600)return;
+++ char requested[33]={0};
+++ if(PE_parse_boot_argn("sweetprofname",requested,sizeof(requested))) {
+++  size_t length=strnlen(requested,sizeof(requested));
+++  if(!length || length>=sizeof(sp_named_target)){printf("PROF invalid target name\n");return;}
+++  for(size_t index=0;index<length;index++) {
+++   char character=requested[index];
+++   if(!((character>='a' && character<='z') || (character>='A' && character<='Z') ||
+++        (character>='0' && character<='9') || character=='.' || character=='_' || character=='-')) {
+++    printf("PROF invalid target name\n");return;
+++   }
+++  }
+++  memcpy(sp_named_target,requested,length+1);sp_target_name=sp_named_target;
+++ }
+ + if(enabled>1)sp_delay=enabled;
+ + if(kernel_thread_start(sp_worker,NULL,&thread)==KERN_SUCCESS)thread_deallocate(thread);
+ +}
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
 index 0000000..4304d45
