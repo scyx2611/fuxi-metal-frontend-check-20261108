@@ -64,6 +64,21 @@ int main(void)
     }
     assert(added == FX_VIBE_SEGMENTS && pattern.count == FX_VIBE_SEGMENTS && pattern.truncated);
 
+    /* 舊格式：開 100、關 50、總長 400 → 開關開關開（最後一段開被總長截成 100） */
+    assert(fx_vibe_periodic(&pattern, 100, 50, 400) == 300);
+    assert(pattern.count == 5 && pattern.total_ms == 400);
+    assert(pattern.segment[0].on && pattern.segment[0].ms == 100 && !pattern.segment[1].on);
+    assert(pattern.segment[4].on && pattern.segment[4].ms == 100);
+    /* 總長落在開段中間：那段截短；落在關段上：結尾的關段丟掉 */
+    assert(fx_vibe_periodic(&pattern, 100, 100, 250) == 150 && pattern.count == 3 && pattern.total_ms == 250);
+    assert(fx_vibe_periodic(&pattern, 100, 100, 150) == 100 && pattern.count == 1 && pattern.total_ms == 100);
+    /* 沒有總長或關段：只震一段；總長比 on 長就震總長 */
+    assert(fx_vibe_periodic(&pattern, 300, 0, 0) == 300 && pattern.count == 1);
+    assert(fx_vibe_periodic(&pattern, 200, 0, 500) == 500 && pattern.count == 1);
+    assert(fx_vibe_periodic(&pattern, 0, 100, 1000) == 0 && pattern.count == 0);
+    /* 很長的循環被 30 秒總長截斷 */
+    assert(fx_vibe_periodic(&pattern, 1000, 1000, 1000000) == 15000 && pattern.truncated);
+
     /* 長段分次向核心要：每次最多 2000 ms，1500 ms 後續約 */
     assert(fx_vibe_request_ms(5000) == FX_VIBE_REQUEST_MS && fx_vibe_renew_ms(5000) == FX_VIBE_RENEW_MS);
     assert(fx_vibe_request_ms(2000) == 2000 && fx_vibe_renew_ms(2000) == 2000);

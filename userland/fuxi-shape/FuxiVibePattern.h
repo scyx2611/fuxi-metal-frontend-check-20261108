@@ -80,6 +80,31 @@ static inline unsigned fx_vibe_finish(fx_vibe_pattern *pattern)
     return on_ms;
 }
 
+/*
+ * FigVibrator 舊格式（OnDuration／OffDuration／TotalDuration，秒）：開 on、關 off 輪流，直到 total；
+ * total <= 0 或 off <= 0 只震一段 on。回傳開的總毫秒數。
+ */
+static inline unsigned fx_vibe_periodic(fx_vibe_pattern *pattern, long long on_ms, long long off_ms, long long total_ms)
+{
+    fx_vibe_reset(pattern);
+    if (on_ms <= 0) return 0;
+    if (total_ms <= 0 || off_ms <= 0) {
+        (void)fx_vibe_append(pattern, true, total_ms > on_ms ? total_ms : on_ms);
+        return fx_vibe_finish(pattern);
+    }
+    long long used = 0;
+    while (used < total_ms) {
+        long long on = on_ms < total_ms - used ? on_ms : total_ms - used;
+        if (!fx_vibe_append(pattern, true, on)) break;
+        used += on;
+        if (used >= total_ms) break;
+        long long off = off_ms < total_ms - used ? off_ms : total_ms - used;
+        if (!fx_vibe_append(pattern, false, off)) break;
+        used += off;
+    }
+    return fx_vibe_finish(pattern);
+}
+
 /* 開的段剩 remaining 毫秒時，這次要向核心要多久。 */
 static inline unsigned fx_vibe_request_ms(unsigned remaining)
 {

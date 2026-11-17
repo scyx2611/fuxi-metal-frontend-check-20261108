@@ -3,7 +3,10 @@
  *
  * mediaserverd（fxinj bit 2 才會載入）：
  *   -[AVHapticServer(VibeSynthEngine) playVibePattern:gain:synchronizer:flags:atTime:completionHandler:]
- *     系統聲音的震動（來電、通知、kSystemSoundID_Vibrate）走這裡；解析 VibePattern 自己排開關，原實作照呼叫。
+ *     系統聲音的震動（來電、通知、kSystemSoundID_Vibrate）走這裡；解析 VibePattern（或 FigVibrator 舊格式
+ *     OnDuration／OffDuration／TotalDuration 秒數）自己排開關，認不得的格式震 300 ms；原實作照呼叫。
+ *     前提：ADT /product/haptics closed-loop=1（loader --product-haptics），MediaExperience 才會建立震動器、
+ *     走 VibeSynthEngine → HapticServerManager_VibeEnginePlay → 這個方法；沒有的話請求在 MediaExperience 就被丟掉。
  *   -[AVHapticServer(VibeSynthEngine) cancelPatternWithOptions:] 立即停。
  *   AVHapticServerInstance 的 load／prepare／start／stop 只記前幾次，用來確認 CoreHaptics 的請求怎麼進來。
  * SpringBoard：
@@ -40,7 +43,7 @@ extern kern_return_t IOObjectRelease(vb_io_object_t object);
 
 enum { VB_NONE, VB_MEDIA, VB_SPRINGBOARD };
 enum { VB_LOG, VB_PULSE, VB_CANCEL };
-enum { VB_LOG_CALLS = 6, VB_PLAY_LOGS = 12, VB_ERROR_LOGS = 8, VB_TAP_MS = 15 };
+enum { VB_LOG_CALLS = 6, VB_PLAY_LOGS = 12, VB_ERROR_LOGS = 8, VB_TAP_MS = 15, VB_FALLBACK_MS = 300 };
 
 static unsigned vb_role;
 static const char *vb_name = "?";
@@ -216,7 +219,18 @@ static bool vb_number(CFTypeRef value, long long *out, double *real)
     return true;
 }
 
-/* 回傳 0 不能解析，1 解析到（*intensity < 0 表示沒給）。 */
+/* FigVibrator 舊格式的秒數（CMTimeMakeWithSeconds 用的）轉毫秒；沒有或不是數字回 -1。 */
+static long long vb_seconds_ms(CFDictionaryRef dictionary, CFStringRef key)
+{
+    long long whole = 0;
+    double seconds = 0.0;
+    if (!vb_number(CFDictionaryGetValue(dictionary, key), &whole, &seconds)) return -1;
+    if (seconds < 0.0) return -1;
+    if (seconds > 600.0) seconds = 600.0;
+    return (long long)(seconds * 1000.0 + 0.5);
+}
+
+/* 回傳 0 不能解析，1 解析到 VibePattern，2 解析到 OnDuration 舊格式（*intensity < 0 表示沒給）。 */
 static int vb_parse(CFTypeRef object, fx_vibe_pattern *pattern, double *intensity)
 {
     fx_vibe_reset(pattern);
@@ -227,7 +241,13 @@ static int vb_parse(CFTypeRef object, fx_vibe_pattern *pattern, double *intensit
     long long ignored = 0;
     if (level && !vb_number(level, &ignored, intensity)) *intensity = -1.0;
     CFTypeRef list = CFDictionaryGetValue(dictionary, CFSTR("VibePattern"));
-    if (list == NULL || CFGetTypeID(list) != CFArrayGetTypeID()) return 0;
+    if (list == NULL || CFGetTypeID(list) != CFArrayGetTypeID()) {
+        long long on = vb_seconds_ms(dictionary, CFSTR("OnDuration"));
+        if (on <= 0) return 0;
+        (void)fx_vibe_periodic(pattern, on, vb_seconds_ms(dictionary, CFSTR("OffDuration")),
+            vb_seconds_ms(dictionary, CFSTR("TotalDuration")));
+        return 2;
+    }
     CFIndex count = CFArrayGetCount((CFArrayRef)list);
     for (CFIndex index = 0; index + 1 < count; index += 2) {
         long long on = 0, ms = 0;
@@ -419,12 +439,20 @@ static void vb_vibe_request(id pattern, double gain, uintptr_t flags, double whe
     int ok = vb_parse((CFTypeRef)pattern, &parsed, &intensity);
     unsigned on_ms = ok ? fx_vibe_finish(&parsed) : 0;
     bool silent = intensity == 0.0;
-    if (ok && on_ms && !silent) vb_play(&parsed);
+    bool fallback = false;
+    if (!ok && pattern && !silent) {
+        /* 認不得的格式：系統確實要震，至少給一下 VB_FALLBACK_MS，紀錄裡留字典內容 */
+        fx_vibe_reset(&parsed);
+        (void)fx_vibe_append(&parsed, true, VB_FALLBACK_MS);
+        on_ms = fx_vibe_finish(&parsed);
+        fallback = true;
+    }
+    if (on_ms && !silent) vb_play(&parsed);
     if (call < VB_PLAY_LOGS) {
         vb_say("vibe play call=%u pattern=%s ok=%d segments=%u total=%ums on=%ums truncated=%u intensity=%.2f "
-            "gain=%.2f flags=%#lx at=%.3f%s\n", call + 1, pattern ? object_getClassName(pattern) : "nil", ok,
+            "gain=%.2f flags=%#lx at=%.3f%s%s\n", call + 1, pattern ? object_getClassName(pattern) : "nil", ok,
             parsed.count, parsed.total_ms, on_ms, parsed.truncated, intensity, gain, (unsigned long)flags, when,
-            silent ? " silent" : "");
+            silent ? " silent" : "", fallback ? " fallback" : "");
         if (call < 3) vb_describe("vibe pattern", (CFTypeRef)pattern);
     }
 }
