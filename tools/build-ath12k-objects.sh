@@ -32,7 +32,9 @@ fi
 export UNIXNU_XNU_ARCH=arm64 UNIXNU_IOS_VERSION=16.0
 export PYTHONPATH=$work/UniXNU/scripts${PYTHONPATH:+:$PYTHONPATH}
 python3 - "$work/Ath12kWifi/tools/fetch-sources.py" \
-    "$work/UniXNU-sheng/scripts/build-ath12k-wifi.py" <<'PY'
+    "$work/UniXNU-sheng/scripts/build-ath12k-wifi.py" \
+    "$(cd "$(dirname "$0")" && pwd)/ath12k-scan-dwell.py" \
+    "$(cd "$(dirname "$0")/../tests" && pwd)/test-ath12k-scan-dwell.py" <<'PY'
 from pathlib import Path
 import sys
 path = Path(sys.argv[1])
@@ -49,6 +51,15 @@ new = 'TRIPLE = "arm64-apple-macos15.5"'
 if text.count(old) != 1:
     raise SystemExit("pinned ath12k target import changed")
 path.write_text(text.replace(old, new))
+text = path.read_text()
+old = "clang = subprocess.run(['xcrun', '-f', 'clang']"
+new = ("subprocess.run([sys.executable, " + repr(str(Path(sys.argv[3]).resolve())) +
+       ", str(module)], check=True)\n"
+       "subprocess.run([sys.executable, " + repr(str(Path(sys.argv[4]).resolve())) +
+       ", str(module)], check=True)\n" + old)
+if text.count(old) != 1:
+    raise SystemExit("pinned ath12k compiler setup changed")
+path.write_text(text.replace(old, new))
 PY
 python3 "$work/UniXNU-sheng/scripts/build-ath12k-wifi.py" "$work/Ath12kWifi" "$work/objects" > "$work/objects.txt"
 sed -n 's/^OBJ //p' "$work/objects.txt" > "$work/objects.list"
@@ -58,6 +69,7 @@ xcrun ld -r -arch arm64 -platform_version macos 15.5 15.5 \
 xcrun nm -u "$out/fuxi_ath12k.o" | sort -u > "$out/fuxi_ath12k.undefined.txt"
 xcrun nm -g --defined-only "$out/fuxi_ath12k.o" | awk '{print $3}' | grep -v '^_nwk_' | sort -u > "$out/fuxi_ath12k.exports.txt"
 cp "$work/objects/build-report.json" "$out/fuxi_ath12k.build-report.json"
+cp "$work/Ath12kWifi/out/fuxi-scan-dwell.json" "$out/fuxi_ath12k.scan-dwell.json"
 xcrun size -m "$out/fuxi_ath12k.o" > "$out/fuxi_ath12k.size.txt"
 xcrun vtool -show-build "$out/fuxi_ath12k.o" > "$out/fuxi_ath12k.platform.txt"
 shasum -a 256 "$out/fuxi_ath12k.o"

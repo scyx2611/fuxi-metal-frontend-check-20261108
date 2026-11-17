@@ -6,6 +6,8 @@ on:
       - codex/adsp-battery
     paths:
       - tools/build-ath12k-objects.sh
+      - tools/ath12k-scan-dwell.py
+      - tests/test-ath12k-scan-dwell.py
       - .github/workflows/ath12k-objects.yml
 permissions:
   contents: read
