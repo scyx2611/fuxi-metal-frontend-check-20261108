@@ -45,6 +45,7 @@ jobs:
           "$cc" -target arm64-apple-ios16.0 -isysroot "$sdk" -O2 -Wall -Wextra -Werror -fstack-protector-strong \
               -dynamiclib userland/fuxi-shape/FuxiShape.c userland/fuxi-shape/FuxiFlashlight.c \
               userland/fuxi-shape/FuxiBatteryAudit.c userland/fuxi-shape/FuxiVibrate.c \
+              userland/fuxi-shape/FuxiWifiAudit.c \
               -lobjc -framework CoreFoundation -framework IOKit \
               -install_name /usr/local/lib/fuxi/libfuxi-sb.dylib -o out/libfuxi-sb.dylib
           codesign -f -s - out/libfuxi-sb.dylib
