@@ -13,6 +13,8 @@
  *   -[SBFTapticEngine actuateFeedback:]、-[_UITapticEngine actuateFeedback:] 先震 15 ms 再呼叫原實作；
  *   -[SBFTapticEngine supportsFeedbackActuation] 在核心執行期可用時回 YES。
  *   ADT fuxi,haptic=3（開機自測）時，30 秒後經系統路徑各試一次 AudioServicesPlaySystemSound。
+ * mediaserverd 在 fuxi,haptic=3 時另跑探針：10 秒與 75 秒各讀一次震動器建立的關卡，77 秒直接呼叫
+ *   CMSessionMgrVibrateForSystemSoundWithOptions 看回傳值。
  *
  * 參數一律以 method_getTypeEncoding 驗證後原樣傳遞；不認得的簽名就不掛。紀錄寫到 stderr
  * （mediaserverd 要配 loader --stderr-log mediaserverd 才進核心紀錄）。
@@ -608,6 +610,107 @@ static void *vb_selftest(void *argument)
     return NULL;
 }
 
+/*
+ * ---- mediaserverd 探針（fuxi,haptic=3）----
+ * MediaExperience 只在「關卡」通過時建立震動器：關卡用 dispatch_once 載入 libVibeSynthEngine 問
+ * VibeSynthEngineHasHardwareSupport（＝MobileGestalt DeviceSupportsClosedLoopHaptics），結果存成一個位元組；
+ * 不成立再找名為 "vibrator" 的 IOService。建立後的震動器存在一個全域指標。這幾個值沒有匯出，
+ * 只能用 iOS 16.7 這份 shared cache 的未滑動位址讀：先用匯出符號算 slide，再比對關卡函式開頭的指令，不符就不讀。
+ */
+static const uint64_t VB_ME_VIBRATE = 0x195ad742cULL;  /* _CMSessionMgrVibrateForSystemSoundWithOptions */
+static const uint64_t VB_ME_GATE = 0x195a93ab0ULL;     /* 關卡函式；開頭是 stp x20, x19, [sp, #-0x20]! */
+static const uint32_t VB_ME_GATE_WORD = 0xa9be4ff4U;
+static const uint64_t VB_ME_ONCE = 0x1dd2ef740ULL;     /* dispatch_once 的 predicate（做完是 -1） */
+static const uint64_t VB_ME_HW = 0x1dd2efcf8ULL;       /* HasHardwareSupport 的結果 */
+static const uint64_t VB_ME_HANDLE = 0x1dd2efa68ULL;   /* libVibeSynthEngine 的 dlopen handle（不支援時會被清掉） */
+static const uint64_t VB_ME_VIBRATOR = 0x1dd2efcb8ULL; /* 建立好的震動器 */
+#define VB_ENGINE_PATH "/System/Library/Frameworks/AudioToolbox.framework/libVibeSynthEngine.dylib"
+
+static uintptr_t vb_strip(const void *pointer)
+{
+    return (uintptr_t)pointer & 0x0000007fffffffffULL;
+}
+
+static void vb_probe(const char *when, bool call)
+{
+    typedef unsigned char (*mg_bool_t)(CFStringRef);
+    typedef unsigned char (*engine_bool_t)(void);
+    typedef int (*engine_init_t)(void);
+    typedef int (*vibrate_t)(uint32_t, CFDictionaryRef);
+    mg_bool_t mg = (mg_bool_t)dlsym(RTLD_DEFAULT, "MGGetBoolAnswer");
+    int closed_loop = mg ? mg(CFSTR("gqDnklGQnpv5ilgh5uHckw")) : -1;
+    void *loaded = dlopen(VB_ENGINE_PATH, RTLD_NOLOAD | RTLD_LAZY | RTLD_LOCAL);
+    void *engine = loaded ? loaded : dlopen(VB_ENGINE_PATH, RTLD_LAZY | RTLD_LOCAL);
+    engine_bool_t has_hw = engine ? (engine_bool_t)dlsym(engine, "VibeSynthEngineHasHardwareSupport") : NULL;
+    int support = has_hw ? has_hw() : -1;
+    void *vibrate_symbol = dlsym(RTLD_DEFAULT, "CMSessionMgrVibrateForSystemSoundWithOptions");
+    uintptr_t vibrate_address = vb_strip(vibrate_symbol);
+    uintptr_t slide = vibrate_address - (uintptr_t)VB_ME_VIBRATE;
+    bool layout = vibrate_address && (slide & 0x3fff) == 0 &&
+                  *(volatile const uint32_t *)((uintptr_t)VB_ME_GATE + slide) == VB_ME_GATE_WORD;
+    long once = 0;
+    unsigned hw_byte = 0;
+    uintptr_t handle = 0, vibrator = 0;
+    if (layout) {
+        once = *(volatile const long *)((uintptr_t)VB_ME_ONCE + slide);
+        hw_byte = *(volatile const uint8_t *)((uintptr_t)VB_ME_HW + slide);
+        handle = *(volatile const uintptr_t *)((uintptr_t)VB_ME_HANDLE + slide);
+        vibrator = *(volatile const uintptr_t *)((uintptr_t)VB_ME_VIBRATOR + slide);
+    }
+    vb_say("vibe probe %s mg-closed-loop=%d engine-loaded=%d has-hw=%d layout=%d once=%ld hw-byte=%u handle=%d "
+           "vibrator=%d\n", when, closed_loop, loaded != NULL, support, layout, once, hw_byte, handle != 0,
+           vibrator != 0);
+    if (layout && vibrator) {
+        /* 震動器的 VibeSynthEngine 函式指標（+0x18 Initialize … +0x38 Cancel）與 +0x40 的狀態 */
+        const uintptr_t *slots = (const uintptr_t *)vibrator;
+        vb_say("vibe probe %s vibrator init=%d prewarm=%d/%d play=%d cancel=%d state=0x%04x\n", when,
+               slots[3] != 0, slots[4] != 0, slots[5] != 0, slots[6] != 0, slots[7] != 0,
+               *(const uint16_t *)(vibrator + 0x40));
+    } else if (layout && hw_byte && engine) {
+        /* 關卡過了卻沒有震動器：多半是 VibeSynthEngineInitialize 失敗，自己問一次它回什麼 */
+        engine_init_t initialize = (engine_init_t)dlsym(engine, "VibeSynthEngineInitialize");
+        vb_say("vibe probe %s VibeSynthEngineInitialize rc=%d\n", when, initialize ? initialize() : -1);
+    }
+    if (call && vibrate_symbol) {
+        /* 直接走 MediaExperience 的系統聲音震動入口：rc 0 且 playVibePattern 有記錄，問題就在 SSServer 之前 */
+        float seconds = 0.2f;
+        CFNumberRef duration = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloatType, &seconds);
+        const void *keys[] = {CFSTR("Duration")};
+        const void *values[] = {duration};
+        CFDictionaryRef options = duration ? CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks) : NULL;
+        if (options) {
+            int rc = ((vibrate_t)vibrate_symbol)(4095, options);
+            vb_say("vibe probe %s CMSessionMgrVibrateForSystemSoundWithOptions(4095, Duration 0.2) rc=%d\n", when, rc);
+            CFRelease(options);
+        }
+        if (duration) CFRelease(duration);
+    }
+}
+
+static void *vb_probe_thread(void *argument)
+{
+    (void)argument;
+    sleep(10);
+    vb_probe("early", false);
+    sleep(65); /* SpringBoard 自測在它啟動後 30 秒、約 8 秒做完；這時應該已經過了 */
+    vb_probe("late", false);
+    sleep(2);
+    vb_probe("direct", true);
+    return NULL;
+}
+
+static void vb_spawn(void *(*body)(void *), const char *what)
+{
+    pthread_t thread;
+    pthread_attr_t attributes;
+    if (pthread_attr_init(&attributes) != 0) return;
+    if (pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED) == 0 &&
+        pthread_create(&thread, &attributes, body, NULL) == 0)
+        vb_say("%s\n", what);
+    (void)pthread_attr_destroy(&attributes);
+}
+
 __attribute__((constructor)) static void fuxi_vibrate_init(void)
 {
     const char *name = getprogname();
@@ -623,14 +726,7 @@ __attribute__((constructor)) static void fuxi_vibrate_init(void)
     }
     vb_say("vibrate kern.fuxivibrate ready; installing haptic hooks\n");
     _dyld_register_func_for_add_image(vb_image_added);
-    if (vb_role == VB_SPRINGBOARD && vb_adt_haptic() == 3) {
-        pthread_t thread;
-        pthread_attr_t attributes;
-        if (pthread_attr_init(&attributes) == 0) {
-            if (pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED) == 0 &&
-                pthread_create(&thread, &attributes, vb_selftest, NULL) == 0)
-                vb_say("vibe selftest scheduled in 30 s (fuxi,haptic=3)\n");
-            (void)pthread_attr_destroy(&attributes);
-        }
-    }
+    if (vb_adt_haptic() != 3) return;
+    if (vb_role == VB_SPRINGBOARD) vb_spawn(vb_selftest, "vibe selftest scheduled in 30 s (fuxi,haptic=3)");
+    if (vb_role == VB_MEDIA) vb_spawn(vb_probe_thread, "vibe probe scheduled at 10/75/77 s (fuxi,haptic=3)");
 }
