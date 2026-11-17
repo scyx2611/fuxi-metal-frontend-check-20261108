@@ -14,6 +14,10 @@ static IMP wifi_audit_match_original, wifi_audit_preflight_original, wifi_audit_
 static IMP wifi_audit_xpc_original, wifi_audit_filtered_original;
 static unsigned wifi_audit_match_calls, wifi_audit_preflight_calls, wifi_audit_profile_calls;
 static unsigned wifi_audit_xpc_calls, wifi_audit_filtered_calls;
+static IMP wifi_audit_known_original, wifi_audit_native_known_original, wifi_audit_allow_original;
+static IMP wifi_audit_sort_original, wifi_audit_transition_original;
+static unsigned wifi_audit_known_calls, wifi_audit_native_known_calls, wifi_audit_allow_calls;
+static unsigned wifi_audit_sort_calls, wifi_audit_transition_calls;
 
 static void wifi_audit_say(const char *line)
 {
@@ -205,6 +209,90 @@ static id wifi_audit_filtered(id self, SEL selector, id properties)
     return result;
 }
 
+static bool wifi_audit_known_call(IMP original, const char *stage, unsigned *calls, id self, SEL selector,
+    id profile, intptr_t trigger, id transition, bool *deferred, id *error)
+{
+    bool result = ((bool (*)(id, SEL, id, intptr_t, id, bool *, id *))original)(
+        self, selector, profile, trigger, transition, deferred, error);
+    unsigned call = __atomic_fetch_add(calls, 1u, __ATOMIC_RELAXED);
+    if (call < 48) {
+        id failure = !result && error ? *error : NULL;
+        char line[400];
+        int length = snprintf(line, sizeof(line),
+            "fuxi: wifid: %s call=%u ssid-id=%08x trigger=%ld transition=%u allowed=%u deferred=%d "
+            "error-present=%u error=%ld autojoin-off=%ld captive=%ld was-captive=%ld\n", stage, call + 1,
+            wifi_audit_ssid(profile), (long)trigger, transition != NULL, result,
+            deferred ? (int)*deferred : -1, failure != NULL, (long)wifi_audit_integer(failure, "code"),
+            (long)wifi_audit_integer(profile, "isAutoJoinDisabled"), (long)wifi_audit_integer(profile, "isCaptive"),
+            (long)wifi_audit_integer(profile, "wasCaptive"));
+        if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+    }
+    return result;
+}
+
+static bool wifi_audit_known(id self, SEL selector, id profile, intptr_t trigger, id transition, bool *deferred,
+    id *error)
+{
+    return wifi_audit_known_call(wifi_audit_known_original, "known decision", &wifi_audit_known_calls,
+        self, selector, profile, trigger, transition, deferred, error);
+}
+
+static bool wifi_audit_native_known(id self, SEL selector, id profile, intptr_t trigger, id transition,
+    bool *deferred, id *error)
+{
+    return wifi_audit_known_call(wifi_audit_native_known_original, "native known decision",
+        &wifi_audit_native_known_calls, self, selector, profile, trigger, transition, deferred, error);
+}
+
+static bool wifi_audit_allow(id self, SEL selector, id scan, intptr_t trigger, bool *deferred, id *error)
+{
+    bool result = ((bool (*)(id, SEL, id, intptr_t, bool *, id *))wifi_audit_allow_original)(
+        self, selector, scan, trigger, deferred, error);
+    unsigned call = __atomic_fetch_add(&wifi_audit_allow_calls, 1u, __ATOMIC_RELAXED);
+    if (call < 32) {
+        id failure = !result && error ? *error : NULL;
+        char line[240];
+        int length = snprintf(line, sizeof(line),
+            "fuxi: wifid: join decision call=%u ssid-id=%08x trigger=%ld allowed=%u deferred=%d "
+            "error-present=%u error=%ld\n", call + 1, wifi_audit_ssid(scan), (long)trigger, result,
+            deferred ? (int)*deferred : -1, failure != NULL, (long)wifi_audit_integer(failure, "code"));
+        if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+    }
+    return result;
+}
+
+static void wifi_audit_sort(id self, SEL selector, id scans, id context)
+{
+    ((void (*)(id, SEL, id, id))wifi_audit_sort_original)(self, selector, scans, context);
+    unsigned call = __atomic_fetch_add(&wifi_audit_sort_calls, 1u, __ATOMIC_RELAXED);
+    if (call < 12) {
+        char line[160];
+        int length = snprintf(line, sizeof(line), "fuxi: wifid: sorted candidates call=%u count=%ld\n",
+            call + 1, (long)wifi_audit_integer(scans, "count"));
+        if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+        wifi_audit_networks("sorted candidate", call + 1, scans);
+    }
+}
+
+static bool wifi_audit_transition(id self, SEL selector, id scan, id previous, intptr_t trigger)
+{
+    bool result = ((bool (*)(id, SEL, id, id, intptr_t))wifi_audit_transition_original)(
+        self, selector, scan, previous, trigger);
+    unsigned call = __atomic_fetch_add(&wifi_audit_transition_calls, 1u, __ATOMIC_RELAXED);
+    if (call < 48) {
+        id channel = wifi_audit_object(scan, "channel");
+        char line[320];
+        int length = snprintf(line, sizeof(line),
+            "fuxi: wifid: transition decision call=%u ssid-id=%08x previous=%u previous-id=%08x "
+            "trigger=%ld allowed=%u channel=%ld channel-flags=%ld six-ghz=%ld\n", call + 1, wifi_audit_ssid(scan),
+            previous != NULL, wifi_audit_ssid(previous), (long)trigger, result,
+            (long)wifi_audit_integer(channel, "channel"), (long)wifi_audit_integer(channel, "flags"),
+            (long)wifi_audit_integer(channel, "is6GHz"));
+        if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+    }
+    return result;
+}
+
 static void wifi_audit_install_candidates(void)
 {
     static struct {
@@ -221,7 +309,17 @@ static void wifi_audit_install_candidates(void)
         {"CWFXPCConnection", "__matchedScanResultsWithKnownNetworkProfiles:scanResults:", "@@@",
             (IMP)wifi_audit_xpc, &wifi_audit_xpc_original, 0},
         {"CWFScanResult", "filteredScanResultWithProperties:", "@@",
-            (IMP)wifi_audit_filtered, &wifi_audit_filtered_original, 0}
+            (IMP)wifi_audit_filtered, &wifi_audit_filtered_original, 0},
+        {"CWFAutoJoinManager", "__allowKnownNetwork:trigger:allowForSeamlessSSIDTransition:defer:error:", "b@q@^^",
+            (IMP)wifi_audit_known, &wifi_audit_known_original, 0},
+        {"CWFAutoJoinManager", "__calloutToAllowKnownNetwork:trigger:allowForSeamlessSSIDTransition:defer:error:",
+            "b@q@^^", (IMP)wifi_audit_native_known, &wifi_audit_native_known_original, 0},
+        {"CWFAutoJoinManager", "__allowJoinCandidate:trigger:defer:error:", "b@q^^",
+            (IMP)wifi_audit_allow, &wifi_audit_allow_original, 0},
+        {"CWFAutoJoinManager", "__sortJoinCandidates:context:", "v@@",
+            (IMP)wifi_audit_sort, &wifi_audit_sort_original, 0},
+        {"CWFAutoJoinManager", "__candidateSupportsSeamlessSSIDTransition:fromNetwork:trigger:", "b@@q",
+            (IMP)wifi_audit_transition, &wifi_audit_transition_original, 0}
     };
     for (unsigned index = 0; index < sizeof(hooks) / sizeof(hooks[0]); index++) {
         if (__atomic_load_n(&hooks[index].done, __ATOMIC_ACQUIRE)) continue;
