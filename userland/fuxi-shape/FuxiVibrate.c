@@ -608,12 +608,100 @@ static void vb_install_supports(void)
     (void)method_setImplementation(method, (IMP)vb_supports);
 }
 
+static IMP vb_feedback_engine_original, vb_feedback_play_original;
+static unsigned vb_feedback_engine_done, vb_feedback_play_done;
+static unsigned vb_feedback_engine_calls, vb_feedback_play_calls;
+
+static intptr_t vb_feedback_integer(id target, const char *name)
+{
+    if (target == NULL) return -1;
+    SEL selector = sel_registerName(name);
+    Method method = class_getInstanceMethod(object_getClass(target), selector);
+    char type[32];
+    if (method == NULL || method_getNumberOfArguments(method) != 2) return -1;
+    method_getReturnType(method, type, sizeof(type));
+    const char *result = vb_skip_qualifiers(type);
+    if (*result == '\0' || strchr("cCiIsSlLqQB", *result) == NULL) return -1;
+    return ((intptr_t (*)(id, SEL))method_getImplementation(method))(target, selector);
+}
+
+static id vb_feedback_engine(id self, SEL selector, id feedback)
+{
+    id engine = ((id (*)(id, SEL, id))vb_feedback_engine_original)(self, selector, feedback);
+    unsigned call = __atomic_fetch_add(&vb_feedback_engine_calls, 1u, __ATOMIC_RELAXED);
+    if (call < VB_PLAY_LOGS)
+        vb_say("feedback engine call=%u feedback=%s engine=%s enabled=%ld types=%ld playable=%ld\n",
+            call + 1, feedback ? object_getClassName(feedback) : "nil", engine ? object_getClassName(engine) : "nil",
+            (long)vb_feedback_integer(engine, "isEnabled"),
+            (long)vb_feedback_integer(feedback, "_effectiveEnabledFeedbackTypes"),
+            (long)vb_feedback_integer(feedback, "_effectivePlayableFeedbackTypes"));
+    return engine;
+}
+
+static void vb_feedback_play(id self, SEL selector, id data, double when, id feedback, uintptr_t types, id player,
+    id completion)
+{
+    unsigned call = __atomic_fetch_add(&vb_feedback_play_calls, 1u, __ATOMIC_RELAXED);
+    if (call < VB_PLAY_LOGS)
+        vb_say("feedback dispatch call=%u engine=%s feedback=%s types=%#lx enabled=%ld suspended=%ld "
+            "state=%ld at=%.3f\n", call + 1, object_getClassName(self),
+            feedback ? object_getClassName(feedback) : "nil", (unsigned long)types,
+            (long)vb_feedback_integer(self, "isEnabled"),
+            (long)vb_feedback_integer(self, "_internal_isSuspended"),
+            (long)vb_feedback_integer(self, "_state"), when);
+    ((void (*)(id, SEL, id, double, id, uintptr_t, id, id))vb_feedback_play_original)(self, selector, data, when,
+        feedback, types, player, completion);
+}
+
+static void vb_install_feedback(void)
+{
+    Class target = objc_getClass("_UIFeedbackEngine");
+    if (target == NULL) return;
+    if (!__atomic_load_n(&vb_feedback_engine_done, __ATOMIC_ACQUIRE)) {
+        Method method = class_getClassMethod(target, sel_registerName("engineForFeedback:"));
+        if (method && !__atomic_exchange_n(&vb_feedback_engine_done, 1u, __ATOMIC_ACQ_REL)) {
+            char result[32];
+            method_getReturnType(method, result, sizeof(result));
+            if (method_getNumberOfArguments(method) == 3 && vb_skip_qualifiers(result)[0] == '@' &&
+                vb_arg(method, 2) == 'x') {
+                vb_feedback_engine_original = method_getImplementation(method);
+                (void)method_setImplementation(method, (IMP)vb_feedback_engine);
+                vb_say("feedback engineForFeedback hooked %s\n", method_getTypeEncoding(method));
+            } else {
+                vb_say("feedback engineForFeedback refused encoding %s\n", method_getTypeEncoding(method));
+            }
+        }
+    }
+    if (!__atomic_load_n(&vb_feedback_play_done, __ATOMIC_ACQUIRE)) {
+        Method method = class_getInstanceMethod(target, sel_registerName(
+            "_internal_playFeedbackData:atTime:feedback:effectiveFeedbackType:existingPlayer:withCompletionBlock:"));
+        if (method && !__atomic_exchange_n(&vb_feedback_play_done, 1u, __ATOMIC_ACQ_REL)) {
+            char result[32];
+            method_getReturnType(method, result, sizeof(result));
+            bool usable = method_getNumberOfArguments(method) == 8 && vb_skip_qualifiers(result)[0] == 'v' &&
+                vb_arg(method, 2) == 'x' && vb_arg(method, 3) == 'd';
+            for (unsigned argument = 4; usable && argument < 8; argument++)
+                usable = vb_arg(method, argument) == 'x';
+            if (usable) {
+                vb_feedback_play_original = method_getImplementation(method);
+                (void)method_setImplementation(method, (IMP)vb_feedback_play);
+                vb_say("feedback internal dispatch hooked %s\n", method_getTypeEncoding(method));
+            } else {
+                vb_say("feedback internal dispatch refused encoding %s\n", method_getTypeEncoding(method));
+            }
+        }
+    }
+}
+
 static void vb_image_added(const struct mach_header *header, intptr_t slide)
 {
     (void)header;
     (void)slide;
     if (vb_role == VB_MEDIA) vb_install_play();
-    if (vb_role == VB_SPRINGBOARD) vb_install_supports();
+    if (vb_role == VB_SPRINGBOARD) {
+        vb_install_supports();
+        vb_install_feedback();
+    }
     for (unsigned index = 0; index < VB_HOOKS; index++) vb_install(index);
 }
 
