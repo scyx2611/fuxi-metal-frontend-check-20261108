@@ -521,8 +521,9 @@ static bool vb_vibe_request(id pattern, double gain, uintptr_t flags, double whe
     if (silent) fx_vibe_reset(&parsed);
     bool queued = vb_play(&parsed, completion);
     if (call < VB_PLAY_LOGS) {
-        vb_say("vibe play call=%u pattern=%s ok=%d segments=%u total=%ums on=%ums truncated=%u intensity=%.2f "
-            "gain=%.2f flags=%#lx at=%.3f%s%s\n", call + 1, pattern ? object_getClassName(pattern) : "nil", ok,
+        vb_say("vibe play call=%u uptime-ms=%llu pattern=%s ok=%d segments=%u total=%ums on=%ums truncated=%u intensity=%.2f "
+            "gain=%.2f flags=%#lx at=%.3f%s%s\n", call + 1, (unsigned long long)vb_now_ms(),
+            pattern ? object_getClassName(pattern) : "nil", ok,
             parsed.count, parsed.total_ms, on_ms, parsed.truncated, intensity, gain, (unsigned long)flags, when,
             silent ? " silent" : "", fallback ? " fallback" : "");
         if (call < 6) vb_describe("vibe pattern", (CFTypeRef)pattern);

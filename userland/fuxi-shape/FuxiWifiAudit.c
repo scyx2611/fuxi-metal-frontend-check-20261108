@@ -48,8 +48,21 @@ static intptr_t wifi_audit_integer(id object, const char *name)
     char type[32];
     if (method == NULL || method_getNumberOfArguments(method) != 2) return -1;
     method_getReturnType(method, type, sizeof(type));
-    if (type[0] == '\0' || strchr("cCiIsSlLqQB", type[0]) == NULL) return -1;
-    return ((intptr_t (*)(id, SEL))method_getImplementation(method))(object, selector);
+    const char *value = type;
+    while (*value && strchr("rnNoORV", *value)) value++;
+    IMP implementation = method_getImplementation(method);
+    switch (*value) {
+        case 'c': return ((int8_t (*)(id, SEL))implementation)(object, selector);
+        case 'C': return ((uint8_t (*)(id, SEL))implementation)(object, selector);
+        case 's': return ((int16_t (*)(id, SEL))implementation)(object, selector);
+        case 'S': return ((uint16_t (*)(id, SEL))implementation)(object, selector);
+        case 'i': return ((int32_t (*)(id, SEL))implementation)(object, selector);
+        case 'I': return ((uint32_t (*)(id, SEL))implementation)(object, selector);
+        case 'l': case 'q': return ((intptr_t (*)(id, SEL))implementation)(object, selector);
+        case 'L': case 'Q': return (intptr_t)((uintptr_t (*)(id, SEL))implementation)(object, selector);
+        case 'B': return ((bool (*)(id, SEL))implementation)(object, selector);
+        default: return -1;
+    }
 }
 
 static uint32_t wifi_audit_ssid(id object)
@@ -73,9 +86,12 @@ static void wifi_audit_network(const char *stage, unsigned call, unsigned index,
     char line[480];
     int length = snprintf(line, sizeof(line),
         "fuxi: wifid: %s call=%u index=%u ssid-id=%08x age-ms=%ld rssi=%ld security=%ld "
-        "wpa2=%ld psk=%ld autojoin-off=%ld disallowed=%ld fils=%ld\n", stage, call, index, wifi_audit_ssid(object),
+        "security-mask=%ld effective-mask=%ld wpa2=%ld psk=%ld autojoin-off=%ld disallowed=%ld fils=%ld\n",
+        stage, call, index, wifi_audit_ssid(object),
         (long)wifi_audit_integer(object, "age"), (long)wifi_audit_integer(object, "RSSI"),
         (long)wifi_audit_integer(object, "strongestSupportedSecurityType"),
+        (long)wifi_audit_integer(object, "supportedSecurityTypes"),
+        (long)wifi_audit_integer(object, "effectiveSupportedSecurityTypes"),
         (long)wifi_audit_integer(object, "isWPA2"), (long)wifi_audit_integer(object, "isPSK"),
         (long)wifi_audit_integer(object, "isAutoJoinDisabled"),
         (long)wifi_audit_integer(object, "isAssociationDisallowed"),
