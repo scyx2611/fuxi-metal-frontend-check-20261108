@@ -3764,7 +3764,7 @@ index 0000000..21fe2c5
 +script now completes without a DROPPED read has to be observed on the
 +device; until then the torch remains unverified.
 diff --git a/docs-lanes/wifi-ios.md b/docs-lanes/wifi-ios.md
-index 326195b..bf1c91b 100644
+index 326195b..dd03442 100644
 --- a/docs-lanes/wifi-ios.md
 +++ b/docs-lanes/wifi-ios.md
 @@ -1,14 +1,21 @@
@@ -3848,7 +3848,34 @@ index 326195b..bf1c91b 100644
  
  The fake backend reports **Fuxi Loopback**, an open BSS on channel 1, RSSI
  −42 dBm. It honors SSID/channel scan filters, accepts only that BSS, rejects
-@@ -261,3 +296,29 @@ through 0104 were applied on the available local base; already present
+@@ -231,6 +266,26 @@ DHCP emulation, Mesa, metal2vulkan and NativeMetal. They are unnecessary for
+ this iOS shim or belong to later hardware/userland work. WPA arithmetic alone
+ does not supply retransmissions or a working radio supplicant.
+ 
++## Opt-in CoreWiFi scan audit (2026-11-17)
++
++The existing HackiOS-derived exec injection helper also accepts bit 8 for the exact
++`/usr/sbin/wifid` executable. All previous masks retain their behavior; without bit 8
++the daemon receives no library. The shared `libfuxi-sb.dylib` contains `FuxiWifiAudit.c`,
++which checks Objective-C signatures before observing the original
++`CWFScanResult initWithScanRecord:includeProperties:` result and
++`CWFScanParameters includeScanResults` getter. It reports at most 96 conversions
++and 24 filter queries: creation success, an SSID identifier, age, RSSI, AP mode,
++ESS status, maximum age, minimum RSSI, BSS type and include-list presence/count.
++It never changes scan parameters or results and never formats a dictionary,
++password, keychain entry or key material.
++
++This reuses the workspace injection/diagnostic approach and the owning 20H392
++IO80211/CoreWiFi framework behavior. On the latest captured boot, native scans
++finish and IO80211 delivers 35/40/48 networks, but autojoin still has no candidate;
++the previous missing-password errors are absent. Runtime conversion/filter
++observations are needed before attributing the remaining failure to a specific
++filter or driver field.
++
+ ## Host validation
+ 
+ ```sh
+@@ -261,3 +316,29 @@ through 0104 were applied on the available local base; already present
  hunk counts and application of every generated source/integration hunk.
  Existing `tools/test-fuxi-h1.py` and `tools/test-fuxi-wlan-w14.py` also pass.
  No phone tools, CI/workflow, push or firmware/blob copy was used.
@@ -13867,10 +13894,10 @@ index 0000000..172d1eb
 +    unittest.main(verbosity=2)
 diff --git a/tools/test-fuxi-exec-inject.py b/tools/test-fuxi-exec-inject.py
 new file mode 100644
-index 0000000..4050eb8
+index 0000000..b0ca5bb
 --- /dev/null
 +++ b/tools/test-fuxi-exec-inject.py
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,65 @@
 +import os
 +from pathlib import Path
 +import subprocess
@@ -13894,13 +13921,18 @@ index 0000000..4050eb8
 +{
 +    const char *sb = "/System/Library/CoreServices/SpringBoard.app/SpringBoard";
 +    const char *media = "/usr/sbin/mediaserverd";
++    const char *wifi = "/usr/sbin/wifid";
 +    const char *app = "/Applications/MobileSafari.app/MobileSafari";
 +    char env[FUXI_INJECT_ENV_MAX];
 +
-+    assert(FUXI_INJECT_ALL == 7u);
-+    for (unsigned mode = 0; mode < 8; mode++) {
++    assert(FUXI_INJECT_ALL == 15u);
++    for (unsigned mode = 0; mode < 16; mode++) {
 +        assert(same(fuxi_inject_library(mode, sb, "SpringBoard"), (mode & 2u) ? FUXI_INJECT_SB_LIB : NULL));
 +        assert(same(fuxi_inject_library(mode, media, "mediaserverd"), (mode & 4u) ? FUXI_INJECT_SB_LIB : NULL));
++        assert(same(fuxi_inject_library(mode, wifi, "wifid"), (mode & 8u) ? FUXI_INJECT_SB_LIB : NULL));
++        assert(!fuxi_inject_library(mode, "/var/tmp/wifid", "wifid"));
++        assert(!fuxi_inject_library(mode, "/usr/sbin/wifid2", "wifid2"));
++        assert(!fuxi_inject_library(mode, wifi, NULL));
 +        assert(same(fuxi_inject_library(mode, app, "MobileSafari"), (mode & 1u) ? FUXI_INJECT_APP_LIB : NULL));
 +        /* 別處同名的 mediaserverd 不注入 */
 +        assert(!fuxi_inject_library(mode, "/var/tmp/mediaserverd", "mediaserverd"));
@@ -13919,7 +13951,7 @@ index 0000000..4050eb8
 +    assert(!fuxi_inject_env(NULL, env, sizeof(env)));
 +    assert(!fuxi_inject_env(FUXI_INJECT_SB_LIB, env, 10));
 +    assert(!fuxi_inject_env(FUXI_INJECT_SB_LIB, env, 0));
-+    puts("PASS: exec injection modes 0..7: SpringBoard, /usr/sbin/mediaserverd and application executables, rejects look-alikes and short buffers");
++    puts("PASS: exec injection modes 0..15: SpringBoard, mediaserverd, opt-in wifid audit and application executables, rejects look-alikes and short buffers");
 +    return 0;
 +}
 +'''
@@ -33625,10 +33657,10 @@ index 0000000..187ad59
 +#endif
 diff --git a/xnu/fuxi-inject/fuxi_exec_inject.h b/xnu/fuxi-inject/fuxi_exec_inject.h
 new file mode 100644
-index 0000000..ef3b7d9
+index 0000000..02b8ee9
 --- /dev/null
 +++ b/xnu/fuxi-inject/fuxi_exec_inject.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,79 @@
 +/*
 + * fxinj=N, or ADT /chosen u32 "fuxi,inject"=N (FUXI): DYLD_INSERT_LIBRARIES added by the kernel at exec, for some programs (patch 0118).
 + *
@@ -33652,7 +33684,8 @@ index 0000000..ef3b7d9
 +#define FUXI_INJECT_APPS        1u
 +#define FUXI_INJECT_SPRINGBOARD 2u
 +#define FUXI_INJECT_MEDIASERVER 4u
-+#define FUXI_INJECT_ALL         (FUXI_INJECT_APPS | FUXI_INJECT_SPRINGBOARD | FUXI_INJECT_MEDIASERVER)
++#define FUXI_INJECT_WIFI_AUDIT  8u
++#define FUXI_INJECT_ALL         (FUXI_INJECT_APPS | FUXI_INJECT_SPRINGBOARD | FUXI_INJECT_MEDIASERVER | FUXI_INJECT_WIFI_AUDIT)
 +#define FUXI_INJECT_APP_LIB     "/usr/local/lib/fuxi/libfuxi-app.dylib"
 +#define FUXI_INJECT_SB_LIB      "/usr/local/lib/fuxi/libfuxi-sb.dylib"
 +#define FUXI_INJECT_ENV_MAX     128
@@ -33686,6 +33719,10 @@ index 0000000..ef3b7d9
 +	}
 +	if (strcmp(name, "mediaserverd") == 0) {
 +		return (mode & FUXI_INJECT_MEDIASERVER) != 0 && strcmp(path, "/usr/sbin/mediaserverd") == 0 ?
++		       FUXI_INJECT_SB_LIB : NULL;
++	}
++	if (strcmp(name, "wifid") == 0) {
++		return (mode & FUXI_INJECT_WIFI_AUDIT) != 0 && strcmp(path, "/usr/sbin/wifid") == 0 ?
 +		       FUXI_INJECT_SB_LIB : NULL;
 +	}
 +	return (mode & FUXI_INJECT_APPS) != 0 && fuxi_inject_is_app(path) ? FUXI_INJECT_APP_LIB : NULL;
@@ -52474,13 +52511,13 @@ index 0000000..3c1ce01
 + 	IOPMPowerSource::free();
 diff --git a/xnu/patches/0118-fuxi-exec-inject.patch b/xnu/patches/0118-fuxi-exec-inject.patch
 new file mode 100644
-index 0000000..4a41033
+index 0000000..321fd96
 --- /dev/null
 +++ b/xnu/patches/0118-fuxi-exec-inject.patch
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,172 @@
 +--- a/bsd/kern/kern_exec.c
 ++++ b/bsd/kern/kern_exec.c
-+@@ -5649,6 +5649,55 @@
++@@ -5649,6 +5649,56 @@
 +  * Note:	The argument and environment vectors are user space pointers
 +  *		to arrays of user space pointers.
 +  */
@@ -52523,10 +52560,11 @@ index 0000000..4a41033
 ++	SInt32 n = OSIncrementAtomic(&said);
 ++
 ++	if (n == 0) {
-++		printf("FUXI INJECT: fxinj=%u:%s%s%s\n", mode,
+++		printf("FUXI INJECT: fxinj=%u:%s%s%s%s\n", mode,
 ++		    (mode & FUXI_INJECT_APPS) ? " applications get " FUXI_INJECT_APP_LIB ";" : "",
 ++		    (mode & FUXI_INJECT_SPRINGBOARD) ? " SpringBoard gets " FUXI_INJECT_SB_LIB ";" : "",
-++		    (mode & FUXI_INJECT_MEDIASERVER) ? " mediaserverd gets " FUXI_INJECT_SB_LIB : "");
+++		    (mode & FUXI_INJECT_MEDIASERVER) ? " mediaserverd gets " FUXI_INJECT_SB_LIB : "",
+++		    (mode & FUXI_INJECT_WIFI_AUDIT) ? " wifid gets " FUXI_INJECT_SB_LIB : "");
 ++	}
 ++	if (n < FUXI_INJECT_SAID) {
 ++		printf("FUXI INJECT: %s <- %s\n", name, library);
@@ -52536,7 +52574,7 @@ index 0000000..4a41033
 + __attribute__((noinline))
 + static int
 + exec_extract_strings(struct image_params *imgp)
-+@@ -5822,6 +5871,30 @@
++@@ -5822,6 +5872,30 @@
 + 		imgp->ip_envc++;
 + 	}
 + 
@@ -52569,7 +52607,7 @@ index 0000000..4a41033
 + 		error = E2BIG;
 +--- /dev/null
 ++++ b/bsd/kern/fuxi_exec_inject.h
-+@@ -0,0 +1,74 @@
++@@ -0,0 +1,79 @@
 ++/*
 ++ * fxinj=N, or ADT /chosen u32 "fuxi,inject"=N (FUXI): DYLD_INSERT_LIBRARIES added by the kernel at exec, for some programs (patch 0118).
 ++ *
@@ -52593,7 +52631,8 @@ index 0000000..4a41033
 ++#define FUXI_INJECT_APPS        1u
 ++#define FUXI_INJECT_SPRINGBOARD 2u
 ++#define FUXI_INJECT_MEDIASERVER 4u
-++#define FUXI_INJECT_ALL         (FUXI_INJECT_APPS | FUXI_INJECT_SPRINGBOARD | FUXI_INJECT_MEDIASERVER)
+++#define FUXI_INJECT_WIFI_AUDIT  8u
+++#define FUXI_INJECT_ALL         (FUXI_INJECT_APPS | FUXI_INJECT_SPRINGBOARD | FUXI_INJECT_MEDIASERVER | FUXI_INJECT_WIFI_AUDIT)
 ++#define FUXI_INJECT_APP_LIB     "/usr/local/lib/fuxi/libfuxi-app.dylib"
 ++#define FUXI_INJECT_SB_LIB      "/usr/local/lib/fuxi/libfuxi-sb.dylib"
 ++#define FUXI_INJECT_ENV_MAX     128
@@ -52627,6 +52666,10 @@ index 0000000..4a41033
 ++	}
 ++	if (strcmp(name, "mediaserverd") == 0) {
 ++		return (mode & FUXI_INJECT_MEDIASERVER) != 0 && strcmp(path, "/usr/sbin/mediaserverd") == 0 ?
+++		       FUXI_INJECT_SB_LIB : NULL;
+++	}
+++	if (strcmp(name, "wifid") == 0) {
+++		return (mode & FUXI_INJECT_WIFI_AUDIT) != 0 && strcmp(path, "/usr/sbin/wifid") == 0 ?
 ++		       FUXI_INJECT_SB_LIB : NULL;
 ++	}
 ++	return (mode & FUXI_INJECT_APPS) != 0 && fuxi_inject_is_app(path) ? FUXI_INJECT_APP_LIB : NULL;
