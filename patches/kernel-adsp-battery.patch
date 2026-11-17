@@ -17517,10 +17517,10 @@ index 0000000..0e08f98
 +}
 diff --git a/tools/test-fuxi-wlan-ios.py b/tools/test-fuxi-wlan-ios.py
 new file mode 100644
-index 0000000..d1fd383
+index 0000000..3131f24
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ios.py
-@@ -0,0 +1,713 @@
+@@ -0,0 +1,768 @@
 +import hashlib
 +import hmac
 +import os
@@ -17579,11 +17579,13 @@ index 0000000..d1fd383
 +static int test_mode;
 +static int test_dwell;
 +static int test_cache;
++static int test_batch;
 +static uint32_t offered_features;
 +static char test_ssid[33];
 +static int PE_parse_boot_argn(const char *name,void *value,int length) {
 +    if (!strcmp(name,"fuxiwlandwell")) { assert(length==4); *(int *)value=test_dwell; return test_dwell!=0; }
 +    if (!strcmp(name,"fuxiwlancache")) { assert(length==4); *(int *)value=test_cache; return test_cache!=0; }
++    if (!strcmp(name,"fuxiwlanbatch")) { assert(length==4); *(int *)value=test_batch; return test_batch!=0; }
 +    if (!strcmp(name,"fuxiwifitest")) { assert(length==4); *(int *)value=test_mode; return 1; }
 +    assert(!strcmp(name,"fuxiwifitestssid") && length==32);
 +    memcpy(value,test_ssid,32); return test_ssid[0]!=0;
@@ -17888,6 +17890,58 @@ index 0000000..d1fd383
 +    memset(&caller_scan,0,sizeof(caller_scan));
 +}
 +
++static void batch_tests(void) {
++    unsigned count, limit;
++    memset(&caller_scan,0,sizeof(caller_scan));
++    caller_scan.dwell_ms=110; caller_scan.frequency_count=40; caller_scan.passive=true;
++    for(unsigned index=0;index<40;index++)
++        caller_scan.frequencies[index]=index<13 ? 2412+index*5 : 5180+(index-13)*20;
++    test_dwell=1; offered_features=FWC_FEATURE_SCAN_DWELL_MS;
++    test_batch=2; bootstrap(); assert(!wli.batch_enabled);
++    assert(!wli_scan_plan(&caller_scan,&count,&limit) && count==40 && limit==40);
++    test_batch=1; bootstrap(); assert(wli.batch_enabled);
++    assert(!wli_scan_plan(&caller_scan,&count,&limit) && count==40 && limit==31);
++    pthread_t thread=begin(2,false); step(); expect_request(2);
++    assert(wli.scan_count==40 && wli.scan_limit==31 && !wli.scan_offset && !wli.cache_valid);
++    uint64_t deadline=wli.deadline;
++    size_t size; const uint8_t *frequencies=request_attribute(20,&size);
++    assert(frequencies && size==31*4 && request_u32(FWC_ATTR_SCAN_DWELL_MS)==110);
++    assert(!request_attribute(19,&size));
++    for(unsigned index=0;index<31;index++) assert(fwc_read32(frequencies+index*4)==caller_scan.frequencies[index]);
++    scan_accept(false); step(); expect_request(2);
++    assert(wli.scan_offset==31 && !wli.fetching && !wli.cache_valid && !atomic_load(&caller_done));
++    assert(wli.deadline==deadline);
++    frequencies=request_attribute(20,&size); assert(frequencies && size==9*4);
++    for(unsigned index=0;index<9;index++) assert(fwc_read32(frequencies+index*4)==caller_scan.frequencies[31+index]);
++    scan_accept(true); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && !caller_result && wli.cache_valid && wli_bss_count==5);
++    assert(wli.scan.frequency_count==40 && wli.scan.dwell_ms==110);
++    bootstrap(); thread=begin(2,false); step(); scan_accept(true); step(); expect_request(2);
++    respond(2,1);
++    assert(!pthread_join(thread,NULL) && caller_result==EINVAL && !wli.cache_valid && !wli.fetching && !wli_bss_count);
++    bootstrap(); thread=begin(2,false); step(); scan_accept(false); step(); expect_request(2);
++    assert(wli_step(wli.deadline)==ETIMEDOUT); wli_fail(ETIMEDOUT);
++    assert(!pthread_join(thread,NULL) && caller_result==ETIMEDOUT && !wli.cache_valid);
++    bootstrap(); caller_scan.frequency_count=50; caller_scan.dwell_ms=1;
++    assert(wli_scan_plan(&caller_scan,&count,&limit)==EINVAL);
++    assert(wli_scan(&caller_scan)==EINVAL && !wli.busy);
++    caller_scan.frequency_count=49;
++    assert(!wli_scan_plan(&caller_scan,&count,&limit) && count==49 && limit==37);
++    caller_scan.dwell_ms=1000; caller_scan.frequency_count=17;
++    assert(wli_scan_plan(&caller_scan,&count,&limit)==EINVAL);
++    caller_scan.frequency_count=16;
++    assert(!wli_scan_plan(&caller_scan,&count,&limit) && limit==12);
++    caller_scan.dwell_ms=0; caller_scan.frequency_count=64;
++    assert(!wli_scan_plan(&caller_scan,&count,&limit) && count==64 && limit==64);
++    caller_scan.dwell_ms=110; caller_scan.frequency_count=0;
++    thread=begin(2,false); step(); expect_request(2);
++    frequencies=request_attribute(20,&size);
++    assert(frequencies && size==8 && fwc_read32(frequencies)==2412 && fwc_read32(frequencies+4)==5180);
++    scan_accept(false); serve_bss(6,0); assert(!pthread_join(thread,NULL) && !caller_result);
++    test_batch=test_dwell=0; offered_features=0;
++    memset(&caller_scan,0,sizeof(caller_scan));
++}
++
 +static void cache_tests(void) {
 +    struct fuxi_wifi_sta_scan previous={0}, asked={0};
 +    assert(wli_scan_covers(&previous,&asked));
@@ -18131,6 +18185,7 @@ index 0000000..d1fd383
 +    memset(address,0,6); assert(fwa_mac_text(address,6,text));
 +    make_fixtures();
 +    dwell_tests();
++    batch_tests();
 +    cache_tests();
 +    bootstrap(); power_test(false,3); power_test(true,4); power_test(true,4);
 +    memset(&caller_scan,0,sizeof(caller_scan)); caller_scan.ssid_length=4;
@@ -33748,10 +33803,10 @@ index 0000000..656f494
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ios.inc b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
 new file mode 100644
-index 0000000..01d9ded
+index 0000000..ebc538c
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-@@ -0,0 +1,1354 @@
+@@ -0,0 +1,1403 @@
 +#include <sys/fuxi_wifi_ios.h>
 +#include <sys/fuxi_wifi_wpa.h>
 +#include <sys/errno.h>
@@ -33780,6 +33835,8 @@ index 0000000..01d9ded
 +#define WLI_JOIN_MS 20000
 +#define WLI_FRESH_MS 20000
 +#define WLI_CACHE_MS 5000
++#define WLI_SCAN_PART_MS 19000
++#define WLI_SCAN_BUDGET_MS 25000
 +#define WLI_DIAG_SCANS 2
 +#define WLI_DIAG_LINES 48
 +
@@ -33817,6 +33874,7 @@ index 0000000..01d9ded
 +	unsigned operation, power_on, power_waiting, scan_accepted, scan_done;
 +	unsigned fetching, fetch_index, scan_reports, diag_lines, dwell_enabled;
 +	unsigned cache_enabled, cache_valid, cache_hits, scan_rejections;
++	unsigned batch_enabled, scan_count, scan_limit, scan_offset;
 +	int result, fatal;
 +	struct fuxi_wifi_sta_scan scan;
 +} wli;
@@ -33890,8 +33948,29 @@ index 0000000..01d9ded
 +}
 +
 +static int
++wli_scan_plan(const struct fuxi_wifi_sta_scan *scan, unsigned *count, unsigned *limit)
++{
++	*count = *limit = scan->frequency_count;
++	if (!wli.batch_enabled || !scan->dwell_ms) { return 0; }
++	if (scan->dwell_ms > 1000) { return EINVAL; }
++	if (!wli.dwell_enabled || !(wli.features & FWC_FEATURE_SCAN_DWELL_MS)) { return EOPNOTSUPP; }
++	*count = scan->frequency_count ? scan->frequency_count : wli_channel_count;
++	if (!*count || *count > WLI_CHANNEL_MAX) { return EINVAL; }
++	unsigned duration_tu = (scan->dwell_ms * 1000u + 1023u) / 1024u;
++	unsigned per_channel_ms = (duration_tu * 1024u + 999u) / 1000u + 500u;
++	if (per_channel_ms * *count > WLI_SCAN_BUDGET_MS) { return EINVAL; }
++	*limit = MIN(*count, WLI_SCAN_PART_MS / per_channel_ms);
++	return *limit ? 0 : EINVAL;
++}
++
++static int
 +wli_submit(unsigned operation, bool on, const struct fuxi_wifi_sta_scan *scan, const struct wli_target *target)
 +{
++	unsigned scan_count = 0, scan_limit = 0;
++	if (scan) {
++		int error = wli_scan_plan(scan, &scan_count, &scan_limit);
++		if (error) { return error; }
++	}
 +	lck_mtx_lock(&wli_lock);
 +	if (wli.fatal || !wli.published || wli.busy) {
 +		int error = wli.fatal ? wli.fatal : wli.busy ? EBUSY : ENXIO;
@@ -33900,7 +33979,12 @@ index 0000000..01d9ded
 +	}
 +	wli.operation = operation;
 +	wli.power_on = on;
-+	if (scan) { wli.scan = *scan; }
++	if (scan) {
++		wli.scan = *scan;
++		wli.scan_count = scan_count;
++		wli.scan_limit = scan_limit;
++		wli.scan_offset = 0;
++	}
 +	if (target) { wli_target = *target; }
 +	wli.busy = 1;
 +	wli.submitted = 0;
@@ -34442,12 +34526,21 @@ index 0000000..01d9ded
 +			memcpy(ssid + 1, wli.scan.ssid, ssid[0]);
 +			wli_add(19, ssid, sizeof(ssid));
 +		}
-+		if (wli.scan.frequency_count) {
++		if (wli.scan_count) {
 +			uint8_t frequencies[256];
-+			for (unsigned index = 0; index < wli.scan.frequency_count; index++) {
-+				fwc_write(frequencies + index * 4, wli.scan.frequencies[index], 4);
++			unsigned count = MIN(wli.scan_limit, wli.scan_count - wli.scan_offset);
++			if (count > sizeof(frequencies) / 4) { return EINVAL; }
++			for (unsigned index = 0; index < count; index++) {
++				unsigned source = wli.scan_offset + index;
++				unsigned frequency = wli.scan.frequency_count ? wli.scan.frequencies[source] :
++				    wli_channels[source].frequency;
++				fwc_write(frequencies + index * 4, frequency, 4);
 +			}
-+			wli_add(20, frequencies, wli.scan.frequency_count * 4);
++			wli_add(20, frequencies, count * 4);
++			if (wli.scan_limit < wli.scan_count) {
++				printf("FUXI WIFI IOS: native scan batch channels %u offset %u total %u\n",
++				    count, wli.scan_offset, wli.scan_count);
++			}
 +		}
 +		if (wli.scan.dwell_ms) { wli_put32(FWC_ATTR_SCAN_DWELL_MS, wli.scan.dwell_ms); }
 +	} else if (operation == 3) {
@@ -35020,6 +35113,10 @@ index 0000000..01d9ded
 +		PE_parse_boot_argn("fuxiwlancache", &cache, sizeof(cache));
 +		wli.cache_enabled = cache == 1;
 +		printf("FUXI WIFI IOS: scan cache opt-in %u max age %u ms\n", wli.cache_enabled, WLI_CACHE_MS);
++		int batch = 0;
++		PE_parse_boot_argn("fuxiwlanbatch", &batch, sizeof(batch));
++		wli.batch_enabled = batch == 1;
++		printf("FUXI WIFI IOS: scan batch opt-in %u budget %u ms\n", wli.batch_enabled, WLI_SCAN_BUDGET_MS);
 +		wli_backend.station.power = wli_power;
 +		wli_backend.station.scan = wli_scan;
 +		wli_backend.station.heard = wli_heard;
@@ -35084,6 +35181,13 @@ index 0000000..01d9ded
 +		}
 +	}
 +	if (busy && operation == WLI_SCAN && wli.scan_accepted && wli.scan_done && !wli.fetching) {
++		if (wli.scan_offset + wli.scan_limit < wli.scan_count) {
++			wli.scan_offset += wli.scan_limit;
++			wli.scan_accepted = wli.scan_done = 0;
++			int error = wli_request(2);
++			if (error) { return error; }
++			return now >= wli.deadline ? ETIMEDOUT : 0;
++		}
 +		wli.fetching = 1;
 +		wli.fetch_index = 0;
 +		wli.diag_lines = 0;
@@ -35409,7 +35513,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..dcd1f5e 100644
+index d21bf85..08c1506 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -35880,7 +35984,7 @@ index d21bf85..dcd1f5e 100644
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,2212 @@
+@@ -5899,3 +6092,2261 @@
  + }
  + r[3] = 0;
  +}
@@ -36738,7 +36842,7 @@ index d21bf85..dcd1f5e 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ios.inc
-+@@ -0,0 +1,1354 @@
++@@ -0,0 +1,1403 @@
 ++#include <sys/fuxi_wifi_ios.h>
 ++#include <sys/fuxi_wifi_wpa.h>
 ++#include <sys/errno.h>
@@ -36767,6 +36871,8 @@ index d21bf85..dcd1f5e 100644
 ++#define WLI_JOIN_MS 20000
 ++#define WLI_FRESH_MS 20000
 ++#define WLI_CACHE_MS 5000
+++#define WLI_SCAN_PART_MS 19000
+++#define WLI_SCAN_BUDGET_MS 25000
 ++#define WLI_DIAG_SCANS 2
 ++#define WLI_DIAG_LINES 48
 ++
@@ -36804,6 +36910,7 @@ index d21bf85..dcd1f5e 100644
 ++	unsigned operation, power_on, power_waiting, scan_accepted, scan_done;
 ++	unsigned fetching, fetch_index, scan_reports, diag_lines, dwell_enabled;
 ++	unsigned cache_enabled, cache_valid, cache_hits, scan_rejections;
+++	unsigned batch_enabled, scan_count, scan_limit, scan_offset;
 ++	int result, fatal;
 ++	struct fuxi_wifi_sta_scan scan;
 ++} wli;
@@ -36877,8 +36984,29 @@ index d21bf85..dcd1f5e 100644
 ++}
 ++
 ++static int
+++wli_scan_plan(const struct fuxi_wifi_sta_scan *scan, unsigned *count, unsigned *limit)
+++{
+++	*count = *limit = scan->frequency_count;
+++	if (!wli.batch_enabled || !scan->dwell_ms) { return 0; }
+++	if (scan->dwell_ms > 1000) { return EINVAL; }
+++	if (!wli.dwell_enabled || !(wli.features & FWC_FEATURE_SCAN_DWELL_MS)) { return EOPNOTSUPP; }
+++	*count = scan->frequency_count ? scan->frequency_count : wli_channel_count;
+++	if (!*count || *count > WLI_CHANNEL_MAX) { return EINVAL; }
+++	unsigned duration_tu = (scan->dwell_ms * 1000u + 1023u) / 1024u;
+++	unsigned per_channel_ms = (duration_tu * 1024u + 999u) / 1000u + 500u;
+++	if (per_channel_ms * *count > WLI_SCAN_BUDGET_MS) { return EINVAL; }
+++	*limit = MIN(*count, WLI_SCAN_PART_MS / per_channel_ms);
+++	return *limit ? 0 : EINVAL;
+++}
+++
+++static int
 ++wli_submit(unsigned operation, bool on, const struct fuxi_wifi_sta_scan *scan, const struct wli_target *target)
 ++{
+++	unsigned scan_count = 0, scan_limit = 0;
+++	if (scan) {
+++		int error = wli_scan_plan(scan, &scan_count, &scan_limit);
+++		if (error) { return error; }
+++	}
 ++	lck_mtx_lock(&wli_lock);
 ++	if (wli.fatal || !wli.published || wli.busy) {
 ++		int error = wli.fatal ? wli.fatal : wli.busy ? EBUSY : ENXIO;
@@ -36887,7 +37015,12 @@ index d21bf85..dcd1f5e 100644
 ++	}
 ++	wli.operation = operation;
 ++	wli.power_on = on;
-++	if (scan) { wli.scan = *scan; }
+++	if (scan) {
+++		wli.scan = *scan;
+++		wli.scan_count = scan_count;
+++		wli.scan_limit = scan_limit;
+++		wli.scan_offset = 0;
+++	}
 ++	if (target) { wli_target = *target; }
 ++	wli.busy = 1;
 ++	wli.submitted = 0;
@@ -37429,12 +37562,21 @@ index d21bf85..dcd1f5e 100644
 ++			memcpy(ssid + 1, wli.scan.ssid, ssid[0]);
 ++			wli_add(19, ssid, sizeof(ssid));
 ++		}
-++		if (wli.scan.frequency_count) {
+++		if (wli.scan_count) {
 ++			uint8_t frequencies[256];
-++			for (unsigned index = 0; index < wli.scan.frequency_count; index++) {
-++				fwc_write(frequencies + index * 4, wli.scan.frequencies[index], 4);
+++			unsigned count = MIN(wli.scan_limit, wli.scan_count - wli.scan_offset);
+++			if (count > sizeof(frequencies) / 4) { return EINVAL; }
+++			for (unsigned index = 0; index < count; index++) {
+++				unsigned source = wli.scan_offset + index;
+++				unsigned frequency = wli.scan.frequency_count ? wli.scan.frequencies[source] :
+++				    wli_channels[source].frequency;
+++				fwc_write(frequencies + index * 4, frequency, 4);
 ++			}
-++			wli_add(20, frequencies, wli.scan.frequency_count * 4);
+++			wli_add(20, frequencies, count * 4);
+++			if (wli.scan_limit < wli.scan_count) {
+++				printf("FUXI WIFI IOS: native scan batch channels %u offset %u total %u\n",
+++				    count, wli.scan_offset, wli.scan_count);
+++			}
 ++		}
 ++		if (wli.scan.dwell_ms) { wli_put32(FWC_ATTR_SCAN_DWELL_MS, wli.scan.dwell_ms); }
 ++	} else if (operation == 3) {
@@ -38007,6 +38149,10 @@ index d21bf85..dcd1f5e 100644
 ++		PE_parse_boot_argn("fuxiwlancache", &cache, sizeof(cache));
 ++		wli.cache_enabled = cache == 1;
 ++		printf("FUXI WIFI IOS: scan cache opt-in %u max age %u ms\n", wli.cache_enabled, WLI_CACHE_MS);
+++		int batch = 0;
+++		PE_parse_boot_argn("fuxiwlanbatch", &batch, sizeof(batch));
+++		wli.batch_enabled = batch == 1;
+++		printf("FUXI WIFI IOS: scan batch opt-in %u budget %u ms\n", wli.batch_enabled, WLI_SCAN_BUDGET_MS);
 ++		wli_backend.station.power = wli_power;
 ++		wli_backend.station.scan = wli_scan;
 ++		wli_backend.station.heard = wli_heard;
@@ -38071,6 +38217,13 @@ index d21bf85..dcd1f5e 100644
 ++		}
 ++	}
 ++	if (busy && operation == WLI_SCAN && wli.scan_accepted && wli.scan_done && !wli.fetching) {
+++		if (wli.scan_offset + wli.scan_limit < wli.scan_count) {
+++			wli.scan_offset += wli.scan_limit;
+++			wli.scan_accepted = wli.scan_done = 0;
+++			int error = wli_request(2);
+++			if (error) { return error; }
+++			return now >= wli.deadline ? ETIMEDOUT : 0;
+++		}
 ++		wli.fetching = 1;
 ++		wli.fetch_index = 0;
 ++		wli.diag_lines = 0;
