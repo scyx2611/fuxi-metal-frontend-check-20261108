@@ -8557,6 +8557,172 @@ index 0000000..df484bd
 +else:
 +    patch.write_text(expected, encoding='utf-8', newline='\n')
 +print('PASS: fuxi-wlan canonical source matches 0099')
+diff --git a/tools/test-fuxi-adt-args.py b/tools/test-fuxi-adt-args.py
+new file mode 100644
+index 0000000..6523d39
+--- /dev/null
++++ b/tools/test-fuxi-adt-args.py
+@@ -0,0 +1,160 @@
++#!/usr/bin/env python3
++"""補丁 0121 主機測試：Wi-Fi 開關可從 ADT /chosen fuxi,args 讀，命令列優先。不碰手機。
++
++用法（WSL／Linux，需要 clang 與未套補丁的 XNU 8796 原始碼）：
++  python3 tools/test-fuxi-adt-args.py /root/fuxi-build/src/xnu-8796.141.3
++把補丁套到 pexpert/gen/bootargs.c 的副本，用替身 device tree 編成主機程式（ASan／UBSan）。
++"""
++from pathlib import Path
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[1]
++PATCH = ROOT / 'xnu/patches/0121-fuxi-adt-wifi-args.patch'
++
++PEXPERT_H = r'''
++#pragma once
++#include <stdint.h>
++#include <string.h>
++typedef int boolean_t;
++#define TRUE 1
++#define FALSE 0
++#define __DECONST(t, p) ((t)(uintptr_t)(const void *)(p))
++char *PE_boot_args(void);
++'''
++DEVICE_TREE_H = r'''
++#pragma once
++typedef struct fake_entry *DTEntry;
++enum { kSuccess = 0, kError = -1 };
++int SecureDTLookupEntry(const DTEntry searchPoint, const char *pathName, DTEntry *foundEntry);
++int SecureDTGetProperty(const DTEntry entry, const char *propertyName, void const **propertyValue, unsigned int *propertySize);
++'''
++DRIVER = r'''
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++static char cmdline[608];
++static int dt_up = 1, has_prop = 1;
++static unsigned char prop_bytes[512];
++static unsigned int prop_size;
++static unsigned lookups;
++char *PE_boot_args(void) { return cmdline; }
++boolean_t IODTGetDefault(const char *name, void *buffer, unsigned int size) { (void)name; (void)buffer; (void)size; return FALSE; }
++int SecureDTLookupEntry(const DTEntry s, const char *path, DTEntry *found)
++{
++	(void)s;
++	lookups++;
++	if (!dt_up || strcmp(path, "/chosen")) { return kError; }
++	*found = (DTEntry)prop_bytes;
++	return kSuccess;
++}
++int SecureDTGetProperty(const DTEntry e, const char *name, void const **value, unsigned int *size)
++{
++	(void)e;
++	if (!has_prop || strcmp(name, "fuxi,args")) { return kError; }
++	*value = malloc(prop_size ? prop_size : 1);          /* ASan 抓越界讀 */
++	memcpy((void *)*value, prop_bytes, prop_size);
++	*size = prop_size;
++	return kSuccess;
++}
++#undef __x86_64__                                       /* 走 embedded 分支 */
++#include "bootargs.c"
++static void set_prop(const char *text, unsigned extra_nul, int drop_nul)
++{
++	size_t n = strlen(text) + 1;
++	memcpy(prop_bytes, text, n);
++	prop_size = (unsigned)n + extra_nul;
++	if (extra_nul) { memset(prop_bytes + n, 0, extra_nul); }
++	if (drop_nul) { prop_size = (unsigned)n - 1; }
++}
++static int argn(const char *name, int fallback)
++{
++	int v = fallback;
++	return PE_parse_boot_argn(name, &v, sizeof(v)) ? v : -1000 - fallback;
++}
++int main(void)
++{
++	char text[16];
++	strcpy(cmdline, "serial=3 fuxiwlan=1 fuxiwlanmlo=64 -v");
++	set_prop("fuxiwlanath=1 fuxiwlanmlo=192 fuxiwifiios=2 fuxiwlandwell=1 fuxiwlanbatch=1 sweetlog=0", 0, 0);
++	assert(argn("fuxiwlan", 0) == 1);
++	assert(argn("fuxiwlanmlo", 0) == 64);                 /* 命令列優先 */
++	assert(argn("fuxiwifiios", 0) == 2);
++	assert(argn("fuxiwlandwell", 0) == 1);
++	assert(argn("fuxiwlanbatch", 0) == 1);
++	assert(PE_parse_boot_arg_str("fuxiwlanath", text, sizeof(text)) && !strcmp(text, "1"));
++	assert(argn("sweetlog", 7) == -1007);                  /* 非 Wi-Fi 名稱不讀 ADT */
++	assert(argn("fuxiwlanx", 5) == -1005);
++	unsigned before = lookups;
++	assert(argn("serialx", 3) == -1003 && lookups == before); /* 不是 Wi-Fi 名稱連查都不查 */
++	assert(argn("fuxiwlan", 0) == 1 && lookups == before);    /* 命令列有就不查 ADT */
++	strcpy(cmdline, "serial=3");
++	assert(argn("fuxiwlanmlo", 0) == 192);
++	dt_up = 0;                                              /* device tree 未就緒 */
++	assert(argn("fuxiwlanmlo", 9) == -1009);
++	dt_up = 1;
++	has_prop = 0;
++	assert(argn("fuxiwlanmlo", 9) == -1009);
++	has_prop = 1;
++	set_prop("fuxiwlanmlo=192", 1, 0);                      /* 中間多一個 NUL：整份不信 */
++	assert(argn("fuxiwlanmlo", 9) == -1009);
++	set_prop("fuxiwlanmlo=192", 0, 1);                      /* 沒有結尾 NUL */
++	assert(argn("fuxiwlanmlo", 9) == -1009);
++	set_prop("", 0, 0);                                     /* 只有 NUL（1 byte） */
++	assert(argn("fuxiwlanmlo", 9) == -1009);
++	char big[300];
++	memset(big, ' ', sizeof(big));
++	memcpy(big, "fuxiwlanmlo=192", 15);
++	big[sizeof(big) - 1] = 0;
++	set_prop(big, 0, 0);                                    /* 超過 256 bytes */
++	assert(argn("fuxiwlanmlo", 9) == -1009);
++	big[255] = 0;
++	set_prop(big, 0, 0);                                    /* 剛好 256 bytes */
++	assert(argn("fuxiwlanmlo", 9) == 192);
++	set_prop("fuxiwlanath=native_longer_than_buffer", 0, 0);
++	assert(PE_parse_boot_arg_str("fuxiwlanath", text, sizeof(text)) && strlen(text) == sizeof(text) - 1);
++	set_prop("fuxiwifiios", 0, 0);                          /* 沒有等號＝1 */
++	assert(argn("fuxiwifiios", 0) == 1);
++	strcpy(cmdline, "");                                    /* 命令列空白仍可讀 ADT */
++	set_prop("fuxiwifiios=2", 0, 0);
++	assert(argn("fuxiwifiios", 0) == 2);
++	puts("PASS fuxi 0121: ADT fuxi,args fills Wi-Fi switches, command line first, malformed ignored");
++	return 0;
++}
++'''
++
++
++def main():
++    if len(sys.argv) != 2:
++        raise SystemExit(__doc__)
++    source = Path(sys.argv[1]) / 'pexpert/gen/bootargs.c'
++    cc = os.environ.get('CC', 'clang')
++    with tempfile.TemporaryDirectory() as tmp:
++        work = Path(tmp)
++        (work / 'pexpert/gen').mkdir(parents=True)
++        shutil.copyfile(source, work / 'pexpert/gen/bootargs.c')
++        subprocess.run(['git', 'init', '-q', '.'], cwd=work, check=True)
++        subprocess.run(['git', 'apply', str(PATCH)], cwd=work, check=True)
++        include = work / 'include/pexpert'
++        include.mkdir(parents=True)
++        (include / 'pexpert.h').write_text(PEXPERT_H)
++        (include / 'device_tree.h').write_text(DEVICE_TREE_H)
++        (work / 'driver.c').write_text(DRIVER)
++        exe = work / 'driver'
++        subprocess.run([cc, '-std=gnu11', '-g', '-O1', '-Wall', '-Werror', '-Wno-unused-function',
++                        '-Wno-builtin-macro-redefined',
++                        '-Wno-incompatible-pointer-types',  # 原版範圍解析：Linux int64_t 是 long
++                        '-DFUXI=1', '-fsanitize=address,undefined',
++                        '-fno-sanitize-recover=all', '-I', str(work / 'include'),
++                        '-I', str(work / 'pexpert/gen'), str(work / 'driver.c'), '-o', str(exe)], check=True)
++        # 替身每次查屬性都 malloc 一份（讓 ASan 抓越界），不回收
++        subprocess.run([str(exe)], check=True, env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0'))
++
++
++if __name__ == '__main__':
++    main()
 diff --git a/tools/test-fuxi-ath12k-link.py b/tools/test-fuxi-ath12k-link.py
 new file mode 100644
 index 0000000..5ed251f
@@ -17819,7 +17985,7 @@ index cf82598..56f7e1a 100755
          out = Path(tmp)
          subprocess.run(['python3', str(ROOT/'tools/build-fuxi-turnip.py'), '--mesa', str(args.mesa.resolve()),
 diff --git a/tools/test-fuxi-wifi-ios.py b/tools/test-fuxi-wifi-ios.py
-index 12e012d..c03fc63 100755
+index 12e012d..c9e609d 100755
 --- a/tools/test-fuxi-wifi-ios.py
 +++ b/tools/test-fuxi-wifi-ios.py
 @@ -53,14 +53,20 @@ typedef void *event_t;
@@ -17855,7 +18021,7 @@ index 12e012d..c03fc63 100755
  static void *current_proc(void) { return NULL; }
  static int proc_suser(void *p) { (void)p; return !superuser; }
  struct kev_msg { unsigned vendor_code,kev_class,kev_subclass,event_code;
-@@ -86,18 +92,69 @@ static int kev_post_msg(struct kev_msg *m) {
+@@ -86,18 +92,74 @@ static int kev_post_msg(struct kev_msg *m) {
   assert(m->kev_class==6 && m->kev_subclass==1 && m->dv[0].data_length==16);
   assert(!strcmp(m->dv[0].data_ptr,"en0"));
   if (m->event_code==4) assert(m->dv[1].data_length==32);
@@ -17875,6 +18041,11 @@ index 12e012d..c03fc63 100755
 +static thread_call_func_t timer_fn; static unsigned timer_armed;
 +static thread_call_t thread_call_allocate(thread_call_func_t f,thread_call_param_t p) { (void)p; timer_fn=f; return &timer_fn; }
 +static void clock_interval_to_deadline(uint32_t i,uint32_t s,uint64_t *d) { *d=(uint64_t)i*s; }
++/* 開關耗時診斷用的時鐘（替身：單調時鐘的奈秒值） */
++static uint64_t mach_absolute_time(void) {
++ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec;
++}
++static void absolutetime_to_nanoseconds(uint64_t a,uint64_t *n) { *n=a; }
 +static int thread_call_enter_delayed(thread_call_t c,uint64_t d) {
 + assert(c==&timer_fn && d==5ull*NSEC_PER_SEC); timer_armed++; return 0;
  }
@@ -17927,7 +18098,7 @@ index 12e012d..c03fc63 100755
  bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *p) {
   assert(p->wireless && !p->up && p->address[0]==2); attached++; return true;
  }
-@@ -114,11 +171,68 @@ static int request(bool set,int type,void *p,unsigned n,int *val) {
+@@ -114,11 +176,68 @@ static int request(bool set,int type,void *p,unsigned n,int *val) {
   int error=fuxi_wifi_apple80211_ioctl(set?SIOCSA80211:SIOCGA80211,&req);
   if(val) *val=req.req_val; return error;
  }
@@ -17998,7 +18169,7 @@ index 12e012d..c03fc63 100755
   fuxi_wifi_ios_init(); assert(attached==1);
   assert(!fuxi_wifi_ios_attach(&fake_backend));
   assert(fuxi_wifi_sta_ask_scan(NULL)==EINVAL && fuxi_wifi_sta_ask_join(NULL)==EINVAL);
-@@ -127,6 +241,17 @@ int main(void) {
+@@ -127,6 +246,17 @@ int main(void) {
   struct apple80211req invalid={.req_if_name="ue0"};
   assert(fuxi_wifi_apple80211_ioctl(SIOCGA80211,&invalid)==ENXIO);
   assert(request(false,999,NULL,0,NULL)==EOPNOTSUPP);
@@ -18016,7 +18187,7 @@ index 12e012d..c03fc63 100755
   struct apple80211_scan_request scan={.version=1};
   assert(request(true,10,&scan,sizeof(scan)-1,NULL)==EINVAL);
   scan.ssid_length=33; assert(request(true,10,&scan,sizeof(scan),NULL)==EINVAL); scan.ssid_length=0;
-@@ -139,6 +264,7 @@ int main(void) {
+@@ -139,6 +269,7 @@ int main(void) {
   assert(request(false,11,&result,sizeof(result),NULL)==0);
   assert(result.ssid_length==13 && !memcmp(result.ssid,"Fuxi Loopback",13));
   assert(result.rssi==-42 && result.channel.channel==1 && result.elements_length==4);
@@ -18024,7 +18195,7 @@ index 12e012d..c03fc63 100755
   assert(request(false,11,&result,sizeof(result),NULL)==EIO);
   struct apple80211_channels channels;
   assert(!request(false,27,&channels,sizeof(channels),NULL) && channels.count==1);
-@@ -149,11 +275,19 @@ int main(void) {
+@@ -149,11 +280,19 @@ int main(void) {
   join.key_length=65; join.key_cipher=10; assert(request(true,20,&join,sizeof(join),NULL)==EINVAL);
   join.key_length=0; assert(!request(true,20,&join,sizeof(join),NULL)); settle();
   int val; assert(!request(false,21,NULL,0,&val) && val==1); assert(link_up);
@@ -18044,7 +18215,7 @@ index 12e012d..c03fc63 100755
   join.key_length=8;memcpy(join.key,"password",8);join.key_cipher=10;
   assert(!request(true,20,&join,sizeof(join),NULL));settle();
   assert(!request(false,21,NULL,0,&val) && val==2 && !link_up);
-@@ -163,7 +297,51 @@ int main(void) {
+@@ -163,7 +302,89 @@ int main(void) {
   assert(request(true,10,&scan,sizeof(scan),NULL)==ENETDOWN);
   power.state[0]=1;assert(!request(true,19,&power,sizeof(power),NULL));settle();
   assert(fuxi_wifi_sta_powered());
@@ -18091,12 +18262,50 @@ index 12e012d..c03fc63 100755
 + atomic_store(&link_hold,0); settle(); assert(!fuxi_wifi_sta_powered());
 + power.state[0]=1; assert(!request(true,19,&power,sizeof(power),NULL)); settle();
 + assert(fuxi_wifi_sta_powered());
++ /* bit 4：要的電源和現在一樣（關被後到的開覆蓋）：不碰底層、不清連線 */
++ struct fuxi_wifi_sta_state st;
++ set_ux(FUXI_WIFI_UX_POWER_SAME,4);
++ assert(!request(true,20,&join,sizeof(join),NULL)); settle(); assert(link_up);
++ fuxi_wifi_sta_state(&st); assert(st.phase==FUXI_WIFI_STA_JOINED);
++ power.state[0]=1; assert(!request(true,19,&power,sizeof(power),NULL)); settle();
++ assert(link_up && fuxi_wifi_sta_powered());
++ fuxi_wifi_sta_state(&st); assert(st.phase==FUXI_WIFI_STA_JOINED);
++ /* 沒開 bit 4：同樣的要求照舊重開底層，連線被清掉 */
++ set_ux(0,4);
++ assert(!request(true,19,&power,sizeof(power),NULL)); settle();
++ assert(!link_up && fuxi_wifi_sta_powered());
++ fuxi_wifi_sta_state(&st); assert(st.phase==FUXI_WIFI_STA_IDLE);
++ /* bit 4 下真的要關仍然關，再開也照常 */
++ set_ux(FUXI_WIFI_UX_POWER_SAME,4);
++ power.state[0]=0; assert(!request(true,19,&power,sizeof(power),NULL)); settle();
++ assert(!fuxi_wifi_sta_powered() && !radio_on());
++ power.state[0]=1; assert(!request(true,19,&power,sizeof(power),NULL)); settle();
++ assert(fuxi_wifi_sta_powered() && radio_on());
++ /* bit 3：國家碼。沒開時 SET／GET 照舊拒絕 */
++ uint8_t cc8[8]={1,0,0,0,'T','W',' ',0}, got[8], bad[8]={1,0,0,0,'t','w',0,0};
++ set_ux(0,4);
++ assert(request(true,51,cc8,8,NULL)==EOPNOTSUPP && request(false,51,got,8,NULL)==EOPNOTSUPP);
++ set_ux(FUXI_WIFI_UX_COUNTRY,4);
++ assert(request(false,51,got,8,NULL)==EOPNOTSUPP);            /* 還沒設過 */
++ assert(request(true,51,cc8,2,NULL)==EINVAL && request(true,51,NULL,8,NULL)==EINVAL);
++ assert(request(true,51,bad,8,NULL)==EINVAL);                  /* 小寫 */
++ bad[4]='T'; bad[5]='W'; bad[6]=0x7f; assert(request(true,51,bad,8,NULL)==EINVAL);
++ assert(request(false,51,got,8,NULL)==EOPNOTSUPP);            /* 不合法的不記 */
++ fail_copy=1; assert(request(true,51,cc8,8,NULL)==EFAULT); fail_copy=0;
++ assert(!request(true,51,cc8,8,NULL));                         /* version＋cc[3] */
++ memset(got,0,8); assert(!request(false,51,got,8,NULL) && got[0]==1 && !memcmp(got+4,"TW ",3));
++ memset(got,0,8); assert(!request(false,51,got,3,NULL) && !memcmp(got,"TW ",3) && !got[3]);
++ assert(!request(true,51,(void *)"US",3,NULL));               /* 只有 cc[3] */
++ memset(got,0,8); assert(!request(false,51,got,8,NULL) && got[0]==1 && !memcmp(got+4,"US",3));
++ assert(!request(true,51,(void *)"US",3,NULL));               /* 同一個碼再設一次 */
++ assert(request(false,51,NULL,8,NULL)==EFAULT);
   puts("PASS: production station, ioctl layouts/events, fake frame callbacks and gates");
 + puts("PASS: fuxi,wifi-ux bit 0 power report follows the queued and running request");
++ puts("PASS: fuxi,wifi-ux bit 3 country code kept, bit 4 same power keeps the link");
   return 0;
  }
  '''
-@@ -181,6 +359,8 @@ def compile_run(source, directory, name):
+@@ -181,6 +402,8 @@ def compile_run(source, directory, name):
                      '-Wno-unused-function', '-Wno-unused-parameter', '-fsanitize=address,undefined',
                      '-pthread', '-I', str(SRC), str(path), '-o', str(binary)], check=True)
      subprocess.run([str(binary)], check=True, timeout=30)
@@ -35277,7 +35486,7 @@ index c8376e4..d363e22 100644
  int sweet_ufs_rootdev(dev_t *dev);
  
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
-index b09ac72..8d05f6e 100644
+index b09ac72..b2a7216 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
 @@ -37,15 +37,20 @@
@@ -35317,7 +35526,17 @@ index b09ac72..8d05f6e 100644
  
  static const char interface_name[16] = "en0";   /* (bsd/dev/fuxi_wifi_net.c makes one interface, and that is its name) */
  
-@@ -154,6 +166,9 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
+@@ -90,6 +102,9 @@ static LCK_GRP_DECLARE(apple80211_lock_group, "fuxi-wifi-apple80211");
+ static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
+ static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
+ static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
++/* fuxi,wifi-ux bit 3：wifid 設過的國家碼（ISO 兩字母＋第三字元），只記不用 */
++static uint8_t country_code[3];
++static bool country_known;
+ 
+ /* ---- channels ---------------------------------------------------------------------------------------- */
+ 
+@@ -154,6 +169,9 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
  	result->version = 1;
  	channel_fill(&result->channel, bss->frequency, 0);
  	result->rssi = bss->rssi;
@@ -35327,7 +35546,7 @@ index b09ac72..8d05f6e 100644
  	result->beacon_interval = bss->beacon_interval;
  	result->capability = bss->capability;
  	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
-@@ -180,6 +195,58 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
+@@ -180,6 +198,58 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
  
  /* ---- get ---------------------------------------------------------------------------------------------- */
  
@@ -35376,9 +35595,9 @@ index b09ac72..8d05f6e 100644
 +		}
 +		value = (read & FUXI_WIFI_UX_ALL) | 0x80000000u;
 +		__atomic_store_n(&wifi_ux_cached, value, __ATOMIC_RELEASE);
-+		printf("FUXI WIFI IOS: ux options 0x%x (power-asked %u, pick-rate %u, keep-link %u)\n",
++		printf("FUXI WIFI IOS: ux options 0x%x (power-asked %u, pick-rate %u, keep-link %u, country %u, power-same %u)\n",
 +		    value & FUXI_WIFI_UX_ALL, !!(value & FUXI_WIFI_UX_POWER_ASKED), !!(value & FUXI_WIFI_UX_PICK_RATE),
-+		    !!(value & FUXI_WIFI_UX_KEEP_LINK));
++		    !!(value & FUXI_WIFI_UX_KEEP_LINK), !!(value & FUXI_WIFI_UX_COUNTRY), !!(value & FUXI_WIFI_UX_POWER_SAME));
 +	}
 +	return value & FUXI_WIFI_UX_ALL;
 +}
@@ -35386,7 +35605,7 @@ index b09ac72..8d05f6e 100644
  static int
  get(struct apple80211req *request)
  {
-@@ -190,8 +257,9 @@ get(struct apple80211req *request)
+@@ -190,8 +260,9 @@ get(struct apple80211req *request)
  	case 43:
  	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
  		static const char name[256] = "Fuxi Wi-Fi iOS shim (synthetic backend)";
@@ -35397,7 +35616,7 @@ index b09ac72..8d05f6e 100644
  	}
  	case 12: {
  		/*
-@@ -219,6 +287,17 @@ get(struct apple80211req *request)
+@@ -219,6 +290,17 @@ get(struct apple80211req *request)
  	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
  		request->req_val = 1;
  		return 0;
@@ -35415,7 +35634,33 @@ index b09ac72..8d05f6e 100644
  	case 27:
  	case 254: {                             /* the channels the radio may tune to */
  		struct apple80211_channels *answer;
-@@ -328,7 +407,17 @@ get(struct apple80211req *request)
+@@ -259,6 +341,25 @@ get(struct apple80211req *request)
+ 		kfree_data(answer, sizeof(*answer));
+ 		return error;
+ 	}
++	case 51: {                              /* the country code wifid set (fuxi,wifi-ux bit 3) */
++		struct {
++			uint32_t version;
++			uint8_t code[4];
++		} answer = { .version = 1 };
++
++		if (!(fuxi_wifi_ux() & FUXI_WIFI_UX_COUNTRY)) {
++			break;                  /* refused below, as before */
++		}
++		lck_mtx_lock(&apple80211_lock);
++		bool known = country_known;
++		memcpy(answer.code, country_code, sizeof(country_code));
++		lck_mtx_unlock(&apple80211_lock);
++		if (!known) {
++			break;                  /* not set yet: refused below, as before */
++		}
++		/* 長度不到 8 的呼叫者只要三個字元；8 以上是 version＋cc[3] */
++		return request->req_len < sizeof(answer) ? give(request, answer.code, 3) : give(request, &answer, sizeof(answer));
++	}
+ 	case 21:                                /* how the last join went (0: not over yet) */
+ 		lck_mtx_lock(&apple80211_lock);
+ 		request->req_val = (int32_t)join_result;
+@@ -328,7 +429,17 @@ get(struct apple80211req *request)
  		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
  		break;
  	}
@@ -35434,7 +35679,7 @@ index b09ac72..8d05f6e 100644
  		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give_network(request, &state->bss);
  		break;
  	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-@@ -379,6 +468,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
+@@ -379,6 +490,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
  		memcpy(what->ssid, asked->ssid, asked->ssid_length);
  	}
  	what->passive = asked->scan_type == 2;
@@ -35442,7 +35687,58 @@ index b09ac72..8d05f6e 100644
  	what->dwell_ms = asked->dwell_ms;
  	/* (more channels than there is room to name: every channel) */
  	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
-@@ -496,12 +586,14 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+@@ -487,6 +599,50 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+ 		snprintf(said, said_size, " (power: %s)", asked.state[0] ? "on" : "off");
+ 		return fuxi_wifi_sta_ask_power(asked.state[0] != 0);
+ 	}
++	case 51: {                              /* the country code (fuxi,wifi-ux bit 3): kept, not applied */
++		/*
++		 * IO80211 框架把 wifid 的 CFString 轉成 version(u32)＋cc[3]（Apple80211Set 長度 8）；
++		 * 只有 3 bytes 時當成 cc[3] 本身。兩字母要是大寫英文或數字，第三字元可為空白、NUL 或可印字元。
++		 */
++		uint8_t bytes[8] = { 0 }, *code;
++		const char *layout;
++		int error;
++
++		if (!(fuxi_wifi_ux() & FUXI_WIFI_UX_COUNTRY)) {
++			return EOPNOTSUPP;
++		}
++		if (request->req_len < 3 || request->req_data == USER_ADDR_NULL) {
++			return EINVAL;
++		}
++		if ((error = copyin(request->req_data, bytes, request->req_len < sizeof(bytes) ? request->req_len :
++		    sizeof(bytes))) != 0) {
++			return error;
++		}
++		if (request->req_len < 7) {
++			code = bytes;
++			layout = "cc";
++		} else {
++			code = bytes + 4;
++			layout = "version+cc";
++		}
++		for (unsigned i = 0; i < 2; i++) {
++			if (!((code[i] >= 'A' && code[i] <= 'Z') || (code[i] >= '0' && code[i] <= '9'))) {
++				snprintf(said, said_size, " (country: not a code, %s)", layout);
++				return EINVAL;
++			}
++		}
++		if (code[2] != 0 && (code[2] < 0x20 || code[2] > 0x7e)) {
++			snprintf(said, said_size, " (country: not a code, %s)", layout);
++			return EINVAL;
++		}
++		lck_mtx_lock(&apple80211_lock);
++		bool changed = !country_known || memcmp(country_code, code, sizeof(country_code)) != 0;
++		memcpy(country_code, code, sizeof(country_code));
++		country_known = true;
++		lck_mtx_unlock(&apple80211_lock);
++		snprintf(said, said_size, " (country: %c%c, %s, %s)", code[0], code[1], layout, changed ? "kept" : "same");
++		return 0;
++	}
+ 	case 10:
+ 		return set_scan(request, said, said_size);
+ 	default:
+@@ -496,12 +652,14 @@ set(const struct apple80211req *request, char *said, size_t said_size)
  
  /* ---- events -------------------------------------------------------------------------------------------- */
  
@@ -35458,7 +35754,7 @@ index b09ac72..8d05f6e 100644
  
  	memcpy(name, interface_name, sizeof(name));
  	message.dv[0].data_length = sizeof(name);
-@@ -510,7 +602,90 @@ post(uint32_t code, const void *data, uint32_t length)
+@@ -510,7 +668,90 @@ post(uint32_t code, const void *data, uint32_t length)
  		message.dv[1].data_length = length;
  		message.dv[1].data_ptr = __DECONST(void *, data);
  	}
@@ -35550,7 +35846,7 @@ index b09ac72..8d05f6e 100644
  }
  
  /* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
-@@ -548,11 +723,20 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
+@@ -548,11 +789,20 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
  		if (state != NULL) {
  			fuxi_wifi_sta_state(state);
  			link.rssi = status == 1 ? state->bss.rssi : 0;
@@ -35571,7 +35867,7 @@ index b09ac72..8d05f6e 100644
  		break;
  	}
  	}
-@@ -609,6 +793,33 @@ fuxi_wifi_apple80211_summary(void)
+@@ -609,11 +859,38 @@ fuxi_wifi_apple80211_summary(void)
  	}
  }
  
@@ -35605,7 +35901,30 @@ index b09ac72..8d05f6e 100644
  /* An Apple80211 request for the radio's interface, from the process that is running now. */
  errno_t
  fuxi_wifi_apple80211_ioctl(u_long command, void *data)
-@@ -641,6 +852,7 @@ fuxi_wifi_apple80211_ioctl(u_long command, void *data)
+ {
+-	static unsigned said;
++	static unsigned said_gets, said_sets;
+ 	struct apple80211req *request = data;
+ 	char who[32] = "?", what[200] = "";
+ 	bool is_set = command == SIOCSA80211;
+@@ -631,9 +908,13 @@ fuxi_wifi_apple80211_ioctl(u_long command, void *data)
+ 	proc_selfname(who, sizeof(who));
+ 	error = is_set ? set(request, what, sizeof(what)) : get(request);
+ 	note(request, is_set, error);
+-	/* (a request that is repeated for ever is said a few hundred times) */
+-	if (said < 800) {
+-		said++;
++	/*
++	 * (a request that is repeated for ever is said a few hundred times; sets — scans, power, joins,
++	 * the country — come far less often and matter late in a run too, so they get their own allowance)
++	 */
++	unsigned *said = is_set ? &said_sets : &said_gets;
++	if (*said < (is_set ? 3000u : 800u)) {
++		(*said)++;
+ 		printf("FUXI WIFI IOS: apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
+ 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
+ 		    EOPNOTSUPP ? "REFUSED\n" : "");
+@@ -641,6 +922,7 @@ fuxi_wifi_apple80211_ioctl(u_long command, void *data)
  			printf("error %d\n", error);
  		}
  	}
@@ -35708,19 +36027,37 @@ index eb5ac01..0eb0bce 100644
  #endif
  #endif
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.c b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.c
-index 9479206..9bc52dc 100644
+index 9479206..899bfd6 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.c
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.c
-@@ -42,6 +42,8 @@ static const struct fuxi_wifi_sta_ops *sta_ops;   /* the station side, while the
+@@ -20,6 +20,7 @@
+  * Fuxi omits the root-file standing/fallback network: wifid owns rejoin policy.
+  */
+ #if defined(FUXI)
++#include <kern/clock.h>
+ #include <kern/kalloc.h>
+ #include <kern/locks.h>
+ #include <kern/sched_prim.h>
+@@ -42,6 +43,18 @@ static const struct fuxi_wifi_sta_ops *sta_ops;   /* the station side, while the
  static bool sta_thread_made;
  static bool sta_calls;                          /* the thread is in a call of the station side's */
  static bool sta_on;                             /* the radio's power, as last asked for */
 +/* fuxi,wifi-ux bit 0：電源要求已從佇列取出、正在切換時的目標 */
 +static bool power_running, power_running_on;
++/* 這一批電源要求中第一個的時間（ms）：紀錄「按下開關到開始切換」等了多久 */
++static uint64_t power_asked_at;
++
++static uint64_t
++sta_now_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ull;
++}
  
  /* what has been asked for and not begun */
  static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
-@@ -86,6 +88,8 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
+@@ -86,6 +99,8 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
  			power = true;
  			power_on = asked_power_on;
  			asked_power = false;
@@ -35729,18 +36066,38 @@ index 9479206..9bc52dc 100644
  		} else if (asked_leave) {
  			leave = true;
  			asked_leave = false;
-@@ -113,14 +117,14 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
+@@ -105,22 +120,33 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
+ 		if (power) {
+ 			struct fuxi_wifi_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+ 			bool was_joined = false;
++			uint64_t began = sta_now_ms();
+ 
+ 			if (state != NULL) {
+ 				ops->state(state);
+ 				was_joined = state->phase == FUXI_WIFI_STA_JOINED;
+ 				kfree_data(state, sizeof(*state));
  			}
- 			error = ops->power(power_on);
+-			error = ops->power(power_on);
  			lck_mtx_lock(&sta_lock);
 -			if (!asked_power) {
 -				sta_on = error == 0 ? power_on : !power_on;
--			}
++			/* fuxi,wifi-ux bit 4：要的和現在一樣就不碰底層（底層重開會清掉連線，mac80211 卻還連著） */
++			bool same = (fuxi_wifi_ux() & FUXI_WIFI_UX_POWER_SAME) && power_on == sta_on;
++			uint64_t waited = power_asked_at && began >= power_asked_at ? began - power_asked_at : 0;
++			lck_mtx_unlock(&sta_lock);
++			if (!same) {
++				error = ops->power(power_on);
+ 			}
++			lck_mtx_lock(&sta_lock);
 +			if (error == 0) { sta_on = power_on; }
 +			power_running = false;
 +			bool confirmed_on = sta_on;
  			lck_mtx_unlock(&sta_lock);
- 			if (!power_on && was_joined) {
+-			if (!power_on && was_joined) {
++			printf("FUXI WIFI IOS: power %s %s %d: waited %llu ms, took %llu ms, joined %u\n", power_on ? "on" : "off",
++			    same ? "kept (already so)" : "applied", error, (unsigned long long)waited,
++			    (unsigned long long)(sta_now_ms() - began), was_joined);
++			if (!power_on && was_joined && !same) {
  				fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
  			}
 -			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_POWER, error == 0 ? power_on : !power_on);
@@ -35748,7 +36105,7 @@ index 9479206..9bc52dc 100644
  		} else if (leave) {
  			ops->leave();
  			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
-@@ -179,10 +183,12 @@ fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops)
+@@ -179,10 +205,12 @@ fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops)
  	}
  	lck_mtx_lock(&sta_lock);
  	sta_ops = ops;
@@ -35763,7 +36120,7 @@ index 9479206..9bc52dc 100644
  }
  
  void
-@@ -203,16 +209,51 @@ fuxi_wifi_sta_present(void)
+@@ -203,16 +231,51 @@ fuxi_wifi_sta_present(void)
  	return present;
  }
  
@@ -35816,15 +36173,18 @@ index 9479206..9bc52dc 100644
  bool
  fuxi_wifi_sta_busy(void)
  {
-@@ -232,7 +273,6 @@ fuxi_wifi_sta_ask_power(bool on)
+@@ -232,7 +295,9 @@ fuxi_wifi_sta_ask_power(bool on)
  		lck_mtx_unlock(&sta_lock);
  		return ENXIO;
  	}
 -	sta_on = on;
++	if (!asked_power) {
++		power_asked_at = sta_now_ms();
++	}
  	asked_power = true;
  	asked_power_on = on;
  	if (!on) {
-@@ -252,7 +292,7 @@ fuxi_wifi_sta_ask_scan(const struct fuxi_wifi_sta_scan *what)
+@@ -252,7 +317,7 @@ fuxi_wifi_sta_ask_scan(const struct fuxi_wifi_sta_scan *what)
  		return EINVAL;
  	}
  	lck_mtx_lock(&sta_lock);
@@ -35833,7 +36193,7 @@ index 9479206..9bc52dc 100644
  		lck_mtx_unlock(&sta_lock);
  		return sta_ops == NULL ? ENXIO : ENETDOWN;
  	}
-@@ -272,7 +312,7 @@ fuxi_wifi_sta_ask_join(const struct fuxi_wifi_sta_join *what)
+@@ -272,7 +337,7 @@ fuxi_wifi_sta_ask_join(const struct fuxi_wifi_sta_join *what)
  		return EINVAL;
  	}
  	lck_mtx_lock(&sta_lock);
@@ -35843,7 +36203,7 @@ index 9479206..9bc52dc 100644
  		return sta_ops == NULL ? ENXIO : ENETDOWN;
  	}
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
-index dce1375..8d86ada 100644
+index dce1375..bf4edca 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
 @@ -45,6 +45,7 @@ struct fuxi_wifi_sta_scan {
@@ -35854,7 +36214,7 @@ index dce1375..8d86ada 100644
  };
  
  enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
-@@ -99,7 +100,22 @@ enum fuxi_wifi_sta_event {
+@@ -99,7 +100,32 @@ enum fuxi_wifi_sta_event {
  	                                         * an errno: it was lost (the access point showed us the door) */
  };
  
@@ -35868,7 +36228,17 @@ index dce1375..8d86ada 100644
 +                                         * （訊號相近時 5 GHz／較寬頻道優先），只看還新鮮、能加入的那些 */
 +#define FUXI_WIFI_UX_KEEP_LINK     4u      /* 已連線時再要求加入：先選好（必要時邊連邊掃）再斷線；
 +                                         * 選中的就是現在這台 AP 則直接回成功，不斷線 */
-+#define FUXI_WIFI_UX_ALL           7u
++/*
++ * 2026-11-17 native-hw000wifi-wifiux-boot-1 再看到的兩個問題：
++ * wifid 的 SET COUNTRY_CODE（51）一直被拒，WiFiLocaleManager 每秒重試 5 次、之後每 30 秒一次；
++ * 開關在掃描中來回切換，關的要求被後到的開覆蓋，radio 從沒關，iOS 端卻把連線當成斷了，
++ * mac80211 仍連著同一台，再認證回 -EALREADY（join finished 16、使用者看到一直轉圈）。
++ */
++#define FUXI_WIFI_UX_COUNTRY       8u      /* SET 51 收下並記住國家碼（只記、不改 Linux 法規域，也不發
++                                         * COUNTRY_CODE_CHANGED：wifid 收到會清掉掃描快取）；GET 51 回記住的碼 */
++#define FUXI_WIFI_UX_POWER_SAME   16u      /* 要的電源狀態和現在一樣（例如關被開覆蓋）：不呼叫底層、不清連線，
++                                         * 只回報電源事件 */
++#define FUXI_WIFI_UX_ALL          31u
 +
  #ifdef KERNEL
 +/* 讀一次 ADT 之後記住（ADT 開機後不變）；沒有這個屬性或長度不對都當 0 */
@@ -37206,10 +37576,10 @@ index 0000000..656f494
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ios.inc b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
 new file mode 100644
-index 0000000..613cc8a
+index 0000000..25c941e
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-@@ -0,0 +1,1622 @@
+@@ -0,0 +1,1633 @@
 +#include <sys/fuxi_wifi_ios.h>
 +#include <sys/fuxi_wifi_wpa.h>
 +#include <sys/errno.h>
@@ -37272,6 +37642,8 @@ index 0000000..613cc8a
 +static unsigned wli_bss_count, wli_channel_count;
 +static struct {
 +	uint64_t session, generation, deadline, scanned_at;
++	uint64_t begun_at, fetch_at;            /* 診斷：工作開始、開始取回掃描結果的時間（ms） */
++	unsigned scan_parts;
 +	uint32_t sequence, pending_sequence, features;
 +	unsigned pending_operation, info, channels, published, busy, submitted;
 +	unsigned operation, power_on, power_waiting, scan_accepted, scan_done;
@@ -37393,7 +37765,7 @@ index 0000000..613cc8a
 +	wli.busy = 1;
 +	wli.submitted = 0;
 +	wli.result = EINPROGRESS;
-+	uint64_t deadline;
++	uint64_t deadline, asked_at = wla_now_ms();
 +	clock_interval_to_deadline(40000, NSEC_PER_MSEC, &deadline);
 +	while (wli.busy && !wli.fatal) {
 +		if (lck_mtx_sleep_deadline(&wli_lock, LCK_SLEEP_DEFAULT, (event_t)&wli.busy,
@@ -37408,7 +37780,8 @@ index 0000000..613cc8a
 +	bool report_scan = error && operation == WLI_SCAN && scan && wli.scan_rejections < 16;
 +	if (report_scan) { wli.scan_rejections++; }
 +	lck_mtx_unlock(&wli_lock);
-+	printf("FUXI WIFI IOS: native operation %u on %u completed %d\n", operation, on, error);
++	printf("FUXI WIFI IOS: native operation %u on %u completed %d in %llu ms\n", operation, on, error,
++	    (unsigned long long)(wla_now_ms() - asked_at));
 +	if (report_scan) {
 +		printf("FUXI WIFI IOS: native scan rejected error %d passive %u dwell %u ms channels %u first %u MHz\n",
 +		    error, scan->passive, scan->dwell_ms, scan->frequency_count,
@@ -38028,8 +38401,11 @@ index 0000000..613cc8a
 +	wli.cache_valid = 1;
 +	lck_mtx_unlock(&wli_lock);
 +	wli.scan_reports++;
-+	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu\n", wli_bss_count,
-+	    (unsigned long long)wli.generation);
++	uint64_t done_at = wla_now_ms(), fetch_at = wli.fetch_at ? wli.fetch_at : done_at;
++	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu (radio %llu ms in %u parts, fetch %llu ms)\n",
++	    wli_bss_count, (unsigned long long)wli.generation,
++	    (unsigned long long)(fetch_at >= wli.begun_at ? fetch_at - wli.begun_at : 0), wli.scan_parts,
++	    (unsigned long long)(done_at >= fetch_at ? done_at - fetch_at : 0));
 +	wli_complete(0);
 +}
 +
@@ -38764,6 +39140,9 @@ index 0000000..613cc8a
 +	if (begin) {
 +		wli.submitted = 1;
 +		wli.deadline = now + 30000;
++		wli.begun_at = now;
++		wli.fetch_at = 0;
++		wli.scan_parts = operation == WLI_SCAN;
 +		wli.scan_accepted = wli.scan_done = wli.fetching = 0;
 +		if (operation == WLI_SCAN) {
 +			if (wli_state.phase == FUXI_WIFI_STA_IDLE) { wli_state.phase = FUXI_WIFI_STA_SCANNING; }
@@ -38806,12 +39185,14 @@ index 0000000..613cc8a
 +		if (wli.scan_offset + wli.scan_limit < wli.scan_count) {
 +			wli.scan_offset += wli.scan_limit;
 +			wli.scan_accepted = wli.scan_done = 0;
++			wli.scan_parts++;
 +			int error = wli_request(2);
 +			if (error) { return error; }
 +			return now >= wli.deadline ? ETIMEDOUT : 0;
 +		}
 +		wli.fetching = 1;
 +		wli.fetch_index = 0;
++		wli.fetch_at = now;
 +		wli.diag_lines = 0;
 +	}
 +	if (!wli.pending_operation) {
@@ -39135,7 +39516,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..2cd1737 100644
+index d21bf85..acbf639 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -39606,7 +39987,7 @@ index d21bf85..2cd1737 100644
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,2480 @@
+@@ -5899,3 +6092,2491 @@
  + }
  + r[3] = 0;
  +}
@@ -40464,7 +40845,7 @@ index d21bf85..2cd1737 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ios.inc
-+@@ -0,0 +1,1622 @@
++@@ -0,0 +1,1633 @@
 ++#include <sys/fuxi_wifi_ios.h>
 ++#include <sys/fuxi_wifi_wpa.h>
 ++#include <sys/errno.h>
@@ -40527,6 +40908,8 @@ index d21bf85..2cd1737 100644
 ++static unsigned wli_bss_count, wli_channel_count;
 ++static struct {
 ++	uint64_t session, generation, deadline, scanned_at;
+++	uint64_t begun_at, fetch_at;            /* 診斷：工作開始、開始取回掃描結果的時間（ms） */
+++	unsigned scan_parts;
 ++	uint32_t sequence, pending_sequence, features;
 ++	unsigned pending_operation, info, channels, published, busy, submitted;
 ++	unsigned operation, power_on, power_waiting, scan_accepted, scan_done;
@@ -40648,7 +41031,7 @@ index d21bf85..2cd1737 100644
 ++	wli.busy = 1;
 ++	wli.submitted = 0;
 ++	wli.result = EINPROGRESS;
-++	uint64_t deadline;
+++	uint64_t deadline, asked_at = wla_now_ms();
 ++	clock_interval_to_deadline(40000, NSEC_PER_MSEC, &deadline);
 ++	while (wli.busy && !wli.fatal) {
 ++		if (lck_mtx_sleep_deadline(&wli_lock, LCK_SLEEP_DEFAULT, (event_t)&wli.busy,
@@ -40663,7 +41046,8 @@ index d21bf85..2cd1737 100644
 ++	bool report_scan = error && operation == WLI_SCAN && scan && wli.scan_rejections < 16;
 ++	if (report_scan) { wli.scan_rejections++; }
 ++	lck_mtx_unlock(&wli_lock);
-++	printf("FUXI WIFI IOS: native operation %u on %u completed %d\n", operation, on, error);
+++	printf("FUXI WIFI IOS: native operation %u on %u completed %d in %llu ms\n", operation, on, error,
+++	    (unsigned long long)(wla_now_ms() - asked_at));
 ++	if (report_scan) {
 ++		printf("FUXI WIFI IOS: native scan rejected error %d passive %u dwell %u ms channels %u first %u MHz\n",
 ++		    error, scan->passive, scan->dwell_ms, scan->frequency_count,
@@ -41283,8 +41667,11 @@ index d21bf85..2cd1737 100644
 ++	wli.cache_valid = 1;
 ++	lck_mtx_unlock(&wli_lock);
 ++	wli.scan_reports++;
-++	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu\n", wli_bss_count,
-++	    (unsigned long long)wli.generation);
+++	uint64_t done_at = wla_now_ms(), fetch_at = wli.fetch_at ? wli.fetch_at : done_at;
+++	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu (radio %llu ms in %u parts, fetch %llu ms)\n",
+++	    wli_bss_count, (unsigned long long)wli.generation,
+++	    (unsigned long long)(fetch_at >= wli.begun_at ? fetch_at - wli.begun_at : 0), wli.scan_parts,
+++	    (unsigned long long)(done_at >= fetch_at ? done_at - fetch_at : 0));
 ++	wli_complete(0);
 ++}
 ++
@@ -42019,6 +42406,9 @@ index d21bf85..2cd1737 100644
 ++	if (begin) {
 ++		wli.submitted = 1;
 ++		wli.deadline = now + 30000;
+++		wli.begun_at = now;
+++		wli.fetch_at = 0;
+++		wli.scan_parts = operation == WLI_SCAN;
 ++		wli.scan_accepted = wli.scan_done = wli.fetching = 0;
 ++		if (operation == WLI_SCAN) {
 ++			if (wli_state.phase == FUXI_WIFI_STA_IDLE) { wli_state.phase = FUXI_WIFI_STA_SCANNING; }
@@ -42061,12 +42451,14 @@ index d21bf85..2cd1737 100644
 ++		if (wli.scan_offset + wli.scan_limit < wli.scan_count) {
 ++			wli.scan_offset += wli.scan_limit;
 ++			wli.scan_accepted = wli.scan_done = 0;
+++			wli.scan_parts++;
 ++			int error = wli_request(2);
 ++			if (error) { return error; }
 ++			return now >= wli.deadline ? ETIMEDOUT : 0;
 ++		}
 ++		wli.fetching = 1;
 ++		wli.fetch_index = 0;
+++		wli.fetch_at = now;
 ++		wli.diag_lines = 0;
 ++	}
 ++	if (!wli.pending_operation) {
@@ -42337,7 +42729,7 @@ index 39be642..40ce125 100644
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
 diff --git a/xnu/patches/0104-fuxi-wifi-ios.patch b/xnu/patches/0104-fuxi-wifi-ios.patch
-index 179f5df..29a7702 100644
+index 179f5df..f6366cd 100644
 --- a/xnu/patches/0104-fuxi-wifi-ios.patch
 +++ b/xnu/patches/0104-fuxi-wifi-ios.patch
 @@ -678,7 +678,7 @@
@@ -42345,7 +42737,7 @@ index 179f5df..29a7702 100644
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_apple80211.c
 -@@ -0,0 +1,647 @@
-+@@ -0,0 +1,859 @@
++@@ -0,0 +1,929 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
@@ -42386,7 +42778,17 @@ index 179f5df..29a7702 100644
  +
  +static const char interface_name[16] = "en0";   /* (bsd/dev/fuxi_wifi_net.c makes one interface, and that is its name) */
  +
-@@ -835,6 +847,9 @@
+@@ -771,6 +783,9 @@
+ +static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
+ +static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
+ +static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+++/* fuxi,wifi-ux bit 3：wifid 設過的國家碼（ISO 兩字母＋第三字元），只記不用 */
+++static uint8_t country_code[3];
+++static bool country_known;
+ +
+ +/* ---- channels ---------------------------------------------------------------------------------------- */
+ +
+@@ -835,6 +850,9 @@
  +	result->version = 1;
  +	channel_fill(&result->channel, bss->frequency, 0);
  +	result->rssi = bss->rssi;
@@ -42396,7 +42798,7 @@ index 179f5df..29a7702 100644
  +	result->beacon_interval = bss->beacon_interval;
  +	result->capability = bss->capability;
  +	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
-@@ -861,6 +876,58 @@
+@@ -861,6 +879,58 @@
  +
  +/* ---- get ---------------------------------------------------------------------------------------------- */
  +
@@ -42445,9 +42847,9 @@ index 179f5df..29a7702 100644
 ++		}
 ++		value = (read & FUXI_WIFI_UX_ALL) | 0x80000000u;
 ++		__atomic_store_n(&wifi_ux_cached, value, __ATOMIC_RELEASE);
-++		printf("FUXI WIFI IOS: ux options 0x%x (power-asked %u, pick-rate %u, keep-link %u)\n",
+++		printf("FUXI WIFI IOS: ux options 0x%x (power-asked %u, pick-rate %u, keep-link %u, country %u, power-same %u)\n",
 ++		    value & FUXI_WIFI_UX_ALL, !!(value & FUXI_WIFI_UX_POWER_ASKED), !!(value & FUXI_WIFI_UX_PICK_RATE),
-++		    !!(value & FUXI_WIFI_UX_KEEP_LINK));
+++		    !!(value & FUXI_WIFI_UX_KEEP_LINK), !!(value & FUXI_WIFI_UX_COUNTRY), !!(value & FUXI_WIFI_UX_POWER_SAME));
 ++	}
 ++	return value & FUXI_WIFI_UX_ALL;
 ++}
@@ -42455,7 +42857,7 @@ index 179f5df..29a7702 100644
  +static int
  +get(struct apple80211req *request)
  +{
-@@ -871,8 +938,9 @@
+@@ -871,8 +941,9 @@
  +	case 43:
  +	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
  +		static const char name[256] = "Fuxi Wi-Fi iOS shim (synthetic backend)";
@@ -42466,7 +42868,7 @@ index 179f5df..29a7702 100644
  +	}
  +	case 12: {
  +		/*
-@@ -900,6 +968,17 @@
+@@ -900,6 +971,17 @@
  +	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
  +		request->req_val = 1;
  +		return 0;
@@ -42484,7 +42886,33 @@ index 179f5df..29a7702 100644
  +	case 27:
  +	case 254: {                             /* the channels the radio may tune to */
  +		struct apple80211_channels *answer;
-@@ -1009,7 +1088,17 @@
+@@ -940,6 +1022,25 @@
+ +		kfree_data(answer, sizeof(*answer));
+ +		return error;
+ +	}
+++	case 51: {                              /* the country code wifid set (fuxi,wifi-ux bit 3) */
+++		struct {
+++			uint32_t version;
+++			uint8_t code[4];
+++		} answer = { .version = 1 };
+++
+++		if (!(fuxi_wifi_ux() & FUXI_WIFI_UX_COUNTRY)) {
+++			break;                  /* refused below, as before */
+++		}
+++		lck_mtx_lock(&apple80211_lock);
+++		bool known = country_known;
+++		memcpy(answer.code, country_code, sizeof(country_code));
+++		lck_mtx_unlock(&apple80211_lock);
+++		if (!known) {
+++			break;                  /* not set yet: refused below, as before */
+++		}
+++		/* 長度不到 8 的呼叫者只要三個字元；8 以上是 version＋cc[3] */
+++		return request->req_len < sizeof(answer) ? give(request, answer.code, 3) : give(request, &answer, sizeof(answer));
+++	}
+ +	case 21:                                /* how the last join went (0: not over yet) */
+ +		lck_mtx_lock(&apple80211_lock);
+ +		request->req_val = (int32_t)join_result;
+@@ -1009,7 +1110,17 @@
  +		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
  +		break;
  +	}
@@ -42503,7 +42931,7 @@ index 179f5df..29a7702 100644
  +		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give_network(request, &state->bss);
  +		break;
  +	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-@@ -1060,6 +1149,7 @@
+@@ -1060,6 +1171,7 @@
  +		memcpy(what->ssid, asked->ssid, asked->ssid_length);
  +	}
  +	what->passive = asked->scan_type == 2;
@@ -42511,7 +42939,58 @@ index 179f5df..29a7702 100644
  +	what->dwell_ms = asked->dwell_ms;
  +	/* (more channels than there is room to name: every channel) */
  +	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
-@@ -1177,12 +1267,14 @@
+@@ -1168,6 +1280,50 @@
+ +		snprintf(said, said_size, " (power: %s)", asked.state[0] ? "on" : "off");
+ +		return fuxi_wifi_sta_ask_power(asked.state[0] != 0);
+ +	}
+++	case 51: {                              /* the country code (fuxi,wifi-ux bit 3): kept, not applied */
+++		/*
+++		 * IO80211 框架把 wifid 的 CFString 轉成 version(u32)＋cc[3]（Apple80211Set 長度 8）；
+++		 * 只有 3 bytes 時當成 cc[3] 本身。兩字母要是大寫英文或數字，第三字元可為空白、NUL 或可印字元。
+++		 */
+++		uint8_t bytes[8] = { 0 }, *code;
+++		const char *layout;
+++		int error;
+++
+++		if (!(fuxi_wifi_ux() & FUXI_WIFI_UX_COUNTRY)) {
+++			return EOPNOTSUPP;
+++		}
+++		if (request->req_len < 3 || request->req_data == USER_ADDR_NULL) {
+++			return EINVAL;
+++		}
+++		if ((error = copyin(request->req_data, bytes, request->req_len < sizeof(bytes) ? request->req_len :
+++		    sizeof(bytes))) != 0) {
+++			return error;
+++		}
+++		if (request->req_len < 7) {
+++			code = bytes;
+++			layout = "cc";
+++		} else {
+++			code = bytes + 4;
+++			layout = "version+cc";
+++		}
+++		for (unsigned i = 0; i < 2; i++) {
+++			if (!((code[i] >= 'A' && code[i] <= 'Z') || (code[i] >= '0' && code[i] <= '9'))) {
+++				snprintf(said, said_size, " (country: not a code, %s)", layout);
+++				return EINVAL;
+++			}
+++		}
+++		if (code[2] != 0 && (code[2] < 0x20 || code[2] > 0x7e)) {
+++			snprintf(said, said_size, " (country: not a code, %s)", layout);
+++			return EINVAL;
+++		}
+++		lck_mtx_lock(&apple80211_lock);
+++		bool changed = !country_known || memcmp(country_code, code, sizeof(country_code)) != 0;
+++		memcpy(country_code, code, sizeof(country_code));
+++		country_known = true;
+++		lck_mtx_unlock(&apple80211_lock);
+++		snprintf(said, said_size, " (country: %c%c, %s, %s)", code[0], code[1], layout, changed ? "kept" : "same");
+++		return 0;
+++	}
+ +	case 10:
+ +		return set_scan(request, said, said_size);
+ +	default:
+@@ -1177,12 +1333,14 @@
  +
  +/* ---- events -------------------------------------------------------------------------------------------- */
  +
@@ -42527,7 +43006,7 @@ index 179f5df..29a7702 100644
  +
  +	memcpy(name, interface_name, sizeof(name));
  +	message.dv[0].data_length = sizeof(name);
-@@ -1191,7 +1283,90 @@
+@@ -1191,7 +1349,90 @@
  +		message.dv[1].data_length = length;
  +		message.dv[1].data_ptr = __DECONST(void *, data);
  +	}
@@ -42619,7 +43098,7 @@ index 179f5df..29a7702 100644
  +}
  +
  +/* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
-@@ -1229,11 +1404,20 @@
+@@ -1229,11 +1470,20 @@
  +		if (state != NULL) {
  +			fuxi_wifi_sta_state(state);
  +			link.rssi = status == 1 ? state->bss.rssi : 0;
@@ -42640,7 +43119,7 @@ index 179f5df..29a7702 100644
  +		break;
  +	}
  +	}
-@@ -1290,6 +1474,33 @@
+@@ -1290,11 +1540,38 @@
  +	}
  +}
  +
@@ -42674,7 +43153,30 @@ index 179f5df..29a7702 100644
  +/* An Apple80211 request for the radio's interface, from the process that is running now. */
  +errno_t
  +fuxi_wifi_apple80211_ioctl(u_long command, void *data)
-@@ -1322,13 +1533,14 @@
+ +{
+-+	static unsigned said;
+++	static unsigned said_gets, said_sets;
+ +	struct apple80211req *request = data;
+ +	char who[32] = "?", what[200] = "";
+ +	bool is_set = command == SIOCSA80211;
+@@ -1312,9 +1589,13 @@
+ +	proc_selfname(who, sizeof(who));
+ +	error = is_set ? set(request, what, sizeof(what)) : get(request);
+ +	note(request, is_set, error);
+-+	/* (a request that is repeated for ever is said a few hundred times) */
+-+	if (said < 800) {
+-+		said++;
+++	/*
+++	 * (a request that is repeated for ever is said a few hundred times; sets — scans, power, joins,
+++	 * the country — come far less often and matter late in a run too, so they get their own allowance)
+++	 */
+++	unsigned *said = is_set ? &said_sets : &said_gets;
+++	if (*said < (is_set ? 3000u : 800u)) {
+++		(*said)++;
+ +		printf("FUXI WIFI IOS: apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
+ +		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
+ +		    EOPNOTSUPP ? "REFUSED\n" : "");
+@@ -1322,13 +1603,14 @@
  +			printf("error %d\n", error);
  +		}
  +	}
@@ -42690,7 +43192,7 @@ index 179f5df..29a7702 100644
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
  + * Fuxi, 2026-10-23: shared diagnostic ABI; 16.7 payloads UNVERIFIED.
-@@ -1445,6 +1657,28 @@
+@@ -1445,6 +1727,28 @@
  +	uint8_t unused_3[4];
  +};
  +
@@ -42719,7 +43221,7 @@ index 179f5df..29a7702 100644
  +_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
  +    "the association request as iOS 16.5 has it");
  +_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
-@@ -1463,7 +1697,7 @@
+@@ -1463,7 +1767,7 @@
  +#endif
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_ios.c
@@ -42728,7 +43230,7 @@ index 179f5df..29a7702 100644
  +/* Fuxi Wi-Fi iOS shim entry and synthetic Ethernet link. No radio access. */
  +#if defined(FUXI)
  +#include <sys/param.h>
-@@ -1477,6 +1711,18 @@
+@@ -1477,6 +1781,18 @@
  +extern void FuxiNetworkStackStart(void);
  +static const struct fuxi_wifi_backend *backend;
  +static bool enabled;
@@ -42747,7 +43249,7 @@ index 179f5df..29a7702 100644
  +
  +static bool
  +transmit(mbuf_t packet, size_t length)
-@@ -1504,6 +1750,7 @@
+@@ -1504,6 +1820,7 @@
  +		return false;
  +	}
  +	backend = ops;
@@ -42755,7 +43257,7 @@ index 179f5df..29a7702 100644
  +	memcpy(link.address, ops->station.address, sizeof(link.address));
  +	ops->start(&input);
  +	fuxi_wifi_sta_attach(&ops->station);
-@@ -1659,17 +1906,24 @@
+@@ -1659,17 +1976,24 @@
  +{
  +	int on = 0;
  +	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
@@ -42782,7 +43284,7 @@ index 179f5df..29a7702 100644
  +/* Fuxi Wi-Fi iOS shim: boot-lifetime backend boundary. */
  +#ifndef FUXI_WIFI_IOS_H
  +#define FUXI_WIFI_IOS_H
-@@ -1704,6 +1958,7 @@
+@@ -1704,6 +2028,7 @@
  +#ifdef KERNEL
  +bool fuxi_wifi_ios_attach(const struct fuxi_wifi_backend *backend);
  +void fuxi_wifi_ios_init(void);
@@ -42790,25 +43292,43 @@ index 179f5df..29a7702 100644
  +#endif
  +#endif
  --- /dev/null
-@@ -2042,7 +2297,7 @@
+@@ -2042,7 +2367,7 @@
  +#endif /* _SYS_FUXI_WIFI_NET_H_ */
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_sta.c
 -@@ -0,0 +1,357 @@
-+@@ -0,0 +1,397 @@
++@@ -0,0 +1,422 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_sta.c (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
-@@ -2087,6 +2342,8 @@
+@@ -2065,6 +2390,7 @@
+ + * Fuxi omits the root-file standing/fallback network: wifid owns rejoin policy.
+ + */
+ +#if defined(FUXI)
+++#include <kern/clock.h>
+ +#include <kern/kalloc.h>
+ +#include <kern/locks.h>
+ +#include <kern/sched_prim.h>
+@@ -2087,6 +2413,18 @@
  +static bool sta_thread_made;
  +static bool sta_calls;                          /* the thread is in a call of the station side's */
  +static bool sta_on;                             /* the radio's power, as last asked for */
 ++/* fuxi,wifi-ux bit 0：電源要求已從佇列取出、正在切換時的目標 */
 ++static bool power_running, power_running_on;
+++/* 這一批電源要求中第一個的時間（ms）：紀錄「按下開關到開始切換」等了多久 */
+++static uint64_t power_asked_at;
+++
+++static uint64_t
+++sta_now_ms(void)
+++{
+++	uint64_t ns = 0;
+++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+++	return ns / 1000000ull;
+++}
  +
  +/* what has been asked for and not begun */
  +static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
-@@ -2131,6 +2388,8 @@
+@@ -2131,6 +2469,8 @@
  +			power = true;
  +			power_on = asked_power_on;
  +			asked_power = false;
@@ -42817,18 +43337,38 @@ index 179f5df..29a7702 100644
  +		} else if (asked_leave) {
  +			leave = true;
  +			asked_leave = false;
-@@ -2158,14 +2417,14 @@
+@@ -2150,22 +2490,33 @@
+ +		if (power) {
+ +			struct fuxi_wifi_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+ +			bool was_joined = false;
+++			uint64_t began = sta_now_ms();
+ +
+ +			if (state != NULL) {
+ +				ops->state(state);
+ +				was_joined = state->phase == FUXI_WIFI_STA_JOINED;
+ +				kfree_data(state, sizeof(*state));
  +			}
- +			error = ops->power(power_on);
+-+			error = ops->power(power_on);
  +			lck_mtx_lock(&sta_lock);
 -+			if (!asked_power) {
 -+				sta_on = error == 0 ? power_on : !power_on;
--+			}
+++			/* fuxi,wifi-ux bit 4：要的和現在一樣就不碰底層（底層重開會清掉連線，mac80211 卻還連著） */
+++			bool same = (fuxi_wifi_ux() & FUXI_WIFI_UX_POWER_SAME) && power_on == sta_on;
+++			uint64_t waited = power_asked_at && began >= power_asked_at ? began - power_asked_at : 0;
+++			lck_mtx_unlock(&sta_lock);
+++			if (!same) {
+++				error = ops->power(power_on);
+ +			}
+++			lck_mtx_lock(&sta_lock);
 ++			if (error == 0) { sta_on = power_on; }
 ++			power_running = false;
 ++			bool confirmed_on = sta_on;
  +			lck_mtx_unlock(&sta_lock);
- +			if (!power_on && was_joined) {
+-+			if (!power_on && was_joined) {
+++			printf("FUXI WIFI IOS: power %s %s %d: waited %llu ms, took %llu ms, joined %u\n", power_on ? "on" : "off",
+++			    same ? "kept (already so)" : "applied", error, (unsigned long long)waited,
+++			    (unsigned long long)(sta_now_ms() - began), was_joined);
+++			if (!power_on && was_joined && !same) {
  +				fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
  +			}
 -+			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_POWER, error == 0 ? power_on : !power_on);
@@ -42836,7 +43376,7 @@ index 179f5df..29a7702 100644
  +		} else if (leave) {
  +			ops->leave();
  +			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
-@@ -2224,10 +2483,12 @@
+@@ -2224,10 +2575,12 @@
  +	}
  +	lck_mtx_lock(&sta_lock);
  +	sta_ops = ops;
@@ -42851,7 +43391,7 @@ index 179f5df..29a7702 100644
  +}
  +
  +void
-@@ -2248,16 +2509,51 @@
+@@ -2248,16 +2601,51 @@
  +	return present;
  +}
  +
@@ -42904,15 +43444,18 @@ index 179f5df..29a7702 100644
  +bool
  +fuxi_wifi_sta_busy(void)
  +{
-@@ -2277,7 +2573,6 @@
+@@ -2277,7 +2665,9 @@
  +		lck_mtx_unlock(&sta_lock);
  +		return ENXIO;
  +	}
 -+	sta_on = on;
+++	if (!asked_power) {
+++		power_asked_at = sta_now_ms();
+++	}
  +	asked_power = true;
  +	asked_power_on = on;
  +	if (!on) {
-@@ -2297,7 +2592,7 @@
+@@ -2297,7 +2687,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
@@ -42921,7 +43464,7 @@ index 179f5df..29a7702 100644
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
-@@ -2317,7 +2612,7 @@
+@@ -2317,7 +2707,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
@@ -42930,16 +43473,16 @@ index 179f5df..29a7702 100644
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
-@@ -2402,7 +2697,7 @@
+@@ -2402,7 +2792,7 @@
  +#endif /* FUXI */
  --- /dev/null
  +++ b/bsd/sys/fuxi_wifi_sta.h
 -@@ -0,0 +1,126 @@
-+@@ -0,0 +1,142 @@
++@@ -0,0 +1,152 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/sys/redwood_sta.h (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
-@@ -2450,6 +2745,7 @@
+@@ -2450,6 +2840,7 @@
  +	uint16_t frequencies[64], frequency_count;      /* only these channels */
  +	bool passive;                           /* only listen */
  +	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
@@ -42947,7 +43490,7 @@ index 179f5df..29a7702 100644
  +};
  +
  +enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
-@@ -2504,7 +2800,22 @@
+@@ -2504,7 +2895,32 @@
  +	                                         * an errno: it was lost (the access point showed us the door) */
  +};
  +
@@ -42961,7 +43504,17 @@ index 179f5df..29a7702 100644
 ++                                         * （訊號相近時 5 GHz／較寬頻道優先），只看還新鮮、能加入的那些 */
 ++#define FUXI_WIFI_UX_KEEP_LINK     4u      /* 已連線時再要求加入：先選好（必要時邊連邊掃）再斷線；
 ++                                         * 選中的就是現在這台 AP 則直接回成功，不斷線 */
-++#define FUXI_WIFI_UX_ALL           7u
+++/*
+++ * 2026-11-17 native-hw000wifi-wifiux-boot-1 再看到的兩個問題：
+++ * wifid 的 SET COUNTRY_CODE（51）一直被拒，WiFiLocaleManager 每秒重試 5 次、之後每 30 秒一次；
+++ * 開關在掃描中來回切換，關的要求被後到的開覆蓋，radio 從沒關，iOS 端卻把連線當成斷了，
+++ * mac80211 仍連著同一台，再認證回 -EALREADY（join finished 16、使用者看到一直轉圈）。
+++ */
+++#define FUXI_WIFI_UX_COUNTRY       8u      /* SET 51 收下並記住國家碼（只記、不改 Linux 法規域，也不發
+++                                         * COUNTRY_CODE_CHANGED：wifid 收到會清掉掃描快取）；GET 51 回記住的碼 */
+++#define FUXI_WIFI_UX_POWER_SAME   16u      /* 要的電源狀態和現在一樣（例如關被開覆蓋）：不呼叫底層、不清連線，
+++                                         * 只回報電源事件 */
+++#define FUXI_WIFI_UX_ALL          31u
 ++
  +#ifdef KERNEL
 ++/* 讀一次 ADT 之後記住（ADT 開機後不變）；沒有這個屬性或長度不對都當 0 */
@@ -54264,6 +54817,93 @@ index 0000000..2e8b25c
 + 		for (index = 0; index < msgbufp->msg_bufx; index++) {
 + 			if (msgbufp->msg_bufc[index] == '\0') {
 + 				continue;
+diff --git a/xnu/patches/0121-fuxi-adt-wifi-args.patch b/xnu/patches/0121-fuxi-adt-wifi-args.patch
+new file mode 100644
+index 0000000..ec01922
+--- /dev/null
++++ b/xnu/patches/0121-fuxi-adt-wifi-args.patch
+@@ -0,0 +1,81 @@
++--- a/pexpert/gen/bootargs.c
+++++ b/pexpert/gen/bootargs.c
++@@ -187,13 +187,66 @@
++ 	return arg_found;
++ }
++ 
+++#if defined(FUXI)
+++/*
+++ * Fuxi (patch 0121): the iOS 16 command line holds 607 bytes. A Wi-Fi switch
+++ * (a name beginning fuxiwlan or fuxiwifi) that is not on it may come from the
+++ * ADT string /chosen fuxi,args, in the same "name=value name=value" form; the
+++ * command line wins. The property is 2..256 bytes and ends in its only NUL.
+++ * Before the device tree is up the lookup fails and nothing changes.
+++ */
+++static char *
+++fuxi_adt_args(const char *arg_string)
+++{
+++	DTEntry chosen;
+++	void const *prop;
+++	unsigned int size, i;
+++	const char *text;
+++
+++	if (strncmp(arg_string, "fuxiwlan", 8) != 0 && strncmp(arg_string, "fuxiwifi", 8) != 0) {
+++		return NULL;
+++	}
+++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
+++	    SecureDTGetProperty(chosen, "fuxi,args", &prop, &size) != kSuccess ||
+++	    size < 2 || size > 256) {
+++		return NULL;
+++	}
+++	text = (const char *)prop;
+++	for (i = 0; i + 1 < size; i++) {
+++		if (text[i] == '\0') {
+++			return NULL;
+++		}
+++	}
+++	if (text[size - 1] != '\0') {
+++		return NULL;
+++	}
+++	return __DECONST(char *, text);
+++}
+++
+++static boolean_t
+++fuxi_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_len, boolean_t force_string)
+++{
+++	char *adt;
+++
+++	if (PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, force_string)) {
+++		return TRUE;
+++	}
+++	adt = fuxi_adt_args(arg_string);
+++	return adt != NULL && PE_parse_boot_argn_internal(adt, arg_string, arg_ptr, max_len, force_string);
+++}
+++#endif
+++
++ boolean_t
++ PE_parse_boot_argn(
++ 	const char      *arg_string,
++ 	void            *arg_ptr,
++ 	int                     max_len)
++ {
+++#if defined(FUXI)
+++	return fuxi_parse_boot_argn(arg_string, arg_ptr, max_len, FALSE);
+++#else
++ 	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE);
+++#endif
++ }
++ 
++ boolean_t
++@@ -202,7 +255,11 @@
++ 	char            *arg_ptr,
++ 	int                     strlen)
++ {
+++#if defined(FUXI)
+++	return fuxi_parse_boot_argn(arg_string, arg_ptr, strlen, TRUE);
+++#else
++ 	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE);
+++#endif
++ }
++ 
++ #if defined(CONFIG_XNUPOST)
 diff --git a/xnu/variants/ath12k-link.patch b/xnu/variants/ath12k-link.patch
 new file mode 100644
 index 0000000..ac807b5
