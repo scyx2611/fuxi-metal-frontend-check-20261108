@@ -3709,7 +3709,7 @@ index 0000000..21fe2c5
 +script now completes without a DROPPED read has to be observed on the
 +device; until then the torch remains unverified.
 diff --git a/docs-lanes/wifi-ios.md b/docs-lanes/wifi-ios.md
-index 326195b..aae12a5 100644
+index 326195b..bf1c91b 100644
 --- a/docs-lanes/wifi-ios.md
 +++ b/docs-lanes/wifi-ios.md
 @@ -1,14 +1,21 @@
@@ -3793,6 +3793,36 @@ index 326195b..aae12a5 100644
  
  The fake backend reports **Fuxi Loopback**, an open BSS on channel 1, RSSI
  −42 dBm. It honors SSID/channel scan filters, accepts only that BSS, rejects
+@@ -261,3 +296,29 @@ through 0104 were applied on the available local base; already present
+ hunk counts and application of every generated source/integration hunk.
+ Existing `tools/test-fuxi-h1.py` and `tools/test-fuxi-wlan-w14.py` also pass.
+ No phone tools, CI/workflow, push or firmware/blob copy was used.
++
++## Native scan extensions (2026-11-17)
++
++The native ath12k bridge has two independent experimental boot arguments,
++both off by default. `fuxiwlandwell=1` accepts explicit scan dwell only when
++the module advertises feature bit 31 in INFO. Attribute 46 carries requested
++milliseconds, bounded to 1–1000. The module converts to cfg80211 TU with
++rounding up; ath12k converts TU to WMI milliseconds and fills all five band
++dwell fields, burst duration and mandatory static dwell. A 110 ms request
++becomes 108 TU and 111 WMI ms. Requests whose channel count and rest allowance
++exceed the 19-second budget are refused. Zero dwell preserves upstream defaults.
++
++`fuxiwlancache=1` allows Apple80211 FAST scans (type 3) to reuse a successful
++completed scan for at most five seconds. The prior scan must cover the requested
++SSID, channel list, passive mode and dwell. A failed, incomplete, powered-off
++or truncated module fallback scan cannot supply this cache; reported BSS ages
++continue advancing. Other scan types still ask the radio.
++
++The module input is CI run `44002779624`, harness `9b5cfcd`; the object, source
++lock, patch provenance, imports, platform and changed production source hashes
++are checked by `tools/ci/ath12k-link.py`. Host ASan/UBSan exercises the production
++control scan and ath12k dwell conversion for every integer millisecond from
++1 through 1000, malformed attributes, timeout budgets and unchanged defaults.
++The bridge suite covers feature negotiation, opt-in gates, cache coverage,
++expiry, power invalidation and real scan completion before success. These
++checks do not establish automatic joining or internet access on hardware.
 diff --git a/docs-lanes/wlan-ath12k.md b/docs-lanes/wlan-ath12k.md
 new file mode 100644
 index 0000000..41ed1f8
@@ -5200,10 +5230,10 @@ index efb83f1..745d165 100644
          uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
 diff --git a/tools/ci/ath12k-link.py b/tools/ci/ath12k-link.py
 new file mode 100644
-index 0000000..e94fbf6
+index 0000000..8743ce2
 --- /dev/null
 +++ b/tools/ci/ath12k-link.py
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,154 @@
 +import argparse
 +import hashlib
 +import json
@@ -5211,8 +5241,9 @@ index 0000000..e94fbf6
 +import struct
 +import subprocess
 +
-+OBJECT_SHA256 = '78178a345c8573a13aa1781221b18ea993b0b8716defb09ba4543e494ad4f6e1'
++OBJECT_SHA256 = 'fbfdc220a37eca52e0db0a8f85a918bbfbbe512e6e4d698144e5a036587cff67'
 +LOCK_SHA256 = 'f23882695f1c136c27b3f9cb36673bebad9ae1fc2af3fa787a98bd4add76c3c9'
++SCAN_DWELL_SHA256 = 'a12107927728e05f4c9e31820a9562cb581355c65d50b9ffa0c2b48d7d503804'
 +ENTRY_POINTS = (
 +    '_nw_wifi_start', '_nw_wifi_step', '_nw_wifi_stop', '_nw_wifi_poll',
 +    '_nw_wifi_irq_mode', '_nw_wifi_scan', '_nw_wifi_bss_count',
@@ -5281,6 +5312,21 @@ index 0000000..e94fbf6
 +            'ath12k object platform differs from the Fuxi kernel build')
 +    report_path = directory / 'fuxi_ath12k.build-report.json'
 +    report = json.loads(report_path.read_text(encoding='utf-8'))
++    dwell_path = directory / 'fuxi_ath12k.scan-dwell.json'
++    require(dwell_path.is_file() and not dwell_path.is_symlink() and
++            digest(dwell_path) == SCAN_DWELL_SHA256, 'ath12k scan dwell provenance differs')
++    dwell = json.loads(dwell_path.read_text(encoding='utf-8'))
++    require(dwell.get('schema') == 'fuxi-ath12k-scan-dwell-v1' and
++            dwell.get('feature_bit') == 1 << 31 and dwell.get('attribute') == 46 and
++            dwell.get('maximum_requested_ms') == 1000 and
++            dwell.get('maximum_scan_budget_ms') == 19000 and
++            dwell.get('hardware_verified') is False, 'ath12k scan dwell ABI differs')
++    for suffix in ('/src/nw_cfg80211_control.c', '/out/ath12k-src/mac.c'):
++        objects = [item for item in report.get('objects', [])
++                   if item.get('source', '').endswith(suffix)]
++        expected = dwell['files'][suffix.lstrip('/')]['after_sha256']
++        require(len(objects) == 1 and objects[0].get('source_sha256') == expected,
++                'ath12k build does not include the reviewed scan dwell source')
 +    require(report.get('runtime') == 'mainline' and
 +            report.get('legacy_station_linked') is False and
 +            report.get('hardware_verified') is False, 'ath12k build report differs')
@@ -5302,10 +5348,12 @@ index 0000000..e94fbf6
 +        'build_report_sha256': digest(report_path),
 +        'source_lock_sha256': LOCK_SHA256,
 +        'source_identity': identity,
++        'scan_dwell_provenance_sha256': SCAN_DWELL_SHA256,
++        'scan_dwell': dwell,
 +        'entry_points': list(ENTRY_POINTS),
 +        'imports': sorted(IMPORTS),
-+        'source_run': 43894744787,
-+        'source_commit': 'cb63de2e6b6fc4a4c63cf8f00c1710cf24f6bb84',
++        'source_run': 44002779624,
++        'source_commit': '9b5cfcd75e3250a5cc56a54cf2be14b982bc9f86',
 +        'kernel_build_target': KERNEL_TARGET,
 +        'macho_platform': KERNEL_PLATFORM[0],
 +        'minimum_os': '15.5',
@@ -8413,10 +8461,10 @@ index 0000000..df484bd
 +print('PASS: fuxi-wlan canonical source matches 0099')
 diff --git a/tools/test-fuxi-ath12k-link.py b/tools/test-fuxi-ath12k-link.py
 new file mode 100644
-index 0000000..6d7facb
+index 0000000..03f86da
 --- /dev/null
 +++ b/tools/test-fuxi-ath12k-link.py
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,108 @@
 +import argparse
 +import json
 +from pathlib import Path
@@ -8501,6 +8549,7 @@ index 0000000..6d7facb
 +            report_path.write_bytes(original)
 +            for filename, replacement in (
 +                    ('fuxi_ath12k.o', b'broken'),
++                    ('fuxi_ath12k.scan-dwell.json', b'{}\n'),
 +                    ('fuxi_ath12k.undefined.txt', b'_unexpected_kernel_import\n'),
 +                    ('fuxi_ath12k.exports.txt', b'')):
 +                path = copied / filename
@@ -8509,6 +8558,14 @@ index 0000000..6d7facb
 +                rejected(lambda: GATE['validate_bundle'](copied))
 +                path.write_bytes(original)
 +                checks += 1
++            report = json.loads(report_path.read_text())
++            for item in report['objects']:
++                if item.get('source', '').endswith('/out/ath12k-src/mac.c'):
++                    item['source_sha256'] = '0' * 64
++            report_path.write_text(json.dumps(report), encoding='utf-8')
++            rejected(lambda: GATE['validate_bundle'](copied))
++            report_path.write_bytes((arguments.bundle / 'fuxi_ath12k.build-report.json').read_bytes())
++            checks += 1
 +            GATE['validate_bundle'](copied)
 +            checks += 1
 +    print(f'PASS ath12k link inputs: {checks} platform and bundle checks')
@@ -17257,7 +17314,7 @@ index 0000000..9cff8f4
 +    unittest.main()
 diff --git a/tools/test-fuxi-wlan-control.c b/tools/test-fuxi-wlan-control.c
 new file mode 100644
-index 0000000..cea2fab
+index 0000000..0e08f98
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-control.c
 @@ -0,0 +1,144 @@
@@ -17398,7 +17455,7 @@ index 0000000..cea2fab
 +	fwc_write(bytes + 16, 56, 4);
 +	memcpy(bytes + 48, bytes + 40, 8);
 +	rejected(&probe, bytes, 56);
-+	fwc_write(bytes + 48, 46, 2);
++	fwc_write(bytes + 48, FWC_ATTR_COUNT, 2);
 +	rejected(&probe, bytes, 56);
 +	struct fwc_probe exhausted = { .session = 1, .sequence = (uint32_t)-1 };
 +	assert(!fwc_probe_request(&exhausted, bytes, sizeof(bytes)));
@@ -17407,10 +17464,10 @@ index 0000000..cea2fab
 +}
 diff --git a/tools/test-fuxi-wlan-ios.py b/tools/test-fuxi-wlan-ios.py
 new file mode 100644
-index 0000000..19bb669
+index 0000000..d1fd383
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ios.py
-@@ -0,0 +1,637 @@
+@@ -0,0 +1,713 @@
 +import hashlib
 +import hmac
 +import os
@@ -17467,8 +17524,13 @@ index 0000000..19bb669
 +    (void)entry; (void)context; *thread=NULL; threads_started++; return 0;
 +}
 +static int test_mode;
++static int test_dwell;
++static int test_cache;
++static uint32_t offered_features;
 +static char test_ssid[33];
 +static int PE_parse_boot_argn(const char *name,void *value,int length) {
++    if (!strcmp(name,"fuxiwlandwell")) { assert(length==4); *(int *)value=test_dwell; return test_dwell!=0; }
++    if (!strcmp(name,"fuxiwlancache")) { assert(length==4); *(int *)value=test_cache; return test_cache!=0; }
 +    if (!strcmp(name,"fuxiwifitest")) { assert(length==4); *(int *)value=test_mode; return 1; }
 +    assert(!strcmp(name,"fuxiwifitestssid") && length==32);
 +    memcpy(value,test_ssid,32); return test_ssid[0]!=0;
@@ -17583,6 +17645,7 @@ index 0000000..19bb669
 +    assert(!wli_step(1) && fwc_read16(captured+8)==1);
 +    size_t length=header(bytes,2,1,2);
 +    length=wli_put(bytes,length,2,station,6); length=wli_put(bytes,length,32,power,4);
++    if(offered_features) length=put32(bytes,length,28,offered_features);
 +    assert(!deliver(bytes,length) && wli.info && wli.generation==2);
 +    assert(!wli_step(2) && fwc_read16(captured+8)==11);
 +    uint8_t channels[64]={0};
@@ -17747,6 +17810,74 @@ index 0000000..19bb669
 +    serve_bss(6,6); assert(!pthread_join(thread,NULL));
 +    assert(!caller_result && wli_bss_count==2 && wli_bss[0].rssi==-56 && wli_bss[0].ssid_length==4);
 +    assert(!memcmp(wli_bss[0].ssid,"real",4) && wli_bss[0].elements_length==4 && !wli.fatal);
++}
++
++static void dwell_tests(void) {
++    memset(&caller_scan,0,sizeof(caller_scan));
++    caller_scan.dwell_ms=110;
++    bootstrap(); assert(wli_scan(&caller_scan)==EOPNOTSUPP && !wli.busy);
++    test_dwell=1; bootstrap(); assert(wli.dwell_enabled && !wli.features);
++    assert(wli_scan(&caller_scan)==EOPNOTSUPP && !wli.busy);
++    offered_features=FWC_FEATURE_SCAN_DWELL_MS;
++    test_dwell=0; bootstrap(); assert(!wli.dwell_enabled && wli.features==offered_features);
++    assert(wli_scan(&caller_scan)==EOPNOTSUPP && !wli.busy);
++    test_dwell=2; bootstrap(); assert(!wli.dwell_enabled);
++    test_dwell=1; bootstrap(); assert(wli.dwell_enabled);
++    caller_scan.dwell_ms=1001; assert(wli_scan(&caller_scan)==EINVAL && !wli.busy);
++    caller_scan.dwell_ms=110; caller_scan.frequency_count=1; caller_scan.frequencies[0]=2412;
++    pthread_t thread=begin(2,false); step(); expect_request(2);
++    assert(request_u32(FWC_ATTR_SCAN_DWELL_MS)==110 && !atomic_load(&caller_done));
++    scan_accept(true); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && !caller_result && !wli.fatal);
++    thread=begin(2,false); step(); expect_request(2); respond(2,6);
++    assert(!pthread_join(thread,NULL) && caller_result==EOPNOTSUPP && !wli.fatal);
++    test_dwell=0; offered_features=0;
++    memset(&caller_scan,0,sizeof(caller_scan));
++}
++
++static void cache_tests(void) {
++    struct fuxi_wifi_sta_scan previous={0}, asked={0};
++    assert(wli_scan_covers(&previous,&asked));
++    asked.frequency_count=1; asked.frequencies[0]=2412;
++    assert(wli_scan_covers(&previous,&asked));
++    previous.frequency_count=1; previous.frequencies[0]=5200;
++    assert(!wli_scan_covers(&previous,&asked));
++    previous.frequencies[0]=2412;
++    assert(wli_scan_covers(&previous,&asked));
++    asked.frequency_count=0; assert(!wli_scan_covers(&previous,&asked));
++    previous.frequency_count=0; previous.ssid_length=4; memcpy(previous.ssid,"IEEE",4);
++    assert(!wli_scan_covers(&previous,&asked));
++    asked.ssid_length=4; memcpy(asked.ssid,"IEEE",4);
++    assert(wli_scan_covers(&previous,&asked));
++    asked.ssid[3]='X'; assert(!wli_scan_covers(&previous,&asked));
++    previous.ssid_length=0; asked.passive=true; assert(!wli_scan_covers(&previous,&asked));
++    asked.passive=false; asked.dwell_ms=110; assert(!wli_scan_covers(&previous,&asked));
++    test_cache=2; bootstrap(); assert(!wli.cache_enabled);
++    test_cache=1; bootstrap(); assert(wli.cache_enabled && !wli.cache_valid);
++    memset(&caller_scan,0,sizeof(caller_scan)); caller_scan.cache_allowed=true;
++    pthread_t thread=begin(2,false); step(); expect_request(2);
++    scan_accept(false); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && !caller_result && wli.cache_valid);
++    unsigned sequence=wli.sequence;
++    assert(!wli_scan(&caller_scan) && wli.sequence==sequence && wli.cache_hits==1);
++    fake_now+=WLI_CACHE_MS;
++    assert(!wli_scan(&caller_scan) && wli.sequence==sequence && wli.cache_hits==2);
++    unsigned heard_seen=0; wli_heard(count_heard,&heard_seen); assert(heard_seen==5);
++    fake_now++;
++    thread=begin(2,false); step(); expect_request(2); assert(!wli.cache_valid);
++    scan_accept(true); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && !caller_result);
++    caller_scan.cache_allowed=false;
++    thread=begin(2,false); step(); expect_request(2);
++    scan_accept(false); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && !caller_result);
++    caller_scan.cache_allowed=true; wli.cache_enabled=0;
++    thread=begin(2,false); step(); expect_request(2);
++    scan_accept(false); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && !caller_result);
++    wli.cache_enabled=1; power_test(false,3);
++    assert(!wli.cache_valid && !wli_bss_count);
++    test_cache=0; memset(&caller_scan,0,sizeof(caller_scan));
 +}
 +
 +/* Events from the module about the join. */
@@ -17946,6 +18077,8 @@ index 0000000..19bb669
 +    address[0]=1; assert(fwa_mac_text(address,6,text));
 +    memset(address,0,6); assert(fwa_mac_text(address,6,text));
 +    make_fixtures();
++    dwell_tests();
++    cache_tests();
 +    bootstrap(); power_test(false,3); power_test(true,4); power_test(true,4);
 +    memset(&caller_scan,0,sizeof(caller_scan)); caller_scan.ssid_length=4;
 +    memcpy(caller_scan.ssid,"real",4); caller_scan.frequency_count=64;
@@ -31806,7 +31939,7 @@ index c8376e4..d363e22 100644
  int sweet_ufs_rootdev(dev_t *dev);
  
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
-index b09ac72..f09517f 100644
+index b09ac72..34e0edb 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
 @@ -37,8 +37,10 @@
@@ -31884,7 +32017,15 @@ index b09ac72..f09517f 100644
  		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give_network(request, &state->bss);
  		break;
  	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-@@ -496,12 +520,14 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+@@ -379,6 +403,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
+ 		memcpy(what->ssid, asked->ssid, asked->ssid_length);
+ 	}
+ 	what->passive = asked->scan_type == 2;
++	what->cache_allowed = asked->scan_type == 3;
+ 	what->dwell_ms = asked->dwell_ms;
+ 	/* (more channels than there is room to name: every channel) */
+ 	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
+@@ -496,12 +521,14 @@ set(const struct apple80211req *request, char *said, size_t said_size)
  
  /* ---- events -------------------------------------------------------------------------------------------- */
  
@@ -31900,7 +32041,7 @@ index b09ac72..f09517f 100644
  
  	memcpy(name, interface_name, sizeof(name));
  	message.dv[0].data_length = sizeof(name);
-@@ -510,7 +536,90 @@ post(uint32_t code, const void *data, uint32_t length)
+@@ -510,7 +537,90 @@ post(uint32_t code, const void *data, uint32_t length)
  		message.dv[1].data_length = length;
  		message.dv[1].data_ptr = __DECONST(void *, data);
  	}
@@ -31992,7 +32133,7 @@ index b09ac72..f09517f 100644
  }
  
  /* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
-@@ -548,11 +657,20 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
+@@ -548,11 +658,20 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
  		if (state != NULL) {
  			fuxi_wifi_sta_state(state);
  			link.rssi = status == 1 ? state->bss.rssi : 0;
@@ -32170,6 +32311,18 @@ index 9479206..731de98 100644
  		lck_mtx_unlock(&sta_lock);
  		return sta_ops == NULL ? ENXIO : ENETDOWN;
  	}
+diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
+index dce1375..9ac5c41 100644
+--- a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
++++ b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
+@@ -45,6 +45,7 @@ struct fuxi_wifi_sta_scan {
+ 	uint16_t frequencies[64], frequency_count;      /* only these channels */
+ 	bool passive;                           /* only listen */
+ 	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
++	bool cache_allowed;
+ };
+ 
+ enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
 diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
 index 1b46ea1..09ba683 100644
 --- a/xnu/fuxi-wlan/fuxi_wlan.c
@@ -33327,15 +33480,19 @@ index 0000000..a37d565
 +}
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_control.h b/xnu/fuxi-wlan/fuxi_wlan_control.h
 new file mode 100644
-index 0000000..e0b7465
+index 0000000..656f494
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_control.h
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,166 @@
 +#ifndef FUXI_WLAN_CONTROL_H
 +#define FUXI_WLAN_CONTROL_H
 +#include <stdint.h>
 +#include <stddef.h>
 +#include <string.h>
++
++#define FWC_FEATURE_SCAN_DWELL_MS (1U << 31)
++#define FWC_ATTR_SCAN_DWELL_MS 46
++#define FWC_ATTR_COUNT 47
 +
 +struct fwc_probe {
 +	uint64_t session, generation;
@@ -33385,7 +33542,7 @@ index 0000000..e0b7465
 +	uint64_t attributes = 0;
 +	for (size_t offset = 40; offset < length;) {
 +		unsigned attribute = fwc_read16(bytes + offset), size = fwc_read16(bytes + offset + 2);
-+		if (!attribute || attribute >= 46 || size < 4 || size > length - offset ||
++		if (!attribute || attribute >= FWC_ATTR_COUNT || size < 4 || size > length - offset ||
 +		    (attributes & ((uint64_t)1 << attribute))) { return 0; }
 +		attributes |= (uint64_t)1 << attribute;
 +		size_t padded = (size + 3u) & ~(size_t)3u;
@@ -33459,7 +33616,7 @@ index 0000000..e0b7465
 +	for (size_t offset = 40; offset < length;) {
 +		unsigned attribute = fwc_read16(bytes + offset);
 +		unsigned size = fwc_read16(bytes + offset + 2);
-+		if (!attribute || attribute >= 46 || size < 4 || size > length - offset ||
++		if (!attribute || attribute >= FWC_ATTR_COUNT || size < 4 || size > length - offset ||
 +		    (attributes & ((uint64_t)1 << attribute))) { return 1; }
 +		attributes |= (uint64_t)1 << attribute;
 +		size_t padded = (size + 3u) & ~(size_t)3u;
@@ -33495,10 +33652,10 @@ index 0000000..e0b7465
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ios.inc b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
 new file mode 100644
-index 0000000..b028004
+index 0000000..970b7ef
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-@@ -0,0 +1,1284 @@
+@@ -0,0 +1,1347 @@
 +#include <sys/fuxi_wifi_ios.h>
 +#include <sys/fuxi_wifi_wpa.h>
 +#include <sys/errno.h>
@@ -33526,6 +33683,7 @@ index 0000000..b028004
 +#define WLI_EAPOL_MOST 1024
 +#define WLI_JOIN_MS 20000
 +#define WLI_FRESH_MS 20000
++#define WLI_CACHE_MS 5000
 +#define WLI_DIAG_SCANS 2
 +#define WLI_DIAG_LINES 48
 +
@@ -33558,10 +33716,11 @@ index 0000000..b028004
 +static unsigned wli_bss_count, wli_channel_count;
 +static struct {
 +	uint64_t session, generation, deadline, scanned_at;
-+	uint32_t sequence, pending_sequence;
++	uint32_t sequence, pending_sequence, features;
 +	unsigned pending_operation, info, channels, published, busy, submitted;
 +	unsigned operation, power_on, power_waiting, scan_accepted, scan_done;
-+	unsigned fetching, fetch_index, scan_reports, diag_lines;
++	unsigned fetching, fetch_index, scan_reports, diag_lines, dwell_enabled;
++	unsigned cache_enabled, cache_valid, cache_hits;
 +	int result, fatal;
 +	struct fuxi_wifi_sta_scan scan;
 +} wli;
@@ -33627,6 +33786,7 @@ index 0000000..b028004
 +	wli.fatal = error;
 +	wli_state.phase = FUXI_WIFI_STA_OFF;
 +	wli_bss_count = 0;
++	wli.cache_valid = 0;
 +	lck_mtx_unlock(&wli_lock);
 +	wli_complete(error);
 +	if (wli_input) { wli_input->link_state(false); }
@@ -33673,11 +33833,45 @@ index 0000000..b028004
 +}
 +
 +static int
++wli_scan_covers(const struct fuxi_wifi_sta_scan *previous, const struct fuxi_wifi_sta_scan *asked)
++{
++	if (previous->passive != asked->passive || previous->dwell_ms != asked->dwell_ms ||
++	    (previous->ssid_length && (previous->ssid_length != asked->ssid_length ||
++	    memcmp(previous->ssid, asked->ssid, previous->ssid_length)))) { return 0; }
++	if (!previous->frequency_count) { return 1; }
++	if (!asked->frequency_count) { return 0; }
++	for (unsigned index = 0; index < asked->frequency_count; index++) {
++		bool present = false;
++		for (unsigned prior = 0; prior < previous->frequency_count; prior++) {
++			present |= previous->frequencies[prior] == asked->frequencies[index];
++		}
++		if (!present) { return 0; }
++	}
++	return 1;
++}
++
++static int
 +wli_scan(const struct fuxi_wifi_sta_scan *scan)
 +{
 +	if (!scan || scan->ssid_length > 32 || scan->frequency_count > 64 ||
 +	    (scan->passive && scan->ssid_length)) { return EINVAL; }
-+	if (scan->dwell_ms) { return EOPNOTSUPP; }
++	if (scan->dwell_ms > 1000) { return EINVAL; }
++	if (scan->dwell_ms && (!wli.dwell_enabled || !(wli.features & FWC_FEATURE_SCAN_DWELL_MS))) {
++		return EOPNOTSUPP;
++	}
++	lck_mtx_lock(&wli_lock);
++	bool cached = scan->cache_allowed && wli.cache_enabled && wli.cache_valid && wli_bss_count &&
++	    !wli.fatal && wli.published && !wli.busy && wli_state.phase != FUXI_WIFI_STA_OFF &&
++	    wla_now_ms() >= wli.scanned_at && wla_now_ms() - wli.scanned_at <= WLI_CACHE_MS &&
++	    wli_scan_covers(&wli.scan, scan);
++	unsigned hits = cached ? ++wli.cache_hits : 0;
++	lck_mtx_unlock(&wli_lock);
++	if (cached) {
++		if (hits <= 8 || !(hits % 64)) {
++			printf("FUXI WIFI IOS: FAST scan uses fresh completed cache %u\n", hits);
++		}
++		return 0;
++	}
 +	return wli_submit(WLI_SCAN, false, scan, NULL);
 +}
 +
@@ -33696,7 +33890,12 @@ index 0000000..b028004
 +	for (unsigned index = 0; index < WLI_BSS_MAX; index++) {
 +		lck_mtx_lock(&wli_lock);
 +		bool present = index < wli_bss_count;
-+		if (present) { bss = wli_bss[index]; }
++		if (present) {
++			bss = wli_bss[index];
++			uint64_t elapsed = wla_now_ms() >= wli.scanned_at ? wla_now_ms() - wli.scanned_at : 0;
++			uint64_t age = (uint64_t)bss.age_ms + elapsed;
++			bss.age_ms = age > (uint32_t)-1 ? (uint32_t)-1 : (uint32_t)age;
++		}
 +		lck_mtx_unlock(&wli_lock);
 +		if (!present) { break; }
 +		if (wli_ui_only_length && (bss.ssid_length != wli_ui_only_length ||
@@ -34003,7 +34202,10 @@ index 0000000..b028004
 +		wli_heard_joined(bss);
 +		lck_mtx_unlock(&wli_lock);
 +	}
++	lck_mtx_lock(&wli_lock);
 +	wli.scanned_at = wla_now_ms();
++	wli.cache_valid = 0;
++	lck_mtx_unlock(&wli_lock);
 +	wli.scan_reports++;
 +	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu (module records)\n", wli_bss_count,
 +	    (unsigned long long)wli.generation);
@@ -34013,7 +34215,10 @@ index 0000000..b028004
 +static void
 +wli_scan_finish(void)
 +{
++	lck_mtx_lock(&wli_lock);
 +	wli.scanned_at = wla_now_ms();
++	wli.cache_valid = 1;
++	lck_mtx_unlock(&wli_lock);
 +	wli.scan_reports++;
 +	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu\n", wli_bss_count,
 +	    (unsigned long long)wli.generation);
@@ -34141,6 +34346,7 @@ index 0000000..b028004
 +			}
 +			wli_add(20, frequencies, wli.scan.frequency_count * 4);
 +		}
++		if (wli.scan.dwell_ms) { wli_put32(FWC_ATTR_SCAN_DWELL_MS, wli.scan.dwell_ms); }
 +	} else if (operation == 3) {
 +		wli_put32(21, wli.fetch_index);
 +	}
@@ -34230,6 +34436,7 @@ index 0000000..b028004
 +			lck_mtx_lock(&wli_lock);
 +			wli_state.phase = wli.power_on ? FUXI_WIFI_STA_IDLE : FUXI_WIFI_STA_OFF;
 +			wli_bss_count = 0;
++			wli.cache_valid = 0;
 +			lck_mtx_unlock(&wli_lock);
 +			if (wli_input) { wli_input->link_state(false); }
 +			wli_complete(0);
@@ -34271,6 +34478,9 @@ index 0000000..b028004
 +		value = fwc_attribute(bytes, length, 32, &size);
 +		if (!value || size != 4 || fwc_read32(value) > 1) { goto invalid; }
 +		wli_state.phase = fwc_read32(value) ? FUXI_WIFI_STA_IDLE : FUXI_WIFI_STA_OFF;
++		value = fwc_attribute(bytes, length, 28, &size);
++		if (value && size != 4) { goto invalid; }
++		wli.features = value ? fwc_read32(value) : 0;
 +		wli.generation = generation;
 +		wli.info = 1;
 +	} else if (operation == 11) {
@@ -34698,6 +34908,15 @@ index 0000000..b028004
 +	}
 +	if (!wli.published) {
 +		if (!fuxi_wifi_ios_native_ready()) { return 0; }
++		int dwell = 0;
++		PE_parse_boot_argn("fuxiwlandwell", &dwell, sizeof(dwell));
++		wli.dwell_enabled = dwell == 1;
++		printf("FUXI WIFI IOS: scan dwell opt-in %u module support %u\n", wli.dwell_enabled,
++		    !!(wli.features & FWC_FEATURE_SCAN_DWELL_MS));
++		int cache = 0;
++		PE_parse_boot_argn("fuxiwlancache", &cache, sizeof(cache));
++		wli.cache_enabled = cache == 1;
++		printf("FUXI WIFI IOS: scan cache opt-in %u max age %u ms\n", wli.cache_enabled, WLI_CACHE_MS);
 +		wli_backend.station.power = wli_power;
 +		wli_backend.station.scan = wli_scan;
 +		wli_backend.station.heard = wli_heard;
@@ -34727,6 +34946,7 @@ index 0000000..b028004
 +		if (operation == WLI_SCAN) {
 +			if (wli_state.phase == FUXI_WIFI_STA_IDLE) { wli_state.phase = FUXI_WIFI_STA_SCANNING; }
 +			wli_bss_count = 0;
++			wli.cache_valid = 0;
 +		} else if (operation == WLI_JOIN) {
 +			memset(&wlj, 0, sizeof(wlj));
 +			wlj.bss = wli_target.bss;
@@ -35086,7 +35306,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..dab2b7c 100644
+index d21bf85..71f131d 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -35557,7 +35777,7 @@ index d21bf85..dab2b7c 100644
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,2138 @@
+@@ -5899,3 +6092,2205 @@
  + }
  + r[3] = 0;
  +}
@@ -36246,12 +36466,16 @@ index d21bf85..dab2b7c 100644
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_control.h
-+@@ -0,0 +1,162 @@
++@@ -0,0 +1,166 @@
 ++#ifndef FUXI_WLAN_CONTROL_H
 ++#define FUXI_WLAN_CONTROL_H
 ++#include <stdint.h>
 ++#include <stddef.h>
 ++#include <string.h>
+++
+++#define FWC_FEATURE_SCAN_DWELL_MS (1U << 31)
+++#define FWC_ATTR_SCAN_DWELL_MS 46
+++#define FWC_ATTR_COUNT 47
 ++
 ++struct fwc_probe {
 ++	uint64_t session, generation;
@@ -36301,7 +36525,7 @@ index d21bf85..dab2b7c 100644
 ++	uint64_t attributes = 0;
 ++	for (size_t offset = 40; offset < length;) {
 ++		unsigned attribute = fwc_read16(bytes + offset), size = fwc_read16(bytes + offset + 2);
-++		if (!attribute || attribute >= 46 || size < 4 || size > length - offset ||
+++		if (!attribute || attribute >= FWC_ATTR_COUNT || size < 4 || size > length - offset ||
 ++		    (attributes & ((uint64_t)1 << attribute))) { return 0; }
 ++		attributes |= (uint64_t)1 << attribute;
 ++		size_t padded = (size + 3u) & ~(size_t)3u;
@@ -36375,7 +36599,7 @@ index d21bf85..dab2b7c 100644
 ++	for (size_t offset = 40; offset < length;) {
 ++		unsigned attribute = fwc_read16(bytes + offset);
 ++		unsigned size = fwc_read16(bytes + offset + 2);
-++		if (!attribute || attribute >= 46 || size < 4 || size > length - offset ||
+++		if (!attribute || attribute >= FWC_ATTR_COUNT || size < 4 || size > length - offset ||
 ++		    (attributes & ((uint64_t)1 << attribute))) { return 1; }
 ++		attributes |= (uint64_t)1 << attribute;
 ++		size_t padded = (size + 3u) & ~(size_t)3u;
@@ -36411,7 +36635,7 @@ index d21bf85..dab2b7c 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ios.inc
-+@@ -0,0 +1,1284 @@
++@@ -0,0 +1,1347 @@
 ++#include <sys/fuxi_wifi_ios.h>
 ++#include <sys/fuxi_wifi_wpa.h>
 ++#include <sys/errno.h>
@@ -36439,6 +36663,7 @@ index d21bf85..dab2b7c 100644
 ++#define WLI_EAPOL_MOST 1024
 ++#define WLI_JOIN_MS 20000
 ++#define WLI_FRESH_MS 20000
+++#define WLI_CACHE_MS 5000
 ++#define WLI_DIAG_SCANS 2
 ++#define WLI_DIAG_LINES 48
 ++
@@ -36471,10 +36696,11 @@ index d21bf85..dab2b7c 100644
 ++static unsigned wli_bss_count, wli_channel_count;
 ++static struct {
 ++	uint64_t session, generation, deadline, scanned_at;
-++	uint32_t sequence, pending_sequence;
+++	uint32_t sequence, pending_sequence, features;
 ++	unsigned pending_operation, info, channels, published, busy, submitted;
 ++	unsigned operation, power_on, power_waiting, scan_accepted, scan_done;
-++	unsigned fetching, fetch_index, scan_reports, diag_lines;
+++	unsigned fetching, fetch_index, scan_reports, diag_lines, dwell_enabled;
+++	unsigned cache_enabled, cache_valid, cache_hits;
 ++	int result, fatal;
 ++	struct fuxi_wifi_sta_scan scan;
 ++} wli;
@@ -36540,6 +36766,7 @@ index d21bf85..dab2b7c 100644
 ++	wli.fatal = error;
 ++	wli_state.phase = FUXI_WIFI_STA_OFF;
 ++	wli_bss_count = 0;
+++	wli.cache_valid = 0;
 ++	lck_mtx_unlock(&wli_lock);
 ++	wli_complete(error);
 ++	if (wli_input) { wli_input->link_state(false); }
@@ -36586,11 +36813,45 @@ index d21bf85..dab2b7c 100644
 ++}
 ++
 ++static int
+++wli_scan_covers(const struct fuxi_wifi_sta_scan *previous, const struct fuxi_wifi_sta_scan *asked)
+++{
+++	if (previous->passive != asked->passive || previous->dwell_ms != asked->dwell_ms ||
+++	    (previous->ssid_length && (previous->ssid_length != asked->ssid_length ||
+++	    memcmp(previous->ssid, asked->ssid, previous->ssid_length)))) { return 0; }
+++	if (!previous->frequency_count) { return 1; }
+++	if (!asked->frequency_count) { return 0; }
+++	for (unsigned index = 0; index < asked->frequency_count; index++) {
+++		bool present = false;
+++		for (unsigned prior = 0; prior < previous->frequency_count; prior++) {
+++			present |= previous->frequencies[prior] == asked->frequencies[index];
+++		}
+++		if (!present) { return 0; }
+++	}
+++	return 1;
+++}
+++
+++static int
 ++wli_scan(const struct fuxi_wifi_sta_scan *scan)
 ++{
 ++	if (!scan || scan->ssid_length > 32 || scan->frequency_count > 64 ||
 ++	    (scan->passive && scan->ssid_length)) { return EINVAL; }
-++	if (scan->dwell_ms) { return EOPNOTSUPP; }
+++	if (scan->dwell_ms > 1000) { return EINVAL; }
+++	if (scan->dwell_ms && (!wli.dwell_enabled || !(wli.features & FWC_FEATURE_SCAN_DWELL_MS))) {
+++		return EOPNOTSUPP;
+++	}
+++	lck_mtx_lock(&wli_lock);
+++	bool cached = scan->cache_allowed && wli.cache_enabled && wli.cache_valid && wli_bss_count &&
+++	    !wli.fatal && wli.published && !wli.busy && wli_state.phase != FUXI_WIFI_STA_OFF &&
+++	    wla_now_ms() >= wli.scanned_at && wla_now_ms() - wli.scanned_at <= WLI_CACHE_MS &&
+++	    wli_scan_covers(&wli.scan, scan);
+++	unsigned hits = cached ? ++wli.cache_hits : 0;
+++	lck_mtx_unlock(&wli_lock);
+++	if (cached) {
+++		if (hits <= 8 || !(hits % 64)) {
+++			printf("FUXI WIFI IOS: FAST scan uses fresh completed cache %u\n", hits);
+++		}
+++		return 0;
+++	}
 ++	return wli_submit(WLI_SCAN, false, scan, NULL);
 ++}
 ++
@@ -36609,7 +36870,12 @@ index d21bf85..dab2b7c 100644
 ++	for (unsigned index = 0; index < WLI_BSS_MAX; index++) {
 ++		lck_mtx_lock(&wli_lock);
 ++		bool present = index < wli_bss_count;
-++		if (present) { bss = wli_bss[index]; }
+++		if (present) {
+++			bss = wli_bss[index];
+++			uint64_t elapsed = wla_now_ms() >= wli.scanned_at ? wla_now_ms() - wli.scanned_at : 0;
+++			uint64_t age = (uint64_t)bss.age_ms + elapsed;
+++			bss.age_ms = age > (uint32_t)-1 ? (uint32_t)-1 : (uint32_t)age;
+++		}
 ++		lck_mtx_unlock(&wli_lock);
 ++		if (!present) { break; }
 ++		if (wli_ui_only_length && (bss.ssid_length != wli_ui_only_length ||
@@ -36916,7 +37182,10 @@ index d21bf85..dab2b7c 100644
 ++		wli_heard_joined(bss);
 ++		lck_mtx_unlock(&wli_lock);
 ++	}
+++	lck_mtx_lock(&wli_lock);
 ++	wli.scanned_at = wla_now_ms();
+++	wli.cache_valid = 0;
+++	lck_mtx_unlock(&wli_lock);
 ++	wli.scan_reports++;
 ++	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu (module records)\n", wli_bss_count,
 ++	    (unsigned long long)wli.generation);
@@ -36926,7 +37195,10 @@ index d21bf85..dab2b7c 100644
 ++static void
 ++wli_scan_finish(void)
 ++{
+++	lck_mtx_lock(&wli_lock);
 ++	wli.scanned_at = wla_now_ms();
+++	wli.cache_valid = 1;
+++	lck_mtx_unlock(&wli_lock);
 ++	wli.scan_reports++;
 ++	printf("FUXI WIFI IOS: native scan complete BSS %u generation %llu\n", wli_bss_count,
 ++	    (unsigned long long)wli.generation);
@@ -37054,6 +37326,7 @@ index d21bf85..dab2b7c 100644
 ++			}
 ++			wli_add(20, frequencies, wli.scan.frequency_count * 4);
 ++		}
+++		if (wli.scan.dwell_ms) { wli_put32(FWC_ATTR_SCAN_DWELL_MS, wli.scan.dwell_ms); }
 ++	} else if (operation == 3) {
 ++		wli_put32(21, wli.fetch_index);
 ++	}
@@ -37143,6 +37416,7 @@ index d21bf85..dab2b7c 100644
 ++			lck_mtx_lock(&wli_lock);
 ++			wli_state.phase = wli.power_on ? FUXI_WIFI_STA_IDLE : FUXI_WIFI_STA_OFF;
 ++			wli_bss_count = 0;
+++			wli.cache_valid = 0;
 ++			lck_mtx_unlock(&wli_lock);
 ++			if (wli_input) { wli_input->link_state(false); }
 ++			wli_complete(0);
@@ -37184,6 +37458,9 @@ index d21bf85..dab2b7c 100644
 ++		value = fwc_attribute(bytes, length, 32, &size);
 ++		if (!value || size != 4 || fwc_read32(value) > 1) { goto invalid; }
 ++		wli_state.phase = fwc_read32(value) ? FUXI_WIFI_STA_IDLE : FUXI_WIFI_STA_OFF;
+++		value = fwc_attribute(bytes, length, 28, &size);
+++		if (value && size != 4) { goto invalid; }
+++		wli.features = value ? fwc_read32(value) : 0;
 ++		wli.generation = generation;
 ++		wli.info = 1;
 ++	} else if (operation == 11) {
@@ -37611,6 +37888,15 @@ index d21bf85..dab2b7c 100644
 ++	}
 ++	if (!wli.published) {
 ++		if (!fuxi_wifi_ios_native_ready()) { return 0; }
+++		int dwell = 0;
+++		PE_parse_boot_argn("fuxiwlandwell", &dwell, sizeof(dwell));
+++		wli.dwell_enabled = dwell == 1;
+++		printf("FUXI WIFI IOS: scan dwell opt-in %u module support %u\n", wli.dwell_enabled,
+++		    !!(wli.features & FWC_FEATURE_SCAN_DWELL_MS));
+++		int cache = 0;
+++		PE_parse_boot_argn("fuxiwlancache", &cache, sizeof(cache));
+++		wli.cache_enabled = cache == 1;
+++		printf("FUXI WIFI IOS: scan cache opt-in %u max age %u ms\n", wli.cache_enabled, WLI_CACHE_MS);
 ++		wli_backend.station.power = wli_power;
 ++		wli_backend.station.scan = wli_scan;
 ++		wli_backend.station.heard = wli_heard;
@@ -37640,6 +37926,7 @@ index d21bf85..dab2b7c 100644
 ++		if (operation == WLI_SCAN) {
 ++			if (wli_state.phase == FUXI_WIFI_STA_IDLE) { wli_state.phase = FUXI_WIFI_STA_SCANNING; }
 ++			wli_bss_count = 0;
+++			wli.cache_valid = 0;
 ++		} else if (operation == WLI_JOIN) {
 ++			memset(&wlj, 0, sizeof(wlj));
 ++			wlj.bss = wli_target.bss;
@@ -37946,7 +38233,7 @@ index 39be642..40ce125 100644
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
 diff --git a/xnu/patches/0104-fuxi-wifi-ios.patch b/xnu/patches/0104-fuxi-wifi-ios.patch
-index 179f5df..db7dd69 100644
+index 179f5df..4cb01f7 100644
 --- a/xnu/patches/0104-fuxi-wifi-ios.patch
 +++ b/xnu/patches/0104-fuxi-wifi-ios.patch
 @@ -678,7 +678,7 @@
@@ -37954,7 +38241,7 @@ index 179f5df..db7dd69 100644
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_apple80211.c
 -@@ -0,0 +1,647 @@
-+@@ -0,0 +1,765 @@
++@@ -0,0 +1,766 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
@@ -38033,7 +38320,15 @@ index 179f5df..db7dd69 100644
  +		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give_network(request, &state->bss);
  +		break;
  +	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-@@ -1177,12 +1201,14 @@
+@@ -1060,6 +1084,7 @@
+ +		memcpy(what->ssid, asked->ssid, asked->ssid_length);
+ +	}
+ +	what->passive = asked->scan_type == 2;
+++	what->cache_allowed = asked->scan_type == 3;
+ +	what->dwell_ms = asked->dwell_ms;
+ +	/* (more channels than there is room to name: every channel) */
+ +	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
+@@ -1177,12 +1202,14 @@
  +
  +/* ---- events -------------------------------------------------------------------------------------------- */
  +
@@ -38049,7 +38344,7 @@ index 179f5df..db7dd69 100644
  +
  +	memcpy(name, interface_name, sizeof(name));
  +	message.dv[0].data_length = sizeof(name);
-@@ -1191,7 +1217,90 @@
+@@ -1191,7 +1218,90 @@
  +		message.dv[1].data_length = length;
  +		message.dv[1].data_ptr = __DECONST(void *, data);
  +	}
@@ -38141,7 +38436,7 @@ index 179f5df..db7dd69 100644
  +}
  +
  +/* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
-@@ -1229,11 +1338,20 @@
+@@ -1229,11 +1339,20 @@
  +		if (state != NULL) {
  +			fuxi_wifi_sta_state(state);
  +			link.rssi = status == 1 ? state->bss.rssi : 0;
@@ -38162,7 +38457,7 @@ index 179f5df..db7dd69 100644
  +		break;
  +	}
  +	}
-@@ -1328,7 +1446,7 @@
+@@ -1328,7 +1447,7 @@
  +#endif /* FUXI */
  --- /dev/null
  +++ b/bsd/sys/fuxi_wifi_apple80211.h
@@ -38171,7 +38466,7 @@ index 179f5df..db7dd69 100644
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
  + * Fuxi, 2026-10-23: shared diagnostic ABI; 16.7 payloads UNVERIFIED.
-@@ -1445,6 +1563,28 @@
+@@ -1445,6 +1564,28 @@
  +	uint8_t unused_3[4];
  +};
  +
@@ -38200,7 +38495,7 @@ index 179f5df..db7dd69 100644
  +_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
  +    "the association request as iOS 16.5 has it");
  +_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
-@@ -1463,7 +1603,7 @@
+@@ -1463,7 +1604,7 @@
  +#endif
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_ios.c
@@ -38209,7 +38504,7 @@ index 179f5df..db7dd69 100644
  +/* Fuxi Wi-Fi iOS shim entry and synthetic Ethernet link. No radio access. */
  +#if defined(FUXI)
  +#include <sys/param.h>
-@@ -1477,6 +1617,18 @@
+@@ -1477,6 +1618,18 @@
  +extern void FuxiNetworkStackStart(void);
  +static const struct fuxi_wifi_backend *backend;
  +static bool enabled;
@@ -38228,7 +38523,7 @@ index 179f5df..db7dd69 100644
  +
  +static bool
  +transmit(mbuf_t packet, size_t length)
-@@ -1504,6 +1656,7 @@
+@@ -1504,6 +1657,7 @@
  +		return false;
  +	}
  +	backend = ops;
@@ -38236,7 +38531,7 @@ index 179f5df..db7dd69 100644
  +	memcpy(link.address, ops->station.address, sizeof(link.address));
  +	ops->start(&input);
  +	fuxi_wifi_sta_attach(&ops->station);
-@@ -1659,17 +1812,24 @@
+@@ -1659,17 +1813,24 @@
  +{
  +	int on = 0;
  +	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
@@ -38263,7 +38558,7 @@ index 179f5df..db7dd69 100644
  +/* Fuxi Wi-Fi iOS shim: boot-lifetime backend boundary. */
  +#ifndef FUXI_WIFI_IOS_H
  +#define FUXI_WIFI_IOS_H
-@@ -1704,6 +1864,7 @@
+@@ -1704,6 +1865,7 @@
  +#ifdef KERNEL
  +bool fuxi_wifi_ios_attach(const struct fuxi_wifi_backend *backend);
  +void fuxi_wifi_ios_init(void);
@@ -38271,7 +38566,7 @@ index 179f5df..db7dd69 100644
  +#endif
  +#endif
  --- /dev/null
-@@ -2158,14 +2319,13 @@
+@@ -2158,14 +2320,13 @@
  +			}
  +			error = ops->power(power_on);
  +			lck_mtx_lock(&sta_lock);
@@ -38289,7 +38584,7 @@ index 179f5df..db7dd69 100644
  +		} else if (leave) {
  +			ops->leave();
  +			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
-@@ -2224,10 +2384,12 @@
+@@ -2224,10 +2385,12 @@
  +	}
  +	lck_mtx_lock(&sta_lock);
  +	sta_ops = ops;
@@ -38304,7 +38599,7 @@ index 179f5df..db7dd69 100644
  +}
  +
  +void
-@@ -2277,7 +2439,6 @@
+@@ -2277,7 +2440,6 @@
  +		lck_mtx_unlock(&sta_lock);
  +		return ENXIO;
  +	}
@@ -38312,7 +38607,7 @@ index 179f5df..db7dd69 100644
  +	asked_power = true;
  +	asked_power_on = on;
  +	if (!on) {
-@@ -2297,7 +2458,7 @@
+@@ -2297,7 +2459,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
@@ -38321,7 +38616,7 @@ index 179f5df..db7dd69 100644
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
-@@ -2317,7 +2478,7 @@
+@@ -2317,7 +2479,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
@@ -38330,6 +38625,23 @@ index 179f5df..db7dd69 100644
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
+@@ -2402,7 +2564,7 @@
+ +#endif /* FUXI */
+ --- /dev/null
+ +++ b/bsd/sys/fuxi_wifi_sta.h
+-@@ -0,0 +1,126 @@
++@@ -0,0 +1,127 @@
+ +/*
+ + * Ported from HackiOS xnu/files/bsd/sys/redwood_sta.h (APSL-2.0)
+ + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
+@@ -2450,6 +2612,7 @@
+ +	uint16_t frequencies[64], frequency_count;      /* only these channels */
+ +	bool passive;                           /* only listen */
+ +	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
+++	bool cache_allowed;
+ +};
+ +
+ +enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
 diff --git a/xnu/patches/0106-fuxi-unixnu.patch b/xnu/patches/0106-fuxi-unixnu.patch
 index d95faff..cac8cfa 100644
 --- a/xnu/patches/0106-fuxi-unixnu.patch
