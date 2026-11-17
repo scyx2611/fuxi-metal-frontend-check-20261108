@@ -608,9 +608,9 @@ static void vb_install_supports(void)
     (void)method_setImplementation(method, (IMP)vb_supports);
 }
 
-static IMP vb_feedback_engine_original, vb_feedback_play_original;
-static unsigned vb_feedback_engine_done, vb_feedback_play_done;
-static unsigned vb_feedback_engine_calls, vb_feedback_play_calls;
+static IMP vb_feedback_engine_original, vb_feedback_play_original, vb_feedback_now_original;
+static unsigned vb_feedback_engine_done, vb_feedback_play_done, vb_feedback_now_done;
+static unsigned vb_feedback_engine_calls, vb_feedback_play_calls, vb_feedback_now_calls;
 
 static intptr_t vb_feedback_integer(id target, const char *name)
 {
@@ -653,6 +653,19 @@ static void vb_feedback_play(id self, SEL selector, id data, double when, id fee
         feedback, types, player, completion);
 }
 
+static void vb_feedback_now(id self, SEL selector, id data, id feedback, id options)
+{
+    unsigned call = __atomic_fetch_add(&vb_feedback_now_calls, 1u, __ATOMIC_RELAXED);
+    if (call < VB_PLAY_LOGS)
+        vb_say("feedback sound call=%u uptime-ms=%llu sound-id=%ld data-types=%ld feedback-types=%ld "
+            "options=%ld feedback=%s\n", call + 1, (unsigned long long)vb_now_ms(),
+            (long)vb_feedback_integer(data, "effectiveSystemSoundID"),
+            (long)vb_feedback_integer(data, "effectiveEnabledFeedbackTypes"),
+            (long)vb_feedback_integer(feedback, "_effectiveEnabledFeedbackTypes"),
+            (long)vb_feedback_integer(options, "count"), feedback ? object_getClassName(feedback) : "nil");
+    ((void (*)(id, SEL, id, id, id))vb_feedback_now_original)(self, selector, data, feedback, options);
+}
+
 static void vb_install_feedback(void)
 {
     Class target = objc_getClass("_UIFeedbackEngine");
@@ -688,6 +701,25 @@ static void vb_install_feedback(void)
                 vb_say("feedback internal dispatch hooked %s\n", method_getTypeEncoding(method));
             } else {
                 vb_say("feedback internal dispatch refused encoding %s\n", method_getTypeEncoding(method));
+            }
+        }
+    }
+    if (!__atomic_load_n(&vb_feedback_now_done, __ATOMIC_ACQUIRE)) {
+        Class sound = objc_getClass("_UIFeedbackSystemSoundEngine");
+        Method method = sound ? class_getInstanceMethod(sound,
+            sel_registerName("_internal_playFeedbackDataNow:forFeedback:withOptions:")) : NULL;
+        if (method && !__atomic_exchange_n(&vb_feedback_now_done, 1u, __ATOMIC_ACQ_REL)) {
+            char result[32];
+            method_getReturnType(method, result, sizeof(result));
+            bool usable = method_getNumberOfArguments(method) == 5 && vb_skip_qualifiers(result)[0] == 'v';
+            for (unsigned argument = 2; usable && argument < 5; argument++)
+                usable = vb_arg(method, argument) == 'x';
+            if (usable) {
+                vb_feedback_now_original = method_getImplementation(method);
+                (void)method_setImplementation(method, (IMP)vb_feedback_now);
+                vb_say("feedback system sound hooked %s\n", method_getTypeEncoding(method));
+            } else {
+                vb_say("feedback system sound refused encoding %s\n", method_getTypeEncoding(method));
             }
         }
     }
