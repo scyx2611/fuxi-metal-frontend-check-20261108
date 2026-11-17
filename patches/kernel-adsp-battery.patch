@@ -16325,19 +16325,33 @@ index cf82598..56f7e1a 100755
          out = Path(tmp)
          subprocess.run(['python3', str(ROOT/'tools/build-fuxi-turnip.py'), '--mesa', str(args.mesa.resolve()),
 diff --git a/tools/test-fuxi-wifi-ios.py b/tools/test-fuxi-wifi-ios.py
-index 12e012d..a91f8f2 100755
+index 12e012d..1f51d40 100755
 --- a/tools/test-fuxi-wifi-ios.py
 +++ b/tools/test-fuxi-wifi-ios.py
-@@ -55,7 +55,7 @@ typedef pthread_t thread_t;
+@@ -53,9 +53,11 @@ typedef void *event_t;
+ typedef int wait_result_t;
+ typedef pthread_t thread_t;
  typedef const void *mbuf_t;
- static int opt, superuser = 1, fail_copy;
+-static int opt, superuser = 1, fail_copy;
++static int opt, trace_opt, superuser = 1, fail_copy;
++static const char *caller = "fixture";
++static unsigned user_traces;
  static unsigned registry, attached;
 -static atomic_uint events[11];
 +static atomic_uint events[64];
  static bool link_up;
  static unsigned received;
  static pthread_cond_t wake_cond = PTHREAD_COND_INITIALIZER;
-@@ -86,7 +86,23 @@ static int kev_post_msg(struct kev_msg *m) {
+@@ -77,7 +79,7 @@ static int copyin(user_addr_t p,void *out,size_t n) {
+ static int copyout(const void *in,user_addr_t p,size_t n) {
+  if (!p || fail_copy) return EFAULT; memcpy((void *)p,in,n); return 0;
+ }
+-static void proc_selfname(char *p,int n) { snprintf(p,n,"fixture"); }
++static void proc_selfname(char *p,int n) { snprintf(p,n,"%s",caller); }
+ static void *current_proc(void) { return NULL; }
+ static int proc_suser(void *p) { (void)p; return !superuser; }
+ struct kev_msg { unsigned vendor_code,kev_class,kev_subclass,event_code;
+@@ -86,9 +88,26 @@ static int kev_post_msg(struct kev_msg *m) {
   assert(m->kev_class==6 && m->kev_subclass==1 && m->dv[0].data_length==16);
   assert(!strcmp(m->dv[0].data_ptr,"en0"));
   if (m->event_code==4) assert(m->dv[1].data_length==32);
@@ -16361,8 +16375,24 @@ index 12e012d..a91f8f2 100755
 + assert(c==&timer_fn && d==5ull*NSEC_PER_SEC); timer_armed++; return 0;
  }
  static int PE_parse_boot_argn(const char *key,void *p,int n) {
++ if (!strcmp(key,"fuxiwifitrace")) { assert(n==4); memcpy(p,&trace_opt,4); return trace_opt!=0; }
   assert(!strcmp(key,"fuxiwifiios") && n==4); memcpy(p,&opt,4); return opt!=0;
-@@ -114,10 +130,16 @@ static int request(bool set,int type,void *p,unsigned n,int *val) {
+ }
+ static int mbuf_copydata(mbuf_t p,size_t off,size_t n,void *out) { memcpy(out,(const char *)p+off,n);return 0; }
+@@ -98,6 +117,12 @@ static void fuxi_wifi_net_link_state(bool up) { link_up=up; }
+ '''
+ 
+ TEST = r'''
++void sweet_prof_user_bt(const char *tag) {
++ assert(!strcmp(tag,"FUXI WIFI IOC383"));
++ assert(!pthread_mutex_trylock(&apple80211_lock)); pthread_mutex_unlock(&apple80211_lock);
++ assert(!pthread_mutex_trylock(&ios_lock)); pthread_mutex_unlock(&ios_lock);
++ user_traces++;
++}
+ bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *p) {
+  assert(p->wireless && !p->up && p->address[0]==2); attached++; return true;
+ }
+@@ -114,11 +139,39 @@ static int request(bool set,int type,void *p,unsigned n,int *val) {
   int error=fuxi_wifi_apple80211_ioctl(set?SIOCSA80211:SIOCGA80211,&req);
   if(val) *val=req.req_val; return error;
  }
@@ -16372,6 +16402,25 @@ index 12e012d..a91f8f2 100755
 + if(argc==2) {
 +  opt=2; fuxi_wifi_ios_init();
 +  assert(!attached && !registry && !fuxi_wifi_sta_present() && fuxi_wifi_ios_native_ready());
++  assert(request(true,383,NULL,4104,NULL)==EOPNOTSUPP && !user_traces);
++  trace_opt=1;
++  assert(request(true,383,NULL,4104,NULL)==EOPNOTSUPP && !user_traces);
++  caller="wifid-client";
++  assert(request(true,383,NULL,4104,NULL)==EOPNOTSUPP && !user_traces);
++  caller="wifid";
++  for(trace_opt=-1;trace_opt<=2;trace_opt++) {
++   if(trace_opt==1) continue;
++   assert(request(true,383,NULL,4104,NULL)==EOPNOTSUPP && !user_traces);
++  }
++  trace_opt=1;
++  assert(request(false,383,NULL,4104,NULL)==EOPNOTSUPP && !user_traces);
++  assert(request(true,382,NULL,4104,NULL)==EOPNOTSUPP && !user_traces);
++  trace_unsupported_request(383,true,EINVAL,caller); assert(!user_traces);
++  superuser=0; assert(request(true,383,NULL,4104,NULL)==EPERM && !user_traces); superuser=1;
++  for(unsigned index=0;index<4;index++) {
++   assert(request(true,383,NULL,4104,NULL)==EOPNOTSUPP);
++   assert(user_traces==(index ? 2u : 1u));
++  }
 +  puts("PASS: native opt-in waits for real backend without publishing synthetic interface"); return 0;
 + }
   assert(sizeof(struct apple80211req)==40 && offsetof(struct apple80211req,req_data)==32);
@@ -16379,9 +16428,13 @@ index 12e012d..a91f8f2 100755
 - opt=2; fuxi_wifi_ios_init(); assert(!attached);
 + opt=3; fuxi_wifi_ios_init(); assert(!attached);
   opt=1; fuxi_wifi_ios_init(); assert(attached==1 && registry==1);
++ trace_opt=1; caller="wifid";
++ assert(request(true,383,NULL,4104,NULL)==EOPNOTSUPP && !user_traces);
++ caller="fixture"; trace_opt=0;
   fuxi_wifi_ios_init(); assert(attached==1);
   assert(!fuxi_wifi_ios_attach(&fake_backend));
-@@ -139,6 +161,7 @@ int main(void) {
+  assert(fuxi_wifi_sta_ask_scan(NULL)==EINVAL && fuxi_wifi_sta_ask_join(NULL)==EINVAL);
+@@ -139,6 +192,7 @@ int main(void) {
   assert(request(false,11,&result,sizeof(result),NULL)==0);
   assert(result.ssid_length==13 && !memcmp(result.ssid,"Fuxi Loopback",13));
   assert(result.rssi==-42 && result.channel.channel==1 && result.elements_length==4);
@@ -16389,7 +16442,7 @@ index 12e012d..a91f8f2 100755
   assert(request(false,11,&result,sizeof(result),NULL)==EIO);
   struct apple80211_channels channels;
   assert(!request(false,27,&channels,sizeof(channels),NULL) && channels.count==1);
-@@ -149,11 +172,19 @@ int main(void) {
+@@ -149,11 +203,19 @@ int main(void) {
   join.key_length=65; join.key_cipher=10; assert(request(true,20,&join,sizeof(join),NULL)==EINVAL);
   join.key_length=0; assert(!request(true,20,&join,sizeof(join),NULL)); settle();
   int val; assert(!request(false,21,NULL,0,&val) && val==1); assert(link_up);
@@ -16409,7 +16462,7 @@ index 12e012d..a91f8f2 100755
   join.key_length=8;memcpy(join.key,"password",8);join.key_cipher=10;
   assert(!request(true,20,&join,sizeof(join),NULL));settle();
   assert(!request(false,21,NULL,0,&val) && val==2 && !link_up);
-@@ -181,6 +212,8 @@ def compile_run(source, directory, name):
+@@ -181,6 +243,8 @@ def compile_run(source, directory, name):
                      '-Wno-unused-function', '-Wno-unused-parameter', '-fsanitize=address,undefined',
                      '-pthread', '-I', str(SRC), str(path), '-o', str(binary)], check=True)
      subprocess.run([str(binary)], check=True, timeout=30)
@@ -31939,10 +31992,10 @@ index c8376e4..d363e22 100644
  int sweet_ufs_rootdev(dev_t *dev);
  
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
-index b09ac72..34e0edb 100644
+index b09ac72..af1e337 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
-@@ -37,8 +37,10 @@
+@@ -37,15 +37,19 @@
   * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
   */
  #if defined(FUXI)
@@ -31951,9 +32004,10 @@ index b09ac72..34e0edb 100644
  #include <kern/locks.h>
 +#include <kern/thread_call.h>
  #include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
  #include <sys/errno.h>
  #include <sys/kern_event.h>
-@@ -46,6 +48,7 @@
+ #include <sys/kernel.h>
  #include <sys/proc.h>
  #include <sys/fuxi_wifi_net.h>
  #include <sys/fuxi_wifi_sta.h>
@@ -31961,7 +32015,7 @@ index b09ac72..34e0edb 100644
  #include <sys/sockio.h>
  #include <sys/systm.h>
  
-@@ -82,7 +85,14 @@ type_name(int32_t type)
+@@ -82,7 +86,14 @@ type_name(int32_t type)
  
  /* Apple80211's events (APPLE80211_M_...) */
  enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
@@ -31977,7 +32031,7 @@ index b09ac72..34e0edb 100644
  
  static const char interface_name[16] = "en0";   /* (bsd/dev/fuxi_wifi_net.c makes one interface, and that is its name) */
  
-@@ -154,6 +164,9 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
+@@ -154,6 +165,9 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
  	result->version = 1;
  	channel_fill(&result->channel, bss->frequency, 0);
  	result->rssi = bss->rssi;
@@ -31987,7 +32041,7 @@ index b09ac72..34e0edb 100644
  	result->beacon_interval = bss->beacon_interval;
  	result->capability = bss->capability;
  	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
-@@ -190,8 +203,9 @@ get(struct apple80211req *request)
+@@ -190,8 +204,9 @@ get(struct apple80211req *request)
  	case 43:
  	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
  		static const char name[256] = "Fuxi Wi-Fi iOS shim (synthetic backend)";
@@ -31998,7 +32052,7 @@ index b09ac72..34e0edb 100644
  	}
  	case 12: {
  		/*
-@@ -328,7 +342,17 @@ get(struct apple80211req *request)
+@@ -328,7 +343,17 @@ get(struct apple80211req *request)
  		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
  		break;
  	}
@@ -32017,7 +32071,7 @@ index b09ac72..34e0edb 100644
  		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give_network(request, &state->bss);
  		break;
  	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-@@ -379,6 +403,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
+@@ -379,6 +404,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
  		memcpy(what->ssid, asked->ssid, asked->ssid_length);
  	}
  	what->passive = asked->scan_type == 2;
@@ -32025,7 +32079,7 @@ index b09ac72..34e0edb 100644
  	what->dwell_ms = asked->dwell_ms;
  	/* (more channels than there is room to name: every channel) */
  	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
-@@ -496,12 +521,14 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+@@ -496,12 +522,14 @@ set(const struct apple80211req *request, char *said, size_t said_size)
  
  /* ---- events -------------------------------------------------------------------------------------------- */
  
@@ -32041,7 +32095,7 @@ index b09ac72..34e0edb 100644
  
  	memcpy(name, interface_name, sizeof(name));
  	message.dv[0].data_length = sizeof(name);
-@@ -510,7 +537,90 @@ post(uint32_t code, const void *data, uint32_t length)
+@@ -510,7 +538,90 @@ post(uint32_t code, const void *data, uint32_t length)
  		message.dv[1].data_length = length;
  		message.dv[1].data_ptr = __DECONST(void *, data);
  	}
@@ -32133,7 +32187,7 @@ index b09ac72..34e0edb 100644
  }
  
  /* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
-@@ -548,11 +658,20 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
+@@ -548,11 +659,20 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
  		if (state != NULL) {
  			fuxi_wifi_sta_state(state);
  			link.rssi = status == 1 ? state->bss.rssi : 0;
@@ -32154,6 +32208,48 @@ index b09ac72..34e0edb 100644
  		break;
  	}
  	}
+@@ -609,6 +729,33 @@ fuxi_wifi_apple80211_summary(void)
+ 	}
+ }
+ 
++extern void sweet_prof_user_bt(const char *tag);
++
++static void
++trace_unsupported_request(int32_t type, bool is_set, int error, const char *caller)
++{
++	static unsigned traces;
++	int enabled = 0;
++
++	if (!is_set || type != 383 || error != EOPNOTSUPP || strcmp(caller, "wifid") ||
++	    !fuxi_wifi_ios_native_ready()) {
++		return;
++	}
++	PE_parse_boot_argn("fuxiwifitrace", &enabled, sizeof(enabled));
++	if (enabled != 1) {
++		return;
++	}
++	lck_mtx_lock(&apple80211_lock);
++	bool allowed = traces < 2;
++	if (allowed) {
++		traces++;
++	}
++	lck_mtx_unlock(&apple80211_lock);
++	if (allowed) {
++		sweet_prof_user_bt("FUXI WIFI IOC383");
++	}
++}
++
+ /* An Apple80211 request for the radio's interface, from the process that is running now. */
+ errno_t
+ fuxi_wifi_apple80211_ioctl(u_long command, void *data)
+@@ -641,6 +788,7 @@ fuxi_wifi_apple80211_ioctl(u_long command, void *data)
+ 			printf("error %d\n", error);
+ 		}
+ 	}
++	trace_unsupported_request(request->req_type, is_set, error, who);
+ 	return error;
+ }
+ 
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.h b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.h
 index c497162..c9ed43d 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.h
@@ -33652,10 +33748,10 @@ index 0000000..656f494
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ios.inc b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
 new file mode 100644
-index 0000000..970b7ef
+index 0000000..01d9ded
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-@@ -0,0 +1,1347 @@
+@@ -0,0 +1,1354 @@
 +#include <sys/fuxi_wifi_ios.h>
 +#include <sys/fuxi_wifi_wpa.h>
 +#include <sys/errno.h>
@@ -33720,7 +33816,7 @@ index 0000000..970b7ef
 +	unsigned pending_operation, info, channels, published, busy, submitted;
 +	unsigned operation, power_on, power_waiting, scan_accepted, scan_done;
 +	unsigned fetching, fetch_index, scan_reports, diag_lines, dwell_enabled;
-+	unsigned cache_enabled, cache_valid, cache_hits;
++	unsigned cache_enabled, cache_valid, cache_hits, scan_rejections;
 +	int result, fatal;
 +	struct fuxi_wifi_sta_scan scan;
 +} wli;
@@ -33821,8 +33917,15 @@ index 0000000..970b7ef
 +		}
 +	}
 +	int error = wli.fatal ? wli.fatal : wli.result;
++	bool report_scan = error && operation == WLI_SCAN && scan && wli.scan_rejections < 16;
++	if (report_scan) { wli.scan_rejections++; }
 +	lck_mtx_unlock(&wli_lock);
 +	printf("FUXI WIFI IOS: native operation %u on %u completed %d\n", operation, on, error);
++	if (report_scan) {
++		printf("FUXI WIFI IOS: native scan rejected error %d passive %u dwell %u ms channels %u first %u MHz\n",
++		    error, scan->passive, scan->dwell_ms, scan->frequency_count,
++		    scan->frequency_count ? scan->frequencies[0] : 0);
++	}
 +	return error;
 +}
 +
@@ -35306,7 +35409,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..71f131d 100644
+index d21bf85..dcd1f5e 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -35777,7 +35880,7 @@ index d21bf85..71f131d 100644
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,2205 @@
+@@ -5899,3 +6092,2212 @@
  + }
  + r[3] = 0;
  +}
@@ -36635,7 +36738,7 @@ index d21bf85..71f131d 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ios.inc
-+@@ -0,0 +1,1347 @@
++@@ -0,0 +1,1354 @@
 ++#include <sys/fuxi_wifi_ios.h>
 ++#include <sys/fuxi_wifi_wpa.h>
 ++#include <sys/errno.h>
@@ -36700,7 +36803,7 @@ index d21bf85..71f131d 100644
 ++	unsigned pending_operation, info, channels, published, busy, submitted;
 ++	unsigned operation, power_on, power_waiting, scan_accepted, scan_done;
 ++	unsigned fetching, fetch_index, scan_reports, diag_lines, dwell_enabled;
-++	unsigned cache_enabled, cache_valid, cache_hits;
+++	unsigned cache_enabled, cache_valid, cache_hits, scan_rejections;
 ++	int result, fatal;
 ++	struct fuxi_wifi_sta_scan scan;
 ++} wli;
@@ -36801,8 +36904,15 @@ index d21bf85..71f131d 100644
 ++		}
 ++	}
 ++	int error = wli.fatal ? wli.fatal : wli.result;
+++	bool report_scan = error && operation == WLI_SCAN && scan && wli.scan_rejections < 16;
+++	if (report_scan) { wli.scan_rejections++; }
 ++	lck_mtx_unlock(&wli_lock);
 ++	printf("FUXI WIFI IOS: native operation %u on %u completed %d\n", operation, on, error);
+++	if (report_scan) {
+++		printf("FUXI WIFI IOS: native scan rejected error %d passive %u dwell %u ms channels %u first %u MHz\n",
+++		    error, scan->passive, scan->dwell_ms, scan->frequency_count,
+++		    scan->frequency_count ? scan->frequencies[0] : 0);
+++	}
 ++	return error;
 ++}
 ++
@@ -38233,7 +38343,7 @@ index 39be642..40ce125 100644
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
 diff --git a/xnu/patches/0104-fuxi-wifi-ios.patch b/xnu/patches/0104-fuxi-wifi-ios.patch
-index 179f5df..4cb01f7 100644
+index 179f5df..f873e33 100644
 --- a/xnu/patches/0104-fuxi-wifi-ios.patch
 +++ b/xnu/patches/0104-fuxi-wifi-ios.patch
 @@ -678,7 +678,7 @@
@@ -38241,11 +38351,11 @@ index 179f5df..4cb01f7 100644
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_apple80211.c
 -@@ -0,0 +1,647 @@
-+@@ -0,0 +1,766 @@
++@@ -0,0 +1,795 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
-@@ -718,8 +718,10 @@
+@@ -718,15 +718,19 @@
  + * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
  + */
  +#if defined(FUXI)
@@ -38254,9 +38364,10 @@ index 179f5df..4cb01f7 100644
  +#include <kern/locks.h>
 ++#include <kern/thread_call.h>
  +#include <libkern/libkern.h>
+++#include <pexpert/pexpert.h>
  +#include <sys/errno.h>
  +#include <sys/kern_event.h>
-@@ -727,6 +729,7 @@
+ +#include <sys/kernel.h>
  +#include <sys/proc.h>
  +#include <sys/fuxi_wifi_net.h>
  +#include <sys/fuxi_wifi_sta.h>
@@ -38264,7 +38375,7 @@ index 179f5df..4cb01f7 100644
  +#include <sys/sockio.h>
  +#include <sys/systm.h>
  +
-@@ -763,7 +766,14 @@
+@@ -763,7 +767,14 @@
  +
  +/* Apple80211's events (APPLE80211_M_...) */
  +enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
@@ -38280,7 +38391,7 @@ index 179f5df..4cb01f7 100644
  +
  +static const char interface_name[16] = "en0";   /* (bsd/dev/fuxi_wifi_net.c makes one interface, and that is its name) */
  +
-@@ -835,6 +845,9 @@
+@@ -835,6 +846,9 @@
  +	result->version = 1;
  +	channel_fill(&result->channel, bss->frequency, 0);
  +	result->rssi = bss->rssi;
@@ -38290,7 +38401,7 @@ index 179f5df..4cb01f7 100644
  +	result->beacon_interval = bss->beacon_interval;
  +	result->capability = bss->capability;
  +	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
-@@ -871,8 +884,9 @@
+@@ -871,8 +885,9 @@
  +	case 43:
  +	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
  +		static const char name[256] = "Fuxi Wi-Fi iOS shim (synthetic backend)";
@@ -38301,7 +38412,7 @@ index 179f5df..4cb01f7 100644
  +	}
  +	case 12: {
  +		/*
-@@ -1009,7 +1023,17 @@
+@@ -1009,7 +1024,17 @@
  +		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
  +		break;
  +	}
@@ -38320,7 +38431,7 @@ index 179f5df..4cb01f7 100644
  +		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give_network(request, &state->bss);
  +		break;
  +	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-@@ -1060,6 +1084,7 @@
+@@ -1060,6 +1085,7 @@
  +		memcpy(what->ssid, asked->ssid, asked->ssid_length);
  +	}
  +	what->passive = asked->scan_type == 2;
@@ -38328,7 +38439,7 @@ index 179f5df..4cb01f7 100644
  +	what->dwell_ms = asked->dwell_ms;
  +	/* (more channels than there is room to name: every channel) */
  +	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
-@@ -1177,12 +1202,14 @@
+@@ -1177,12 +1203,14 @@
  +
  +/* ---- events -------------------------------------------------------------------------------------------- */
  +
@@ -38344,7 +38455,7 @@ index 179f5df..4cb01f7 100644
  +
  +	memcpy(name, interface_name, sizeof(name));
  +	message.dv[0].data_length = sizeof(name);
-@@ -1191,7 +1218,90 @@
+@@ -1191,7 +1219,90 @@
  +		message.dv[1].data_length = length;
  +		message.dv[1].data_ptr = __DECONST(void *, data);
  +	}
@@ -38436,7 +38547,7 @@ index 179f5df..4cb01f7 100644
  +}
  +
  +/* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
-@@ -1229,11 +1339,20 @@
+@@ -1229,11 +1340,20 @@
  +		if (state != NULL) {
  +			fuxi_wifi_sta_state(state);
  +			link.rssi = status == 1 ? state->bss.rssi : 0;
@@ -38457,7 +38568,48 @@ index 179f5df..4cb01f7 100644
  +		break;
  +	}
  +	}
-@@ -1328,7 +1447,7 @@
+@@ -1290,6 +1410,33 @@
+ +	}
+ +}
+ +
+++extern void sweet_prof_user_bt(const char *tag);
+++
+++static void
+++trace_unsupported_request(int32_t type, bool is_set, int error, const char *caller)
+++{
+++	static unsigned traces;
+++	int enabled = 0;
+++
+++	if (!is_set || type != 383 || error != EOPNOTSUPP || strcmp(caller, "wifid") ||
+++	    !fuxi_wifi_ios_native_ready()) {
+++		return;
+++	}
+++	PE_parse_boot_argn("fuxiwifitrace", &enabled, sizeof(enabled));
+++	if (enabled != 1) {
+++		return;
+++	}
+++	lck_mtx_lock(&apple80211_lock);
+++	bool allowed = traces < 2;
+++	if (allowed) {
+++		traces++;
+++	}
+++	lck_mtx_unlock(&apple80211_lock);
+++	if (allowed) {
+++		sweet_prof_user_bt("FUXI WIFI IOC383");
+++	}
+++}
+++
+ +/* An Apple80211 request for the radio's interface, from the process that is running now. */
+ +errno_t
+ +fuxi_wifi_apple80211_ioctl(u_long command, void *data)
+@@ -1322,13 +1469,14 @@
+ +			printf("error %d\n", error);
+ +		}
+ +	}
+++	trace_unsupported_request(request->req_type, is_set, error, who);
+ +	return error;
+ +}
+ +
  +#endif /* FUXI */
  --- /dev/null
  +++ b/bsd/sys/fuxi_wifi_apple80211.h
@@ -38466,7 +38618,7 @@ index 179f5df..4cb01f7 100644
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
  + * Fuxi, 2026-10-23: shared diagnostic ABI; 16.7 payloads UNVERIFIED.
-@@ -1445,6 +1564,28 @@
+@@ -1445,6 +1593,28 @@
  +	uint8_t unused_3[4];
  +};
  +
@@ -38495,7 +38647,7 @@ index 179f5df..4cb01f7 100644
  +_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
  +    "the association request as iOS 16.5 has it");
  +_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
-@@ -1463,7 +1604,7 @@
+@@ -1463,7 +1633,7 @@
  +#endif
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_ios.c
@@ -38504,7 +38656,7 @@ index 179f5df..4cb01f7 100644
  +/* Fuxi Wi-Fi iOS shim entry and synthetic Ethernet link. No radio access. */
  +#if defined(FUXI)
  +#include <sys/param.h>
-@@ -1477,6 +1618,18 @@
+@@ -1477,6 +1647,18 @@
  +extern void FuxiNetworkStackStart(void);
  +static const struct fuxi_wifi_backend *backend;
  +static bool enabled;
@@ -38523,7 +38675,7 @@ index 179f5df..4cb01f7 100644
  +
  +static bool
  +transmit(mbuf_t packet, size_t length)
-@@ -1504,6 +1657,7 @@
+@@ -1504,6 +1686,7 @@
  +		return false;
  +	}
  +	backend = ops;
@@ -38531,7 +38683,7 @@ index 179f5df..4cb01f7 100644
  +	memcpy(link.address, ops->station.address, sizeof(link.address));
  +	ops->start(&input);
  +	fuxi_wifi_sta_attach(&ops->station);
-@@ -1659,17 +1813,24 @@
+@@ -1659,17 +1842,24 @@
  +{
  +	int on = 0;
  +	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
@@ -38558,7 +38710,7 @@ index 179f5df..4cb01f7 100644
  +/* Fuxi Wi-Fi iOS shim: boot-lifetime backend boundary. */
  +#ifndef FUXI_WIFI_IOS_H
  +#define FUXI_WIFI_IOS_H
-@@ -1704,6 +1865,7 @@
+@@ -1704,6 +1894,7 @@
  +#ifdef KERNEL
  +bool fuxi_wifi_ios_attach(const struct fuxi_wifi_backend *backend);
  +void fuxi_wifi_ios_init(void);
@@ -38566,7 +38718,7 @@ index 179f5df..4cb01f7 100644
  +#endif
  +#endif
  --- /dev/null
-@@ -2158,14 +2320,13 @@
+@@ -2158,14 +2349,13 @@
  +			}
  +			error = ops->power(power_on);
  +			lck_mtx_lock(&sta_lock);
@@ -38584,7 +38736,7 @@ index 179f5df..4cb01f7 100644
  +		} else if (leave) {
  +			ops->leave();
  +			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
-@@ -2224,10 +2385,12 @@
+@@ -2224,10 +2414,12 @@
  +	}
  +	lck_mtx_lock(&sta_lock);
  +	sta_ops = ops;
@@ -38599,7 +38751,7 @@ index 179f5df..4cb01f7 100644
  +}
  +
  +void
-@@ -2277,7 +2440,6 @@
+@@ -2277,7 +2469,6 @@
  +		lck_mtx_unlock(&sta_lock);
  +		return ENXIO;
  +	}
@@ -38607,7 +38759,7 @@ index 179f5df..4cb01f7 100644
  +	asked_power = true;
  +	asked_power_on = on;
  +	if (!on) {
-@@ -2297,7 +2459,7 @@
+@@ -2297,7 +2488,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
@@ -38616,7 +38768,7 @@ index 179f5df..4cb01f7 100644
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
-@@ -2317,7 +2479,7 @@
+@@ -2317,7 +2508,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
@@ -38625,7 +38777,7 @@ index 179f5df..4cb01f7 100644
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
-@@ -2402,7 +2564,7 @@
+@@ -2402,7 +2593,7 @@
  +#endif /* FUXI */
  --- /dev/null
  +++ b/bsd/sys/fuxi_wifi_sta.h
@@ -38634,7 +38786,7 @@ index 179f5df..4cb01f7 100644
  +/*
  + * Ported from HackiOS xnu/files/bsd/sys/redwood_sta.h (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
-@@ -2450,6 +2612,7 @@
+@@ -2450,6 +2641,7 @@
  +	uint16_t frequencies[64], frequency_count;      /* only these channels */
  +	bool passive;                           /* only listen */
  +	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
