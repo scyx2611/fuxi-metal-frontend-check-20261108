@@ -332,7 +332,7 @@ index 0000000..359d1dd
 +
 +尚待下一階段驗證的部分為 kernel build 接線、GPR 在 fuxi firmware 的 40-byte query 接受情況、hardware audio、iOS HAL load 與實際 app 路由。
 diff --git a/docs-lanes/audio.md b/docs-lanes/audio.md
-index 0d93161..8166386 100644
+index 0d93161..7c78083 100644
 --- a/docs-lanes/audio.md
 +++ b/docs-lanes/audio.md
 @@ -273,6 +273,33 @@ sent, capture 200 of 200 periods). Sheng is an SM8550-class board, so most of th
@@ -369,6 +369,23 @@ index 0d93161..8166386 100644
  Sources and licenses: UniXNU-sheng commit `08cde20edc32` (BSD-2-Clause-Patent), files under `package/` named in each ported
  header. hackios (APSL) was read for ideas only (its single RSC mutex).
  
+@@ -321,6 +348,16 @@ only if the ADT cannot carry it. The HAL plug-in stays opt-in through `fuxi-sys-
+ ### Blockers and facts needed
+ 
+ 1. Fuxi ACDB/topology ids for the TDM speaker and the capture path (files above), plus the AudioReach TDM interface param id and layout.
++   2026-11-17: the stock files were read from the phone's Android side (read-only, hashed before and after each transfer, kept in
++   `work/adsp-battery/android-audio-config-1117`, not in git; `statusbar-fix/fetch-android-audio-config.py`). They are the ACDB
++   `odm/etc/acdbdata/Tutu/Tutu_acdb_cal.acdb` and `Tutu_workspaceFileXml.qwsp`, `usecaseKvManager.xml`, `kvh2xml.xml`,
++   `card-defs.xml`, `backend_conf.xml` and `sku_kalama/{resourcemanager,mixer_paths}_kalama_mtp.xml` plus the overlays.
++   - Stock `resourcemanager_kalama_mtp.xml`: `PAL_DEVICE_OUT_SPEAKER` uses `TDM-LPAIF-RX-SECONDARY` at 48 kHz, 2 ch, 24 bit,
++     with `speaker_protection_enabled` 0, so protection runs on the amp DSP.
++   - `backend_conf.xml` agrees: `TDM-LPAIF-RX-SECONDARY` ch=2 bits=24.
++   - `mixer_paths_overlay_static.xml` sets T/B `DSP1 Firmware` "Protection", `AMP PCM Gain` 18, `Digital PCM Volume` 817 and
++     `Fast Use Case Delta File` `T-music.txt`/`B-music.txt`.
++   - The amp DSP firmware and tuning files live under `/vendor/firmware` and have not been pulled yet.
+ 2. CS35L41 register init for ASP RX1 direct (clock/PLL reference from the TDM SCLK, ASP enables, gain, global enable, DEVID check).
+    `ShengCs35l43.c` shows the shape only; Linux's driver is GPL and is ideas only. Needed: a non-GPL register list or a carefully
+    reconstructed one verified by DEVID reads and PLL-lock status before any audio.
 diff --git a/docs-lanes/battery-freshness.md b/docs-lanes/battery-freshness.md
 new file mode 100644
 index 0000000..e6cee9f
@@ -10964,10 +10981,10 @@ index 0000000..b7d102d
 +    main()
 diff --git a/tools/test-fuxi-bluetooth.py b/tools/test-fuxi-bluetooth.py
 new file mode 100644
-index 0000000..48a43f2
+index 0000000..88fb729
 --- /dev/null
 +++ b/tools/test-fuxi-bluetooth.py
-@@ -0,0 +1,567 @@
+@@ -0,0 +1,572 @@
 +#!/usr/bin/env python3
 +"""Compile and run the production BT protocol and snapshot with synthetic I/O."""
 +
@@ -11196,10 +11213,15 @@ index 0000000..48a43f2
 +        expect_probe(&uart, FUXI_BT_TIMEOUT, &result);
 +        assert(!result.version_valid);
 +    }
-+    fake_init(&uart);
-+    uart.response[8] = 1;
-+    expect_probe(&uart, FUXI_BT_CONTROLLER, &result);
-+    assert(result.controller_status == 1 && !result.version_valid);
++    /* event[8] follows Linux btqca and is skipped: the WCN7850 sends 0x0c, and no value changes the version. */
++    for (unsigned value = 0; value < 256; value += 0x0c) {
++        fake_init(&uart);
++        uart.response[8] = (uint8_t)value;
++        expect_probe(&uart, FUXI_BT_OK, &result);
++        assert(result.version_valid && result.controller_status == 0);
++        assert(result.version.product == 0x12345678 && result.version.soc == 0x11223344);
++        assert(result.reply_size == 21 && result.reply[8] == value);
++    }
 +    for (unsigned field = 6; field <= 7; field++) {
 +        fake_init(&uart);
 +        uart.response[field] ^= 1;
@@ -11537,7 +11559,7 @@ index 0000000..48a43f2
 +    main()
 diff --git a/tools/test-fuxi-bt-board.py b/tools/test-fuxi-bt-board.py
 new file mode 100644
-index 0000000..97ae8db
+index 0000000..8a0deb6
 --- /dev/null
 +++ b/tools/test-fuxi-bt-board.py
 @@ -0,0 +1,606 @@
@@ -11684,7 +11706,7 @@ index 0000000..97ae8db
 +static void soc_step(struct soc *soc)
 +{
 +    static const uint8_t reply[] = {
-+        4, 0x0e, 18, 1, 0, 0xfc, 0, 0x19, 0,
++        4, 0x0e, 18, 1, 0, 0xfc, 0, 0x19, 0x0c,
 +        0x78, 0x56, 0x34, 0x12, 0xbc, 0x9a, 0x20, 0,
 +        0x44, 0x33, 0x22, 0x11
 +    };
@@ -29395,10 +29417,10 @@ index 0000000..e298226
 +}
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt.c b/xnu/fuxi-bluetooth/fuxi_bt.c
 new file mode 100644
-index 0000000..7a549b7
+index 0000000..77639ac
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt.c
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,394 @@
 +#include "fuxi_bt.h"
 +#include <string.h>
 +
@@ -29477,10 +29499,12 @@ index 0000000..7a549b7
 +            if (event[6] != 0 || event[7] != 0x19) {
 +                return FUXI_BT_PROTOCOL;
 +            }
-+            result->controller_status = event[8];
-+            if (event[8]) {
-+                return FUXI_BT_CONTROLLER;
-+            }
++            /*
++             * WCN3991 以後的版本回應放在 Command Complete：event[6]=cresp(0)、event[7]=rtype(0x19)，
++             * event[8] 是多出的一個位元組，版本資料從 event[9] 起。Linux btqca.c qca_read_soc_version
++             * 對 soc_type >= QCA_WCN3991 用 memcpy(ver, edl->data + 1, ...) 直接略過它、不當狀態碼；
++             * 2026-11-17 WCN7850 實機回 0x0c（等於 12 位元組版本資料長度），之前誤判成 Command Disallowed。
++             */
 +            result->version.product = fuxi_bt_le32(event + 9);
 +            result->version.patch = fuxi_bt_le16(event + 13);
 +            result->version.rom = fuxi_bt_le16(event + 15);
@@ -31275,10 +31299,10 @@ index 0000000..35331b3
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_xnu.c b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
 new file mode 100644
-index 0000000..d97b555
+index 0000000..48478dd
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,342 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
@@ -31450,6 +31474,17 @@ index 0000000..d97b555
 +        result->tx_bytes, result->rx_bytes, result->drained_bytes, result->frames,
 +        result->ignored_frames, result->polls, result->elapsed_us,
 +        (unsigned)result->controller_status, (unsigned)result->version_valid);
++    if (result->reply_size == sizeof(result->reply)) {
++        /* 原始版本回應（H4 0x04 起 21 位元組），解析有疑問時不必再跑一趟就能對照。 */
++        static const char digits[] = "0123456789abcdef";
++        char hex[sizeof(result->reply) * 2 + 1];
++        for (unsigned index = 0; index < sizeof(result->reply); index++) {
++            hex[index * 2] = digits[result->reply[index] >> 4];
++            hex[index * 2 + 1] = digits[result->reply[index] & 15];
++        }
++        hex[sizeof(hex) - 1] = 0;
++        printf("FUXI BT: reply %s\n", hex);
++    }
 +    if (result->version_valid) {
 +        printf("FUXI BT: QCA version product=%#x soc=%#x rom=%#x patch=%#x\n",
 +            result->version.product, result->version.soc,
@@ -42218,10 +42253,10 @@ index 8349337..ed20c83 100644
  +}
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..266109e
+index 0000000..3c1ce01
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,10202 @@
+@@ -0,0 +1,10215 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,31 @@
@@ -47280,7 +47315,7 @@ index 0000000..266109e
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt.c
-+@@ -0,0 +1,392 @@
++@@ -0,0 +1,394 @@
 ++#include "fuxi_bt.h"
 ++#include <string.h>
 ++
@@ -47359,10 +47394,12 @@ index 0000000..266109e
 ++            if (event[6] != 0 || event[7] != 0x19) {
 ++                return FUXI_BT_PROTOCOL;
 ++            }
-++            result->controller_status = event[8];
-++            if (event[8]) {
-++                return FUXI_BT_CONTROLLER;
-++            }
+++            /*
+++             * WCN3991 以後的版本回應放在 Command Complete：event[6]=cresp(0)、event[7]=rtype(0x19)，
+++             * event[8] 是多出的一個位元組，版本資料從 event[9] 起。Linux btqca.c qca_read_soc_version
+++             * 對 soc_type >= QCA_WCN3991 用 memcpy(ver, edl->data + 1, ...) 直接略過它、不當狀態碼；
+++             * 2026-11-17 WCN7850 實機回 0x0c（等於 12 位元組版本資料長度），之前誤判成 Command Disallowed。
+++             */
 ++            result->version.product = fuxi_bt_le32(event + 9);
 ++            result->version.patch = fuxi_bt_le16(event + 13);
 ++            result->version.rom = fuxi_bt_le16(event + 15);
@@ -47675,7 +47712,7 @@ index 0000000..266109e
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_xnu.c
-+@@ -0,0 +1,331 @@
++@@ -0,0 +1,342 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
@@ -47847,6 +47884,17 @@ index 0000000..266109e
 ++        result->tx_bytes, result->rx_bytes, result->drained_bytes, result->frames,
 ++        result->ignored_frames, result->polls, result->elapsed_us,
 ++        (unsigned)result->controller_status, (unsigned)result->version_valid);
+++    if (result->reply_size == sizeof(result->reply)) {
+++        /* 原始版本回應（H4 0x04 起 21 位元組），解析有疑問時不必再跑一趟就能對照。 */
+++        static const char digits[] = "0123456789abcdef";
+++        char hex[sizeof(result->reply) * 2 + 1];
+++        for (unsigned index = 0; index < sizeof(result->reply); index++) {
+++            hex[index * 2] = digits[result->reply[index] >> 4];
+++            hex[index * 2 + 1] = digits[result->reply[index] & 15];
+++        }
+++        hex[sizeof(hex) - 1] = 0;
+++        printf("FUXI BT: reply %s\n", hex);
+++    }
 ++    if (result->version_valid) {
 ++        printf("FUXI BT: QCA version product=%#x soc=%#x rom=%#x patch=%#x\n",
 ++            result->version.product, result->version.soc,
