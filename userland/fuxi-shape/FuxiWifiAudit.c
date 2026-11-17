@@ -1,3 +1,5 @@
+#include <CoreFoundation/CoreFoundation.h>
+#include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <objc/runtime.h>
 #include <stdbool.h>
@@ -5,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include "FuxiErrorAudit.h"
 
@@ -19,6 +22,8 @@ static IMP wifi_audit_known_original, wifi_audit_native_known_original, wifi_aud
 static IMP wifi_audit_sort_original, wifi_audit_transition_original;
 static unsigned wifi_audit_known_calls, wifi_audit_native_known_calls, wifi_audit_allow_calls;
 static unsigned wifi_audit_sort_calls, wifi_audit_transition_calls;
+static IMP wifi_audit_perform_original, wifi_audit_associate_original;
+static unsigned wifi_audit_perform_calls, wifi_audit_associate_calls;
 
 static void wifi_audit_say(const char *line)
 {
@@ -270,6 +275,70 @@ static bool wifi_audit_allow(id self, SEL selector, id scan, intptr_t trigger, b
     return result;
 }
 
+/* 加入失敗的錯誤鏈：只輸出 domain 雜湊、數字碼與固定分類，不輸出 userInfo 任意字串 */
+static void wifi_audit_error_chain(const char *stage, unsigned call, id failure)
+{
+    FuxiErrorAuditEntry entries[FUXI_ERROR_AUDIT_DEPTH];
+    unsigned count = fuxi_error_audit((CFTypeRef)failure, entries);
+    for (unsigned depth = 0; depth < count; depth++) {
+        char line[240];
+        int length = snprintf(line, sizeof(line),
+            "fuxi: wifid: %s error call=%u depth=%u domain-id=%08x code=%ld reason=%s\n",
+            stage, call, depth, entries[depth].domain, (long)entries[depth].code, entries[depth].reason);
+        if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+    }
+}
+
+/*
+ * CWFAutoJoinManager -__performJoinWithNetwork:context:error:
+ * 2026-11-17 反組譯（CoreWiFi 20H392）：失敗只有 code 6（associateToNetworkHandler 為 nil）或
+ * code 57（__calloutToAssociateWithParameters:error: 失敗，底層錯誤在 userInfo）；失敗後網路 ID
+ * 進 _failedToJoinKnownNetworkIDs，同輪 __allowJoinCandidate 才回「Already failed to auto-join」。
+ */
+static bool wifi_audit_perform_join(id self, SEL selector, id network, id context, id *error)
+{
+    uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    bool result = ((bool (*)(id, SEL, id, id, id *))wifi_audit_perform_original)(
+        self, selector, network, context, error);
+    uint64_t elapsed = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started) / 1000000u;
+    unsigned call = __atomic_fetch_add(&wifi_audit_perform_calls, 1u, __ATOMIC_RELAXED);
+    if (call < 24) {
+        id failure = !result && error ? *error : NULL;
+        char line[280];
+        int length = snprintf(line, sizeof(line),
+            "fuxi: wifid: perform join call=%u ssid-id=%08x context=%u handler=%u result=%u elapsed-ms=%llu "
+            "error-present=%u error=%ld\n", call + 1, wifi_audit_ssid(network), context != NULL,
+            wifi_audit_object(self, "associateToNetworkHandler") != NULL, result,
+            (unsigned long long)elapsed, failure != NULL, (long)wifi_audit_integer(failure, "code"));
+        if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+        wifi_audit_error_chain("perform join", call + 1, failure);
+    }
+    return result;
+}
+
+/* CWFAutoJoinManager -__calloutToAssociateWithParameters:error:（呼叫 wifid 的 associate handler） */
+static bool wifi_audit_associate(id self, SEL selector, id parameters, id *error)
+{
+    uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    bool result = ((bool (*)(id, SEL, id, id *))wifi_audit_associate_original)(self, selector, parameters, error);
+    uint64_t elapsed = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started) / 1000000u;
+    unsigned call = __atomic_fetch_add(&wifi_audit_associate_calls, 1u, __ATOMIC_RELAXED);
+    if (call < 24) {
+        id failure = !result && error ? *error : NULL;
+        id scan = wifi_audit_object(parameters, "scanResult");
+        char line[280];
+        int length = snprintf(line, sizeof(line),
+            "fuxi: wifid: associate callout call=%u ssid-id=%08x scan=%u remember=%ld force-bssid=%ld "
+            "result=%u elapsed-ms=%llu error-present=%u error=%ld\n", call + 1, wifi_audit_ssid(scan), scan != NULL,
+            (long)wifi_audit_integer(parameters, "rememberUponSuccessfulAssociation"),
+            (long)wifi_audit_integer(parameters, "forceBSSID"), result, (unsigned long long)elapsed,
+            failure != NULL, (long)wifi_audit_integer(failure, "code"));
+        if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+        wifi_audit_error_chain("associate callout", call + 1, failure);
+    }
+    return result;
+}
+
 static void wifi_audit_sort(id self, SEL selector, id scans, id context)
 {
     ((void (*)(id, SEL, id, id))wifi_audit_sort_original)(self, selector, scans, context);
@@ -302,13 +371,38 @@ static bool wifi_audit_transition(id self, SEL selector, id scan, id previous, i
     return result;
 }
 
+typedef struct {
+    const char *target, *selector, *types;
+    IMP replacement, *original;
+    unsigned done;
+} wifi_audit_hook;
+
+/* 依 types 字串（回傳型別＋各引數；b＝BOOL）核對 ABI，相符才換實作；每個項目只試一次。 */
+static void wifi_audit_install_table(const char *label, wifi_audit_hook *hooks, unsigned total)
+{
+    for (unsigned index = 0; index < total; index++) {
+        if (__atomic_load_n(&hooks[index].done, __ATOMIC_ACQUIRE)) continue;
+        Class target = objc_getClass(hooks[index].target);
+        Method method = target ? class_getInstanceMethod(target, sel_registerName(hooks[index].selector)) : NULL;
+        if (method == NULL || __atomic_exchange_n(&hooks[index].done, 1u, __ATOMIC_ACQ_REL)) continue;
+        size_t count = strlen(hooks[index].types);
+        bool usable = method_getNumberOfArguments(method) == count + 1 &&
+            wifi_audit_type(method, 0, hooks[index].types[0]);
+        for (unsigned argument = 1; usable && argument < count; argument++)
+            usable = wifi_audit_type(method, argument + 1, hooks[index].types[argument]);
+        char line[320];
+        int length = snprintf(line, sizeof(line), "fuxi: %s hook %s %s %s\n", label, hooks[index].target,
+            hooks[index].selector, usable ? "installed" : "refused ABI");
+        if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+        if (!usable) continue;
+        *hooks[index].original = method_getImplementation(method);
+        (void)method_setImplementation(method, hooks[index].replacement);
+    }
+}
+
 static void wifi_audit_install_candidates(void)
 {
-    static struct {
-        const char *target, *selector, *types;
-        IMP replacement, *original;
-        unsigned done;
-    } hooks[] = {
+    static wifi_audit_hook hooks[] = {
         {"CWFAutoJoinManager", "__matchAndJoinScanResults:allowPreAssociationScan:context:error:", "b@b@^",
             (IMP)wifi_audit_match, &wifi_audit_match_original, 0},
         {"CWFAutoJoinManager", "__preflightMatchKnownNetworksForScanResult:", "b@",
@@ -328,26 +422,13 @@ static void wifi_audit_install_candidates(void)
         {"CWFAutoJoinManager", "__sortJoinCandidates:context:", "v@@",
             (IMP)wifi_audit_sort, &wifi_audit_sort_original, 0},
         {"CWFAutoJoinManager", "__candidateSupportsSeamlessSSIDTransition:fromNetwork:trigger:", "b@@q",
-            (IMP)wifi_audit_transition, &wifi_audit_transition_original, 0}
+            (IMP)wifi_audit_transition, &wifi_audit_transition_original, 0},
+        {"CWFAutoJoinManager", "__performJoinWithNetwork:context:error:", "b@@^",
+            (IMP)wifi_audit_perform_join, &wifi_audit_perform_original, 0},
+        {"CWFAutoJoinManager", "__calloutToAssociateWithParameters:error:", "b@^",
+            (IMP)wifi_audit_associate, &wifi_audit_associate_original, 0}
     };
-    for (unsigned index = 0; index < sizeof(hooks) / sizeof(hooks[0]); index++) {
-        if (__atomic_load_n(&hooks[index].done, __ATOMIC_ACQUIRE)) continue;
-        Class target = objc_getClass(hooks[index].target);
-        Method method = target ? class_getInstanceMethod(target, sel_registerName(hooks[index].selector)) : NULL;
-        if (method == NULL || __atomic_exchange_n(&hooks[index].done, 1u, __ATOMIC_ACQ_REL)) continue;
-        size_t count = strlen(hooks[index].types);
-        bool usable = method_getNumberOfArguments(method) == count + 1 &&
-            wifi_audit_type(method, 0, hooks[index].types[0]);
-        for (unsigned argument = 1; usable && argument < count; argument++)
-            usable = wifi_audit_type(method, argument + 1, hooks[index].types[argument]);
-        char line[320];
-        int length = snprintf(line, sizeof(line), "fuxi: wifid: candidate hook %s %s\n",
-            hooks[index].selector, usable ? "installed" : "refused ABI");
-        if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
-        if (!usable) continue;
-        *hooks[index].original = method_getImplementation(method);
-        (void)method_setImplementation(method, hooks[index].replacement);
-    }
+    wifi_audit_install_table("wifid: candidate", hooks, sizeof(hooks) / sizeof(hooks[0]));
 }
 
 static id wifi_audit_parameters(id self, SEL selector)
@@ -402,9 +483,160 @@ static void wifi_audit_image(const struct mach_header *header, intptr_t slide)
     }
 }
 
+/*
+ * SpringBoard 狀態欄 Wi-Fi 圖示（ADT /chosen fuxi,wifi-sb 非 0 才裝；唯讀，原實作照呼叫、回傳值不改）。
+ * 20H392 反組譯：-[SBSystemStatusWifiDataProvider _updateWifiActive] 的 block 以
+ * SBWiFiManager isPowered && isPrimaryInterface && isAssociated 決定 wifiActive，_updateData 再把
+ * wifiActive 與 signalStrengthBars 發佈給狀態欄；isPrimaryInterface 是 NWSystemPathMonitor isWiFiPrimary
+ * （primaryEvaluator.path usesInterfaceType:wifi）。核心 en0 已是 IFNET_SUBFAMILY_WIFI
+ * （ksrc/xnu/fuxi-wifi-ios：原生與合成後端共用 link.wireless=true），所以要實測是哪一項為假。
+ * 每個值只在改變時記一行（各最多 16 行），RSSI 回報最多 24 行；不記 SSID、BSSID 或任何網路名稱。
+ */
+enum { SB_WIFI_CHANGES = 16, SB_WIFI_RSSI_LOGS = 24 };
+enum { SB_POWERED, SB_PRIMARY, SB_ASSOCIATED, SB_ENABLED, SB_BARS, SB_RSSI, SB_ACTIVE, SB_VALUES };
+static const char *const sb_wifi_names[SB_VALUES] = {
+    "isPowered", "isPrimaryInterface", "isAssociated", "wiFiEnabled", "signalStrengthBars", "signalStrengthRSSI",
+    "provider-setWifiActive"
+};
+static IMP sb_wifi_original[SB_VALUES], sb_wifi_rssi_original, sb_wifi_primary_original, sb_wifi_link_original;
+static long long sb_wifi_last[SB_VALUES];
+static unsigned sb_wifi_changes[SB_VALUES], sb_wifi_rssi_calls, sb_wifi_primary_calls, sb_wifi_link_calls;
+static unsigned sb_wifi_seen[SB_VALUES];
+
+static unsigned long long sb_wifi_uptime_ms(void)
+{
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ull;
+}
+
+static void sb_wifi_value(unsigned which, long long value)
+{
+    bool first = !__atomic_exchange_n(&sb_wifi_seen[which], 1u, __ATOMIC_ACQ_REL);
+    long long previous = __atomic_exchange_n(&sb_wifi_last[which], value, __ATOMIC_ACQ_REL);
+    if (!first && previous == value) return;
+    unsigned change = __atomic_fetch_add(&sb_wifi_changes[which], 1u, __ATOMIC_RELAXED);
+    if (change >= SB_WIFI_CHANGES) return;
+    char line[200], before[24] = "none";
+    if (!first) (void)snprintf(before, sizeof(before), "%lld", previous);
+    int length = snprintf(line, sizeof(line), "fuxi: sb-wifi: %s change=%u uptime-ms=%llu value=%lld previous=%s\n",
+        sb_wifi_names[which], change + 1, sb_wifi_uptime_ms(), value, before);
+    if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+}
+
+#define SB_WIFI_BOOL_GETTER(function, which) \
+    static bool function(id self, SEL selector) \
+    { \
+        bool result = ((bool (*)(id, SEL))sb_wifi_original[which])(self, selector); \
+        sb_wifi_value(which, result); \
+        return result; \
+    }
+#define SB_WIFI_INT_GETTER(function, which) \
+    static int function(id self, SEL selector) \
+    { \
+        int result = ((int (*)(id, SEL))sb_wifi_original[which])(self, selector); \
+        sb_wifi_value(which, result); \
+        return result; \
+    }
+SB_WIFI_BOOL_GETTER(sb_wifi_powered, SB_POWERED)
+SB_WIFI_BOOL_GETTER(sb_wifi_primary, SB_PRIMARY)
+SB_WIFI_BOOL_GETTER(sb_wifi_associated, SB_ASSOCIATED)
+SB_WIFI_BOOL_GETTER(sb_wifi_enabled, SB_ENABLED)
+SB_WIFI_INT_GETTER(sb_wifi_bars, SB_BARS)
+SB_WIFI_INT_GETTER(sb_wifi_rssi_value, SB_RSSI)
+
+static void sb_wifi_set_active(id self, SEL selector, bool active)
+{
+    sb_wifi_value(SB_ACTIVE, active);
+    ((void (*)(id, SEL, bool))sb_wifi_original[SB_ACTIVE])(self, selector, active);
+}
+
+static void sb_wifi_rssi(id self, SEL selector, int raw, float scaled)
+{
+    unsigned call = __atomic_fetch_add(&sb_wifi_rssi_calls, 1u, __ATOMIC_RELAXED);
+    if (call < SB_WIFI_RSSI_LOGS) {
+        char line[200];
+        int length = snprintf(line, sizeof(line), "fuxi: sb-wifi: rssi update call=%u uptime-ms=%llu raw=%d scaled=%.3f\n",
+            call + 1, sb_wifi_uptime_ms(), raw, (double)scaled);
+        if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+    }
+    ((void (*)(id, SEL, int, float))sb_wifi_rssi_original)(self, selector, raw, scaled);
+}
+
+static void sb_wifi_event(const char *name, unsigned *calls)
+{
+    unsigned call = __atomic_fetch_add(calls, 1u, __ATOMIC_RELAXED);
+    if (call >= SB_WIFI_CHANGES) return;
+    char line[160];
+    int length = snprintf(line, sizeof(line), "fuxi: sb-wifi: %s call=%u uptime-ms=%llu\n", name, call + 1,
+        sb_wifi_uptime_ms());
+    if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+}
+
+static void sb_wifi_primary_changed(id self, SEL selector, id notification)
+{
+    sb_wifi_event("primaryInterfaceChanged", &sb_wifi_primary_calls);
+    ((void (*)(id, SEL, id))sb_wifi_primary_original)(self, selector, notification);
+}
+
+static void sb_wifi_link_changed(id self, SEL selector)
+{
+    sb_wifi_event("linkDidChange", &sb_wifi_link_calls);
+    ((void (*)(id, SEL))sb_wifi_link_original)(self, selector);
+}
+
+static void sb_wifi_image(const struct mach_header *header, intptr_t slide)
+{
+    (void)header;
+    (void)slide;
+    static wifi_audit_hook hooks[] = {
+        {"SBWiFiManager", "isPowered", "b", (IMP)sb_wifi_powered, &sb_wifi_original[SB_POWERED], 0},
+        {"SBWiFiManager", "isPrimaryInterface", "b", (IMP)sb_wifi_primary, &sb_wifi_original[SB_PRIMARY], 0},
+        {"SBWiFiManager", "isAssociated", "b", (IMP)sb_wifi_associated, &sb_wifi_original[SB_ASSOCIATED], 0},
+        {"SBWiFiManager", "wiFiEnabled", "b", (IMP)sb_wifi_enabled, &sb_wifi_original[SB_ENABLED], 0},
+        {"SBWiFiManager", "signalStrengthBars", "i", (IMP)sb_wifi_bars, &sb_wifi_original[SB_BARS], 0},
+        {"SBWiFiManager", "signalStrengthRSSI", "i", (IMP)sb_wifi_rssi_value, &sb_wifi_original[SB_RSSI], 0},
+        {"SBWiFiManager", "_updateSignalStrengthFromRawRSSI:andScaledRSSI:", "vif", (IMP)sb_wifi_rssi,
+            &sb_wifi_rssi_original, 0},
+        {"SBWiFiManager", "_primaryInterfaceChanged:", "v@", (IMP)sb_wifi_primary_changed,
+            &sb_wifi_primary_original, 0},
+        {"SBWiFiManager", "_linkDidChange", "v", (IMP)sb_wifi_link_changed, &sb_wifi_link_original, 0},
+        {"SBSystemStatusWifiDataProvider", "setWifiActive:", "vb", (IMP)sb_wifi_set_active,
+            &sb_wifi_original[SB_ACTIVE], 0}
+    };
+    wifi_audit_install_table("sb-wifi:", hooks, sizeof(hooks) / sizeof(hooks[0]));
+}
+
+typedef mach_port_t wifi_audit_io_object_t;
+extern wifi_audit_io_object_t IORegistryEntryFromPath(mach_port_t main_port, const char *path);
+extern CFTypeRef IORegistryEntryCreateCFProperty(wifi_audit_io_object_t entry, CFStringRef key,
+    CFAllocatorRef allocator, uint32_t options);
+extern kern_return_t IOObjectRelease(wifi_audit_io_object_t object);
+
+static unsigned wifi_audit_adt_u32(CFStringRef key)
+{
+    wifi_audit_io_object_t chosen = IORegistryEntryFromPath(MACH_PORT_NULL, "IODeviceTree:/chosen");
+    unsigned value = 0;
+    if (chosen == MACH_PORT_NULL) return 0;
+    CFTypeRef data = IORegistryEntryCreateCFProperty(chosen, key, kCFAllocatorDefault, 0);
+    if (data && CFGetTypeID(data) == CFDataGetTypeID() && CFDataGetLength((CFDataRef)data) == 4) {
+        uint32_t raw = 0;
+        CFDataGetBytes((CFDataRef)data, CFRangeMake(0, 4), (UInt8 *)&raw);
+        value = raw;
+    }
+    if (data) CFRelease(data);
+    (void)IOObjectRelease(chosen);
+    return value;
+}
+
 __attribute__((constructor)) static void fuxi_wifi_audit_init(void)
 {
     const char *name = getprogname();
-    if (name == NULL || strcmp(name, "wifid") != 0) return;
+    if (name == NULL) return;
+    if (strcmp(name, "SpringBoard") == 0) {
+        if (wifi_audit_adt_u32(CFSTR("fuxi,wifi-sb")) == 0) return;
+        wifi_audit_say("fuxi: sb-wifi: status audit enabled (fuxi,wifi-sb)\n");
+        _dyld_register_func_for_add_image(sb_wifi_image);
+        return;
+    }
+    if (strcmp(name, "wifid") != 0) return;
     _dyld_register_func_for_add_image(wifi_audit_image);
 }

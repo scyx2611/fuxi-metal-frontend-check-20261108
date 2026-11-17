@@ -43,11 +43,17 @@ static int pthread_cond_timedwait_relative_np(pthread_cond_t *cond, pthread_mute
     }
     return pthread_cond_timedwait(cond, mutex, &until);
 }
-static bool vb_write(unsigned ms)
+static unsigned vb_amp_max;
+enum { LEVEL_LOG = 64 };
+static atomic_uint levels_logged, levels[LEVEL_LOG];
+static bool vb_write(unsigned ms, unsigned level)
 {
-    assert(ms <= FX_VIBE_REQUEST_MS);
+    assert(ms <= FX_VIBE_REQUEST_MS && level <= 255);
+    assert(ms || !level);
     atomic_store(&motor, ms != 0);
     atomic_fetch_add(ms ? &starts : &stops, 1);
+    unsigned slot = atomic_fetch_add(&levels_logged, 1);
+    if (slot < LEVEL_LOG) atomic_store(&levels[slot], ms ? level + 1000 : 0);
     return true;
 }
 static void vb_say(const char *format, ...) { (void)format; }
@@ -178,7 +184,43 @@ int main(void)
     assert(vb_play(&pattern, &silent));
     test_done(&silent);
     assert(atomic_load(&starts) == after_cancel);
-    puts("PASS: production vibration worker completion ownership, cancel, replacement, reentry and 128 rapid requests");
+
+    /* 振幅分階：相鄰開段只換振幅、中間不停，最後一段結束才停；關段之後重新開 */
+    fx_vibe_reset(&pattern);
+    assert(fx_vibe_append_level(&pattern, true, 20, 40) && fx_vibe_append_level(&pattern, true, 20, 255));
+    assert(fx_vibe_append_level(&pattern, true, 20, 90) && fx_vibe_append(&pattern, false, 20));
+    assert(fx_vibe_append_level(&pattern, true, 20, 60));
+    assert(fx_vibe_finish(&pattern) == 80 && pattern.count == 5);
+    fx_vibe_scale(&pattern, 200);
+    test_completion stepped = {{NULL, 0, 0, test_invoke}, 0, 0, 0, 0};
+    unsigned stops_before = atomic_load(&stops);
+    atomic_store(&levels_logged, 0);
+    assert(vb_play(&pattern, &stepped));
+    test_done(&stepped);
+    unsigned logged = atomic_load(&levels_logged);
+    assert(logged >= 6 && logged < LEVEL_LOG && atomic_load(&stops) - stops_before == 2 && !atomic_load(&motor));
+    unsigned expected[] = {1031, 1200, 1071, 0, 1047, 0}, seen = 0;
+    for (unsigned index = 0; index < logged; index++) {
+        unsigned value = atomic_load(&levels[index]);
+        if (seen && value == expected[seen - 1]) continue; /* 同一段的續約 */
+        assert(seen < 6 && value == expected[seen]);
+        seen++;
+    }
+    assert(seen == 6);
+
+    /* SpringBoard 輕觸：有上限就帶上限，沒有帶 0 */
+    atomic_store(&levels_logged, 0);
+    vb_amp_max = 120;
+    vb_pulse(15);
+    test_wait(&levels_logged, 2);
+    assert(atomic_load(&levels[0]) == 1120 && atomic_load(&levels[1]) == 0);
+    vb_amp_max = 0;
+    test_pause(5);
+    atomic_store(&levels_logged, 0);
+    vb_pulse(15);
+    test_wait(&levels_logged, 2);
+    assert(atomic_load(&levels[0]) == 1000 && atomic_load(&levels[1]) == 0);
+    puts("PASS: production vibration worker completion ownership, cancel, replacement, reentry, 128 rapid requests and stepped amplitude");
     return 0;
 }
 """

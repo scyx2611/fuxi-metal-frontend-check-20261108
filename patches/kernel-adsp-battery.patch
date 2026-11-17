@@ -14466,10 +14466,10 @@ index 0000000..3144cfe
 +    main()
 diff --git a/tools/test-fuxi-haptic-runtime.py b/tools/test-fuxi-haptic-runtime.py
 new file mode 100644
-index 0000000..4e62da1
+index 0000000..1f4e0be
 --- /dev/null
 +++ b/tools/test-fuxi-haptic-runtime.py
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,271 @@
 +import os
 +from pathlib import Path
 +import subprocess
@@ -14515,7 +14515,7 @@ index 0000000..4e62da1
 +{
 +    Model *model = context;
 +    assert(fuxi_haptic_writable(address));
-+    assert(address == 0xf04c || address == 0xf046);
++    assert(address == 0xf04c || address == 0xf046 || address == 0xf126);
 +    if (model->writes < 64) model->written[model->writes] = address;
 +    model->writes++;
 +    if (model->write_fail) return -1;
@@ -14613,6 +14613,26 @@ index 0000000..4e62da1
 +    assert(!fuxi_vibrate_request(&state, 0, 12));
 +    assert(fuxi_vibrate_request(NULL, 0, 0) < 0);
 +
++    /* sysctl 值：bit 0..15 毫秒、bit 16..23 振幅；舊使用端只送毫秒＝振幅 0（沿用） */
++    unsigned ms = 7, level = 7;
++    assert(!fuxi_vibrate_decode(15, &ms, &level) && ms == 15 && level == 0);
++    assert(!fuxi_vibrate_decode(15 | (0x60 << 16), &ms, &level) && ms == 15 && level == 0x60);
++    assert(!fuxi_vibrate_decode(0xff << 16, &ms, &level) && ms == 0 && level == 0xff);
++    assert(!fuxi_vibrate_decode(2000 | (0xff << 16), &ms, &level) && ms == 2000 && level == 0xff);
++    assert(fuxi_vibrate_decode(2001, &ms, &level) < 0);
++    assert(fuxi_vibrate_decode(2001 | (0x60 << 16), &ms, &level) < 0);
++    assert(fuxi_vibrate_decode(1 << 24, &ms, &level) < 0);
++    assert(fuxi_vibrate_decode(-1, &ms, &level) < 0);
++    FuxiVibrateRuntime leveled = {0};
++    assert(!fuxi_vibrate_request_level(&leveled, 20, 0x60, 1) && leveled.level == 0x60);
++    assert(!fuxi_vibrate_request_level(&leveled, 0, 0, 2) && leveled.level == 0x60 && !fuxi_vibrate_wanted(&leveled, 2));
++    assert(!fuxi_vibrate_request_level(&leveled, 20, 0, 3) && leveled.level == 0);
++    saved = leveled;
++    assert(fuxi_vibrate_request_level(&leveled, 20, 0x100, 4) < 0 && !memcmp(&leveled, &saved, sizeof(leveled)));
++    assert(fuxi_vibrate_request_level(&leveled, 2001, 0x60, 4) < 0 && !memcmp(&leveled, &saved, sizeof(leveled)));
++    leveled.failed = 1;
++    assert(fuxi_vibrate_request_level(&leveled, 20, 0x60, 5) < 0 && leveled.level == 0);
++
 +    /* Android 留下的狀態通過檢查，且檢查不寫任何暫存器 */
 +    android(&model);
 +    io = io_for(&model);
@@ -14690,7 +14710,26 @@ index 0000000..4e62da1
 +    unsigned before = model.writes;
 +    assert(fuxi_vibrate_stop(&io, &polls, &toggled) == FUXI_HAPTIC_HARDWARE && model.writes == before);
 +
-+    puts("PASS: HAP525 DIRECT_PLAY runtime caller policy, lease, Android-state check, start/stop/HPWR poll, module toggle fallback, fault and verify paths");
++    /* 振幅：0 或相同不寫；不同就寫 0xf126 並讀回；播放中可改；讀回不符、owner 換人不更新現值 */
++    uint8_t current = 0;
++    unsigned amplitude_writes = 0;
++    android(&model);
++    current = model.reg[0x126];
++    assert(!fuxi_vibrate_amplitude(&io, 0, &current, &amplitude_writes) && !amplitude_writes && !model.writes);
++    assert(!fuxi_vibrate_amplitude(&io, 0xff, &current, &amplitude_writes) && !amplitude_writes && !model.writes);
++    assert(!fuxi_vibrate_amplitude(&io, 0x60, &current, &amplitude_writes));
++    assert(current == 0x60 && model.reg[0x126] == 0x60 && amplitude_writes == 1 && model.written[0] == 0xf126);
++    assert(!fuxi_vibrate_start(&io));
++    assert(!fuxi_vibrate_amplitude(&io, 0x30, &current, &amplitude_writes) && current == 0x30 && model.reg[0x4c] == 0x81);
++    assert(!fuxi_vibrate_stop(&io, &polls, &toggled) && model.reg[0x126] == 0x30);
++    assert(fuxi_vibrate_amplitude(&io, 0x100, &current, &amplitude_writes) == FUXI_HAPTIC_INVALID && current == 0x30);
++    android(&model); current = 0xff; model.verify_lie = 1;
++    assert(fuxi_vibrate_amplitude(&io, 0x60, &current, &amplitude_writes) == FUXI_HAPTIC_VERIFY && current == 0xff);
++    android(&model); current = 0xff; model.owners[1] = 2;
++    assert(fuxi_vibrate_amplitude(&io, 0x60, &current, &amplitude_writes) == FUXI_HAPTIC_HARDWARE);
++    assert(current == 0xff && !model.writes && model.reg[0x126] == 0xff);
++
++    puts("PASS: HAP525 DIRECT_PLAY runtime caller policy, lease, amplitude field, Android-state check, start/stop/HPWR poll, module toggle fallback, fault and verify paths");
 +    return 0;
 +}
 +'''
@@ -17780,7 +17819,7 @@ index cf82598..56f7e1a 100755
          out = Path(tmp)
          subprocess.run(['python3', str(ROOT/'tools/build-fuxi-turnip.py'), '--mesa', str(args.mesa.resolve()),
 diff --git a/tools/test-fuxi-wifi-ios.py b/tools/test-fuxi-wifi-ios.py
-index 12e012d..1f51d40 100755
+index 12e012d..7904d0e 100755
 --- a/tools/test-fuxi-wifi-ios.py
 +++ b/tools/test-fuxi-wifi-ios.py
 @@ -53,9 +53,11 @@ typedef void *event_t;
@@ -17806,7 +17845,7 @@ index 12e012d..1f51d40 100755
  static void *current_proc(void) { return NULL; }
  static int proc_suser(void *p) { (void)p; return !superuser; }
  struct kev_msg { unsigned vendor_code,kev_class,kev_subclass,event_code;
-@@ -86,9 +88,26 @@ static int kev_post_msg(struct kev_msg *m) {
+@@ -86,11 +88,41 @@ static int kev_post_msg(struct kev_msg *m) {
   assert(m->kev_class==6 && m->kev_subclass==1 && m->dv[0].data_length==16);
   assert(!strcmp(m->dv[0].data_ptr,"en0"));
   if (m->event_code==4) assert(m->dv[1].data_length==32);
@@ -17833,8 +17872,23 @@ index 12e012d..1f51d40 100755
 + if (!strcmp(key,"fuxiwifitrace")) { assert(n==4); memcpy(p,&trace_opt,4); return trace_opt!=0; }
   assert(!strcmp(key,"fuxiwifiios") && n==4); memcpy(p,&opt,4); return opt!=0;
  }
++/* ADT /chosen：只有 fuxi,wifi-rssi 一個屬性，長度可改來測錯誤長度 */
++typedef const void *DTEntry;
++#define kSuccess 0
++#define kError (-1)
++static uint32_t adt_rssi; static unsigned adt_rssi_bytes=4, adt_lookups;
++static int SecureDTLookupEntry(const void *root,const char *path,DTEntry *entry) {
++ assert(!root && !strcmp(path,"/chosen")); adt_lookups++; *entry=&adt_rssi; return kSuccess;
++}
++static int SecureDTGetProperty(DTEntry entry,const char *name,void const **prop,unsigned int *bytes) {
++ assert(entry==&adt_rssi && !strcmp(name,"fuxi,wifi-rssi"));
++ if (!adt_rssi) return kError;
++ *prop=&adt_rssi; *bytes=adt_rssi_bytes; return kSuccess;
++}
  static int mbuf_copydata(mbuf_t p,size_t off,size_t n,void *out) { memcpy(out,(const char *)p+off,n);return 0; }
-@@ -98,6 +117,12 @@ static void fuxi_wifi_net_link_state(bool up) { link_up=up; }
+ static void FuxiNetworkStackStart(void) { registry++; }
+ static void fuxi_wifi_net_input(const uint8_t *p,size_t n) { assert(p[12]==0x88 && n>=14); received++; }
+@@ -98,6 +130,12 @@ static void fuxi_wifi_net_link_state(bool up) { link_up=up; }
  '''
  
  TEST = r'''
@@ -17847,7 +17901,7 @@ index 12e012d..1f51d40 100755
  bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *p) {
   assert(p->wireless && !p->up && p->address[0]==2); attached++; return true;
  }
-@@ -114,11 +139,39 @@ static int request(bool set,int type,void *p,unsigned n,int *val) {
+@@ -114,11 +152,39 @@ static int request(bool set,int type,void *p,unsigned n,int *val) {
   int error=fuxi_wifi_apple80211_ioctl(set?SIOCSA80211:SIOCGA80211,&req);
   if(val) *val=req.req_val; return error;
  }
@@ -17889,7 +17943,25 @@ index 12e012d..1f51d40 100755
   fuxi_wifi_ios_init(); assert(attached==1);
   assert(!fuxi_wifi_ios_attach(&fake_backend));
   assert(fuxi_wifi_sta_ask_scan(NULL)==EINVAL && fuxi_wifi_sta_ask_join(NULL)==EINVAL);
-@@ -139,6 +192,7 @@ int main(void) {
+@@ -127,6 +193,17 @@ int main(void) {
+  struct apple80211req invalid={.req_if_name="ue0"};
+  assert(fuxi_wifi_apple80211_ioctl(SIOCGA80211,&invalid)==ENXIO);
+  assert(request(false,999,NULL,0,NULL)==EOPNOTSUPP);
++ /* RSSI_BOUNDS (106)：預設照舊拒絕；ADT fuxi,wifi-rssi=1（4 bytes）才回 {1,-128,127,-128}，不必先加入網路 */
++ struct { uint32_t version; int32_t minimum,maximum,threshold; } bounds={0};
++ assert(request(false,106,&bounds,sizeof(bounds),NULL)==EOPNOTSUPP && !bounds.version);
++ adt_rssi=2; assert(request(false,106,&bounds,sizeof(bounds),NULL)==EOPNOTSUPP && !bounds.version);
++ adt_rssi=1; adt_rssi_bytes=8; assert(request(false,106,&bounds,sizeof(bounds),NULL)==EOPNOTSUPP && !bounds.version);
++ adt_rssi_bytes=4; assert(!request(false,106,&bounds,sizeof(bounds),NULL));
++ assert(bounds.version==1 && bounds.minimum==-128 && bounds.maximum==127 && bounds.threshold==-128);
++ assert(request(false,106,NULL,sizeof(bounds),NULL)==EFAULT);
++ struct { uint32_t version; int32_t minimum; } shorter={0};
++ assert(!request(false,106,&shorter,sizeof(shorter),NULL) && shorter.version==1 && shorter.minimum==-128);
++ assert(adt_lookups>=6); adt_rssi=0;
+  struct apple80211_scan_request scan={.version=1};
+  assert(request(true,10,&scan,sizeof(scan)-1,NULL)==EINVAL);
+  scan.ssid_length=33; assert(request(true,10,&scan,sizeof(scan),NULL)==EINVAL); scan.ssid_length=0;
+@@ -139,6 +216,7 @@ int main(void) {
   assert(request(false,11,&result,sizeof(result),NULL)==0);
   assert(result.ssid_length==13 && !memcmp(result.ssid,"Fuxi Loopback",13));
   assert(result.rssi==-42 && result.channel.channel==1 && result.elements_length==4);
@@ -17897,7 +17969,7 @@ index 12e012d..1f51d40 100755
   assert(request(false,11,&result,sizeof(result),NULL)==EIO);
   struct apple80211_channels channels;
   assert(!request(false,27,&channels,sizeof(channels),NULL) && channels.count==1);
-@@ -149,11 +203,19 @@ int main(void) {
+@@ -149,11 +227,19 @@ int main(void) {
   join.key_length=65; join.key_cipher=10; assert(request(true,20,&join,sizeof(join),NULL)==EINVAL);
   join.key_length=0; assert(!request(true,20,&join,sizeof(join),NULL)); settle();
   int val; assert(!request(false,21,NULL,0,&val) && val==1); assert(link_up);
@@ -17917,7 +17989,7 @@ index 12e012d..1f51d40 100755
   join.key_length=8;memcpy(join.key,"password",8);join.key_cipher=10;
   assert(!request(true,20,&join,sizeof(join),NULL));settle();
   assert(!request(false,21,NULL,0,&val) && val==2 && !link_up);
-@@ -181,6 +243,8 @@ def compile_run(source, directory, name):
+@@ -181,6 +267,8 @@ def compile_run(source, directory, name):
                      '-Wno-unused-function', '-Wno-unused-parameter', '-fsanitize=address,undefined',
                      '-pthread', '-I', str(SRC), str(path), '-o', str(binary)], check=True)
      subprocess.run([str(binary)], check=True, timeout=30)
@@ -26367,7 +26439,7 @@ index 0000000..a3b1e7a
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_haptic_pulse.h b/xnu/fuxi-adsp/fuxi_haptic_pulse.h
 new file mode 100644
-index 0000000..442bfbf
+index 0000000..38479c4
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_haptic_pulse.h
 @@ -0,0 +1,259 @@
@@ -26421,7 +26493,7 @@ index 0000000..442bfbf
 +{
 +    return address == 0xf046 || address == 0xf048 || address == 0xf04b ||
 +        address == 0xf04c || address == 0xf04e || address == 0xf063 ||
-+        address == 0xf130 || address == 0xf131 ||
++        address == 0xf126 || address == 0xf130 || address == 0xf131 ||
 +        (address >= 0xf134 && address <= 0xf14b);
 +}
 +
@@ -26632,10 +26704,10 @@ index 0000000..442bfbf
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_haptic_runtime.h b/xnu/fuxi-adsp/fuxi_haptic_runtime.h
 new file mode 100644
-index 0000000..0437b93
+index 0000000..e67f8ce
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_haptic_runtime.h
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,176 @@
 +#ifndef FUXI_HAPTIC_RUNTIME_H
 +#define FUXI_HAPTIC_RUNTIME_H
 +/*
@@ -26644,7 +26716,10 @@ index 0000000..0437b93
 + * 開：SPMI_PLAY(0xf04c) 寫 0x81（PLAY_EN | 來源 DIRECT_PLAY，不開 brake）；
 + * 關：寫 0x01，再輪詢 HPWR_INTF(0xf00b) 低兩位回到 0（HPWR_DISABLED）；
 + * 逾時就照 Linux 的 haptics_toggle_module_enable 關開模組一次再等。
-+ * 振幅、VMAX、自動共振都沿用 Android 開機前留下的設定，這裡只檢查不改寫。
++ * VMAX、自動共振沿用 Android 開機前留下的設定，這裡只檢查不改寫。
++ * 振幅（2026-11-17）：sysctl 值的 bit 16..23 是 DIRECT_PLAY 振幅，寫進 PTN 0x26（0xf126；Linux
++ * qcom-hv-haptics 的 HAP_PTN_DIRECT_PLAY_REG，0..0xff 線性乘上 VMAX，haptics_set_direct_play 播放中也照寫）。
++ * 0 表示沿用目前的值：只送毫秒的舊使用端完全不變。VMAX 不改，所以任何級數都不超過 Android 自己會用的強度。
 + */
 +#include <stdint.h>
 +#include "fuxi_haptic_pulse.h"
@@ -26656,7 +26731,9 @@ index 0000000..0437b93
 +    FUXI_VIBRATE_PLAY = 0x81,
 +    FUXI_VIBRATE_IDLE = 0x01,
 +    FUXI_VIBRATE_MODULE_ON = 0x80,
-+    FUXI_VIBRATE_VMAX_LIMIT = 0x1c /* 50 mV/碼，1400 mV：Android 留下的值，不接受更高 */
++    FUXI_VIBRATE_VMAX_LIMIT = 0x1c, /* 50 mV/碼，1400 mV：Android 留下的值，不接受更高 */
++    FUXI_VIBRATE_LEVEL_SHIFT = 16,  /* sysctl 值：bit 0..15 毫秒，bit 16..23 振幅，其餘須為 0 */
++    FUXI_VIBRATE_AMPLITUDE = 0xf126
 +};
 +
 +typedef struct {
@@ -26665,8 +26742,18 @@ index 0000000..0437b93
 +    uint64_t plays;
 +    unsigned failed;
 +    unsigned playing;
++    unsigned level;     /* 目前請求的振幅，0＝沿用暫存器現值 */
 +    int last_error;
 +} FuxiVibrateRuntime;
++
++/* sysctl 寫入值拆成毫秒與振幅；格式不對（負數、高位元、超過上限）回 -1。 */
++static inline int fuxi_vibrate_decode(int value, unsigned *ms, unsigned *level)
++{
++    if (value < 0 || ((unsigned)value >> 24)) return -1;
++    *ms = (unsigned)value & 0xffffu;
++    *level = ((unsigned)value >> FUXI_VIBRATE_LEVEL_SHIFT) & 0xffu;
++    return *ms > FUXI_VIBRATE_MAX_MS ? -1 : 0;
++}
 +
 +/* 允許的呼叫者：root，或平台二進位檔名為 SpringBoard／mediaserverd。 */
 +static inline int fuxi_vibrate_caller_allowed(unsigned root, unsigned platform, const char *name)
@@ -26691,6 +26778,25 @@ index 0000000..0437b93
 +    state->deadline = ms ? now + (uint64_t)ms * 1000000ull : 0;
 +    state->requests++;
 +    return 0;
++}
++
++/* 同上，另帶振幅（0..0xff）；停止（ms=0）不改記下的振幅。 */
++static inline int fuxi_vibrate_request_level(FuxiVibrateRuntime *state, unsigned ms, unsigned level, uint64_t now)
++{
++    if (level > 0xffu || fuxi_vibrate_request(state, ms, now)) return -1;
++    if (ms) state->level = level;
++    return 0;
++}
++
++/* 播放前或播放中套用振幅：0 或與現值相同就不寫；寫入讀回相符才更新 *current。 */
++static inline int fuxi_vibrate_amplitude(const FuxiHapticIo *io, unsigned level, uint8_t *current, unsigned *writes)
++{
++    if (!level || level == *current) return FUXI_HAPTIC_OK;
++    if (level > 0xffu) return FUXI_HAPTIC_INVALID;
++    int result = fuxi_haptic_write_checked(io, FUXI_VIBRATE_AMPLITUDE, (uint8_t)level);
++    (*writes)++;
++    if (!result) *current = (uint8_t)level;
++    return result;
 +}
 +
 +static inline unsigned fuxi_vibrate_wanted(FuxiVibrateRuntime *state, uint64_t now)
@@ -26780,10 +26886,10 @@ index 0000000..0437b93
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_pmic.c b/xnu/fuxi-adsp/fuxi_pmic.c
 new file mode 100644
-index 0000000..afdef7d
+index 0000000..bd467e3
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_pmic.c
-@@ -0,0 +1,808 @@
+@@ -0,0 +1,844 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
@@ -27269,16 +27375,20 @@ index 0000000..afdef7d
 +    int changed = 0;
 +    int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
 +    if (error || !changed) return error;
-+    if (value < 0 || value > FUXI_VIBRATE_MAX_MS) return EINVAL;
++    unsigned ms = 0, level = 0;
++    if (fuxi_vibrate_decode(value, &ms, &level)) return EINVAL;
 +    lck_mtx_lock(&fp_vibrate_lock);
-+    error = fuxi_vibrate_request(&fp_vibrate_state, (unsigned)value, fp_torch_now()) ? EIO : 0;
++    error = fuxi_vibrate_request_level(&fp_vibrate_state, ms, level, fp_torch_now()) ? EIO : 0;
 +    lck_mtx_unlock(&fp_vibrate_lock);
 +    if (!error) fp_vibrate_kick_worker();
 +    return error;
 +}
 +
 +SYSCTL_PROC(_kern, OID_AUTO, fuxivibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
-+    0, 0, fp_vibrate_sysctl, "I", "Fuxi HAP525 direct play ms 0..2000, platform SpringBoard/mediaserverd or root");
++    0, 0, fp_vibrate_sysctl, "I",
++    "Fuxi HAP525 direct play ms 0..2000 | amplitude<<16 (0 keeps), platform SpringBoard/mediaserverd or root");
++
++static uint8_t fp_vibrate_android_amplitude, fp_vibrate_android_vmax; /* 開機時 Android 留下的值，只給紀錄 */
 +
 +/* 等到 deadline_ns（0 表示不限）或有新請求。 */
 +static void fp_vibrate_sleep(unsigned seen, uint64_t deadline_ns)
@@ -27316,8 +27426,8 @@ index 0000000..afdef7d
 +    (void)argument;
 +    (void)wait_result;
 +    const FuxiHapticIo io = {NULL, fp_haptic_owner, fp_haptic_read, fp_haptic_write, fp_flash_wait, 0};
-+    unsigned playing = 0, logged = 0, health_checks = 0;
-+    uint8_t mid_hpwr = 0, mid_fault = 0;
++    unsigned playing = 0, logged = 0, health_checks = 0, amplitude_writes = 0, amplitude_logged = 0;
++    uint8_t mid_hpwr = 0, mid_fault = 0, amplitude = fp_vibrate_android_amplitude, low = 0, high = 0;
 +    uint64_t started_ns = 0;
 +    for (;;) {
 +        unsigned seen = __atomic_load_n(&fp_vibrate_kick, __ATOMIC_ACQUIRE);
@@ -27325,13 +27435,42 @@ index 0000000..afdef7d
 +        lck_mtx_lock(&fp_vibrate_lock);
 +        unsigned failed = fp_vibrate_state.failed;
 +        unsigned want = fuxi_vibrate_wanted(&fp_vibrate_state, now);
++        unsigned level = fp_vibrate_state.level;
 +        uint64_t deadline = fp_vibrate_state.deadline;
 +        lck_mtx_unlock(&fp_vibrate_lock);
 +        if (failed && !playing) {
 +            fp_vibrate_sleep(seen, 0);
 +            continue;
 +        }
++        if (want && !failed) {
++            /* 振幅先於開始寫；播放中改了也照寫（Linux haptics_set_gain 同樣在播放中改 DIRECT_PLAY） */
++            unsigned before = amplitude_writes;
++            int result = fuxi_vibrate_amplitude(&io, level, &amplitude, &amplitude_writes);
++            if (result) {
++                unsigned polls = 0, toggled = 0;
++                int stop_result = playing ? fuxi_vibrate_stop(&io, &polls, &toggled) : 0;
++                playing = 0;
++                lck_mtx_lock(&fp_vibrate_lock);
++                fp_vibrate_state.playing = 0;
++                lck_mtx_unlock(&fp_vibrate_lock);
++                fp_vibrate_fail(&io, "amplitude refused", result);
++                printf("FUXI PMIC: vibrate amplitude level=%#x kept=%#x stop-rc=%d polls=%u toggled=%u\n",
++                    level, amplitude, stop_result, polls, toggled);
++                continue;
++            }
++            if (amplitude_writes != before && amplitude_logged < 8) {
++                amplitude_logged++;
++                printf("FUXI PMIC: vibrate amplitude %#x (Android left %#x, VMAX %#x kept) writes=%u%s\n",
++                    amplitude, fp_vibrate_android_amplitude, fp_vibrate_android_vmax, amplitude_writes,
++                    playing ? " while playing" : "");
++            }
++            if (playing) {
++                if (amplitude < low) low = amplitude;
++                if (amplitude > high) high = amplitude;
++            }
++        }
 +        if (want && !playing) {
++            low = high = amplitude;
 +            int result = fuxi_vibrate_start(&io);
 +            if (result) {
 +                unsigned polls = 0, toggled = 0;
@@ -27362,9 +27501,9 @@ index 0000000..afdef7d
 +            lck_mtx_unlock(&fp_vibrate_lock);
 +            if (logged < 16 || result || toggled) {
 +                logged++;
-+                printf("FUXI PMIC: vibrate play=%llu on-us=%llu checks=%u hpwr-mid=%#x fault-mid=%#x stop-rc=%d stop-polls=%u stop-us=%llu toggled=%u\n",
++                printf("FUXI PMIC: vibrate play=%llu on-us=%llu checks=%u hpwr-mid=%#x fault-mid=%#x stop-rc=%d stop-polls=%u stop-us=%llu toggled=%u amp=%#x..%#x\n",
 +                    plays, (stop_ns - started_ns) / 1000, health_checks, mid_hpwr, mid_fault, result, polls,
-+                    (stopped_ns - stop_ns) / 1000, toggled);
++                    (stopped_ns - stop_ns) / 1000, toggled, low, high);
 +            }
 +            if (result) fp_vibrate_fail(&io, "stop unverified", result);
 +            continue;
@@ -27417,6 +27556,9 @@ index 0000000..afdef7d
 +    if (fp_haptic_prepare()) return;
 +    const FuxiHapticIo io = {NULL, fp_haptic_owner, fp_haptic_read, fp_haptic_write, fp_flash_wait, 0};
 +    int result = fuxi_vibrate_check(&io);
++    if (!result && (fuxi_haptic_read_stable(&io, FUXI_VIBRATE_AMPLITUDE, &fp_vibrate_android_amplitude) ||
++        fuxi_haptic_read_stable(&io, 0xf048, &fp_vibrate_android_vmax)))
++        result = FUXI_HAPTIC_IO;
 +    if (result) {
 +        printf("FUXI PMIC: vibrate runtime refused check rc=%d; writes=0\n", result);
 +        return;
@@ -27428,8 +27570,8 @@ index 0000000..afdef7d
 +    }
 +    thread_deallocate(thread);
 +    __atomic_store_n(&fp_vibrate_ready, 1u, __ATOMIC_RELEASE);
-+    printf("FUXI PMIC: vibrate runtime ready; DIRECT_PLAY 0x81/0x01, sysctl kern.fuxivibrate ms<=%u, Android VMAX/amplitude kept\n",
-+        (unsigned)FUXI_VIBRATE_MAX_MS);
++    printf("FUXI PMIC: vibrate runtime ready; DIRECT_PLAY 0x81/0x01, sysctl kern.fuxivibrate ms<=%u | amplitude<<16, Android VMAX %#x kept, amplitude %#x until asked\n",
++        (unsigned)FUXI_VIBRATE_MAX_MS, fp_vibrate_android_vmax, fp_vibrate_android_amplitude);
 +    if (fp_vibrate_selftest && kernel_thread_start(fp_vibrate_selftest_worker, NULL, &thread) == KERN_SUCCESS)
 +        thread_deallocate(thread);
 +}
@@ -34519,6 +34661,33 @@ index 0000000..8a1b9db
 +        FUXI_RAM_PREP_ENABLED, cases, checks);
 +    return 0;
 +}
+diff --git a/xnu/fuxi-unixnu/SweetFramebuffer.cpp b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
+index 8b38ece..a13e5a7 100644
+--- a/xnu/fuxi-unixnu/SweetFramebuffer.cpp
++++ b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
+@@ -32,7 +32,8 @@
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+- * the first swap on (it still reaches the persistent log; panics draw).
++ * the first swap on (it still reaches the persistent log; panics draw);
++ * sweetfb_noconsole=2 (patch 0119) keeps it off the screen from vcattach.
+  *
+  * FUXI (0093): frames are shown at up to 60 Hz by default (7 fast cores;
+  * sweetfb_hz still overrides), the tick runs on absolute deadlines so the
+@@ -653,10 +654,10 @@ AppleCLCD::start(IOService *provider)
+  PE_parse_boot_argn("fuxigpuscanoutlog", &log, sizeof(log));
+  int quiet = 0;
+  PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet));
+- fScanout = scanout == 1 && quiet == 1;
++ fScanout = scanout == 1 && (quiet == 1 || quiet == 2);
+  fScanoutLog = log == 1 ? 2 : fScanout ? 1 : 0;
+  if (scanout == 1 && !fScanout)
+-  IOLog("FUXI SCANOUT: unavailable, requires sweetfb_noconsole=1; existing present path\n");
++  IOLog("FUXI SCANOUT: unavailable, requires sweetfb_noconsole=1 or 2; existing present path\n");
+  if (fScanout) { sweet_console_muted = 1; fConsolePaused = true; }
+  fuxi_gpu_scanout_configure(fPixels, fScanout, check);
+  uint32_t nc = 0;
 diff --git a/xnu/fuxi-unixnu/sweet_ufs.c b/xnu/fuxi-unixnu/sweet_ufs.c
 index c8376e4..d363e22 100644
 --- a/xnu/fuxi-unixnu/sweet_ufs.c
@@ -34868,10 +35037,10 @@ index c8376e4..d363e22 100644
  int sweet_ufs_rootdev(dev_t *dev);
  
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
-index b09ac72..af1e337 100644
+index b09ac72..c8f9f18 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_apple80211.c
-@@ -37,15 +37,19 @@
+@@ -37,15 +37,20 @@
   * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
   */
  #if defined(FUXI)
@@ -34880,6 +35049,7 @@ index b09ac72..af1e337 100644
  #include <kern/locks.h>
 +#include <kern/thread_call.h>
  #include <libkern/libkern.h>
++#include <pexpert/device_tree.h>
 +#include <pexpert/pexpert.h>
  #include <sys/errno.h>
  #include <sys/kern_event.h>
@@ -34891,7 +35061,7 @@ index b09ac72..af1e337 100644
  #include <sys/sockio.h>
  #include <sys/systm.h>
  
-@@ -82,7 +86,14 @@ type_name(int32_t type)
+@@ -82,7 +87,14 @@ type_name(int32_t type)
  
  /* Apple80211's events (APPLE80211_M_...) */
  enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
@@ -34907,7 +35077,7 @@ index b09ac72..af1e337 100644
  
  static const char interface_name[16] = "en0";   /* (bsd/dev/fuxi_wifi_net.c makes one interface, and that is its name) */
  
-@@ -154,6 +165,9 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
+@@ -154,6 +166,9 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
  	result->version = 1;
  	channel_fill(&result->channel, bss->frequency, 0);
  	result->rssi = bss->rssi;
@@ -34917,7 +35087,39 @@ index b09ac72..af1e337 100644
  	result->beacon_interval = bss->beacon_interval;
  	result->capability = bss->capability;
  	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
-@@ -190,8 +204,9 @@ get(struct apple80211req *request)
+@@ -180,6 +195,31 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
+ 
+ /* ---- get ---------------------------------------------------------------------------------------------- */
+ 
++/*
++ * RSSI_BOUNDS (106), opt-in with ADT /chosen u32 "fuxi,wifi-rssi" = 1 (the command line is full). IO80211 of 16.5
++ * asks it with 16 bytes, version 1 first, and turns the three int32 after it into RSSI_MIN, RSSI_MAX and
++ * RSSI_THRESHOLD; wifid keeps RSSI_THRESHOLD as WiFiDeviceManager's legacy join floor (+0x80, compared against
++ * every candidate before a join). Refused, that floor stays 0 and every negative-dBm network is "Below minimum
++ * RSSI threshold": no automatic join, ever. ath12k reports the signal as a signed 8-bit dBm, so the bounds are
++ * the limits of that format and the floor is the lowest of them: wifid's own quality policy (its -80/-90 dBm
++ * auto-join passes, the moving-network floors) is left as it is. The same fix as UniXNU's zizhan port (its
++ * device record: g331 automatic association with stock wifid); the layout was read from IO80211 20H392.
++ */
++static bool
++rssi_bounds_enabled(void)
++{
++	DTEntry chosen;
++	void const *prop;
++	unsigned int bytes;
++	uint32_t value = 0;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	    SecureDTGetProperty(chosen, "fuxi,wifi-rssi", &prop, &bytes) == kSuccess && bytes == sizeof(value)) {
++		memcpy(&value, prop, sizeof(value));
++	}
++	return value == 1;
++}
++
+ static int
+ get(struct apple80211req *request)
+ {
+@@ -190,8 +230,9 @@ get(struct apple80211req *request)
  	case 43:
  	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
  		static const char name[256] = "Fuxi Wi-Fi iOS shim (synthetic backend)";
@@ -34928,7 +35130,25 @@ index b09ac72..af1e337 100644
  	}
  	case 12: {
  		/*
-@@ -328,7 +343,17 @@ get(struct apple80211req *request)
+@@ -219,6 +260,17 @@ get(struct apple80211req *request)
+ 	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
+ 		request->req_val = 1;
+ 		return 0;
++	case 106: {                             /* the strengths the radio can report, and the floor to join at */
++		struct {
++			uint32_t version;
++			int32_t minimum, maximum, threshold;
++		} answer = { .version = 1, .minimum = INT8_MIN, .maximum = INT8_MAX, .threshold = INT8_MIN };
++
++		if (!rssi_bounds_enabled()) {
++			break;                  /* refused below, as before */
++		}
++		return give(request, &answer, sizeof(answer));
++	}
+ 	case 27:
+ 	case 254: {                             /* the channels the radio may tune to */
+ 		struct apple80211_channels *answer;
+@@ -328,7 +380,17 @@ get(struct apple80211req *request)
  		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
  		break;
  	}
@@ -34947,7 +35167,7 @@ index b09ac72..af1e337 100644
  		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give_network(request, &state->bss);
  		break;
  	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-@@ -379,6 +404,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
+@@ -379,6 +441,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
  		memcpy(what->ssid, asked->ssid, asked->ssid_length);
  	}
  	what->passive = asked->scan_type == 2;
@@ -34955,7 +35175,7 @@ index b09ac72..af1e337 100644
  	what->dwell_ms = asked->dwell_ms;
  	/* (more channels than there is room to name: every channel) */
  	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
-@@ -496,12 +522,14 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+@@ -496,12 +559,14 @@ set(const struct apple80211req *request, char *said, size_t said_size)
  
  /* ---- events -------------------------------------------------------------------------------------------- */
  
@@ -34971,7 +35191,7 @@ index b09ac72..af1e337 100644
  
  	memcpy(name, interface_name, sizeof(name));
  	message.dv[0].data_length = sizeof(name);
-@@ -510,7 +538,90 @@ post(uint32_t code, const void *data, uint32_t length)
+@@ -510,7 +575,90 @@ post(uint32_t code, const void *data, uint32_t length)
  		message.dv[1].data_length = length;
  		message.dv[1].data_ptr = __DECONST(void *, data);
  	}
@@ -35063,7 +35283,7 @@ index b09ac72..af1e337 100644
  }
  
  /* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
-@@ -548,11 +659,20 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
+@@ -548,11 +696,20 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
  		if (state != NULL) {
  			fuxi_wifi_sta_state(state);
  			link.rssi = status == 1 ? state->bss.rssi : 0;
@@ -35084,7 +35304,7 @@ index b09ac72..af1e337 100644
  		break;
  	}
  	}
-@@ -609,6 +729,33 @@ fuxi_wifi_apple80211_summary(void)
+@@ -609,6 +766,33 @@ fuxi_wifi_apple80211_summary(void)
  	}
  }
  
@@ -35118,7 +35338,7 @@ index b09ac72..af1e337 100644
  /* An Apple80211 request for the radio's interface, from the process that is running now. */
  errno_t
  fuxi_wifi_apple80211_ioctl(u_long command, void *data)
-@@ -641,6 +788,7 @@ fuxi_wifi_apple80211_ioctl(u_long command, void *data)
+@@ -641,6 +825,7 @@ fuxi_wifi_apple80211_ioctl(u_long command, void *data)
  			printf("error %d\n", error);
  		}
  	}
@@ -41317,7 +41537,7 @@ index 39be642..40ce125 100644
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
 diff --git a/xnu/patches/0104-fuxi-wifi-ios.patch b/xnu/patches/0104-fuxi-wifi-ios.patch
-index 179f5df..f873e33 100644
+index 179f5df..ec9a01c 100644
 --- a/xnu/patches/0104-fuxi-wifi-ios.patch
 +++ b/xnu/patches/0104-fuxi-wifi-ios.patch
 @@ -678,7 +678,7 @@
@@ -41325,11 +41545,11 @@ index 179f5df..f873e33 100644
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_apple80211.c
 -@@ -0,0 +1,647 @@
-+@@ -0,0 +1,795 @@
++@@ -0,0 +1,832 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
-@@ -718,15 +718,19 @@
+@@ -718,15 +718,20 @@
  + * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
  + */
  +#if defined(FUXI)
@@ -41338,6 +41558,7 @@ index 179f5df..f873e33 100644
  +#include <kern/locks.h>
 ++#include <kern/thread_call.h>
  +#include <libkern/libkern.h>
+++#include <pexpert/device_tree.h>
 ++#include <pexpert/pexpert.h>
  +#include <sys/errno.h>
  +#include <sys/kern_event.h>
@@ -41349,7 +41570,7 @@ index 179f5df..f873e33 100644
  +#include <sys/sockio.h>
  +#include <sys/systm.h>
  +
-@@ -763,7 +767,14 @@
+@@ -763,7 +768,14 @@
  +
  +/* Apple80211's events (APPLE80211_M_...) */
  +enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
@@ -41365,7 +41586,7 @@ index 179f5df..f873e33 100644
  +
  +static const char interface_name[16] = "en0";   /* (bsd/dev/fuxi_wifi_net.c makes one interface, and that is its name) */
  +
-@@ -835,6 +846,9 @@
+@@ -835,6 +847,9 @@
  +	result->version = 1;
  +	channel_fill(&result->channel, bss->frequency, 0);
  +	result->rssi = bss->rssi;
@@ -41375,7 +41596,39 @@ index 179f5df..f873e33 100644
  +	result->beacon_interval = bss->beacon_interval;
  +	result->capability = bss->capability;
  +	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
-@@ -871,8 +885,9 @@
+@@ -861,6 +876,31 @@
+ +
+ +/* ---- get ---------------------------------------------------------------------------------------------- */
+ +
+++/*
+++ * RSSI_BOUNDS (106), opt-in with ADT /chosen u32 "fuxi,wifi-rssi" = 1 (the command line is full). IO80211 of 16.5
+++ * asks it with 16 bytes, version 1 first, and turns the three int32 after it into RSSI_MIN, RSSI_MAX and
+++ * RSSI_THRESHOLD; wifid keeps RSSI_THRESHOLD as WiFiDeviceManager's legacy join floor (+0x80, compared against
+++ * every candidate before a join). Refused, that floor stays 0 and every negative-dBm network is "Below minimum
+++ * RSSI threshold": no automatic join, ever. ath12k reports the signal as a signed 8-bit dBm, so the bounds are
+++ * the limits of that format and the floor is the lowest of them: wifid's own quality policy (its -80/-90 dBm
+++ * auto-join passes, the moving-network floors) is left as it is. The same fix as UniXNU's zizhan port (its
+++ * device record: g331 automatic association with stock wifid); the layout was read from IO80211 20H392.
+++ */
+++static bool
+++rssi_bounds_enabled(void)
+++{
+++	DTEntry chosen;
+++	void const *prop;
+++	unsigned int bytes;
+++	uint32_t value = 0;
+++
+++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+++	    SecureDTGetProperty(chosen, "fuxi,wifi-rssi", &prop, &bytes) == kSuccess && bytes == sizeof(value)) {
+++		memcpy(&value, prop, sizeof(value));
+++	}
+++	return value == 1;
+++}
+++
+ +static int
+ +get(struct apple80211req *request)
+ +{
+@@ -871,8 +911,9 @@
  +	case 43:
  +	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
  +		static const char name[256] = "Fuxi Wi-Fi iOS shim (synthetic backend)";
@@ -41386,7 +41639,25 @@ index 179f5df..f873e33 100644
  +	}
  +	case 12: {
  +		/*
-@@ -1009,7 +1024,17 @@
+@@ -900,6 +941,17 @@
+ +	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
+ +		request->req_val = 1;
+ +		return 0;
+++	case 106: {                             /* the strengths the radio can report, and the floor to join at */
+++		struct {
+++			uint32_t version;
+++			int32_t minimum, maximum, threshold;
+++		} answer = { .version = 1, .minimum = INT8_MIN, .maximum = INT8_MAX, .threshold = INT8_MIN };
+++
+++		if (!rssi_bounds_enabled()) {
+++			break;                  /* refused below, as before */
+++		}
+++		return give(request, &answer, sizeof(answer));
+++	}
+ +	case 27:
+ +	case 254: {                             /* the channels the radio may tune to */
+ +		struct apple80211_channels *answer;
+@@ -1009,7 +1061,17 @@
  +		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
  +		break;
  +	}
@@ -41405,7 +41676,7 @@ index 179f5df..f873e33 100644
  +		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give_network(request, &state->bss);
  +		break;
  +	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-@@ -1060,6 +1085,7 @@
+@@ -1060,6 +1122,7 @@
  +		memcpy(what->ssid, asked->ssid, asked->ssid_length);
  +	}
  +	what->passive = asked->scan_type == 2;
@@ -41413,7 +41684,7 @@ index 179f5df..f873e33 100644
  +	what->dwell_ms = asked->dwell_ms;
  +	/* (more channels than there is room to name: every channel) */
  +	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
-@@ -1177,12 +1203,14 @@
+@@ -1177,12 +1240,14 @@
  +
  +/* ---- events -------------------------------------------------------------------------------------------- */
  +
@@ -41429,7 +41700,7 @@ index 179f5df..f873e33 100644
  +
  +	memcpy(name, interface_name, sizeof(name));
  +	message.dv[0].data_length = sizeof(name);
-@@ -1191,7 +1219,90 @@
+@@ -1191,7 +1256,90 @@
  +		message.dv[1].data_length = length;
  +		message.dv[1].data_ptr = __DECONST(void *, data);
  +	}
@@ -41521,7 +41792,7 @@ index 179f5df..f873e33 100644
  +}
  +
  +/* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
-@@ -1229,11 +1340,20 @@
+@@ -1229,11 +1377,20 @@
  +		if (state != NULL) {
  +			fuxi_wifi_sta_state(state);
  +			link.rssi = status == 1 ? state->bss.rssi : 0;
@@ -41542,7 +41813,7 @@ index 179f5df..f873e33 100644
  +		break;
  +	}
  +	}
-@@ -1290,6 +1410,33 @@
+@@ -1290,6 +1447,33 @@
  +	}
  +}
  +
@@ -41576,7 +41847,7 @@ index 179f5df..f873e33 100644
  +/* An Apple80211 request for the radio's interface, from the process that is running now. */
  +errno_t
  +fuxi_wifi_apple80211_ioctl(u_long command, void *data)
-@@ -1322,13 +1469,14 @@
+@@ -1322,13 +1506,14 @@
  +			printf("error %d\n", error);
  +		}
  +	}
@@ -41592,7 +41863,7 @@ index 179f5df..f873e33 100644
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
  + * Fuxi, 2026-10-23: shared diagnostic ABI; 16.7 payloads UNVERIFIED.
-@@ -1445,6 +1593,28 @@
+@@ -1445,6 +1630,28 @@
  +	uint8_t unused_3[4];
  +};
  +
@@ -41621,7 +41892,7 @@ index 179f5df..f873e33 100644
  +_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
  +    "the association request as iOS 16.5 has it");
  +_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
-@@ -1463,7 +1633,7 @@
+@@ -1463,7 +1670,7 @@
  +#endif
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_ios.c
@@ -41630,7 +41901,7 @@ index 179f5df..f873e33 100644
  +/* Fuxi Wi-Fi iOS shim entry and synthetic Ethernet link. No radio access. */
  +#if defined(FUXI)
  +#include <sys/param.h>
-@@ -1477,6 +1647,18 @@
+@@ -1477,6 +1684,18 @@
  +extern void FuxiNetworkStackStart(void);
  +static const struct fuxi_wifi_backend *backend;
  +static bool enabled;
@@ -41649,7 +41920,7 @@ index 179f5df..f873e33 100644
  +
  +static bool
  +transmit(mbuf_t packet, size_t length)
-@@ -1504,6 +1686,7 @@
+@@ -1504,6 +1723,7 @@
  +		return false;
  +	}
  +	backend = ops;
@@ -41657,7 +41928,7 @@ index 179f5df..f873e33 100644
  +	memcpy(link.address, ops->station.address, sizeof(link.address));
  +	ops->start(&input);
  +	fuxi_wifi_sta_attach(&ops->station);
-@@ -1659,17 +1842,24 @@
+@@ -1659,17 +1879,24 @@
  +{
  +	int on = 0;
  +	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
@@ -41684,7 +41955,7 @@ index 179f5df..f873e33 100644
  +/* Fuxi Wi-Fi iOS shim: boot-lifetime backend boundary. */
  +#ifndef FUXI_WIFI_IOS_H
  +#define FUXI_WIFI_IOS_H
-@@ -1704,6 +1894,7 @@
+@@ -1704,6 +1931,7 @@
  +#ifdef KERNEL
  +bool fuxi_wifi_ios_attach(const struct fuxi_wifi_backend *backend);
  +void fuxi_wifi_ios_init(void);
@@ -41692,7 +41963,7 @@ index 179f5df..f873e33 100644
  +#endif
  +#endif
  --- /dev/null
-@@ -2158,14 +2349,13 @@
+@@ -2158,14 +2386,13 @@
  +			}
  +			error = ops->power(power_on);
  +			lck_mtx_lock(&sta_lock);
@@ -41710,7 +41981,7 @@ index 179f5df..f873e33 100644
  +		} else if (leave) {
  +			ops->leave();
  +			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
-@@ -2224,10 +2414,12 @@
+@@ -2224,10 +2451,12 @@
  +	}
  +	lck_mtx_lock(&sta_lock);
  +	sta_ops = ops;
@@ -41725,7 +41996,7 @@ index 179f5df..f873e33 100644
  +}
  +
  +void
-@@ -2277,7 +2469,6 @@
+@@ -2277,7 +2506,6 @@
  +		lck_mtx_unlock(&sta_lock);
  +		return ENXIO;
  +	}
@@ -41733,7 +42004,7 @@ index 179f5df..f873e33 100644
  +	asked_power = true;
  +	asked_power_on = on;
  +	if (!on) {
-@@ -2297,7 +2488,7 @@
+@@ -2297,7 +2525,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
@@ -41742,7 +42013,7 @@ index 179f5df..f873e33 100644
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
-@@ -2317,7 +2508,7 @@
+@@ -2317,7 +2545,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
@@ -41751,7 +42022,7 @@ index 179f5df..f873e33 100644
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
-@@ -2402,7 +2593,7 @@
+@@ -2402,7 +2630,7 @@
  +#endif /* FUXI */
  --- /dev/null
  +++ b/bsd/sys/fuxi_wifi_sta.h
@@ -41760,7 +42031,7 @@ index 179f5df..f873e33 100644
  +/*
  + * Ported from HackiOS xnu/files/bsd/sys/redwood_sta.h (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
-@@ -2450,6 +2641,7 @@
+@@ -2450,6 +2678,7 @@
  +	uint16_t frequencies[64], frequency_count;      /* only these channels */
  +	bool passive;                           /* only listen */
  +	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
@@ -41769,7 +42040,7 @@ index 179f5df..f873e33 100644
  +
  +enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
 diff --git a/xnu/patches/0106-fuxi-unixnu.patch b/xnu/patches/0106-fuxi-unixnu.patch
-index d95faff..cac8cfa 100644
+index d95faff..da02b50 100644
 --- a/xnu/patches/0106-fuxi-unixnu.patch
 +++ b/xnu/patches/0106-fuxi-unixnu.patch
 @@ -42,7 +42,19 @@
@@ -42235,6 +42506,245 @@ index d95faff..cac8cfa 100644
  --- /dev/null
  +++ b/bsd/dev/fuxi_unixnu_ufs.h
  @@ -0,0 +1,36 @@
+@@ -402,7 +746,17 @@
+ +POSSIBILITY OF SUCH DAMAGE.
+ --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
+ +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+-@@ -42,7 +42,11 @@
++@@ -32,7 +32,8 @@
++  * The panel memory itself is published as an IOSurface and returned as the
++  * default framebuffer surface. The kernel text console keeps drawing over
++  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
++- * the first swap on (it still reaches the persistent log; panics draw).
+++ * the first swap on (it still reaches the persistent log; panics draw);
+++ * sweetfb_noconsole=2 (patch 0119) keeps it off the screen from vcattach.
++  *
++  * FUXI (0093): frames are shown at up to 60 Hz by default (7 fast cores;
++  * sweetfb_hz still overrides), the tick runs on absolute deadlines so the
++@@ -42,7 +43,11 @@
+   * read-modify-write fade read it back uncached). sweet_fb_display_off tells
+   * the touch driver (bsd/dev/fuxi_touch.c) that the display is off.
+   */
+@@ -414,7 +768,7 @@
+  #if defined(FUXI)
+  extern "C" {
+  #include "../../../bsd/dev/fuxi_adreno.h"
+-@@ -65,7 +69,18 @@
++@@ -65,7 +70,18 @@
+  #include <IOKit/system.h>
+  #include <pexpert/pexpert.h>
+  #include <kern/clock.h>
+@@ -433,7 +787,7 @@
+  
+  enum {
+  	kSweetFBGetLayerDefaultSurface  = 3,
+-@@ -82,6 +97,13 @@
++@@ -82,6 +98,13 @@
+  
+  #define SWEET_FB_SWAP_REC_SIZE          0x46c
+  #define SWEET_FB_LAYERS                 4
+@@ -447,7 +801,7 @@
+  #define SWEET_FB_NOTIFY_TYPES           8
+  #define SWEET_FB_NOTIFY_VSYNC           5
+  #define SWEET_FB_VSYNC_US               16667
+-@@ -127,25 +149,204 @@
++@@ -127,25 +150,204 @@
+  	OSArray      *fClients;
+  	uint32_t      fSwapID;
+  	bool          fConsolePaused;
+@@ -656,7 +1010,7 @@
+  };
+  
+  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+-@@ -174,6 +375,163 @@
++@@ -174,6 +376,163 @@
+  OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+  #if defined(FUXI)
+  extern "C" void fuxi_display_kick(void);
+@@ -820,7 +1174,7 @@
+  #endif
+  
+  bool
+-@@ -214,7 +572,33 @@
++@@ -214,7 +573,33 @@
+  		OSSafeReleaseNULL(fWorkLoop);
+  		return false;
+  	}
+@@ -855,7 +1209,7 @@
+  	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+  		IOLog("SWEET FB: no vsync timer\n");
+  		return false;
+-@@ -227,11 +611,20 @@
++@@ -227,11 +612,20 @@
+  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+  #if defined(FUXI)
+@@ -878,7 +1232,7 @@
+  #else
+  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+  #endif
+-@@ -239,28 +632,150 @@
++@@ -239,28 +633,150 @@
+  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+  	setProperty("external", false);
+  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+@@ -904,10 +1258,10 @@
+ + PE_parse_boot_argn("fuxigpuscanoutlog", &log, sizeof(log));
+ + int quiet = 0;
+ + PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet));
+-+ fScanout = scanout == 1 && quiet == 1;
+++ fScanout = scanout == 1 && (quiet == 1 || quiet == 2);
+ + fScanoutLog = log == 1 ? 2 : fScanout ? 1 : 0;
+ + if (scanout == 1 && !fScanout)
+-+  IOLog("FUXI SCANOUT: unavailable, requires sweetfb_noconsole=1; existing present path\n");
+++  IOLog("FUXI SCANOUT: unavailable, requires sweetfb_noconsole=1 or 2; existing present path\n");
+ + if (fScanout) { sweet_console_muted = 1; fConsolePaused = true; }
+ + fuxi_gpu_scanout_configure(fPixels, fScanout, check);
+ + uint32_t nc = 0;
+@@ -1035,7 +1389,7 @@
+  #else
+  	(void)fb;
+  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+-@@ -272,44 +787,34 @@
++@@ -272,44 +788,34 @@
+  {
+  	AppleCLCD *fb = (AppleCLCD *)owner;
+  	uint64_t now = mach_absolute_time();
+@@ -1098,7 +1452,7 @@
+  	if (fb->fPowerOff) {
+  		/* Fade out: halve every channel each vsync, then black, then idle. */
+  		uint32_t step = fb->fFadeStep;
+-@@ -319,14 +824,22 @@
++@@ -319,14 +825,22 @@
+  		IOLockUnlock(fb->fLock);
+  #if defined(FUXI)
+  		if (step == 0) {
+@@ -1126,7 +1480,7 @@
+  		}
+  #else
+  		if (step <= 6) {
+-@@ -341,20 +854,13 @@
++@@ -341,20 +855,13 @@
+  		sweet_fb_rearm(fb, sender);
+  		return;
+  	}
+@@ -1154,7 +1508,7 @@
+  	sweet_fb_rearm(fb, sender);
+  }
+  
+-@@ -388,38 +894,356 @@
++@@ -388,38 +895,356 @@
+  static uint32_t sweet_fb_swaps_logged;
+  static uint64_t sweet_fb_swap_count;
+  
+@@ -1537,7 +1891,7 @@
+  
+  	if (!fConsolePaused) {
+  		int quiet = 0;
+-@@ -442,7 +1266,7 @@
++@@ -442,7 +1267,7 @@
+  		if (!(mask & (1u << layer)) || id == 0) {
+  			continue;
+  		}
+@@ -1546,7 +1900,7 @@
+  		if (sweet_fb_swaps_logged < 16) {
+  			sweet_fb_swaps_logged++;
+  			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
+-@@ -451,6 +1275,7 @@
++@@ -451,6 +1276,7 @@
+  			    get32(a, 12), dx, dy, w, h);
+  		}
+  		if (s == NULL || s == fSurface) {
+@@ -1554,7 +1908,7 @@
+  			OSSafeReleaseNULL(s);
+  			continue;
+  		}
+-@@ -500,35 +1325,262 @@
++@@ -500,35 +1326,262 @@
+  		if (src != 0 && bpe == 4) {
+  			int copied = 0;
+  #if defined(FUXI)
+@@ -1825,7 +2179,7 @@
+  	fStatCopy += took;
+  	fStatCopyMax = took > fStatCopyMax ? took : fStatCopyMax;
+  	if (++fStatFrames >= 600) {
+-@@ -538,15 +1590,47 @@
++@@ -538,15 +1591,47 @@
+  		absolutetime_to_nanoseconds(t1 - fStatStart, &span_ns);
+  		IOLockLock(fLock);
+  		uint32_t swaps = fStatSwaps, dropped = fStatDropped;
+@@ -1876,7 +2230,7 @@
+  		sweet_surface_gpu_stats(&split);
+  		uint64_t ticks[] = {split.pin, split.lookup, split.map, split.clean,
+  		    split.submit, split.wait, split.unmap, split.cpu};
+-@@ -557,13 +1641,21 @@
++@@ -557,13 +1642,21 @@
+  			absolutetime_to_nanoseconds(ticks[i], &ns);
+  			us[i] = attempts ? ns / 1000 / attempts : 0;
+  		}
+@@ -1901,7 +2255,7 @@
+  		fGpuBusyTicks = fGpuFailed = 0;
+  		fGpuFrames = fCpuFrames = 0;
+  		fGpuTime = fCpuTime = 0;
+-@@ -571,6 +1663,33 @@
++@@ -571,6 +1664,33 @@
+  		fStatCopy = fStatCopyMax = 0;
+  		fStatStart = t1;
+  	}
+@@ -1935,7 +2289,7 @@
+  #endif
+  }
+  
+-@@ -620,6 +1739,7 @@
++@@ -620,6 +1740,7 @@
+  	IOLockLock(fFB->fLock);
+  	old = fPort;
+  	fPort = port;
+@@ -1943,7 +2297,7 @@
+  	IOLockUnlock(fFB->fLock);
+  	if (old != MACH_PORT_NULL) {
+  		releaseNotificationPort(old);
+-@@ -643,6 +1763,40 @@
++@@ -643,6 +1764,40 @@
+  }
+  
+  static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
+@@ -1984,7 +2338,7 @@
+  
+  IOReturn
+  IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+-@@ -660,7 +1814,7 @@
++@@ -660,7 +1815,7 @@
+  		break;
+  	case kSweetFBSwapBegin:
+  		IOLockLock(fFB->fLock);
+@@ -1993,7 +2347,7 @@
+  		IOLockUnlock(fFB->fLock);
+  		outCount = 1;
+  		break;
+-@@ -672,7 +1826,7 @@
++@@ -672,7 +1827,7 @@
+  			break;
+  		}
+  		memcpy(rec, args->structureInput, sizeof(rec));
+@@ -2002,7 +2356,7 @@
+  		break;
+  	}
+  	case kSweetFBGetID:
+-@@ -698,6 +1852,7 @@
++@@ -698,6 +1853,7 @@
+  			IOLockLock(fFB->fLock);
+  			fFunc[type] = args->scalarInput[0];
+  			fRefcon[type] = args->scalarInput[1];
+@@ -2010,7 +2364,7 @@
+  			IOLockUnlock(fFB->fLock);
+  			char name[32];
+  			proc_selfname(name, sizeof(name));
+-@@ -707,19 +1862,13 @@
++@@ -707,19 +1863,13 @@
+  		break;
+  	case kSweetFBRequestPowerChange:
+  		if (args->scalarInputCount >= 1) {
 diff --git a/xnu/patches/0111-fuxi-user-profiler.patch b/xnu/patches/0111-fuxi-user-profiler.patch
 index 8349337..ed20c83 100644
 --- a/xnu/patches/0111-fuxi-user-profiler.patch
@@ -42290,10 +42800,10 @@ index 8349337..ed20c83 100644
  +}
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..3c1ce01
+index 0000000..a420483
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,10215 @@
+@@ -0,0 +1,10285 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,31 @@
@@ -44225,7 +44735,7 @@ index 0000000..3c1ce01
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_pmic.c
-+@@ -0,0 +1,808 @@
++@@ -0,0 +1,844 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
@@ -44711,16 +45221,20 @@ index 0000000..3c1ce01
 ++    int changed = 0;
 ++    int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
 ++    if (error || !changed) return error;
-++    if (value < 0 || value > FUXI_VIBRATE_MAX_MS) return EINVAL;
+++    unsigned ms = 0, level = 0;
+++    if (fuxi_vibrate_decode(value, &ms, &level)) return EINVAL;
 ++    lck_mtx_lock(&fp_vibrate_lock);
-++    error = fuxi_vibrate_request(&fp_vibrate_state, (unsigned)value, fp_torch_now()) ? EIO : 0;
+++    error = fuxi_vibrate_request_level(&fp_vibrate_state, ms, level, fp_torch_now()) ? EIO : 0;
 ++    lck_mtx_unlock(&fp_vibrate_lock);
 ++    if (!error) fp_vibrate_kick_worker();
 ++    return error;
 ++}
 ++
 ++SYSCTL_PROC(_kern, OID_AUTO, fuxivibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
-++    0, 0, fp_vibrate_sysctl, "I", "Fuxi HAP525 direct play ms 0..2000, platform SpringBoard/mediaserverd or root");
+++    0, 0, fp_vibrate_sysctl, "I",
+++    "Fuxi HAP525 direct play ms 0..2000 | amplitude<<16 (0 keeps), platform SpringBoard/mediaserverd or root");
+++
+++static uint8_t fp_vibrate_android_amplitude, fp_vibrate_android_vmax; /* 開機時 Android 留下的值，只給紀錄 */
 ++
 ++/* 等到 deadline_ns（0 表示不限）或有新請求。 */
 ++static void fp_vibrate_sleep(unsigned seen, uint64_t deadline_ns)
@@ -44758,8 +45272,8 @@ index 0000000..3c1ce01
 ++    (void)argument;
 ++    (void)wait_result;
 ++    const FuxiHapticIo io = {NULL, fp_haptic_owner, fp_haptic_read, fp_haptic_write, fp_flash_wait, 0};
-++    unsigned playing = 0, logged = 0, health_checks = 0;
-++    uint8_t mid_hpwr = 0, mid_fault = 0;
+++    unsigned playing = 0, logged = 0, health_checks = 0, amplitude_writes = 0, amplitude_logged = 0;
+++    uint8_t mid_hpwr = 0, mid_fault = 0, amplitude = fp_vibrate_android_amplitude, low = 0, high = 0;
 ++    uint64_t started_ns = 0;
 ++    for (;;) {
 ++        unsigned seen = __atomic_load_n(&fp_vibrate_kick, __ATOMIC_ACQUIRE);
@@ -44767,13 +45281,42 @@ index 0000000..3c1ce01
 ++        lck_mtx_lock(&fp_vibrate_lock);
 ++        unsigned failed = fp_vibrate_state.failed;
 ++        unsigned want = fuxi_vibrate_wanted(&fp_vibrate_state, now);
+++        unsigned level = fp_vibrate_state.level;
 ++        uint64_t deadline = fp_vibrate_state.deadline;
 ++        lck_mtx_unlock(&fp_vibrate_lock);
 ++        if (failed && !playing) {
 ++            fp_vibrate_sleep(seen, 0);
 ++            continue;
 ++        }
+++        if (want && !failed) {
+++            /* 振幅先於開始寫；播放中改了也照寫（Linux haptics_set_gain 同樣在播放中改 DIRECT_PLAY） */
+++            unsigned before = amplitude_writes;
+++            int result = fuxi_vibrate_amplitude(&io, level, &amplitude, &amplitude_writes);
+++            if (result) {
+++                unsigned polls = 0, toggled = 0;
+++                int stop_result = playing ? fuxi_vibrate_stop(&io, &polls, &toggled) : 0;
+++                playing = 0;
+++                lck_mtx_lock(&fp_vibrate_lock);
+++                fp_vibrate_state.playing = 0;
+++                lck_mtx_unlock(&fp_vibrate_lock);
+++                fp_vibrate_fail(&io, "amplitude refused", result);
+++                printf("FUXI PMIC: vibrate amplitude level=%#x kept=%#x stop-rc=%d polls=%u toggled=%u\n",
+++                    level, amplitude, stop_result, polls, toggled);
+++                continue;
+++            }
+++            if (amplitude_writes != before && amplitude_logged < 8) {
+++                amplitude_logged++;
+++                printf("FUXI PMIC: vibrate amplitude %#x (Android left %#x, VMAX %#x kept) writes=%u%s\n",
+++                    amplitude, fp_vibrate_android_amplitude, fp_vibrate_android_vmax, amplitude_writes,
+++                    playing ? " while playing" : "");
+++            }
+++            if (playing) {
+++                if (amplitude < low) low = amplitude;
+++                if (amplitude > high) high = amplitude;
+++            }
+++        }
 ++        if (want && !playing) {
+++            low = high = amplitude;
 ++            int result = fuxi_vibrate_start(&io);
 ++            if (result) {
 ++                unsigned polls = 0, toggled = 0;
@@ -44804,9 +45347,9 @@ index 0000000..3c1ce01
 ++            lck_mtx_unlock(&fp_vibrate_lock);
 ++            if (logged < 16 || result || toggled) {
 ++                logged++;
-++                printf("FUXI PMIC: vibrate play=%llu on-us=%llu checks=%u hpwr-mid=%#x fault-mid=%#x stop-rc=%d stop-polls=%u stop-us=%llu toggled=%u\n",
+++                printf("FUXI PMIC: vibrate play=%llu on-us=%llu checks=%u hpwr-mid=%#x fault-mid=%#x stop-rc=%d stop-polls=%u stop-us=%llu toggled=%u amp=%#x..%#x\n",
 ++                    plays, (stop_ns - started_ns) / 1000, health_checks, mid_hpwr, mid_fault, result, polls,
-++                    (stopped_ns - stop_ns) / 1000, toggled);
+++                    (stopped_ns - stop_ns) / 1000, toggled, low, high);
 ++            }
 ++            if (result) fp_vibrate_fail(&io, "stop unverified", result);
 ++            continue;
@@ -44859,6 +45402,9 @@ index 0000000..3c1ce01
 ++    if (fp_haptic_prepare()) return;
 ++    const FuxiHapticIo io = {NULL, fp_haptic_owner, fp_haptic_read, fp_haptic_write, fp_flash_wait, 0};
 ++    int result = fuxi_vibrate_check(&io);
+++    if (!result && (fuxi_haptic_read_stable(&io, FUXI_VIBRATE_AMPLITUDE, &fp_vibrate_android_amplitude) ||
+++        fuxi_haptic_read_stable(&io, 0xf048, &fp_vibrate_android_vmax)))
+++        result = FUXI_HAPTIC_IO;
 ++    if (result) {
 ++        printf("FUXI PMIC: vibrate runtime refused check rc=%d; writes=0\n", result);
 ++        return;
@@ -44870,8 +45416,8 @@ index 0000000..3c1ce01
 ++    }
 ++    thread_deallocate(thread);
 ++    __atomic_store_n(&fp_vibrate_ready, 1u, __ATOMIC_RELEASE);
-++    printf("FUXI PMIC: vibrate runtime ready; DIRECT_PLAY 0x81/0x01, sysctl kern.fuxivibrate ms<=%u, Android VMAX/amplitude kept\n",
-++        (unsigned)FUXI_VIBRATE_MAX_MS);
+++    printf("FUXI PMIC: vibrate runtime ready; DIRECT_PLAY 0x81/0x01, sysctl kern.fuxivibrate ms<=%u | amplitude<<16, Android VMAX %#x kept, amplitude %#x until asked\n",
+++        (unsigned)FUXI_VIBRATE_MAX_MS, fp_vibrate_android_vmax, fp_vibrate_android_amplitude);
 ++    if (fp_vibrate_selftest && kernel_thread_start(fp_vibrate_selftest_worker, NULL, &thread) == KERN_SUCCESS)
 ++        thread_deallocate(thread);
 ++}
@@ -49855,7 +50401,7 @@ index 0000000..3c1ce01
 ++{
 ++    return address == 0xf046 || address == 0xf048 || address == 0xf04b ||
 ++        address == 0xf04c || address == 0xf04e || address == 0xf063 ||
-++        address == 0xf130 || address == 0xf131 ||
+++        address == 0xf126 || address == 0xf130 || address == 0xf131 ||
 ++        (address >= 0xf134 && address <= 0xf14b);
 ++}
 ++
@@ -51968,7 +52514,7 @@ index 0000000..3c1ce01
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_haptic_runtime.h
-+@@ -0,0 +1,142 @@
++@@ -0,0 +1,176 @@
 ++#ifndef FUXI_HAPTIC_RUNTIME_H
 ++#define FUXI_HAPTIC_RUNTIME_H
 ++/*
@@ -51977,7 +52523,10 @@ index 0000000..3c1ce01
 ++ * 開：SPMI_PLAY(0xf04c) 寫 0x81（PLAY_EN | 來源 DIRECT_PLAY，不開 brake）；
 ++ * 關：寫 0x01，再輪詢 HPWR_INTF(0xf00b) 低兩位回到 0（HPWR_DISABLED）；
 ++ * 逾時就照 Linux 的 haptics_toggle_module_enable 關開模組一次再等。
-++ * 振幅、VMAX、自動共振都沿用 Android 開機前留下的設定，這裡只檢查不改寫。
+++ * VMAX、自動共振沿用 Android 開機前留下的設定，這裡只檢查不改寫。
+++ * 振幅（2026-11-17）：sysctl 值的 bit 16..23 是 DIRECT_PLAY 振幅，寫進 PTN 0x26（0xf126；Linux
+++ * qcom-hv-haptics 的 HAP_PTN_DIRECT_PLAY_REG，0..0xff 線性乘上 VMAX，haptics_set_direct_play 播放中也照寫）。
+++ * 0 表示沿用目前的值：只送毫秒的舊使用端完全不變。VMAX 不改，所以任何級數都不超過 Android 自己會用的強度。
 ++ */
 ++#include <stdint.h>
 ++#include "fuxi_haptic_pulse.h"
@@ -51989,7 +52538,9 @@ index 0000000..3c1ce01
 ++    FUXI_VIBRATE_PLAY = 0x81,
 ++    FUXI_VIBRATE_IDLE = 0x01,
 ++    FUXI_VIBRATE_MODULE_ON = 0x80,
-++    FUXI_VIBRATE_VMAX_LIMIT = 0x1c /* 50 mV/碼，1400 mV：Android 留下的值，不接受更高 */
+++    FUXI_VIBRATE_VMAX_LIMIT = 0x1c, /* 50 mV/碼，1400 mV：Android 留下的值，不接受更高 */
+++    FUXI_VIBRATE_LEVEL_SHIFT = 16,  /* sysctl 值：bit 0..15 毫秒，bit 16..23 振幅，其餘須為 0 */
+++    FUXI_VIBRATE_AMPLITUDE = 0xf126
 ++};
 ++
 ++typedef struct {
@@ -51998,8 +52549,18 @@ index 0000000..3c1ce01
 ++    uint64_t plays;
 ++    unsigned failed;
 ++    unsigned playing;
+++    unsigned level;     /* 目前請求的振幅，0＝沿用暫存器現值 */
 ++    int last_error;
 ++} FuxiVibrateRuntime;
+++
+++/* sysctl 寫入值拆成毫秒與振幅；格式不對（負數、高位元、超過上限）回 -1。 */
+++static inline int fuxi_vibrate_decode(int value, unsigned *ms, unsigned *level)
+++{
+++    if (value < 0 || ((unsigned)value >> 24)) return -1;
+++    *ms = (unsigned)value & 0xffffu;
+++    *level = ((unsigned)value >> FUXI_VIBRATE_LEVEL_SHIFT) & 0xffu;
+++    return *ms > FUXI_VIBRATE_MAX_MS ? -1 : 0;
+++}
 ++
 ++/* 允許的呼叫者：root，或平台二進位檔名為 SpringBoard／mediaserverd。 */
 ++static inline int fuxi_vibrate_caller_allowed(unsigned root, unsigned platform, const char *name)
@@ -52024,6 +52585,25 @@ index 0000000..3c1ce01
 ++    state->deadline = ms ? now + (uint64_t)ms * 1000000ull : 0;
 ++    state->requests++;
 ++    return 0;
+++}
+++
+++/* 同上，另帶振幅（0..0xff）；停止（ms=0）不改記下的振幅。 */
+++static inline int fuxi_vibrate_request_level(FuxiVibrateRuntime *state, unsigned ms, unsigned level, uint64_t now)
+++{
+++    if (level > 0xffu || fuxi_vibrate_request(state, ms, now)) return -1;
+++    if (ms) state->level = level;
+++    return 0;
+++}
+++
+++/* 播放前或播放中套用振幅：0 或與現值相同就不寫；寫入讀回相符才更新 *current。 */
+++static inline int fuxi_vibrate_amplitude(const FuxiHapticIo *io, unsigned level, uint8_t *current, unsigned *writes)
+++{
+++    if (!level || level == *current) return FUXI_HAPTIC_OK;
+++    if (level > 0xffu) return FUXI_HAPTIC_INVALID;
+++    int result = fuxi_haptic_write_checked(io, FUXI_VIBRATE_AMPLITUDE, (uint8_t)level);
+++    (*writes)++;
+++    if (!result) *current = (uint8_t)level;
+++    return result;
 ++}
 ++
 ++static inline unsigned fuxi_vibrate_wanted(FuxiVibrateRuntime *state, uint64_t now)
@@ -52687,6 +53267,72 @@ index 0000000..321fd96
 ++	n = snprintf(env, size, "DYLD_INSERT_LIBRARIES=%s", library);
 ++	return n > 0 && (size_t)n < size;
 ++}
+diff --git a/xnu/patches/0119-sweet-quiet-boot.patch b/xnu/patches/0119-sweet-quiet-boot.patch
+new file mode 100644
+index 0000000..2e8b25c
+--- /dev/null
++++ b/xnu/patches/0119-sweet-quiet-boot.patch
+@@ -0,0 +1,60 @@
++--- a/osfmk/console/serial_console.c
+++++ b/osfmk/console/serial_console.c
++@@ -269,7 +269,8 @@
++ #if defined(ARM64_BOARD_CONFIG_SWEET)
++ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
++ /*
++- * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
+++ * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents,
+++ * or by vcattach from the start (sweetfb_noconsole=2, patch 0119):
++  * console text still goes to the persistent log, but is not drawn over
++  * the GUI. A panic draws again.
++  */
++--- a/osfmk/console/video_console.c
+++++ b/osfmk/console/video_console.c
++@@ -110,6 +110,10 @@
++ 
++ #include "sys/msgbuf.h"
++ 
+++#if defined(ARM64_BOARD_CONFIG_SWEET)
+++extern int sweet_console_muted;         /* osfmk/console/serial_console.c (0067) */
+++#endif
+++
++ /*
++  * Generic Console (Front-End)
++  * ---------------------------
++@@ -3052,6 +3056,22 @@
++ {
++ 	vm_initialized = TRUE;
++ 
+++#if defined(ARM64_BOARD_CONFIG_SWEET)
+++	/*
+++	 * FUXI (0119): boot-arg sweetfb_noconsole=2 keeps the text console off the
+++	 * screen from here on (sweetfb_noconsole=1 does it from the GUI's first
+++	 * frame): no replay of the early log, no boot text. Everything still goes
+++	 * to the persistent log; a panic draws.
+++	 */
+++	{
+++		int quiet = 0;
+++		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet == 2) {
+++			sweet_console_muted = 1;
+++			printf("FUXI QUIET BOOT: console text kept off the screen from vcattach (sweetfb_noconsole=2)\n");
+++		}
+++	}
+++#endif
+++
++ #if defined(CONFIG_VC_PROGRESS_METER_SUPPORT)
++ 	const boot_args * bootargs  = (typeof(bootargs))PE_state.bootArgs;
++ 
++@@ -3083,6 +3103,11 @@
++ 
++ 		initialize_screen(NULL, kPEAcquireScreen);
++ 
+++#if defined(ARM64_BOARD_CONFIG_SWEET)
+++		if (sweet_console_muted) {
+++			return;
+++		}
+++#endif
++ 		for (index = 0; index < msgbufp->msg_bufx; index++) {
++ 			if (msgbufp->msg_bufc[index] == '\0') {
++ 				continue;
 diff --git a/xnu/variants/ath12k-link.patch b/xnu/variants/ath12k-link.patch
 new file mode 100644
 index 0000000..ac807b5

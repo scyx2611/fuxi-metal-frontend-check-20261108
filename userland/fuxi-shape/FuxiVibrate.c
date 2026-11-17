@@ -51,6 +51,17 @@ enum { VB_LOG_CALLS = 6, VB_PLAY_LOGS = 12, VB_ERROR_LOGS = 8, VB_TAP_MS = 15, V
 
 static unsigned vb_role;
 static const char *vb_name = "?";
+/*
+ * ADT /chosen 開關（預設關，2026-11-17）：
+ *   fuxi,haptic-ui  SpringBoard：CoreHaptics engine 從未建成時（mediaserverd 的 AVHapticServer 起不來，
+ *                   client 回 -4810），每次 UI 播放改用 kern.fuxivibrate 輕觸這麼多毫秒（8..40）。
+ *   fuxi,haptic-env mediaserverd：Atoms 依 Envelope 面積換成等效全開時間（FuxiVibePattern.h）。
+ *   fuxi,haptic-amp 兩者：核心 DIRECT_PLAY 振幅上限（1..255，需要帶振幅欄位的核心）。mediaserverd 照 Envelope
+ *                   逐 10 ms 調振幅（優先於 haptic-env），並乘上 Intensity 與 gain；SpringBoard 的輕觸用這個值。
+ *                   沒設時一律送 0，核心沿用 Android 留下的振幅（舊行為）。
+ */
+static unsigned vb_ui_ms, vb_envelope, vb_envelope_logs, vb_amp_max;
+static unsigned vb_core_ok; /* SpringBoard：任一 CoreHaptics engine 建成過就不再回退 */
 
 __attribute__((format(printf, 1, 2))) static void vb_say(const char *format, ...)
 {
@@ -85,13 +96,14 @@ static bool vb_ready(int *error)
 
 static unsigned vb_write_errors;
 
-static bool vb_write(unsigned ms)
+/* 核心值：bit 0..15 毫秒、bit 16..23 振幅（0＝沿用）。 */
+static bool vb_write(unsigned ms, unsigned level)
 {
-    int value = (int)ms;
+    int value = (int)(ms | (level & 0xffu) << 16);
     if (sysctlbyname("kern.fuxivibrate", NULL, NULL, &value, sizeof(value)) == 0) return true;
     int error = errno;
     if (__atomic_fetch_add(&vb_write_errors, 1u, __ATOMIC_RELAXED) < VB_ERROR_LOGS)
-        vb_say("vibrate write ms=%u failed errno=%d\n", ms, error);
+        vb_say("vibrate write ms=%u level=%u failed errno=%d\n", ms, level, error);
     return false;
 }
 
@@ -156,17 +168,21 @@ static void *vb_run(void *argument)
         void *completion = vb_pending_completion;
         vb_pending_completion = NULL;
         bool interrupted = false;
+        uint64_t end = vb_now_ms(); /* 照整份 pattern 的時間軸排，不讓每段的排程延遲累積 */
         for (unsigned index = 0; index < pattern.count && !interrupted; index++) {
-            uint64_t end = vb_now_ms() + pattern.segment[index].ms;
+            end += pattern.segment[index].ms;
             if (!pattern.segment[index].on) {
                 interrupted = vb_wait(seen, end);
                 continue;
             }
+            /* 下一段也是開（換振幅）：多要一點時間、段尾不停，核心只改振幅不重新啟動 */
+            bool next_on = index + 1 < pattern.count && pattern.segment[index + 1].on;
             for (;;) {
                 uint64_t now = vb_now_ms();
                 if (now >= end) break;
                 unsigned remaining = (unsigned)(end - now);
-                bool written = vb_write(fx_vibe_request_ms(remaining));
+                bool written = vb_write(fx_vibe_request_ms(remaining + (next_on ? FX_VIBE_SLACK_MS : 0)),
+                    pattern.segment[index].level);
                 if (!written) {
                     interrupted = true;
                     break;
@@ -176,7 +192,7 @@ static void *vb_run(void *argument)
                     break;
                 }
             }
-            if (pattern.segment[index].on) (void)vb_write(0);
+            if (!next_on || interrupted) (void)vb_write(0, 0);
         }
         (void)pthread_mutex_unlock(&vb_lock);
         vb_finish(completion);
@@ -230,7 +246,7 @@ static void vb_cancel(void)
     fx_vibe_reset(&vb_pending);
     vb_generation++;
     (void)pthread_cond_broadcast(&vb_cond);
-    (void)vb_write(0);
+    (void)vb_write(0, 0);
     (void)pthread_mutex_unlock(&vb_lock);
     vb_finish(completion);
 }
@@ -241,6 +257,7 @@ static void vb_pulse(unsigned ms)
     fx_vibe_reset(&pattern);
     (void)fx_vibe_append(&pattern, true, ms);
     (void)fx_vibe_finish(&pattern);
+    fx_vibe_scale(&pattern, __atomic_load_n(&vb_amp_max, __ATOMIC_RELAXED));
     (void)vb_play(&pattern, NULL);
 }
 
@@ -272,12 +289,32 @@ static long long vb_seconds_ms(CFDictionaryRef dictionary, CFStringRef key)
     return (long long)(seconds * 1000.0 + 0.5);
 }
 
+/* Envelope 點列（{Level, Time}）讀進陣列；格式不對回 0（呼叫端改用整段 Duration）。 */
+static unsigned vb_envelope_points(CFTypeRef value, double *time_s, double *level)
+{
+    if (value == NULL || CFGetTypeID(value) != CFArrayGetTypeID()) return 0;
+    CFIndex count = CFArrayGetCount((CFArrayRef)value);
+    if (count <= 0 || count > FX_VIBE_ENVELOPE_POINTS) return 0;
+    for (CFIndex index = 0; index < count; index++) {
+        CFTypeRef item = CFArrayGetValueAtIndex((CFArrayRef)value, index);
+        long long ignored = 0;
+        if (item == NULL || CFGetTypeID(item) != CFDictionaryGetTypeID()) return 0;
+        if (!vb_number(CFDictionaryGetValue((CFDictionaryRef)item, CFSTR("Time")), &ignored, &time_s[index]) ||
+            !vb_number(CFDictionaryGetValue((CFDictionaryRef)item, CFSTR("Level")), &ignored, &level[index]))
+            return 0;
+    }
+    return (unsigned)count;
+}
+
 static int vb_atoms(CFTypeRef value, fx_vibe_pattern *pattern)
 {
     if (value == NULL || CFGetTypeID(value) != CFArrayGetTypeID()) return 0;
     CFArrayRef atoms = (CFArrayRef)value;
     CFIndex count = CFArrayGetCount(atoms);
     if (count <= 0 || count > FX_VIBE_SEGMENTS) return 0;
+    long long cursor = 0; /* 原時間軸上前一個 atom 的結尾；Envelope 縮短後下一個 atom 仍照原時間起 */
+    bool shaped = __atomic_load_n(&vb_amp_max, __ATOMIC_RELAXED) != 0;
+    bool envelope = shaped || __atomic_load_n(&vb_envelope, __ATOMIC_RELAXED) != 0;
     for (CFIndex index = 0; index < count; index++) {
         CFTypeRef item = CFArrayGetValueAtIndex(atoms, index);
         if (item == NULL || CFGetTypeID(item) != CFDictionaryGetTypeID()) return 0;
@@ -285,7 +322,7 @@ static int vb_atoms(CFTypeRef value, fx_vibe_pattern *pattern)
         long long start = vb_seconds_ms(atom, CFSTR("StartTime"));
         long long duration = vb_seconds_ms(atom, CFSTR("Duration"));
         if (start < 0 && CFDictionaryContainsKey(atom, CFSTR("StartTime"))) return 0;
-        if (start < 0) start = pattern->total_ms;
+        if (start < 0) start = envelope ? cursor : pattern->total_ms;
         if (duration <= 0) {
             CFTypeRef type = CFDictionaryGetValue(atom, CFSTR("Type"));
             if (type && CFGetTypeID(type) == CFStringGetTypeID() &&
@@ -294,7 +331,39 @@ static int vb_atoms(CFTypeRef value, fx_vibe_pattern *pattern)
                 duration = VB_TAP_MS;
         }
         if (duration <= 0) return 0;
-        if (!fx_vibe_atom(pattern, start, duration)) return pattern->truncated ? 3 : 0;
+        long long on_start = start, on_ms = duration;
+        if (start + duration > cursor) cursor = start + duration;
+        if (envelope) {
+            double times[FX_VIBE_ENVELOPE_POINTS], levels[FX_VIBE_ENVELOPE_POINTS];
+            unsigned points = vb_envelope_points(CFDictionaryGetValue(atom, CFSTR("Envelope")), times, levels);
+            if (shaped && points) {
+                /* 振幅模式：整段照包絡調振幅；點列不對才退回下面的整段 Duration */
+                unsigned before = pattern->count;
+                long long shaped_on = fx_vibe_shape(pattern, start, duration, times, levels, points);
+                if (__atomic_fetch_add(&vb_envelope_logs, 1u, __ATOMIC_RELAXED) < VB_PLAY_LOGS)
+                    vb_say("vibe shape atom=%ld points=%u start=%lldms duration=%lldms on=%lldms segments=%u..%u\n",
+                        (long)index, points, start, duration, shaped_on, before, pattern->count);
+                if (pattern->truncated) return 3;
+                if (shaped_on >= 0) continue;
+            }
+            long long offset = 0;
+            long long effective = points ? fx_vibe_envelope(times, levels, points, duration, &offset) : -1;
+            if (points && __atomic_fetch_add(&vb_envelope_logs, 1u, __ATOMIC_RELAXED) < VB_PLAY_LOGS)
+                vb_say("vibe envelope atom=%ld points=%u duration=%lldms effective=%lldms offset=%lldms\n",
+                    (long)index, points, duration, effective, offset);
+            if (shaped && points) effective = -1; /* 包絡無效：整段 Duration，振幅照 atom 上限 */
+            if (effective == 0) continue;
+            if (effective > 0) {
+                on_start = start + offset;
+                on_ms = effective;
+                /* 重疊的 atom：起點不能早於最後一個開段，否則 fx_vibe_atom 會整份拒絕 */
+                if (pattern->count && on_start < (long long)pattern->total_ms) {
+                    long long floor = (long long)pattern->total_ms - pattern->segment[pattern->count - 1].ms;
+                    if (on_start < floor) on_start = floor;
+                }
+            }
+        }
+        if (!fx_vibe_atom(pattern, on_start, on_ms)) return pattern->truncated ? 3 : 0;
     }
     return 3;
 }
@@ -520,13 +589,22 @@ static bool vb_vibe_request(id pattern, double gain, uintptr_t flags, double whe
         fallback = true;
     }
     if (silent) fx_vibe_reset(&parsed);
+    unsigned amplitude = fx_vibe_amplitude(__atomic_load_n(&vb_amp_max, __ATOMIC_RELAXED), intensity, gain);
+    fx_vibe_scale(&parsed, amplitude);
+    unsigned low = 0, high = 0;
+    for (unsigned index = 0; index < parsed.count; index++) {
+        unsigned level = parsed.segment[index].level;
+        if (!parsed.segment[index].on) continue;
+        if (!low || level < low) low = level;
+        if (level > high) high = level;
+    }
     bool queued = vb_play(&parsed, completion);
     if (call < VB_PLAY_LOGS) {
         vb_say("vibe play call=%u uptime-ms=%llu pattern=%s ok=%d segments=%u total=%ums on=%ums truncated=%u intensity=%.2f "
-            "gain=%.2f flags=%#lx at=%.3f%s%s\n", call + 1, (unsigned long long)vb_now_ms(),
+            "gain=%.2f flags=%#lx at=%.3f amplitude=%u level=%u..%u%s%s\n", call + 1, (unsigned long long)vb_now_ms(),
             pattern ? object_getClassName(pattern) : "nil", ok,
             parsed.count, parsed.total_ms, on_ms, parsed.truncated, intensity, gain, (unsigned long)flags, when,
-            silent ? " silent" : "", fallback ? " fallback" : "");
+            amplitude, low, high, silent ? " silent" : "", fallback ? " fallback" : "");
         if (call < 6) vb_describe("vibe pattern", (CFTypeRef)pattern);
     }
     return queued;
@@ -658,6 +736,7 @@ static id vb_feedback_core_create(id self, SEL selector)
 {
     id error = ((id (*)(id, SEL))vb_feedback_core_create_original)(self, selector);
     unsigned call = __atomic_fetch_add(&vb_feedback_core_create_calls, 1u, __ATOMIC_RELAXED);
+    if (error == NULL) __atomic_store_n(&vb_core_ok, 1u, __ATOMIC_RELEASE);
     if (call < VB_PLAY_LOGS) {
         vb_say("feedback core create call=%u uptime-ms=%llu engine=%s error-present=%u error=%ld\n",
             call + 1, (unsigned long long)vb_now_ms(), object_getClassName(self), error != NULL,
@@ -695,23 +774,16 @@ static void vb_feedback_request(id self, SEL selector, id feedback, double inter
         self, selector, feedback, interval, since, regular);
 }
 
-static void vb_install_core_feedback(void)
+/* 依 types 字串核對 ABI 才換實作：第 0 個字元是回傳值，其後是參數；'b' 代表 BOOL（B 或 c）。 */
+typedef struct {
+    const char *target, *selector, *types;
+    IMP replacement, *original;
+    unsigned done;
+} vb_typed_hook;
+
+static void vb_install_typed(const char *label, vb_typed_hook *hooks, size_t total)
 {
-    static struct {
-        const char *target, *selector, *types;
-        IMP replacement, *original;
-        unsigned done;
-    } hooks[] = {
-        {"_UIFeedbackCoreHapticsEngine", "_internal_initializeCoreHapticsEngine", "b",
-            (IMP)vb_feedback_core_init, &vb_feedback_core_init_original, 0},
-        {"_UIFeedbackCoreHapticsEngine", "_internal_createCoreHapticsEngine", "@",
-            (IMP)vb_feedback_core_create, &vb_feedback_core_create_original, 0},
-        {"_UIFeedbackCoreHapticsEngine", "_internal_coreHapticsEngineFinishedWithError:completion:", "v@@",
-            (IMP)vb_feedback_core_finish, &vb_feedback_core_finish_original, 0},
-        {"UIFeedbackGenerator", "_playFeedback:withMinimumIntervalPassed:since:prefersRegularPace:", "v@d^b",
-            (IMP)vb_feedback_request, &vb_feedback_request_original, 0}
-    };
-    for (unsigned index = 0; index < sizeof(hooks) / sizeof(hooks[0]); index++) {
+    for (size_t index = 0; index < total; index++) {
         if (__atomic_load_n(&hooks[index].done, __ATOMIC_ACQUIRE)) continue;
         Class target = objc_getClass(hooks[index].target);
         Method method = target ? class_getInstanceMethod(target, sel_registerName(hooks[index].selector)) : NULL;
@@ -726,11 +798,70 @@ static void vb_install_core_feedback(void)
             char expected = hooks[index].types[argument];
             usable = expected == 'b' ? actual == 'B' || actual == 'c' : actual == expected;
         }
-        vb_say("feedback core hook %s %s\n", hooks[index].selector, usable ? "installed" : "refused ABI");
+        vb_say("%s hook %s %s %s\n", label, hooks[index].target, hooks[index].selector,
+            usable ? "installed" : "refused ABI");
         if (!usable) continue;
         *hooks[index].original = method_getImplementation(method);
         (void)method_setImplementation(method, hooks[index].replacement);
     }
+}
+
+/* ---- SpringBoard：UI 回退脈衝（fuxi,haptic-ui） ---- */
+enum { VB_UI_GAP_MS = 40, VB_UI_LOGS = 24 };
+static IMP vb_engine_play_original;
+static unsigned vb_engine_play_calls, vb_ui_pulses;
+static uint64_t vb_ui_last_ms;
+
+/*
+ * -[_UIFeedbackEngine _playFeedback:atTime:withCompletionBlock:] 只在基底類別實作（UIKitCore 20H392 核對過），
+ * 所有 engine 的 UI 播放都經過這裡；CoreHaptics 家族在 engine 啟動失敗時不會走到 _internal_playFeedbackData。
+ * SystemSound engine 已經經 mediaserverd 的 VibeSynth 震，不重複。
+ */
+static void vb_engine_play(id self, SEL selector, id feedback, double when, id completion)
+{
+    unsigned call = __atomic_fetch_add(&vb_engine_play_calls, 1u, __ATOMIC_RELAXED);
+    const char *engine = object_getClassName(self);
+    bool core = engine && strstr(engine, "CoreHaptics") != NULL;
+    unsigned ms = __atomic_load_n(&vb_ui_ms, __ATOMIC_RELAXED);
+    const char *fallback = "off";
+    if (core && ms && !__atomic_load_n(&vb_core_ok, __ATOMIC_ACQUIRE)) {
+        uint64_t now = vb_now_ms();
+        uint64_t last = __atomic_load_n(&vb_ui_last_ms, __ATOMIC_RELAXED);
+        fallback = "coalesced";
+        if ((last == 0 || now - last >= VB_UI_GAP_MS) &&
+            __atomic_compare_exchange_n(&vb_ui_last_ms, &last, now, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            vb_pulse(ms);
+            (void)__atomic_fetch_add(&vb_ui_pulses, 1u, __ATOMIC_RELAXED);
+            fallback = "pulse";
+        }
+    } else if (core && ms) {
+        fallback = "core-ok";
+    } else if (!core) {
+        fallback = "not-core";
+    }
+    if (call < VB_UI_LOGS)
+        vb_say("feedback engine play call=%u uptime-ms=%llu engine=%s feedback=%s at=%.3f state=%ld fallback=%s "
+            "pulses=%u\n", call + 1, (unsigned long long)vb_now_ms(), engine ? engine : "?",
+            feedback ? object_getClassName(feedback) : "nil", when, (long)vb_feedback_integer(self, "_state"),
+            fallback, __atomic_load_n(&vb_ui_pulses, __ATOMIC_RELAXED));
+    ((void (*)(id, SEL, id, double, id))vb_engine_play_original)(self, selector, feedback, when, completion);
+}
+
+static void vb_install_core_feedback(void)
+{
+    static vb_typed_hook hooks[] = {
+        {"_UIFeedbackCoreHapticsEngine", "_internal_initializeCoreHapticsEngine", "b",
+            (IMP)vb_feedback_core_init, &vb_feedback_core_init_original, 0},
+        {"_UIFeedbackCoreHapticsEngine", "_internal_createCoreHapticsEngine", "@",
+            (IMP)vb_feedback_core_create, &vb_feedback_core_create_original, 0},
+        {"_UIFeedbackCoreHapticsEngine", "_internal_coreHapticsEngineFinishedWithError:completion:", "v@@",
+            (IMP)vb_feedback_core_finish, &vb_feedback_core_finish_original, 0},
+        {"UIFeedbackGenerator", "_playFeedback:withMinimumIntervalPassed:since:prefersRegularPace:", "v@d^b",
+            (IMP)vb_feedback_request, &vb_feedback_request_original, 0},
+        {"_UIFeedbackEngine", "_playFeedback:atTime:withCompletionBlock:", "v@d@",
+            (IMP)vb_engine_play, &vb_engine_play_original, 0}
+    };
+    vb_install_typed("feedback core", hooks, sizeof(hooks) / sizeof(hooks[0]));
 }
 
 static id vb_feedback_engine(id self, SEL selector, id feedback)
@@ -834,11 +965,87 @@ static void vb_install_feedback(void)
     }
 }
 
+/*
+ * ---- mediaserverd：AVHapticServer 起不來的確認診斷（唯讀） ----
+ * CoreHaptics client 對 com.apple.audio.hapticd 的 configure 回覆只等 1 秒；server 的 -init 依序
+ * setupSSSClient → incrementInit:（HapticSynth 要音訊輸出），失敗就回 nil、不建 listener，client 得 -4810。
+ * 型別字串取自 AudioToolbox 20H392：init @16@0:8、setupSSSClient B16@0:8、incrementInit: B24@0:8^@16、
+ * listener:shouldAcceptNewConnection: B32@0:8@16@24。
+ */
+static IMP vb_server_init_original, vb_server_setup_original, vb_server_increment_original, vb_server_accept_original;
+static unsigned vb_server_init_calls, vb_server_setup_calls, vb_server_increment_calls, vb_server_accept_calls;
+
+static id vb_server_init(id self, SEL selector)
+{
+    unsigned call = __atomic_fetch_add(&vb_server_init_calls, 1u, __ATOMIC_RELAXED);
+    uint64_t start = vb_now_ms();
+    id result = ((id (*)(id, SEL))vb_server_init_original)(self, selector);
+    if (call < VB_LOG_CALLS)
+        vb_say("haptic server init call=%u uptime-ms=%llu elapsed-ms=%llu result=%s\n", call + 1,
+            (unsigned long long)start, (unsigned long long)(vb_now_ms() - start), result ? "object" : "nil");
+    return result;
+}
+
+static bool vb_server_setup(id self, SEL selector)
+{
+    unsigned call = __atomic_fetch_add(&vb_server_setup_calls, 1u, __ATOMIC_RELAXED);
+    uint64_t start = vb_now_ms();
+    bool result = ((bool (*)(id, SEL))vb_server_setup_original)(self, selector);
+    if (call < VB_LOG_CALLS)
+        vb_say("haptic server setupSSSClient call=%u uptime-ms=%llu elapsed-ms=%llu result=%u\n", call + 1,
+            (unsigned long long)start, (unsigned long long)(vb_now_ms() - start), result);
+    return result;
+}
+
+static bool vb_server_increment(id self, SEL selector, id *error)
+{
+    unsigned call = __atomic_fetch_add(&vb_server_increment_calls, 1u, __ATOMIC_RELAXED);
+    uint64_t start = vb_now_ms();
+    bool result = ((bool (*)(id, SEL, id *))vb_server_increment_original)(self, selector, error);
+    if (call < VB_LOG_CALLS) {
+        id failure = !result && error ? *error : NULL;
+        vb_say("haptic server incrementInit call=%u uptime-ms=%llu elapsed-ms=%llu result=%u error-out=%u "
+            "error-present=%u\n", call + 1, (unsigned long long)start, (unsigned long long)(vb_now_ms() - start),
+            result, error != NULL, failure != NULL);
+        FuxiErrorAuditEntry entries[FUXI_ERROR_AUDIT_DEPTH];
+        unsigned count = failure ? fuxi_error_audit((CFTypeRef)failure, entries) : 0;
+        for (unsigned depth = 0; depth < count; depth++)
+            vb_say("haptic server incrementInit error call=%u depth=%u domain-id=%08x code=%ld reason=%s\n",
+                call + 1, depth, entries[depth].domain, (long)entries[depth].code, entries[depth].reason);
+    }
+    return result;
+}
+
+static bool vb_server_accept(id self, SEL selector, id listener, id connection)
+{
+    unsigned call = __atomic_fetch_add(&vb_server_accept_calls, 1u, __ATOMIC_RELAXED);
+    bool result = ((bool (*)(id, SEL, id, id))vb_server_accept_original)(self, selector, listener, connection);
+    if (call < VB_LOG_CALLS)
+        vb_say("haptic server accept call=%u uptime-ms=%llu pid=%ld result=%u\n", call + 1,
+            (unsigned long long)vb_now_ms(), (long)vb_feedback_integer(connection, "processIdentifier"), result);
+    return result;
+}
+
+static void vb_install_server(void)
+{
+    static vb_typed_hook hooks[] = {
+        {"AVHapticServer", "init", "@", (IMP)vb_server_init, &vb_server_init_original, 0},
+        {"AVHapticServer", "setupSSSClient", "b", (IMP)vb_server_setup, &vb_server_setup_original, 0},
+        {"AVHapticServer", "incrementInit:", "b^", (IMP)vb_server_increment, &vb_server_increment_original, 0},
+        {"AVHapticServer", "listener:shouldAcceptNewConnection:", "b@@", (IMP)vb_server_accept,
+            &vb_server_accept_original, 0},
+    };
+    vb_install_typed("haptic server", hooks, sizeof(hooks) / sizeof(hooks[0]));
+}
+
 static void vb_image_added(const struct mach_header *header, intptr_t slide)
 {
     (void)header;
     (void)slide;
-    if (vb_role == VB_MEDIA) vb_install_play();
+    if (vb_role == VB_MEDIA) {
+        vb_install_play();
+        vb_install_server();
+    }
     if (vb_role == VB_SPRINGBOARD) {
         vb_install_supports();
         vb_install_feedback();
@@ -847,12 +1054,12 @@ static void vb_image_added(const struct mach_header *header, intptr_t slide)
 }
 
 /* ---- SpringBoard 自測（fuxi,haptic=3） ---- */
-static unsigned vb_adt_haptic(void)
+static unsigned vb_adt_u32(CFStringRef key)
 {
     vb_io_object_t chosen = IORegistryEntryFromPath(MACH_PORT_NULL, "IODeviceTree:/chosen");
     unsigned value = 0;
     if (chosen == MACH_PORT_NULL) return 0;
-    CFTypeRef data = IORegistryEntryCreateCFProperty(chosen, CFSTR("fuxi,haptic"), kCFAllocatorDefault, 0);
+    CFTypeRef data = IORegistryEntryCreateCFProperty(chosen, key, kCFAllocatorDefault, 0);
     if (data && CFGetTypeID(data) == CFDataGetTypeID() && CFDataGetLength((CFDataRef)data) == 4) {
         uint32_t raw = 0;
         CFDataGetBytes((CFDataRef)data, CFRangeMake(0, 4), (UInt8 *)&raw);
@@ -1123,10 +1330,19 @@ __attribute__((constructor)) static void fuxi_vibrate_init(void)
         vb_say("vibrate kern.fuxivibrate unavailable errno=%d; haptic hooks skipped\n", error);
         return;
     }
-    vb_say("vibrate kern.fuxivibrate ready; installing haptic hooks\n");
+    if (vb_role == VB_SPRINGBOARD) {
+        unsigned ms = vb_adt_u32(CFSTR("fuxi,haptic-ui"));
+        if (ms) ms = ms < 8 ? 8 : ms > 40 ? 40 : ms;
+        __atomic_store_n(&vb_ui_ms, ms, __ATOMIC_RELAXED);
+    }
+    if (vb_role == VB_MEDIA) __atomic_store_n(&vb_envelope, vb_adt_u32(CFSTR("fuxi,haptic-env")) != 0, __ATOMIC_RELAXED);
+    unsigned amplitude = vb_adt_u32(CFSTR("fuxi,haptic-amp"));
+    __atomic_store_n(&vb_amp_max, amplitude > 255 ? 255u : amplitude, __ATOMIC_RELAXED);
+    vb_say("vibrate kern.fuxivibrate ready; installing haptic hooks ui-fallback-ms=%u envelope=%u amplitude-max=%u\n",
+        vb_ui_ms, vb_envelope, vb_amp_max);
     _dyld_register_func_for_add_image(vb_image_added);
     if (vb_role == VB_MEDIA) vb_spawn(vb_bridge_thread, "vibe native bridge waiting for MediaExperience vibrator");
-    if (vb_adt_haptic() != 3) return;
+    if (vb_adt_u32(CFSTR("fuxi,haptic")) != 3) return;
     if (vb_role == VB_SPRINGBOARD) vb_spawn(vb_selftest, "vibe selftest scheduled in 30 s (fuxi,haptic=3)");
     if (vb_role == VB_MEDIA) vb_spawn(vb_probe_thread, "vibe probe scheduled at 10/75/77 s (fuxi,haptic=3)");
 }
