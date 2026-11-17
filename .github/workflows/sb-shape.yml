@@ -9,6 +9,7 @@ on:
       - userland/fuxi-shape/**
       - tools/test-flashlight-levels.c
       - tools/test-vibe-pattern.c
+      - tools/test-vibe-worker.py
       - .github/workflows/sb-shape.yml
 permissions:
   contents: read
@@ -32,6 +33,7 @@ jobs:
           clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
               -Iuserland/fuxi-shape tools/test-vibe-pattern.c -o /tmp/fuxi-vibe-pattern
           /tmp/fuxi-vibe-pattern
+          python3 tools/test-vibe-worker.py
       - name: Build, sign ad hoc, check
         shell: bash
         run: |

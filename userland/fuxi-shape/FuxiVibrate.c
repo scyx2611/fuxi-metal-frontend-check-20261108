@@ -20,6 +20,7 @@
  * （mediaserverd 要配 loader --stderr-log mediaserverd 才進核心紀錄）。
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <mach/mach.h>
@@ -97,8 +98,31 @@ static bool vb_write(unsigned ms)
 static pthread_mutex_t vb_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t vb_cond = PTHREAD_COND_INITIALIZER;
 static fx_vibe_pattern vb_pending;
+static void *vb_pending_completion;
 static unsigned vb_generation;
 static unsigned vb_worker;
+
+extern void *_Block_copy(const void *block);
+extern void _Block_release(const void *block);
+
+typedef struct {
+    const void *isa;
+    int flags;
+    int reserved;
+    void (*invoke)(void *block);
+} vb_completion;
+
+static void vb_complete(void *block)
+{
+    if (block == NULL) return;
+    ((vb_completion *)block)->invoke(block);
+    _Block_release(block);
+}
+
+static void vb_finish(void *block)
+{
+    if (block) dispatch_async_f(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), block, vb_complete);
+}
 
 static uint64_t vb_now_ms(void)
 {
@@ -128,6 +152,8 @@ static void *vb_run(void *argument)
         while (vb_generation == seen) (void)pthread_cond_wait(&vb_cond, &vb_lock);
         seen = vb_generation;
         pattern = vb_pending;
+        void *completion = vb_pending_completion;
+        vb_pending_completion = NULL;
         bool interrupted = false;
         for (unsigned index = 0; index < pattern.count && !interrupted; index++) {
             uint64_t end = vb_now_ms() + pattern.segment[index].ms;
@@ -139,9 +165,7 @@ static void *vb_run(void *argument)
                 uint64_t now = vb_now_ms();
                 if (now >= end) break;
                 unsigned remaining = (unsigned)(end - now);
-                (void)pthread_mutex_unlock(&vb_lock);
                 bool written = vb_write(fx_vibe_request_ms(remaining));
-                (void)pthread_mutex_lock(&vb_lock);
                 if (!written) {
                     interrupted = true;
                     break;
@@ -151,7 +175,11 @@ static void *vb_run(void *argument)
                     break;
                 }
             }
+            if (pattern.segment[index].on) (void)vb_write(0);
         }
+        (void)pthread_mutex_unlock(&vb_lock);
+        vb_finish(completion);
+        (void)pthread_mutex_lock(&vb_lock);
     }
     return NULL;
 }
@@ -173,26 +201,37 @@ static bool vb_start_worker(void)
     return true;
 }
 
-static void vb_play(const fx_vibe_pattern *pattern)
+static bool vb_play(const fx_vibe_pattern *pattern, const void *completion)
 {
+    void *copied = completion ? _Block_copy(completion) : NULL;
+    if (completion && copied == NULL) return false;
+    void *replaced = NULL;
     (void)pthread_mutex_lock(&vb_lock);
     bool ready = vb_start_worker();
     if (ready) {
+        replaced = vb_pending_completion;
         vb_pending = *pattern;
+        vb_pending_completion = copied;
         vb_generation++;
         (void)pthread_cond_broadcast(&vb_cond);
     }
     (void)pthread_mutex_unlock(&vb_lock);
+    if (!ready && copied) _Block_release(copied);
+    vb_finish(replaced);
+    return ready;
 }
 
 static void vb_cancel(void)
 {
     (void)pthread_mutex_lock(&vb_lock);
+    void *completion = vb_pending_completion;
+    vb_pending_completion = NULL;
     fx_vibe_reset(&vb_pending);
     vb_generation++;
     (void)pthread_cond_broadcast(&vb_cond);
-    (void)pthread_mutex_unlock(&vb_lock);
     (void)vb_write(0);
+    (void)pthread_mutex_unlock(&vb_lock);
+    vb_finish(completion);
 }
 
 static void vb_pulse(unsigned ms)
@@ -201,7 +240,7 @@ static void vb_pulse(unsigned ms)
     fx_vibe_reset(&pattern);
     (void)fx_vibe_append(&pattern, true, ms);
     (void)fx_vibe_finish(&pattern);
-    vb_play(&pattern);
+    (void)vb_play(&pattern, NULL);
 }
 
 /* ---- VibePattern 字典 ---- */
@@ -434,13 +473,14 @@ static double vb_fp_value(double raw, char type)
     return (double)single.f;
 }
 
-static void vb_vibe_request(id pattern, double gain, uintptr_t flags, double when, unsigned call)
+static bool vb_vibe_request(id pattern, double gain, uintptr_t flags, double when, unsigned call,
+    const void *completion)
 {
     fx_vibe_pattern parsed;
     double intensity = -1.0;
     int ok = vb_parse((CFTypeRef)pattern, &parsed, &intensity);
     unsigned on_ms = ok ? fx_vibe_finish(&parsed) : 0;
-    bool silent = intensity == 0.0;
+    bool silent = intensity == 0.0 || gain <= 0.0;
     bool fallback = false;
     if (!ok && pattern && !silent) {
         /* 認不得的格式：系統確實要震，至少給一下 VB_FALLBACK_MS，紀錄裡留字典內容 */
@@ -449,7 +489,8 @@ static void vb_vibe_request(id pattern, double gain, uintptr_t flags, double whe
         on_ms = fx_vibe_finish(&parsed);
         fallback = true;
     }
-    if (on_ms && !silent) vb_play(&parsed);
+    if (silent) fx_vibe_reset(&parsed);
+    bool queued = vb_play(&parsed, completion);
     if (call < VB_PLAY_LOGS) {
         vb_say("vibe play call=%u pattern=%s ok=%d segments=%u total=%ums on=%ums truncated=%u intensity=%.2f "
             "gain=%.2f flags=%#lx at=%.3f%s%s\n", call + 1, pattern ? object_getClassName(pattern) : "nil", ok,
@@ -457,13 +498,14 @@ static void vb_vibe_request(id pattern, double gain, uintptr_t flags, double whe
             silent ? " silent" : "", fallback ? " fallback" : "");
         if (call < 3) vb_describe("vibe pattern", (CFTypeRef)pattern);
     }
+    return queued;
 }
 
 static uintptr_t vb_play_fp(id self, SEL selector, id pattern, double gain, id synchronizer, uintptr_t flags,
     double when, id handler)
 {
     unsigned call = __atomic_fetch_add(&vb_play_calls, 1u, __ATOMIC_RELAXED);
-    vb_vibe_request(pattern, vb_fp_value(gain, vb_gain_type), flags, vb_fp_value(when, vb_time_type), call);
+    (void)vb_vibe_request(pattern, vb_fp_value(gain, vb_gain_type), flags, vb_fp_value(when, vb_time_type), call, NULL);
     uintptr_t result = ((vb_play_fp_t)vb_play_original)(self, selector, pattern, gain, synchronizer, flags, when,
         handler);
     if (call < VB_PLAY_LOGS) vb_say("vibe play call=%u original=%#lx\n", call + 1, (unsigned long)result);
@@ -474,7 +516,7 @@ static uintptr_t vb_play_int(id self, SEL selector, id pattern, double gain, id 
     uintptr_t when, id handler)
 {
     unsigned call = __atomic_fetch_add(&vb_play_calls, 1u, __ATOMIC_RELAXED);
-    vb_vibe_request(pattern, vb_fp_value(gain, vb_gain_type), flags, (double)when, call);
+    (void)vb_vibe_request(pattern, vb_fp_value(gain, vb_gain_type), flags, (double)when, call, NULL);
     uintptr_t result = ((vb_play_int_t)vb_play_original)(self, selector, pattern, gain, synchronizer, flags, when,
         handler);
     if (call < VB_PLAY_LOGS) vb_say("vibe play call=%u original=%#lx\n", call + 1, (unsigned long)result);
@@ -631,6 +673,71 @@ static uintptr_t vb_strip(const void *pointer)
     return (uintptr_t)pointer & 0x0000007fffffffffULL;
 }
 
+static unsigned vb_native_calls;
+
+static int vb_native_play(CFDictionaryRef pattern, float gain, void *synchronizer, uint32_t flags,
+    const void *completion)
+{
+    if (pattern == NULL || CFGetTypeID(pattern) != CFDictionaryGetTypeID()) return -50;
+    unsigned call = __atomic_fetch_add(&vb_native_calls, 1u, __ATOMIC_RELAXED);
+    bool queued = vb_vibe_request((id)pattern, gain, flags, 0.0, call, completion);
+    if (call < VB_PLAY_LOGS)
+        vb_say("vibe native play call=%u queued=%u synchronizer=%u completion=%u\n", call + 1, queued,
+            synchronizer != NULL, completion != NULL);
+    return queued ? 0 : -108;
+}
+
+static int vb_native_cancel(CFDictionaryRef options)
+{
+    (void)options;
+    vb_cancel();
+    vb_say("vibe native cancel\n");
+    return 0;
+}
+
+static void *vb_bridge_thread(void *argument)
+{
+    (void)argument;
+    typedef int (*mutex_t)(void *);
+    mutex_t lock = (mutex_t)dlsym(RTLD_DEFAULT, "FigSimpleMutexLock");
+    mutex_t unlock = (mutex_t)dlsym(RTLD_DEFAULT, "FigSimpleMutexUnlock");
+    void *vibrate = dlsym(RTLD_DEFAULT, "CMSessionMgrVibrateForSystemSoundWithOptions");
+    uintptr_t address = vb_strip(vibrate);
+    uintptr_t slide = address - (uintptr_t)VB_ME_VIBRATE;
+    bool layout = address && (slide & 0x3fff) == 0 &&
+        *(volatile const uint32_t *)address == 0xd10303ffU &&
+        *(volatile const uint32_t *)((uintptr_t)VB_ME_GATE + slide) == VB_ME_GATE_WORD;
+    if (!layout || lock == NULL || unlock == NULL) {
+        vb_say("vibe native bridge refused layout=%u mutex=%u/%u\n", layout, lock != NULL, unlock != NULL);
+        return NULL;
+    }
+    for (unsigned attempt = 0; attempt < 90; attempt++) {
+        uintptr_t vibrator = *(volatile const uintptr_t *)((uintptr_t)VB_ME_VIBRATOR + slide);
+        void *engine = dlopen(VB_ENGINE_PATH, RTLD_NOLOAD | RTLD_LAZY | RTLD_LOCAL);
+        if (engine && vibrator && *(volatile const uint8_t *)((uintptr_t)VB_ME_HW + slide)) {
+            uintptr_t *slots = (uintptr_t *)vibrator;
+            void *play = dlsym(engine, "VibeSynthEnginePlay");
+            void *cancel = dlsym(engine, "VibeSynthEngineCancelWithOptions");
+            int rc = slots[0] ? lock((void *)slots[0]) : -1;
+            if (rc == 0) {
+                bool expected = play && cancel && slots[6] == (uintptr_t)play && slots[7] == (uintptr_t)cancel;
+                if (expected) {
+                    slots[6] = (uintptr_t)vb_native_play;
+                    slots[7] = (uintptr_t)vb_native_cancel;
+                }
+                (void)unlock((void *)slots[0]);
+                (void)dlclose(engine);
+                vb_say("vibe native bridge %s; play/cancel -> kern.fuxivibrate\n", expected ? "installed" : "refused slots");
+                return NULL;
+            }
+        }
+        if (engine) (void)dlclose(engine);
+        sleep(1);
+    }
+    vb_say("vibe native bridge timed out waiting for MediaExperience vibrator\n");
+    return NULL;
+}
+
 static void vb_probe(const char *when, bool call)
 {
     typedef unsigned char (*mg_bool_t)(CFStringRef);
@@ -726,6 +833,7 @@ __attribute__((constructor)) static void fuxi_vibrate_init(void)
     }
     vb_say("vibrate kern.fuxivibrate ready; installing haptic hooks\n");
     _dyld_register_func_for_add_image(vb_image_added);
+    if (vb_role == VB_MEDIA) vb_spawn(vb_bridge_thread, "vibe native bridge waiting for MediaExperience vibrator");
     if (vb_adt_haptic() != 3) return;
     if (vb_role == VB_SPRINGBOARD) vb_spawn(vb_selftest, "vibe selftest scheduled in 30 s (fuxi,haptic=3)");
     if (vb_role == VB_MEDIA) vb_spawn(vb_probe_thread, "vibe probe scheduled at 10/75/77 s (fuxi,haptic=3)");
