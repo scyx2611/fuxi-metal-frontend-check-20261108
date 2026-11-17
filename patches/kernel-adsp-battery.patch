@@ -8159,6 +8159,29 @@ index c7d2b39..d27f1d3 100644
          blob = adt.serialize(root)
      except (ValueError, KeyError, struct.error, OSError) as error:
          ap.exit(1, str(error) + '\n')
+diff --git a/tools/patches/mesa-fuxi-hostimport.patch b/tools/patches/mesa-fuxi-hostimport.patch
+index 90d7242..54eacf5 100644
+--- a/tools/patches/mesa-fuxi-hostimport.patch
++++ b/tools/patches/mesa-fuxi-hostimport.patch
+@@ -74,6 +74,18 @@
+        return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+     VkResult collected = darwin_collect_retired(dev);
+     if (collected != VK_SUCCESS)
++@@ -435,7 +441,10 @@
++    kern_return_t kr = dw_call(NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
++    if (kr != KERN_SUCCESS) {
++       darwin_free_iova(dev, iova, size);
++-      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE, "BoImport failed: 0x%x", kr);
+++      const VkResult failure =
+++         kr == kIOReturnNoMemory || kr == kIOReturnNoResources
+++            ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_INVALID_EXTERNAL_HANDLE;
+++      return vk_errorf(dev, failure, "BoImport failed: 0x%x", kr);
++    }
++    NativeAdrenoAbiBoMap map = {.handle = reply.handle, .iova = iova, .permissions = 3u, .writeback = 0, .shareability = 2};
++    NativeAdrenoAbiBoMapReply mapped = {};
+ --- a/src/freedreno/vulkan/tu_formats.cc
+ +++ b/src/freedreno/vulkan/tu_formats.cc
+ @@ -745,6 +745,10 @@
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
 index 0000000..41f6b5b
@@ -16037,6 +16060,142 @@ index 0000000..bb75103
 +
 +if __name__ == '__main__':
 +    main()
+diff --git a/tools/test-fuxi-turnip-hostimport.py b/tools/test-fuxi-turnip-hostimport.py
+index cf82598..56f7e1a 100755
+--- a/tools/test-fuxi-turnip-hostimport.py
++++ b/tools/test-fuxi-turnip-hostimport.py
+@@ -5,6 +5,7 @@ Supply external Mesa and hash-verified upstream text patches. The build recipe
+ checks/applies the exact known patch prefix; no Mesa sources are vendored.
+ """
+ import argparse
++import hashlib
+ from pathlib import Path
+ import subprocess
+ import tempfile
+@@ -39,6 +40,8 @@ PREFIX = r'''
+ static VkResult vk_errorf(const void *,VkResult result,const char *,...) {return result;}
+ using kern_return_t=int;using mach_vm_address_t=uint64_t;
+ constexpr int KERN_SUCCESS=0,kIOReturnBusy=1;
++constexpr int kIOReturnNoMemory=static_cast<int32_t>(0xe00002bd),kIOReturnNoResources=static_cast<int32_t>(0xe00002be);
++constexpr int kIOReturnBadArgument=static_cast<int32_t>(0xe00002c2),kIOReturnUnsupported=static_cast<int32_t>(0xe00002c7);
+ constexpr int TU_BO_ALLOC_NO_FLAGS=0;
+ struct tu_physical_device {bool has_host_import;};
+ struct tu_device {tu_physical_device *physical_device;int dma_bo_lock,vk;void *darwin_retire;};
+@@ -49,6 +52,7 @@ struct tu_bo {
+ static tu_bo storage;
+ static struct {NativeAdrenoAbiParams params;int conn;pthread_mutex_t lock;uint32_t last_fence;} dw={{},0,PTHREAD_MUTEX_INITIALIZER,0};
+ static unsigned allocations,iova_frees,imports,bo_frees,cpu_unmaps,waits,fail,polls;
++static int import_error=123;
+ static uint32_t polled_fence;
+ static bool iova_live,bo_live,fence_pending;
+ static VkResult vk_device_set_lost(int *,const char *,...) {return VK_ERROR_DEVICE_LOST;}
+@@ -69,7 +73,7 @@ static int dw_call(unsigned method,const void *input,size_t n,void *out,size_t m
+   assert(n==sizeof(NativeAdrenoAbiBoImport) && m==sizeof(NativeAdrenoAbiBoAllocReply));
+   auto &r=*(const NativeAdrenoAbiBoImport *)input;
+   assert(r.address==0x100000 && r.bytes==32768 && iova_live);imports++;
+-  if(fail==2)return 123;
++  if(fail==2)return import_error;
+   bo_live=true;((NativeAdrenoAbiBoAllocReply *)out)->handle=1;return 0;
+  }
+  if(method==NativeAdrenoMethodBoMap) {
+@@ -139,6 +143,16 @@ int main() {
+  for(fail=1;fail<=3;fail++) {
+   assert(darwin_bo_init_host(&dev,&out,(void *)0x100000,32768)!=VK_SUCCESS && !out && !bo_live && !iova_live);
+  }
++ fail=2;
++ for(int native_error:{kIOReturnNoMemory,kIOReturnNoResources,kIOReturnBadArgument,kIOReturnUnsupported,123}) {
++  import_error=native_error;
++  unsigned prior_frees=iova_frees,prior_bo_frees=bo_frees;
++  VkResult expected=native_error==kIOReturnNoMemory || native_error==kIOReturnNoResources
++   ? VK_ERROR_OUT_OF_DEVICE_MEMORY:VK_ERROR_INVALID_EXTERNAL_HANDLE;
++  assert(darwin_bo_init_host(&dev,&out,(void *)0x100000,32768)==expected);
++  assert(!out && !bo_live && !iova_live && iova_frees==prior_frees+1 && bo_frees==prior_bo_frees);
++ }
++ import_error=123;
+  fail=0;assert(!darwin_bo_init_host(&dev,&out,(void *)0x100000,32768));
+  assert(out==&storage && out->map==(void *)0x100000 && out->never_unmap && !out->darwin_token && out->darwin_handle==1 && out->refcnt==1);
+  out->refcnt=2;unsigned before=bo_frees;
+@@ -191,11 +205,79 @@ int main() {
+ '''
+ 
+ 
++def error_map_test(patches):
++    upstream = patches / 'turnip-darwin-kmd.patch'
++    expected = 'f3bc6d470f8e0bde1b1d0d370175ec105ee45fe50075e43279581e61b1455c2b'
++    if hashlib.sha256(upstream.read_bytes()).hexdigest() != expected:
++        raise ValueError('Pinned upstream KMD patch does not match the build recipe')
++    payload = upstream.read_text()
++    section = payload.split('+++ b/src/freedreno/vulkan/tu_knl_darwin.cc\n', 1)[1]
++    section = section.split('\ndiff --git ', 1)[0]
++    source = ''.join(line[1:] + '\n' for line in section.splitlines()
++                     if line.startswith('+') and not line.startswith('+++'))
++    with tempfile.TemporaryDirectory(prefix='fuxi-import-error-') as temporary:
++        directory = Path(temporary)
++        target = directory / 'src/freedreno/vulkan/tu_knl_darwin.cc'
++        target.parent.mkdir(parents=True)
++        target.write_text(source)
++        overlay = ROOT / 'tools/patches/mesa-fuxi-hostimport.patch'
++        command = ['git', 'apply', '--include=src/freedreno/vulkan/tu_knl_darwin.cc']
++        subprocess.run(command + ['--check', str(overlay)], cwd=directory, check=True)
++        subprocess.run(command + [str(overlay)], cwd=directory, check=True)
++        model = PREFIX.replace('#include <vulkan/vulkan_core.h>', '''
++#include <initializer_list>
++enum VkResult { VK_SUCCESS=0,VK_TIMEOUT=2,VK_ERROR_OUT_OF_HOST_MEMORY=-1,
++ VK_ERROR_OUT_OF_DEVICE_MEMORY=-2,VK_ERROR_DEVICE_LOST=-4,VK_ERROR_INVALID_EXTERNAL_HANDLE=-1000072003 };
++using VkPhysicalDevice=void *;
++struct VkPhysicalDeviceExternalBufferInfo {};
++struct VkExternalBufferProperties {};
++''')
++        model += '''
++static VkResult darwin_collect_retired(tu_device *) {return VK_SUCCESS;}
++static VkResult darwin_map_failure(tu_device *,uint64_t,uint64_t,uint64_t,kern_return_t) {return VK_ERROR_DEVICE_LOST;}
++'''
++        model += function(target.read_text(), 'darwin_bo_init_host')
++        model += '''
++int main() {
++ tu_physical_device physical={true};tu_device device={&physical,0,0,nullptr};
++ dw.params.flags=NativeAdrenoParamsHostImport;
++ for(int native_error:{kIOReturnNoMemory,kIOReturnNoResources,kIOReturnBadArgument,kIOReturnUnsupported,123}) {
++  import_error=native_error;fail=2;tu_bo *output=&storage;
++  unsigned prior_frees=iova_frees,prior_bo_frees=bo_frees;
++  VkResult expected=native_error==kIOReturnNoMemory || native_error==kIOReturnNoResources
++   ? VK_ERROR_OUT_OF_DEVICE_MEMORY:VK_ERROR_INVALID_EXTERNAL_HANDLE;
++  assert(darwin_bo_init_host(&device,&output,(void *)0x100000,32768)==expected);
++  assert(!output && !bo_live && !iova_live && iova_frees==prior_frees+1 && bo_frees==prior_bo_frees);
++ }
++ tu_bo *output=&storage;unsigned prior_allocations=allocations;
++ assert(darwin_bo_init_host(&device,&output,(void *)0x101000,32768)==VK_ERROR_INVALID_EXTERNAL_HANDLE);
++ assert(!output && allocations==prior_allocations);
++ fail=0;assert(darwin_bo_init_host(&device,&output,(void *)0x100000,32768)==VK_SUCCESS);
++ assert(output==&storage && bo_live && iova_live && output->map==(void *)0x100000);
++ puts("PASS: pinned production BoImport maps resource pressure to Vulkan OOM, preserves invalid-input refusal, unwinds IOVA and keeps successful import");
++}
++'''
++        source_path = directory / 'import-errors.cpp'
++        source_path.write_text(model)
++        executable = directory / 'import-errors'
++        subprocess.run(['clang++', '-std=c++17', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
++                        '-Wno-unused-function', '-Wno-unused-variable', '-Wno-missing-field-initializers',
++                        '-fsanitize=address,undefined', '-I' + str(ROOT / 'xnu/fuxi-adreno'),
++                        str(source_path), '-o', str(executable)], check=True)
++        subprocess.run([str(executable)], check=True)
++
++
+ def main():
+     ap = argparse.ArgumentParser(description=__doc__)
+-    ap.add_argument('--mesa', type=Path, required=True)
++    ap.add_argument('--mesa', type=Path)
+     ap.add_argument('--patches', type=Path, required=True)
++    ap.add_argument('--error-map-only', action='store_true')
+     args = ap.parse_args()
++    if args.error_map_only:
++        error_map_test(args.patches.resolve())
++        return
++    if args.mesa is None:
++        ap.error('--mesa is required unless --error-map-only is selected')
+     with tempfile.TemporaryDirectory() as tmp:
+         out = Path(tmp)
+         subprocess.run(['python3', str(ROOT/'tools/build-fuxi-turnip.py'), '--mesa', str(args.mesa.resolve()),
 diff --git a/tools/test-fuxi-wifi-ios.py b/tools/test-fuxi-wifi-ios.py
 index 12e012d..a91f8f2 100755
 --- a/tools/test-fuxi-wifi-ios.py
