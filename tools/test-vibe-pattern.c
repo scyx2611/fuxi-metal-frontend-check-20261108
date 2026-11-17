@@ -79,6 +79,24 @@ int main(void)
     /* 很長的循環被 30 秒總長截斷 */
     assert(fx_vibe_periodic(&pattern, 1000, 1000, 1000000) == 15000 && pattern.truncated);
 
+    fx_vibe_reset(&pattern);
+    assert(fx_vibe_atom(&pattern, 50, 20));
+    assert(fx_vibe_atom(&pattern, 60, 30));
+    assert(fx_vibe_atom(&pattern, 65, 10));
+    assert(fx_vibe_atom(&pattern, 120, 15));
+    assert(fx_vibe_finish(&pattern) == 55 && pattern.count == 4 && pattern.total_ms == 135);
+    assert(!pattern.segment[0].on && pattern.segment[0].ms == 50);
+    assert(pattern.segment[1].on && pattern.segment[1].ms == 40);
+    assert(!pattern.segment[2].on && pattern.segment[2].ms == 30);
+    assert(pattern.segment[3].on && pattern.segment[3].ms == 15);
+    assert(!fx_vibe_atom(&pattern, 20, 10));
+    assert(!fx_vibe_atom(&pattern, -1, 10));
+    assert(!fx_vibe_atom(&pattern, 200, 0));
+    assert(!fx_vibe_atom(&pattern, FX_VIBE_TOTAL_MS + 1, 10));
+    fx_vibe_reset(&pattern);
+    assert(!fx_vibe_atom(&pattern, FX_VIBE_TOTAL_MS - 5, 15));
+    assert(pattern.truncated && pattern.total_ms == FX_VIBE_TOTAL_MS);
+
     /* 長段分次向核心要：每次最多 2000 ms，1500 ms 後續約 */
     assert(fx_vibe_request_ms(5000) == FX_VIBE_REQUEST_MS && fx_vibe_renew_ms(5000) == FX_VIBE_RENEW_MS);
     assert(fx_vibe_request_ms(2000) == 2000 && fx_vibe_renew_ms(2000) == 2000);

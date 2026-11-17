@@ -4,7 +4,7 @@
  * mediaserverd（fxinj bit 2 才會載入）：
  *   -[AVHapticServer(VibeSynthEngine) playVibePattern:gain:synchronizer:flags:atTime:completionHandler:]
  *     系統聲音的震動（來電、通知、kSystemSoundID_Vibrate）走這裡；解析 VibePattern（或 FigVibrator 舊格式
- *     OnDuration／OffDuration／TotalDuration 秒數）自己排開關，認不得的格式震 300 ms；原實作照呼叫。
+ *     OnDuration／OffDuration／TotalDuration 秒數）自己排開關，認不得的格式震 15 ms；原實作照呼叫。
  *     前提：ADT /product/haptics closed-loop=1（loader --product-haptics），MediaExperience 才會建立震動器、
  *     走 VibeSynthEngine → HapticServerManager_VibeEnginePlay → 這個方法；沒有的話請求在 MediaExperience 就被丟掉。
  *   -[AVHapticServer(VibeSynthEngine) cancelPatternWithOptions:] 立即停。
@@ -46,14 +46,14 @@ extern kern_return_t IOObjectRelease(vb_io_object_t object);
 
 enum { VB_NONE, VB_MEDIA, VB_SPRINGBOARD };
 enum { VB_LOG, VB_PULSE, VB_CANCEL };
-enum { VB_LOG_CALLS = 6, VB_PLAY_LOGS = 12, VB_ERROR_LOGS = 8, VB_TAP_MS = 15, VB_FALLBACK_MS = 300 };
+enum { VB_LOG_CALLS = 6, VB_PLAY_LOGS = 12, VB_ERROR_LOGS = 8, VB_TAP_MS = 15, VB_FALLBACK_MS = 15 };
 
 static unsigned vb_role;
 static const char *vb_name = "?";
 
 __attribute__((format(printf, 1, 2))) static void vb_say(const char *format, ...)
 {
-    char line[320];
+    char line[1024];
     int prefix = snprintf(line, sizeof(line), "fuxi: %s: ", vb_name);
     if (prefix < 0 || prefix >= (int)sizeof(line)) return;
     va_list ap;
@@ -271,6 +271,33 @@ static long long vb_seconds_ms(CFDictionaryRef dictionary, CFStringRef key)
     return (long long)(seconds * 1000.0 + 0.5);
 }
 
+static int vb_atoms(CFTypeRef value, fx_vibe_pattern *pattern)
+{
+    if (value == NULL || CFGetTypeID(value) != CFArrayGetTypeID()) return 0;
+    CFArrayRef atoms = (CFArrayRef)value;
+    CFIndex count = CFArrayGetCount(atoms);
+    if (count <= 0 || count > FX_VIBE_SEGMENTS) return 0;
+    for (CFIndex index = 0; index < count; index++) {
+        CFTypeRef item = CFArrayGetValueAtIndex(atoms, index);
+        if (item == NULL || CFGetTypeID(item) != CFDictionaryGetTypeID()) return 0;
+        CFDictionaryRef atom = (CFDictionaryRef)item;
+        long long start = vb_seconds_ms(atom, CFSTR("StartTime"));
+        long long duration = vb_seconds_ms(atom, CFSTR("Duration"));
+        if (start < 0 && CFDictionaryContainsKey(atom, CFSTR("StartTime"))) return 0;
+        if (start < 0) start = pattern->total_ms;
+        if (duration <= 0) {
+            CFTypeRef type = CFDictionaryGetValue(atom, CFSTR("Type"));
+            if (type && CFGetTypeID(type) == CFStringGetTypeID() &&
+                (CFEqual(type, CFSTR("tap")) || CFEqual(type, CFSTR("Minitap")) ||
+                 CFEqual(type, CFSTR("Microtap")) || CFEqual(type, CFSTR("LPWidetap"))))
+                duration = VB_TAP_MS;
+        }
+        if (duration <= 0) return 0;
+        if (!fx_vibe_atom(pattern, start, duration)) return pattern->truncated ? 3 : 0;
+    }
+    return 3;
+}
+
 /* 回傳 0 不能解析，1 解析到 VibePattern，2 解析到 OnDuration 舊格式（*intensity < 0 表示沒給）。 */
 static int vb_parse(CFTypeRef object, fx_vibe_pattern *pattern, double *intensity)
 {
@@ -281,6 +308,8 @@ static int vb_parse(CFTypeRef object, fx_vibe_pattern *pattern, double *intensit
     CFTypeRef level = CFDictionaryGetValue(dictionary, CFSTR("Intensity"));
     long long ignored = 0;
     if (level && !vb_number(level, &ignored, intensity)) *intensity = -1.0;
+    CFTypeRef atoms = CFDictionaryGetValue(dictionary, CFSTR("Atoms"));
+    if (atoms) return vb_atoms(atoms, pattern);
     CFTypeRef list = CFDictionaryGetValue(dictionary, CFSTR("VibePattern"));
     if (list == NULL || CFGetTypeID(list) != CFArrayGetTypeID()) {
         long long on = vb_seconds_ms(dictionary, CFSTR("OnDuration"));
@@ -302,13 +331,13 @@ static int vb_parse(CFTypeRef object, fx_vibe_pattern *pattern, double *intensit
 
 static void vb_describe(const char *what, CFTypeRef object)
 {
-    char text[200] = "(null)";
+    char text[800] = "(null)";
     if (object) {
         CFStringRef description = CFCopyDescription(object);
         text[0] = 0;
         if (description) {
             CFIndex length = CFStringGetLength(description), used = 0;
-            CFIndex characters = length > 180 ? 180 : length;
+            CFIndex characters = length > 760 ? 760 : length;
             (void)CFStringGetBytes(description, CFRangeMake(0, characters), kCFStringEncodingUTF8, '?', false,
                 (UInt8 *)text, (CFIndex)sizeof(text) - 4, &used);
             text[used] = 0;
@@ -496,7 +525,7 @@ static bool vb_vibe_request(id pattern, double gain, uintptr_t flags, double whe
             "gain=%.2f flags=%#lx at=%.3f%s%s\n", call + 1, pattern ? object_getClassName(pattern) : "nil", ok,
             parsed.count, parsed.total_ms, on_ms, parsed.truncated, intensity, gain, (unsigned long)flags, when,
             silent ? " silent" : "", fallback ? " fallback" : "");
-        if (call < 3) vb_describe("vibe pattern", (CFTypeRef)pattern);
+        if (call < 6) vb_describe("vibe pattern", (CFTypeRef)pattern);
     }
     return queued;
 }
@@ -674,6 +703,7 @@ static uintptr_t vb_strip(const void *pointer)
 }
 
 static unsigned vb_native_calls;
+static unsigned vb_native_cancels;
 
 static int vb_native_play(CFDictionaryRef pattern, float gain, void *synchronizer, uint32_t flags,
     const void *completion)
@@ -691,7 +721,8 @@ static int vb_native_cancel(CFDictionaryRef options)
 {
     (void)options;
     vb_cancel();
-    vb_say("vibe native cancel\n");
+    if (__atomic_fetch_add(&vb_native_cancels, 1u, __ATOMIC_RELAXED) < VB_PLAY_LOGS)
+        vb_say("vibe native cancel\n");
     return 0;
 }
 
@@ -804,6 +835,38 @@ static void *vb_probe_thread(void *argument)
     vb_probe("late", false);
     sleep(2);
     vb_probe("direct", true);
+    sleep(3);
+    typedef int (*vibrate_t)(uint32_t, CFDictionaryRef);
+    typedef void (*stop_t)(CFDictionaryRef);
+    vibrate_t vibrate = (vibrate_t)dlsym(RTLD_DEFAULT, "CMSessionMgrVibrateForSystemSoundWithOptions");
+    stop_t stop = (stop_t)dlsym(RTLD_DEFAULT, "CMSessionMgrVibratorStopWithOptions");
+    double seconds = 2.0, intensity = 1.0;
+    CFNumberRef duration = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &seconds);
+    CFNumberRef level = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &intensity);
+    const void *keys[] = {CFSTR("OnDuration"), CFSTR("TotalDuration"), CFSTR("Intensity")};
+    const void *values[] = {duration, duration, level};
+    CFDictionaryRef pattern = duration && level ? CFDictionaryCreate(kCFAllocatorDefault, keys, values, 3,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks) : NULL;
+    const void *option_keys[] = {CFSTR("VibrationPattern")};
+    const void *option_values[] = {pattern};
+    CFDictionaryRef options = pattern ? CFDictionaryCreate(kCFAllocatorDefault, option_keys, option_values, 1,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks) : NULL;
+    const void *stop_keys[] = {CFSTR("CancelAtLoopEnd")};
+    const void *stop_values[] = {kCFBooleanFalse};
+    CFDictionaryRef stop_options = CFDictionaryCreate(kCFAllocatorDefault, stop_keys, stop_values, 1,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (vibrate && stop && options && stop_options) {
+        int rc = vibrate(4095, options);
+        vb_say("vibe probe cancel play rc=%d requested=2000ms\n", rc);
+        usleep(120000);
+        stop(stop_options);
+        vb_say("vibe probe cancel stop sent after 120ms\n");
+    }
+    if (stop_options) CFRelease(stop_options);
+    if (options) CFRelease(options);
+    if (pattern) CFRelease(pattern);
+    if (level) CFRelease(level);
+    if (duration) CFRelease(duration);
     return NULL;
 }
 

@@ -80,6 +80,22 @@ static inline unsigned fx_vibe_finish(fx_vibe_pattern *pattern)
     return on_ms;
 }
 
+static inline bool fx_vibe_atom(fx_vibe_pattern *pattern, long long start_ms, long long duration_ms)
+{
+    if (start_ms < 0 || duration_ms <= 0 || start_ms > FX_VIBE_TOTAL_MS) return false;
+    if (duration_ms > FX_VIBE_SEGMENT_MS) duration_ms = FX_VIBE_SEGMENT_MS;
+    long long end_ms = start_ms + duration_ms;
+    if (start_ms < pattern->total_ms) {
+        if (!pattern->count || !pattern->segment[pattern->count - 1].on ||
+            start_ms < pattern->total_ms - pattern->segment[pattern->count - 1].ms) return false;
+        if (end_ms <= pattern->total_ms) return true;
+        return fx_vibe_append(pattern, true, end_ms - pattern->total_ms);
+    }
+    while (pattern->total_ms < start_ms)
+        if (!fx_vibe_append(pattern, false, start_ms - pattern->total_ms)) return false;
+    return fx_vibe_append(pattern, true, duration_ms);
+}
+
 /*
  * FigVibrator 舊格式（OnDuration／OffDuration／TotalDuration，秒）：開 on、關 off 輪流，直到 total；
  * total <= 0 或 off <= 0 只震一段 on。回傳開的總毫秒數。
