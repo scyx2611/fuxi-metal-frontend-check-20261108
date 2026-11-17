@@ -8273,10 +8273,10 @@ index 90d7242..54eacf5 100644
  @@ -745,6 +745,10 @@
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..5e168e6
+index 0000000..d0a59cb
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,171 @@
 +#!/usr/bin/env python3
 +"""Generate/check patch 0117 (fuxi-adsp): the audio DSP owner (boot-arg fuxiadsp) and its battery manager client.
 +
@@ -8313,6 +8313,11 @@ index 0000000..5e168e6
 +    'fuxi_bt_xnu.c': BLUETOOTH_SOURCE / 'fuxi_bt_xnu.c',
 +    'fuxi_bt.h': BLUETOOTH_SOURCE / 'fuxi_bt.h',
 +}
++# WCN7850 藍牙 UART：GENI FIFO 驅動與板級準備（fuxi,bt=3）
++SOURCES += ('fuxi_bt_geni_fifo.c', 'fuxi_bt_board.c')
++HEADERS += ('fuxi_bt_geni_fifo.h', 'fuxi_bt_board.h')
++SOURCE_PATHS.update({name: BLUETOOTH_SOURCE / name for name in
++                     ('fuxi_bt_geni_fifo.c', 'fuxi_bt_board.c', 'fuxi_bt_geni_fifo.h', 'fuxi_bt_board.h')})
 +SOURCES += ('fuxi_battery_freshness.c',)
 +HEADERS += ('fuxi_battery_freshness.h', 'fuxi_battery_poll_pause.h')
 +SOURCE_PATHS.update({
@@ -10373,10 +10378,10 @@ index 0000000..922f6a1
 +    main()
 diff --git a/tools/test-fuxi-bluetooth-xnu.py b/tools/test-fuxi-bluetooth-xnu.py
 new file mode 100644
-index 0000000..13326f2
+index 0000000..b7d102d
 --- /dev/null
 +++ b/tools/test-fuxi-bluetooth-xnu.py
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,580 @@
 +#!/usr/bin/env python3
 +"""Exercise the production XNU entry using host declarations and simulated MMIO."""
 +
@@ -10395,6 +10400,7 @@ index 0000000..13326f2
 +STUBS = r'''
 +#include <stdlib.h>
 +#include <stdarg.h>
++#include "fuxi_bt_board.h"
 +#ifdef _MSC_VER
 +#include <intrin.h>
 +#define __ATOMIC_ACQUIRE 0
@@ -10463,7 +10469,66 @@ index 0000000..13326f2
 +    uintptr_t address;
 +    uint64_t pa;
 +};
-+static struct test_page test_pages[16];
++static struct test_page test_pages[32];
++struct test_written_reg {
++    uint64_t pa;
++    uint32_t value;
++};
++static struct test_written_reg test_written[32];
++static unsigned test_written_count;
++static unsigned test_writes;
++static uint64_t test_clock_us;
++static unsigned test_wlan; /* 0 一直低、1 一直高、2 先高 10 秒、低 2 秒、再高 */
++static bool test_gpll0_ok;
++static bool test_adt_present;
++static uint32_t test_adt_value;
++static unsigned test_adt_size;
++static unsigned test_adt_lookups;
++
++typedef const void *DTEntry;
++#define kSuccess 0
++static int SecureDTLookupEntry(const void *root, const char *path, DTEntry *entry)
++{
++    assert(!root && !strcmp(path, "/chosen") && entry);
++    test_adt_lookups++;
++    *entry = &test_adt_value;
++    return kSuccess;
++}
++
++static int SecureDTGetProperty(DTEntry entry, const char *name, const void **value, unsigned int *size)
++{
++    assert(entry == &test_adt_value && !strcmp(name, "fuxi,bt"));
++    if (!test_adt_present) {
++        return 1;
++    }
++    *value = &test_adt_value;
++    *size = test_adt_size;
++    return kSuccess;
++}
++
++static void clock_get_uptime(uint64_t *absolute)
++{
++    *absolute = test_clock_us * 3u;
++}
++
++static void absolutetime_to_nanoseconds(uint64_t absolute, uint64_t *nanoseconds)
++{
++    *nanoseconds = absolute / 3u * 1000u;
++}
++
++static void delay(int microseconds)
++{
++    assert(microseconds > 0);
++    test_clock_us += (unsigned)microseconds;
++}
++
++static bool test_wlan_high(void)
++{
++    if (test_wlan == 2) {
++        return test_clock_us < 10000000u || test_clock_us >= 12000000u;
++    }
++    return test_wlan == 1;
++}
 +static unsigned test_page_count;
 +
 +static void test_printf(const char *format, ...)
@@ -10543,7 +10608,7 @@ index 0000000..13326f2
 +{
 +    static const uint32_t branches[] = {0x233d4, 0x233d0, 0x233cc, 0x23004, 0x1e754};
 +    uint64_t pa = 0;
-+    assert(!write && !reserved);
++    assert(write <= 1 && !reserved);
 +    test_mmio++;
 +    if (test_read_failure == test_mmio) {
 +        return 1;
@@ -10555,7 +10620,42 @@ index 0000000..13326f2
 +        }
 +    }
 +    assert(pa);
++    if (write) {
++        /* fuxi,bt=3 在 wrapper 前失敗時只會寫 GCC（投票與 SE6 RCG）。 */
++        unsigned index = 0;
++        assert(pa >= FUXI_BT_GCC_BASE && pa < FUXI_BT_GCC_BASE + 0x60000);
++        test_writes++;
++        while (index < test_written_count && test_written[index].pa != pa) {
++            index++;
++        }
++        if (index == test_written_count) {
++            assert(test_written_count < 32);
++            test_written[test_written_count++].pa = pa;
++        }
++        test_written[index].value = (uint32_t)*value;
++        return 0;
++    }
 +    *value = 0;
++    if (pa == FUXI_BT_TLMM_BASE + 80u * 0x1000u) {
++        *value = test_wlan_high() ? 0x200u : 0;
++    } else if (pa == FUXI_BT_TLMM_BASE + 80u * 0x1000u + 4u) {
++        *value = test_wlan_high() ? 2u : 0;
++    } else if (test_gpll0_ok && pa == FUXI_BT_GCC_BASE + 0x52018) {
++        *value = 1;
++    } else if (test_gpll0_ok && pa == FUXI_BT_GCC_BASE) {
++        *value = 1u << 31;
++    } else if (test_gpll0_ok && pa == FUXI_BT_GCC_BASE + 0x18) {
++        *value = 0x402;
++    }
++    for (unsigned index = 0; index < test_written_count; index++) {
++        if (test_written[index].pa == pa) {
++            *value = test_written[index].value;
++            if (pa == FUXI_BT_GCC_BASE + 0x1e760) {
++                *value &= ~1u; /* CMD_UPDATE 立即完成 */
++            }
++            return 0;
++        }
++    }
 +    for (unsigned index = 0; index < 5; index++) {
 +        if (pa == FUXI_BT_GCC_BASE + branches[index] && (test_off_mask & (1u << index))) {
 +            *value = 1u << 31;
@@ -10619,6 +10719,106 @@ index 0000000..13326f2
 +    test_log_size = test_page_count = 0;
 +    test_log[0] = 0;
 +    fuxi_bt_started = fuxi_bt_mode = fuxi_bt_registration = 0;
++    test_written_count = test_writes = test_wlan = test_adt_lookups = 0;
++    test_clock_us = 0;
++    test_gpll0_ok = test_adt_present = false;
++    test_adt_value = test_adt_size = 0;
++}
++
++static uint32_t test_written_value(uint64_t pa)
++{
++    for (unsigned index = 0; index < test_written_count; index++) {
++        if (test_written[index].pa == pa) {
++            return test_written[index].value;
++        }
++    }
++    assert(false);
++    return 0;
++}
++
++static void test_board_mode(void)
++{
++    static const uint32_t restored[] = {0x52010, 0x1e764, 0x1e768, 0x1e76c, 0x1e770};
++    /* 命令列已滿：沒有 fuxibt 時讀 ADT /chosen fuxi,bt（u32）。 */
++    test_entry_reset(0);
++    test_arg_present = false;
++    test_adt_present = true;
++    test_adt_value = 3;
++    test_adt_size = 4;
++    fuxi_bt_init();
++    assert(test_threads == 1 && fuxi_bt_mode == 3 && test_adt_lookups == 1);
++    test_entry_reset(0);
++    test_arg_present = false;
++    test_adt_present = true;
++    test_adt_value = 3;
++    test_adt_size = 8;
++    fuxi_bt_init();
++    assert(!test_threads && test_adt_lookups == 1);
++    test_entry_reset(0);
++    test_arg_present = false;
++    test_adt_present = true;
++    test_adt_value = 0x80000000u;
++    test_adt_size = 4;
++    fuxi_bt_init();
++    assert(!test_threads && strstr(test_log, "mode -1 rejected"));
++    test_entry_reset(0);
++    test_arg_present = false;
++    test_adt_present = true;
++    test_adt_value = 4;
++    test_adt_size = 4;
++    fuxi_bt_init();
++    assert(!test_threads && strstr(test_log, "mode 4 rejected"));
++    test_entry_reset(0);
++    test_adt_present = true;
++    test_adt_value = 3;
++    test_adt_size = 4;
++    fuxi_bt_init();
++    assert(!test_threads && !test_adt_lookups);
++    test_entry_reset(0);
++    test_arg_present = false;
++    fuxi_bt_init();
++    assert(!test_threads && test_adt_lookups == 1);
++
++    /* WLAN_EN 一直沒拉高：300 秒後放棄，不寫任何暫存器。 */
++    test_entry_reset(3);
++    fuxi_bt_init();
++    fuxi_bt_worker(NULL, 0);
++    assert(strstr(test_log, "not steady high for 15 s within 300 s; BT_EN untouched"));
++    assert(!test_writes && test_allocations == test_frees && test_terminations == 1);
++    assert(test_clock_us >= 300000000u && test_clock_us < 300500000u);
++    assert(!strstr(test_log, "board power"));
++
++    /* WLAN_EN 穩定、GPLL0 沒鎖：在 gpll0 階段停下，不寫。 */
++    test_entry_reset(3);
++    test_wlan = 1;
++    fuxi_bt_init();
++    fuxi_bt_worker(NULL, 0);
++    assert(strstr(test_log, "board WLAN_EN steady after 15000 ms"));
++    assert(strstr(test_log, "board power status=no-uart stage=gpll0"));
++    assert(strstr(test_log, "board restore status=ok"));
++    assert(!test_writes && test_allocations == test_frees && !strstr(test_log, "probe status="));
++
++    /* WLAN_EN 中途掉 2 秒：從再次拉高起重新算 15 秒。 */
++    test_entry_reset(3);
++    test_wlan = 2;
++    fuxi_bt_init();
++    fuxi_bt_worker(NULL, 0);
++    assert(strstr(test_log, "board WLAN_EN steady after 27000 ms"));
++
++    /* GPLL0 正常但 QUP wrapper 讀不到：投票與 RCG 都寫過，之後全部還原。 */
++    test_entry_reset(3);
++    test_wlan = 1;
++    test_gpll0_ok = true;
++    fuxi_bt_init();
++    fuxi_bt_worker(NULL, 0);
++    assert(strstr(test_log, "board power status=no-uart stage=wrapper value=0 "));
++    assert(strstr(test_log, "added=0x40f rcg_cfg=0->0x2601"));
++    assert(strstr(test_log, "board restore status=ok"));
++    assert(test_writes == 12 && test_allocations == test_frees);
++    for (unsigned index = 0; index < sizeof(restored) / sizeof(restored[0]); index++) {
++        assert(test_written_value(FUXI_BT_GCC_BASE + restored[index]) == 0);
++    }
++    assert(!strstr(test_log, "probe status="));
 +}
 +
 +static void test_entry(void)
@@ -10627,7 +10827,7 @@ index 0000000..13326f2
 +    for (int mode = -1; mode <= 3; mode++) {
 +        test_entry_reset(mode);
 +        fuxi_bt_init();
-+        if (mode != 1 && mode != 2) {
++        if (mode < 1 || mode > 3) {
 +            assert(!test_threads && !test_allocations && !test_mmio);
 +        } else {
 +            assert(test_threads == 1 && test_thread_refs == 1);
@@ -10698,8 +10898,9 @@ index 0000000..13326f2
 +        assert(!uart.acquisitions && !uart.releases);
 +        assert(strstr(test_log, "read fault pa="));
 +    }
++    test_board_mode();
 +    test_entry_reset(0);
-+    puts("PASS XNU host model: default-off/invalid args, one-shot startup, registration, survey gates, QCA worker, 6 allocation/7 pmap/35 MMIO failure cleanup paths");
++    puts("PASS XNU host model: default-off/invalid args, ADT fuxi,bt fallback, one-shot startup, registration, survey gates, QCA worker, board mode WLAN_EN gate/GPLL0 refusal/write+restore, 6 allocation/7 pmap/35 MMIO failure cleanup paths");
 +}
 +
 +int main(void)
@@ -10740,13 +10941,15 @@ index 0000000..13326f2
 +        if msvc:
 +            command = compiler + [
 +                "/nologo", "/std:c11", "/W4", "/WX", "/Od", "/D_CRT_SECURE_NO_WARNINGS",
-+                f"/I{SOURCE}", str(SOURCE / "fuxi_bt.c"), str(generated),
++                f"/I{SOURCE}", str(SOURCE / "fuxi_bt.c"), str(SOURCE / "fuxi_bt_geni_fifo.c"),
++                str(SOURCE / "fuxi_bt_board.c"), str(generated),
 +                f"/Fe{executable}"
 +            ]
 +        else:
 +            command = compiler + [
 +                "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
-+                "-I", str(SOURCE), str(SOURCE / "fuxi_bt.c"), str(generated),
++                "-I", str(SOURCE), str(SOURCE / "fuxi_bt.c"), str(SOURCE / "fuxi_bt_geni_fifo.c"),
++                str(SOURCE / "fuxi_bt_board.c"), str(generated),
 +                "-o", str(executable)
 +            ]
 +            if args.sanitize:
@@ -11328,6 +11531,618 @@ index 0000000..48a43f2
 +        subprocess.run([str(executable)], cwd=directory, env=environment, check=True, timeout=60)
 +        print(f"Compiler {compiler[0]}")
 +        print(f"Sanitizers {'ASan/UBSan' if args.sanitize else 'disabled'}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/test-fuxi-bt-board.py b/tools/test-fuxi-bt-board.py
+new file mode 100644
+index 0000000..97ae8db
+--- /dev/null
++++ b/tools/test-fuxi-bt-board.py
+@@ -0,0 +1,606 @@
++#!/usr/bin/env python3
++"""End-to-end host check of the WCN7850 Bluetooth board glue (fuxi,bt=3).
++
++Production fuxi_bt_board.c + fuxi_bt_geni_fifo.c + fuxi_bt.c run against a
++simulated GCC / TLMM / QUP wrapper and the GENI register model that
++test-fuxi-bt-geni-fifo.py already uses (reused, not copied), so the clock,
++pin and BT_EN sequence, the QCA version query over the FIFO driver and the
++full restore are exercised together.
++"""
++
++import argparse
++import importlib.util
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++
++
++ROOT = Path(__file__).resolve().parents[1]
++SOURCE = ROOT / "xnu" / "fuxi-bluetooth"
++
++BOARD = r'''
++#include <stdlib.h>
++#include "fuxi_bt_board.h"
++
++#define GCC(offset) (FUXI_BT_GCC_BASE + (uint64_t)(offset))
++#define RCG(offset) GCC(0x1e760u + (offset))
++#define TLMM_CTL(pin) (FUXI_BT_TLMM_BASE + (uint64_t)(pin) * 0x1000u)
++#define TLMM_IO(pin) (TLMM_CTL(pin) + 4u)
++
++static const uint32_t branch_offsets[] = {0x233d4, 0x233d0, 0x233cc, 0x23004, 0x1e754};
++static const uint32_t branch_votes[] = {1u << 0, 1u << 1, 1u << 2, 1u << 3, 1u << 10};
++
++struct soc_reg {
++    uint64_t pa;
++    uint32_t value;
++    uint32_t original;
++    bool writable;
++    unsigned writes;
++};
++
++struct soc {
++    struct model uart;
++    struct soc_reg regs[40];
++    unsigned count;
++    unsigned calls, fail_at, failed_call;
++    unsigned rcg_pending;
++    bool branch_stuck, rcg_stuck, rcg_ignore_cfg, rcg_root_off, pin_stuck, bt_en_dead;
++    bool sw_ctrl_follows, replied;
++    uint64_t bt_en_low_at, bt_en_high_at, bt_en_checked_at;
++    unsigned bt_en_high_writes;
++};
++
++static struct soc_reg *soc_find(struct soc *soc, uint64_t pa)
++{
++    for (unsigned index = 0; index < soc->count; index++) {
++        if (soc->regs[index].pa == pa) {
++            return &soc->regs[index];
++        }
++    }
++    fprintf(stderr, "access outside the model pa=%#llx\n", (unsigned long long)pa);
++    assert(false);
++    return NULL;
++}
++
++static void soc_add(struct soc *soc, uint64_t pa, uint32_t value, bool writable)
++{
++    assert(soc->count < sizeof(soc->regs) / sizeof(soc->regs[0]));
++    soc->regs[soc->count++] = (struct soc_reg){pa, value, value, writable, 0};
++}
++
++static uint32_t soc_value(struct soc *soc, uint64_t pa)
++{
++    return soc_find(soc, pa)->value;
++}
++
++static void soc_init(struct soc *soc)
++{
++    memset(soc, 0, sizeof(*soc));
++    model_init(&soc->uart);
++    soc_add(soc, GCC(0x0), (1u << 31) | 7u, false);          /* GPLL0 MODE：LOCK_DET */
++    soc_add(soc, GCC(0x18), 0x403u, false);                   /* USER_CTL：main+even、後除 2 */
++    soc_add(soc, GCC(0x52018), 0x1u, false);                  /* GPLL0 投票 */
++    soc_add(soc, GCC(0x52010), 0x10000u, true);               /* 實機觀察到的 QUP 投票值 */
++    for (unsigned index = 0; index < 5; index++) {
++        /* s_ahb、m_ahb 開著 HWCG，閒置時一直回報 off。 */
++        soc_add(soc, GCC(branch_offsets[index]), index == 1 || index == 2 ? 2u : 0u, false);
++    }
++    soc_add(soc, RCG(0), 0, true);
++    soc_add(soc, RCG(4), 0x100000u, true);                    /* TCXO、HW_CLK_CTRL */
++    soc_add(soc, RCG(8), 0x10000u, true);
++    soc_add(soc, RCG(12), 0x20000u, true);
++    soc_add(soc, RCG(16), 0x30000u, true);
++    soc_add(soc, FUXI_BT_WRAPPER_BASE + 4u, 0x30090000u, false);
++    for (unsigned pin = 76; pin <= 79; pin++) {
++        soc_add(soc, TLMM_CTL(pin), 0x800u | (pin < 78 ? 1u : 3u), true);
++    }
++    soc_add(soc, TLMM_CTL(80), 0x200u, false);                /* WLAN_EN：GPIO 輸出 */
++    soc_add(soc, TLMM_IO(80), 0x2u, false);
++    soc_add(soc, TLMM_CTL(81), 0x801u, true);                 /* BT_EN：輸入、下拉 */
++    soc_add(soc, TLMM_IO(81), 0x0u, true);
++    soc_add(soc, TLMM_IO(82), 0x0u, false);                   /* SW_CTRL */
++    soc->sw_ctrl_follows = true;
++}
++
++static bool soc_fault(struct soc *soc)
++{
++    soc->calls++;
++    if (soc->fail_at && soc->calls == soc->fail_at) {
++        soc->failed_call = soc->calls;
++        return true;
++    }
++    return false;
++}
++
++static bool soc_uart(uint64_t pa)
++{
++    return pa >= FUXI_BT_UART_BASE && pa < FUXI_BT_UART_BASE + 0x4000u;
++}
++
++static bool soc_bt_on(struct soc *soc)
++{
++    return !soc->bt_en_dead && (soc_value(soc, TLMM_CTL(81)) & (1u << 9)) &&
++        (soc_value(soc, TLMM_IO(81)) & 2u);
++}
++
++/* 控制器只在時脈、腳位、BT_EN 全對時回應。 */
++static bool soc_controller_ready(struct soc *soc)
++{
++    return soc_bt_on(soc) &&
++        (soc_value(soc, GCC(0x52010)) & 0x40fu) == 0x40fu &&
++        (soc_value(soc, RCG(4)) & 0x371fu) == 0x2601u &&
++        (soc_value(soc, RCG(8)) & 0xffffu) == 384u &&
++        (soc_value(soc, RCG(12)) & 0xffffu) == 0xc476u &&
++        (soc_value(soc, RCG(16)) & 0xffffu) == 0xc2f6u &&
++        (soc_value(soc, TLMM_CTL(78)) & 0x3fcu) == 4u &&
++        (soc_value(soc, TLMM_CTL(79)) & 0x3fcu) == 4u;
++}
++
++static void soc_step(struct soc *soc)
++{
++    static const uint8_t reply[] = {
++        4, 0x0e, 18, 1, 0, 0xfc, 0, 0x19, 0,
++        0x78, 0x56, 0x34, 0x12, 0xbc, 0x9a, 0x20, 0,
++        0x44, 0x33, 0x22, 0x11
++    };
++    model_tx_step(&soc->uart);
++    if (!soc->replied && soc->uart.wire_size == 5 && soc_controller_ready(soc)) {
++        assert(!memcmp(soc->uart.wire, (uint8_t[]){1, 0, 0xfc, 1, 0x19}, 5));
++        model_rx_load(&soc->uart, reply, sizeof(reply));
++        soc->replied = true;
++    }
++}
++
++static enum fuxi_bt_status soc_read(void *context, uint64_t pa, uint32_t *value)
++{
++    struct soc *soc = context;
++    struct soc_reg *reg;
++    uint32_t result;
++    assert(!(pa & 3));
++    if (soc_fault(soc)) {
++        return FUXI_BT_IO;
++    }
++    if (soc_uart(pa)) {
++        return model_read(&soc->uart, (uint32_t)(pa - FUXI_BT_UART_BASE), value);
++    }
++    reg = soc_find(soc, pa);
++    result = reg->value;
++    for (unsigned index = 0; index < 5; index++) {
++        if (pa == GCC(branch_offsets[index])) {
++            const bool hwcg = result & 2u;
++            if (hwcg || !(soc_value(soc, GCC(0x52010)) & branch_votes[index]) ||
++                (soc->branch_stuck && index == 4)) {
++                result |= 1u << 31;
++            }
++        }
++    }
++    if (pa == RCG(0)) {
++        result &= ~((1u << 31) | 1u);
++        if (soc->rcg_pending) {
++            result |= 1u;
++            if (!soc->rcg_stuck) {
++                soc->rcg_pending--;
++            }
++        }
++        if (!(soc_value(soc, GCC(0x52010)) & (1u << 10)) || soc->rcg_root_off) {
++            result |= 1u << 31;
++        }
++    }
++    if (pa == TLMM_IO(81)) {
++        result = (result & 2u) | (soc_bt_on(soc) ? 1u : 0u);
++        soc->bt_en_checked_at = soc->uart.clock;
++    } else if (pa == TLMM_IO(80)) {
++        result |= (result >> 1) & 1u;
++    } else if (pa == TLMM_IO(82) && soc->sw_ctrl_follows) {
++        result = soc_bt_on(soc) ? 1u : 0u;
++    }
++    *value = result;
++    return FUXI_BT_OK;
++}
++
++static enum fuxi_bt_status soc_write(void *context, uint64_t pa, uint32_t value)
++{
++    struct soc *soc = context;
++    struct soc_reg *reg;
++    assert(!(pa & 3));
++    if (soc_fault(soc)) {
++        return FUXI_BT_IO;
++    }
++    if (soc_uart(pa)) {
++        return model_write(&soc->uart, (uint32_t)(pa - FUXI_BT_UART_BASE), value);
++    }
++    reg = soc_find(soc, pa);
++    assert(reg->writable);
++    reg->writes++;
++    if (pa == RCG(0)) {
++        assert(!(value & ~((1u << 31) | 1u)));
++        if (value & 1u) {
++            soc->rcg_pending = 2;
++        }
++        return FUXI_BT_OK;
++    }
++    if (pa == RCG(4) && soc->rcg_ignore_cfg) {
++        return FUXI_BT_OK;
++    }
++    if (pa == TLMM_CTL(78) && soc->pin_stuck) {
++        return FUXI_BT_OK;
++    }
++    if (pa == TLMM_IO(81)) {
++        assert(!(value & ~2u));
++        if (value & 2u) {
++            soc->bt_en_high_at = soc->uart.clock;
++            soc->bt_en_high_writes++;
++        }
++    }
++    if (pa == TLMM_CTL(81) && (value & (1u << 9)) && !(soc_value(soc, TLMM_IO(81)) & 2u)) {
++        soc->bt_en_low_at = soc->uart.clock;
++    }
++    reg->value = value;
++    return FUXI_BT_OK;
++}
++
++static uint64_t soc_now(void *context)
++{
++    return ((struct soc *)context)->uart.clock;
++}
++
++static void soc_wait(void *context, unsigned microseconds)
++{
++    struct soc *soc = context;
++    soc->uart.clock += microseconds;
++    soc_step(soc);
++}
++
++static struct fuxi_bt_board_io soc_io(struct soc *soc)
++{
++    struct fuxi_bt_board_io io = {soc, soc_read, soc_write, soc_now, soc_wait};
++    return io;
++}
++
++/* GCC／TLMM 全部回到原值（RCG CMD 只比可寫位元）。 */
++static void soc_assert_restored(struct soc *soc, uint64_t except)
++{
++    for (unsigned index = 0; index < soc->count; index++) {
++        const struct soc_reg *reg = &soc->regs[index];
++        if (reg->pa != except) {
++            assert(reg->value == reg->original);
++        }
++    }
++}
++
++static void soc_assert_untouched(struct soc *soc)
++{
++    for (unsigned index = 0; index < soc->count; index++) {
++        assert(!soc->regs[index].writes);
++    }
++    assert(!soc->uart.writes);
++}
++
++static void test_success(void)
++{
++    struct soc soc;
++    struct fuxi_bt_board board;
++    struct fuxi_bt_board_io io;
++    struct fuxi_bt_uart_ops ops;
++    struct fuxi_bt_result result;
++    bool ready = false;
++    soc_init(&soc);
++    io = soc_io(&soc);
++    assert(fuxi_bt_board_wlan_ready(&io, &ready) == FUXI_BT_OK && ready);
++    assert(fuxi_bt_board_power_on(&board, &io) == FUXI_BT_OK);
++    assert(board.stage == FUXI_BT_STAGE_READY && board.error == FUXI_BT_OK);
++    assert(board.vote == 0x10000u && board.added_votes == 0x40fu);
++    assert(soc_value(&soc, GCC(0x52010)) == 0x1040fu);
++    assert(board.rcg_saved[0] == 0x100000u && board.rcg_cfg == 0x102601u);
++    assert(soc_value(&soc, RCG(4)) == 0x102601u);
++    assert(soc_value(&soc, RCG(8)) == 0x10180u);
++    assert(soc_value(&soc, RCG(12)) == 0x2c476u);
++    assert(soc_value(&soc, RCG(16)) == 0x3c2f6u);
++    assert(soc_value(&soc, TLMM_CTL(76)) == 0x805u && soc_value(&soc, TLMM_CTL(77)) == 0x805u);
++    assert(soc_value(&soc, TLMM_CTL(78)) == 0x807u && soc_value(&soc, TLMM_CTL(79)) == 0x807u);
++    assert(soc_value(&soc, TLMM_CTL(81)) == 0xa01u && soc_value(&soc, TLMM_IO(81)) == 2u);
++    assert(board.qup_version == 0x30090000u && board.firmware == 0x204u);
++    assert(!board.sw_ctrl_before && board.sw_ctrl_after == 1u);
++    assert(soc.bt_en_high_writes == 1);
++    assert(soc.bt_en_high_at - soc.bt_en_low_at >= FUXI_BT_BT_EN_LOW_US);
++    assert(soc.bt_en_checked_at - soc.bt_en_high_at >= FUXI_BT_POWERUP_US);
++    assert(!soc.uart.writes);
++    fuxi_bt_board_uart_ops(&board, &ops);
++    assert(fuxi_bt_uart_ops_valid(&ops));
++    assert(fuxi_bt_probe_run(1, &ops, &result) == FUXI_BT_OK);
++    assert(result.version_valid && result.cleanup == FUXI_BT_OK && result.tx_bytes == 5);
++    assert(result.version.product == 0x12345678u && result.version.soc == 0x11223344u);
++    assert(result.version.rom == 0x20u && result.version.patch == 0x9abcu);
++    assert(board.fifo.tx_completed == 5 && board.fifo.restored && board.fifo.quiescent);
++    assert(!board.fifo_used);
++    for (unsigned index = 0; index < sizeof(saved_regs) / sizeof(saved_regs[0]); index++) {
++        assert(soc.uart.regs[saved_regs[index] / 4] == soc.uart.original[saved_regs[index] / 4]);
++    }
++    assert(fuxi_bt_board_power_off(&board) == FUXI_BT_OK);
++    soc_assert_restored(&soc, 0);
++    assert(!board.votes_changed && !board.rcg_changed && !board.pins_changed && !board.bt_en_changed);
++    assert(fuxi_bt_board_power_off(&board) == FUXI_BT_OK);
++    puts("PASS board success: GPLL0 gate, 5 votes, HWCG skip, RCG 7.3728 MHz M/N/D/CFG, pinmux, BT_EN 50+100 ms, QCA version over the FIFO driver, full restore");
++}
++
++static void test_vote_already_present(void)
++{
++    struct soc soc;
++    struct fuxi_bt_board board;
++    struct fuxi_bt_board_io io;
++    soc_init(&soc);
++    soc_find(&soc, GCC(0x52010))->value = soc_find(&soc, GCC(0x52010))->original = 0x1040fu;
++    io = soc_io(&soc);
++    assert(fuxi_bt_board_power_on(&board, &io) == FUXI_BT_OK);
++    assert(!board.added_votes && !board.votes_changed);
++    assert(fuxi_bt_board_power_off(&board) == FUXI_BT_OK);
++    assert(!soc_find(&soc, GCC(0x52010))->writes);
++    soc_assert_restored(&soc, 0);
++}
++
++typedef void (*soc_setup)(struct soc *);
++static void setup_wlan_off(struct soc *soc) { soc_find(soc, TLMM_IO(80))->value = 0; }
++static void setup_wlan_func(struct soc *soc) { soc_find(soc, TLMM_CTL(80))->value = 0x204u; }
++static void setup_wlan_input(struct soc *soc) { soc_find(soc, TLMM_CTL(80))->value = 0; }
++static void setup_gpll0_vote(struct soc *soc) { soc_find(soc, GCC(0x52018))->value = 0; }
++static void setup_gpll0_lock(struct soc *soc) { soc_find(soc, GCC(0x0))->value = 7u; }
++static void setup_gpll0_even(struct soc *soc) { soc_find(soc, GCC(0x18))->value = 0x401u; }
++static void setup_gpll0_div(struct soc *soc) { soc_find(soc, GCC(0x18))->value = 0x003u; }
++static void setup_branch(struct soc *soc) { soc->branch_stuck = true; }
++static void setup_rcg_busy(struct soc *soc) { soc->rcg_pending = 1; soc->rcg_stuck = true; }
++static void setup_rcg_stuck(struct soc *soc) { soc->rcg_stuck = true; }
++static void setup_rcg_cfg(struct soc *soc) { soc->rcg_ignore_cfg = true; }
++static void setup_rcg_off(struct soc *soc) { soc->rcg_root_off = true; }
++static void setup_wrapper_zero(struct soc *soc) { soc_find(soc, FUXI_BT_WRAPPER_BASE + 4u)->value = 0; }
++static void setup_wrapper_ones(struct soc *soc) { soc_find(soc, FUXI_BT_WRAPPER_BASE + 4u)->value = ~0u; }
++static void setup_protocol(struct soc *soc) { soc->uart.regs[0x68 / 4] = 0x104u; }
++static void setup_disabled(struct soc *soc) { soc->uart.regs[0x64 / 4] = 1u; }
++static void setup_pin(struct soc *soc) { soc->pin_stuck = true; }
++static void setup_bt_en(struct soc *soc) { soc->bt_en_dead = true; }
++
++static void test_refusals(void)
++{
++    static const struct {
++        soc_setup setup;
++        enum fuxi_bt_status status;
++        enum fuxi_bt_board_stage stage;
++        enum fuxi_bt_status cleanup;
++        bool writes;
++    } cases[] = {
++        {setup_wlan_off, FUXI_BT_OFF, FUXI_BT_STAGE_WLAN, FUXI_BT_OK, false},
++        {setup_wlan_func, FUXI_BT_OFF, FUXI_BT_STAGE_WLAN, FUXI_BT_OK, false},
++        {setup_wlan_input, FUXI_BT_OFF, FUXI_BT_STAGE_WLAN, FUXI_BT_OK, false},
++        {setup_gpll0_vote, FUXI_BT_NO_UART, FUXI_BT_STAGE_GPLL0, FUXI_BT_OK, false},
++        {setup_gpll0_lock, FUXI_BT_NO_UART, FUXI_BT_STAGE_GPLL0, FUXI_BT_OK, false},
++        {setup_gpll0_even, FUXI_BT_NO_UART, FUXI_BT_STAGE_GPLL0, FUXI_BT_OK, false},
++        {setup_gpll0_div, FUXI_BT_NO_UART, FUXI_BT_STAGE_GPLL0, FUXI_BT_OK, false},
++        {setup_branch, FUXI_BT_TIMEOUT, FUXI_BT_STAGE_BRANCH, FUXI_BT_OK, true},
++        {setup_rcg_busy, FUXI_BT_BUSY, FUXI_BT_STAGE_RCG, FUXI_BT_OK, true},
++        {setup_rcg_stuck, FUXI_BT_TIMEOUT, FUXI_BT_STAGE_RCG, FUXI_BT_TIMEOUT, true},
++        {setup_rcg_cfg, FUXI_BT_IO, FUXI_BT_STAGE_RCG, FUXI_BT_OK, true},
++        {setup_rcg_off, FUXI_BT_OFF, FUXI_BT_STAGE_RCG, FUXI_BT_OK, true},
++        {setup_wrapper_zero, FUXI_BT_NO_UART, FUXI_BT_STAGE_WRAPPER, FUXI_BT_OK, true},
++        {setup_wrapper_ones, FUXI_BT_NO_UART, FUXI_BT_STAGE_WRAPPER, FUXI_BT_OK, true},
++        {setup_protocol, FUXI_BT_NO_UART, FUXI_BT_STAGE_ENGINE, FUXI_BT_OK, true},
++        {setup_disabled, FUXI_BT_NO_UART, FUXI_BT_STAGE_ENGINE, FUXI_BT_OK, true},
++        {setup_pin, FUXI_BT_IO, FUXI_BT_STAGE_PINS, FUXI_BT_OK, true},
++        {setup_bt_en, FUXI_BT_IO, FUXI_BT_STAGE_BT_EN, FUXI_BT_OK, true},
++    };
++    for (unsigned index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
++        struct soc soc;
++        struct fuxi_bt_board board;
++        struct fuxi_bt_board_io io;
++        struct fuxi_bt_uart_ops ops;
++        soc_init(&soc);
++        cases[index].setup(&soc);
++        for (unsigned reg = 0; reg < soc.count; reg++) {
++            soc.regs[reg].original = soc.regs[reg].value;
++        }
++        io = soc_io(&soc);
++        assert(fuxi_bt_board_power_on(&board, &io) == cases[index].status);
++        assert(board.stage == cases[index].stage && board.error == cases[index].status);
++        if (!cases[index].writes) {
++            soc_assert_untouched(&soc);
++        }
++        if (cases[index].stage < FUXI_BT_STAGE_BT_EN) {
++            assert(!soc.bt_en_high_writes && !soc_find(&soc, TLMM_CTL(81))->writes);
++        }
++        fuxi_bt_board_uart_ops(&board, &ops);
++        assert(ops.acquire(ops.context, FUXI_BT_BOOT_BAUD) == FUXI_BT_NO_UART);
++        assert(fuxi_bt_board_power_off(&board) == cases[index].cleanup);
++        soc_assert_restored(&soc, 0);
++        assert(!soc.uart.writes);
++    }
++    printf("PASS board refusals: %u stage gates (WLAN_EN, GPLL0, branch, RCG busy/stuck/readback/root-off, wrapper, SE protocol/disable, pinmux readback, BT_EN) each restore\n",
++        (unsigned)(sizeof(cases) / sizeof(cases[0])));
++}
++
++static void test_guards(void)
++{
++    struct soc soc;
++    struct fuxi_bt_board board;
++    struct fuxi_bt_board_io io, broken;
++    struct fuxi_bt_uart_ops ops;
++    bool ready = true;
++    size_t count = 0;
++    uint8_t byte = 0;
++    soc_init(&soc);
++    io = soc_io(&soc);
++    assert(fuxi_bt_board_wlan_ready(NULL, &ready) == FUXI_BT_ARGUMENT);
++    assert(fuxi_bt_board_wlan_ready(&io, NULL) == FUXI_BT_ARGUMENT);
++    assert(fuxi_bt_board_power_on(NULL, &io) == FUXI_BT_ARGUMENT);
++    assert(fuxi_bt_board_power_on(&board, NULL) == FUXI_BT_ARGUMENT);
++    broken = io;
++    broken.write = NULL;
++    assert(fuxi_bt_board_power_on(&board, &broken) == FUXI_BT_ARGUMENT);
++    broken = io;
++    broken.wait_us = NULL;
++    assert(fuxi_bt_board_power_on(&board, &broken) == FUXI_BT_ARGUMENT);
++    memset(&board, 0, sizeof(board));
++    assert(fuxi_bt_board_power_off(&board) == FUXI_BT_ARGUMENT);
++    assert(fuxi_bt_board_power_off(NULL) == FUXI_BT_ARGUMENT);
++    assert(!strcmp(fuxi_bt_board_stage_name(FUXI_BT_STAGE_READY), "ready"));
++    assert(!strcmp(fuxi_bt_board_stage_name((enum fuxi_bt_board_stage)99), "unknown"));
++    fuxi_bt_board_uart_ops(NULL, &ops);
++    assert(!ops.context && !ops.acquire);
++    fuxi_bt_board_uart_ops(&board, NULL);
++    soc_assert_untouched(&soc);
++    assert(fuxi_bt_board_power_on(&board, &io) == FUXI_BT_OK);
++    fuxi_bt_board_uart_ops(&board, &ops);
++    assert(ops.release(ops.context) == FUXI_BT_OK);
++    assert(ops.acquire(ops.context, 9600) == FUXI_BT_ARGUMENT);
++    assert(!soc.uart.writes);
++    assert(ops.acquire(ops.context, FUXI_BT_BOOT_BAUD) == FUXI_BT_OK);
++    assert(board.fifo_used && board.fifo.state == FUXI_BT_FIFO_OPEN);
++    assert(ops.acquire(ops.context, FUXI_BT_BOOT_BAUD) == FUXI_BT_BUSY);
++    assert(ops.read(ops.context, &byte, 1, &count) == FUXI_BT_AGAIN && !count);
++    assert(ops.now_us(ops.context) == soc.uart.clock);
++    /* power_off 在 FIFO 還開著時先關 FIFO，再還原板級設定。 */
++    assert(fuxi_bt_board_power_off(&board) == FUXI_BT_OK);
++    assert(!board.fifo_used && board.fifo.restored);
++    soc_assert_restored(&soc, 0);
++    for (unsigned index = 0; index < sizeof(saved_regs) / sizeof(saved_regs[0]); index++) {
++        assert(soc.uart.regs[saved_regs[index] / 4] == soc.uart.original[saved_regs[index] / 4]);
++    }
++    /* 模型本身的 helper 與共用設定。 */
++    assert(model_io(&soc.uart).read == model_read && model_now(&soc.uart) == soc.uart.clock);
++    assert(config.source_hz == FUXI_BT_SE_HZ && config.qup_version == board.qup_version);
++    puts("PASS board guards: NULL/incomplete callbacks, stage names, ops before READY, baud check, double acquire, power_off closing an open FIFO");
++}
++
++static void test_no_reply(void)
++{
++    struct soc soc;
++    struct fuxi_bt_board board;
++    struct fuxi_bt_board_io io;
++    struct fuxi_bt_uart_ops ops;
++    struct fuxi_bt_result result;
++    soc_init(&soc);
++    soc.uart.cts_blocked = true; /* 控制器沒拉 CTS：TX 卡住 */
++    io = soc_io(&soc);
++    assert(fuxi_bt_board_power_on(&board, &io) == FUXI_BT_OK);
++    fuxi_bt_board_uart_ops(&board, &ops);
++    assert(fuxi_bt_probe_run(1, &ops, &result) != FUXI_BT_OK);
++    assert(!result.version_valid && !board.fifo_used && result.cleanup == FUXI_BT_OK);
++    assert(fuxi_bt_board_power_off(&board) == FUXI_BT_OK);
++    soc_assert_restored(&soc, 0);
++    printf("PASS board no-reply: CTS held -> probe %s cleanup %s after %llu us, board restored\n",
++        fuxi_bt_status_name(result.status), fuxi_bt_status_name(result.cleanup),
++        (unsigned long long)result.elapsed_us);
++}
++
++/* 每一次 MMIO 呼叫都注入一次失敗：power_on／probe 階段的失敗都要能完整還原，清理階段的失敗要回報。 */
++static void test_faults(void)
++{
++    struct soc soc;
++    struct fuxi_bt_board board;
++    struct fuxi_bt_board_io io;
++    struct fuxi_bt_uart_ops ops;
++    struct fuxi_bt_result result;
++    unsigned total, before_off, early = 0, cleanup_faults = 0;
++    soc_init(&soc);
++    io = soc_io(&soc);
++    assert(fuxi_bt_board_power_on(&board, &io) == FUXI_BT_OK);
++    fuxi_bt_board_uart_ops(&board, &ops);
++    assert(fuxi_bt_probe_run(1, &ops, &result) == FUXI_BT_OK);
++    before_off = soc.calls;
++    assert(fuxi_bt_board_power_off(&board) == FUXI_BT_OK);
++    total = soc.calls;
++    for (unsigned fail = 1; fail <= total; fail++) {
++        enum fuxi_bt_status status, cleanup;
++        uint64_t failed_pa = 0;
++        soc_init(&soc);
++        soc.fail_at = fail;
++        io = soc_io(&soc);
++        status = fuxi_bt_board_power_on(&board, &io);
++        if (status == FUXI_BT_OK) {
++            fuxi_bt_board_uart_ops(&board, &ops);
++            (void)fuxi_bt_probe_run(1, &ops, &result);
++        }
++        before_off = soc.calls;
++        cleanup = fuxi_bt_board_power_off(&board);
++        assert(soc.failed_call == fail);
++        if (fail <= before_off) {
++            early++;
++            assert(cleanup == FUXI_BT_OK || board.fifo.io_fault || result.cleanup != FUXI_BT_OK ||
++                board.fifo.state == FUXI_BT_FIFO_CLOSE_FAILED);
++            soc_assert_restored(&soc, 0);
++        } else {
++            cleanup_faults++;
++            assert(cleanup != FUXI_BT_OK);
++            for (unsigned index = 0; index < soc.count; index++) {
++                if (soc.regs[index].value != soc.regs[index].original) {
++                    assert(!failed_pa);
++                    failed_pa = soc.regs[index].pa;
++                }
++            }
++            soc_assert_restored(&soc, failed_pa);
++        }
++        assert(!board.votes_changed && !board.rcg_changed && !board.pins_changed && !board.bt_en_changed);
++    }
++    printf("PASS board faults: %u MMIO fault sites (%u before restore fully undone, %u during restore reported)\n",
++        total, early, cleanup_faults);
++}
++
++int main(void)
++{
++    test_success();
++    test_vote_already_present();
++    test_refusals();
++    test_guards();
++    test_no_reply();
++    test_faults();
++    puts("PASS production WCN7850 board glue: success path, refusals, guards, no-reply and exhaustive MMIO faults");
++    return 0;
++}
++'''
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--sanitize", action="store_true")
++    parser.add_argument("--cc", nargs="+")
++    args = parser.parse_args()
++    sys.dont_write_bytecode = True
++    specification = importlib.util.spec_from_file_location(
++        "fuxi_bluetooth_host_compiler", ROOT / "tools" / "test-fuxi-bluetooth.py")
++    module = importlib.util.module_from_spec(specification)
++    specification.loader.exec_module(module)
++    fifo_specification = importlib.util.spec_from_file_location(
++        "fuxi_bt_geni_fifo_model", ROOT / "tools" / "test-fuxi-bt-geni-fifo.py")
++    fifo = importlib.util.module_from_spec(fifo_specification)
++    fifo_specification.loader.exec_module(fifo)
++    model = fifo.HARNESS[:fifo.HARNESS.index("static void open_ok(")]
++    compiler, environment = module.compiler_configuration(args.cc)
++    msvc = Path(compiler[0]).name.lower() in ("cl", "cl.exe")
++    if msvc and args.sanitize:
++        raise SystemExit("--sanitize requires Clang or GCC with ASan and UBSan.")
++    sources = [str(SOURCE / name) for name in ("fuxi_bt_board.c", "fuxi_bt_geni_fifo.c", "fuxi_bt.c")]
++    with tempfile.TemporaryDirectory(prefix="fuxi-bt-board-") as temporary:
++        directory = Path(temporary)
++        harness = directory / "board-model.c"
++        harness.write_text(model + BOARD, encoding="utf-8")
++        executable = directory / ("board-model.exe" if os.name == "nt" else "board-model")
++        if msvc:
++            command = compiler + [
++                "/nologo", "/std:c11", "/W4", "/WX", "/Od", "/D_CRT_SECURE_NO_WARNINGS",
++                f"/I{SOURCE}", *sources, str(harness), f"/Fe{executable}"
++            ]
++        else:
++            command = compiler + [
++                "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
++                "-I", str(SOURCE), *sources, str(harness), "-o", str(executable)
++            ]
++            if args.sanitize:
++                command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
++        subprocess.run(command, cwd=directory, env=environment, check=True)
++        subprocess.run([str(executable)], cwd=directory, env=environment, check=True, timeout=120)
++        print(f"Compiler {compiler[0]}")
++        print(f"Sanitizers {'ASan/UBSan' if args.sanitize else 'disabled'}")
++        print("GCC, TLMM, QUP wrapper, GENI FIFO traffic and the controller reply are emulated.")
 +
 +
 +if __name__ == "__main__":
@@ -29082,6 +29897,614 @@ index 0000000..0e23c8a
 +void fuxi_bt_init(void);
 +
 +#endif
+diff --git a/xnu/fuxi-bluetooth/fuxi_bt_board.c b/xnu/fuxi-bluetooth/fuxi_bt_board.c
+new file mode 100644
+index 0000000..aeb1a18
+--- /dev/null
++++ b/xnu/fuxi-bluetooth/fuxi_bt_board.c
+@@ -0,0 +1,501 @@
++#include "fuxi_bt_board.h"
++#include <string.h>
++
++/* TLMM：每支腳 0x1000；CTL 的 pull [1:0]、func [5:2]、drive [8:6]、OE bit 9；IO 的 IN bit 0、OUT bit 1。 */
++#define FUXI_BT_TLMM_CTL(pin) (FUXI_BT_TLMM_BASE + (uint64_t)(pin) * 0x1000u)
++#define FUXI_BT_TLMM_IO(pin) (FUXI_BT_TLMM_CTL(pin) + 4u)
++#define FUXI_BT_TLMM_FIELDS 0x3ffu
++#define FUXI_BT_PULL_DOWN 1u
++#define FUXI_BT_PULL_UP 3u
++#define FUXI_BT_TLMM_OE (1u << 9)
++#define FUXI_BT_TLMM_OUT 2u
++#define FUXI_BT_TLMM_IN 1u
++
++#define FUXI_BT_BRANCH_OFF (1u << 31)
++#define FUXI_BT_BRANCH_HWCG (1u << 1)
++#define FUXI_BT_RCG_UPDATE 1u
++#define FUXI_BT_RCG_ROOT_OFF (1u << 31)
++/* hid 除頻 [4:0]、來源 [10:8]、MND 模式 [13:12]；bit 20（HW_CLK_CTRL）保留 XBL 的設定。 */
++#define FUXI_BT_RCG_CFG_FIELDS 0x371fu
++/* F(7372800, P_GCC_GPLL0_OUT_EVEN, 1, 384, 15625)：pre_div 2*1-1、parent_map_8 來源 6、雙沿 MND。 */
++#define FUXI_BT_RCG_CFG_VALUE (1u | (6u << 8) | (2u << 12))
++#define FUXI_BT_MND_MASK 0xffffu
++#define FUXI_BT_MND_M 384u
++#define FUXI_BT_MND_N 15625u
++
++static const uint32_t fuxi_bt_board_branches[] = {0x233d4, 0x233d0, 0x233cc, 0x23004, 0x1e754};
++
++const char *fuxi_bt_board_stage_name(enum fuxi_bt_board_stage stage)
++{
++    static const char *const names[] = {
++        "idle", "wlan", "gpll0", "vote", "branch", "rcg", "wrapper",
++        "engine", "pins", "bt-en", "ready"
++    };
++    if ((unsigned)stage >= sizeof(names) / sizeof(names[0])) {
++        return "unknown";
++    }
++    return names[stage];
++}
++
++static bool fuxi_bt_board_read(struct fuxi_bt_board *board, uint64_t pa, uint32_t *value)
++{
++    if (board->io.read(board->io.context, pa, value) == FUXI_BT_OK) {
++        return true;
++    }
++    if (board->error == FUXI_BT_OK) {
++        board->error = FUXI_BT_IO;
++        board->failed_value = (uint32_t)pa;
++    }
++    return false;
++}
++
++static bool fuxi_bt_board_write(struct fuxi_bt_board *board, uint64_t pa, uint32_t value)
++{
++    if (board->io.write(board->io.context, pa, value) == FUXI_BT_OK) {
++        return true;
++    }
++    if (board->error == FUXI_BT_OK) {
++        board->error = FUXI_BT_IO;
++        board->failed_value = (uint32_t)pa;
++    }
++    return false;
++}
++
++static enum fuxi_bt_status fuxi_bt_board_fail(struct fuxi_bt_board *board,
++    enum fuxi_bt_status status, uint32_t value)
++{
++    if (board->error == FUXI_BT_OK) {
++        board->error = status;
++        board->failed_value = value;
++    }
++    return board->error;
++}
++
++enum fuxi_bt_status fuxi_bt_board_wlan_ready(const struct fuxi_bt_board_io *io, bool *ready)
++{
++    uint32_t ctl, value;
++    enum fuxi_bt_status status;
++    if (!io || !io->read || !ready) {
++        return FUXI_BT_ARGUMENT;
++    }
++    *ready = false;
++    status = io->read(io->context, FUXI_BT_TLMM_CTL(FUXI_BT_GPIO_WLAN_EN), &ctl);
++    if (status != FUXI_BT_OK) {
++        return status;
++    }
++    status = io->read(io->context, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_WLAN_EN), &value);
++    if (status != FUXI_BT_OK) {
++        return status;
++    }
++    *ready = !((ctl >> 2) & 0xfu) && (ctl & FUXI_BT_TLMM_OE) && (value & FUXI_BT_TLMM_OUT);
++    return FUXI_BT_OK;
++}
++
++/* 投票後等五個分支開：hwcg 開著的分支（s_ahb、m_ahb）閒置時可能仍回報 off，比照 Linux 跳過。 */
++static enum fuxi_bt_status fuxi_bt_board_branches_wait(struct fuxi_bt_board *board)
++{
++    for (unsigned attempt = 0; attempt <= FUXI_BT_BRANCH_TIMEOUT_US / 10u; attempt++) {
++        uint32_t pending = 0, value = 0;
++        for (unsigned index = 0; index < 5; index++) {
++            if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + fuxi_bt_board_branches[index], &value)) {
++                return board->error;
++            }
++            if ((value & FUXI_BT_BRANCH_OFF) && !(value & FUXI_BT_BRANCH_HWCG)) {
++                pending = value;
++            }
++        }
++        if (!pending) {
++            return FUXI_BT_OK;
++        }
++        if (attempt == FUXI_BT_BRANCH_TIMEOUT_US / 10u) {
++            return fuxi_bt_board_fail(board, FUXI_BT_TIMEOUT, pending);
++        }
++        board->io.wait_us(board->io.context, 10);
++    }
++    return fuxi_bt_board_fail(board, FUXI_BT_TIMEOUT, 0);
++}
++
++static enum fuxi_bt_status fuxi_bt_board_rcg_update(struct fuxi_bt_board *board)
++{
++    uint32_t command = 0;
++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command) ||
++        !fuxi_bt_board_write(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, command | FUXI_BT_RCG_UPDATE)) {
++        return board->error;
++    }
++    for (unsigned attempt = 0; attempt <= FUXI_BT_RCG_TIMEOUT_US / 10u; attempt++) {
++        if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command)) {
++            return board->error;
++        }
++        if (!(command & FUXI_BT_RCG_UPDATE)) {
++            return FUXI_BT_OK;
++        }
++        if (attempt < FUXI_BT_RCG_TIMEOUT_US / 10u) {
++            board->io.wait_us(board->io.context, 10);
++        }
++    }
++    return fuxi_bt_board_fail(board, FUXI_BT_TIMEOUT, command);
++}
++
++static enum fuxi_bt_status fuxi_bt_board_rcg(struct fuxi_bt_board *board)
++{
++    static const uint32_t offsets[] = {4, 8, 12, 16};
++    uint32_t command = 0, values[4];
++    enum fuxi_bt_status status;
++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command)) {
++        return board->error;
++    }
++    if (command & FUXI_BT_RCG_UPDATE) {
++        return fuxi_bt_board_fail(board, FUXI_BT_BUSY, command);
++    }
++    for (unsigned index = 0; index < 4; index++) {
++        if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + offsets[index],
++            &board->rcg_saved[index])) {
++            return board->error;
++        }
++    }
++    values[0] = (board->rcg_saved[0] & ~FUXI_BT_RCG_CFG_FIELDS) | FUXI_BT_RCG_CFG_VALUE;
++    values[1] = (board->rcg_saved[1] & ~FUXI_BT_MND_MASK) | FUXI_BT_MND_M;
++    values[2] = (board->rcg_saved[2] & ~FUXI_BT_MND_MASK) |
++        (~(FUXI_BT_MND_N - FUXI_BT_MND_M) & FUXI_BT_MND_MASK);
++    values[3] = (board->rcg_saved[3] & ~FUXI_BT_MND_MASK) | (~FUXI_BT_MND_N & FUXI_BT_MND_MASK);
++    board->rcg_changed = true;
++    /* 和 Linux 一樣先寫 M/N/D 再寫 CFG，最後 CMD_UPDATE。 */
++    for (unsigned index = 1; index < 4; index++) {
++        if (!fuxi_bt_board_write(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + offsets[index], values[index])) {
++            return board->error;
++        }
++    }
++    if (!fuxi_bt_board_write(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + 4, values[0])) {
++        return board->error;
++    }
++    status = fuxi_bt_board_rcg_update(board);
++    if (status != FUXI_BT_OK) {
++        return status;
++    }
++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + 4, &board->rcg_cfg) ||
++        !fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command)) {
++        return board->error;
++    }
++    if ((board->rcg_cfg & FUXI_BT_RCG_CFG_FIELDS) != FUXI_BT_RCG_CFG_VALUE) {
++        return fuxi_bt_board_fail(board, FUXI_BT_IO, board->rcg_cfg);
++    }
++    if (command & FUXI_BT_RCG_ROOT_OFF) {
++        return fuxi_bt_board_fail(board, FUXI_BT_OFF, command);
++    }
++    return FUXI_BT_OK;
++}
++
++enum fuxi_bt_status fuxi_bt_board_power_on(struct fuxi_bt_board *board,
++    const struct fuxi_bt_board_io *io)
++{
++    uint32_t value = 0;
++    bool ready = false;
++    enum fuxi_bt_status status;
++    if (!board || !io || !io->read || !io->write || !io->now_us || !io->wait_us) {
++        return FUXI_BT_ARGUMENT;
++    }
++    memset(board, 0, sizeof(*board));
++    board->io = *io;
++
++    board->stage = FUXI_BT_STAGE_WLAN;
++    status = fuxi_bt_board_wlan_ready(io, &ready);
++    if (status != FUXI_BT_OK) {
++        return fuxi_bt_board_fail(board, status, 0);
++    }
++    if (!ready) {
++        return fuxi_bt_board_fail(board, FUXI_BT_OFF, 0);
++    }
++
++    board->stage = FUXI_BT_STAGE_GPLL0;
++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_GPLL0_VOTE, &value) ||
++        !fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_GPLL0_MODE, &board->gpll0_mode) ||
++        !fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_GPLL0_USER, &board->gpll0_user)) {
++        return board->error;
++    }
++    /* GPLL0 已投票、已鎖定，EVEN 輸出開著且後除 2（300 MHz）；不是就不動它。 */
++    if (!(value & 1u) || !(board->gpll0_mode & (1u << 31)) ||
++        !(board->gpll0_user & 2u) || ((board->gpll0_user >> 10) & 0xfu) != 1u) {
++        return fuxi_bt_board_fail(board, FUXI_BT_NO_UART, board->gpll0_user);
++    }
++
++    board->stage = FUXI_BT_STAGE_VOTE;
++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_VOTE_REG, &board->vote)) {
++        return board->error;
++    }
++    board->added_votes = FUXI_BT_VOTE_BITS & ~board->vote;
++    if (board->added_votes) {
++        board->votes_changed = true;
++        if (!fuxi_bt_board_write(board, FUXI_BT_GCC_BASE + FUXI_BT_VOTE_REG,
++            board->vote | FUXI_BT_VOTE_BITS)) {
++            return board->error;
++        }
++    }
++
++    board->stage = FUXI_BT_STAGE_BRANCH;
++    status = fuxi_bt_board_branches_wait(board);
++    if (status != FUXI_BT_OK) {
++        return status;
++    }
++
++    board->stage = FUXI_BT_STAGE_RCG;
++    status = fuxi_bt_board_rcg(board);
++    if (status != FUXI_BT_OK) {
++        return status;
++    }
++
++    board->stage = FUXI_BT_STAGE_WRAPPER;
++    if (!fuxi_bt_board_read(board, FUXI_BT_WRAPPER_BASE + 4, &board->qup_version)) {
++        return board->error;
++    }
++    if (!board->qup_version || board->qup_version == 0xffffffffu) {
++        return fuxi_bt_board_fail(board, FUXI_BT_NO_UART, board->qup_version);
++    }
++
++    board->stage = FUXI_BT_STAGE_ENGINE;
++    if (!fuxi_bt_board_read(board, FUXI_BT_UART_BASE + FUXI_BT_FIFO_FIRMWARE, &board->firmware) ||
++        !fuxi_bt_board_read(board, FUXI_BT_UART_BASE + FUXI_BT_FIFO_IF_DISABLE, &value)) {
++        return board->error;
++    }
++    if (((board->firmware >> 8) & 0xffu) != 2u) {
++        return fuxi_bt_board_fail(board, FUXI_BT_NO_UART, board->firmware);
++    }
++    if (value & 1u) {
++        return fuxi_bt_board_fail(board, FUXI_BT_NO_UART, value);
++    }
++
++    /* sm8550.dtsi qup_uart14：CTS/RTS 下拉、TX/RX 上拉，2 mA，function qup2_se6（1）。 */
++    board->stage = FUXI_BT_STAGE_PINS;
++    for (unsigned index = 0; index < 4; index++) {
++        const unsigned pin = FUXI_BT_GPIO_UART_FIRST + index;
++        if (!fuxi_bt_board_read(board, FUXI_BT_TLMM_CTL(pin), &board->pin_ctl[index])) {
++            return board->error;
++        }
++    }
++    board->pins_changed = true;
++    for (unsigned index = 0; index < 4; index++) {
++        const unsigned pin = FUXI_BT_GPIO_UART_FIRST + index;
++        const uint32_t wanted = (index < 2 ? FUXI_BT_PULL_DOWN : FUXI_BT_PULL_UP) | (1u << 2);
++        uint32_t readback = 0;
++        if (!fuxi_bt_board_write(board, FUXI_BT_TLMM_CTL(pin),
++                (board->pin_ctl[index] & ~FUXI_BT_TLMM_FIELDS) | wanted) ||
++            !fuxi_bt_board_read(board, FUXI_BT_TLMM_CTL(pin), &readback)) {
++            return board->error;
++        }
++        if ((readback & FUXI_BT_TLMM_FIELDS) != wanted) {
++            return fuxi_bt_board_fail(board, FUXI_BT_IO, readback);
++        }
++    }
++
++    board->stage = FUXI_BT_STAGE_BT_EN;
++    if (!fuxi_bt_board_read(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_SW_CTRL), &value) ||
++        !fuxi_bt_board_read(board, FUXI_BT_TLMM_CTL(FUXI_BT_GPIO_BT_EN), &board->bt_en_ctl) ||
++        !fuxi_bt_board_read(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_BT_EN), &board->bt_en_io)) {
++        return board->error;
++    }
++    board->sw_ctrl_before = value & FUXI_BT_TLMM_IN;
++    board->bt_en_changed = true;
++    if (!fuxi_bt_board_write(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_BT_EN), 0) ||
++        !fuxi_bt_board_write(board, FUXI_BT_TLMM_CTL(FUXI_BT_GPIO_BT_EN),
++            (board->bt_en_ctl & ~FUXI_BT_TLMM_FIELDS) | FUXI_BT_PULL_DOWN | FUXI_BT_TLMM_OE)) {
++        return board->error;
++    }
++    board->io.wait_us(board->io.context, FUXI_BT_BT_EN_LOW_US);
++    if (!fuxi_bt_board_write(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_BT_EN), FUXI_BT_TLMM_OUT)) {
++        return board->error;
++    }
++    board->io.wait_us(board->io.context, FUXI_BT_POWERUP_US);
++    if (!fuxi_bt_board_read(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_BT_EN), &value)) {
++        return board->error;
++    }
++    if (!(value & FUXI_BT_TLMM_IN)) {
++        return fuxi_bt_board_fail(board, FUXI_BT_IO, value);
++    }
++    if (!fuxi_bt_board_read(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_SW_CTRL), &value)) {
++        return board->error;
++    }
++    board->sw_ctrl_after = value & FUXI_BT_TLMM_IN;
++    board->stage = FUXI_BT_STAGE_READY;
++    return FUXI_BT_OK;
++}
++
++static enum fuxi_bt_status fuxi_bt_board_cleanup_write(struct fuxi_bt_board *board,
++    uint64_t pa, uint32_t value, enum fuxi_bt_status *cleanup)
++{
++    if (board->io.write(board->io.context, pa, value) != FUXI_BT_OK && *cleanup == FUXI_BT_OK) {
++        *cleanup = FUXI_BT_IO;
++    }
++    return *cleanup;
++}
++
++static enum fuxi_bt_status fuxi_bt_board_release(void *context);
++
++enum fuxi_bt_status fuxi_bt_board_power_off(struct fuxi_bt_board *board)
++{
++    enum fuxi_bt_status cleanup = FUXI_BT_OK;
++    if (!board || !board->io.read || !board->io.write || !board->io.wait_us) {
++        return FUXI_BT_ARGUMENT;
++    }
++    if (board->fifo_used) {
++        cleanup = fuxi_bt_board_release(board);
++    }
++    if (board->bt_en_changed) {
++        (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_BT_EN), 0, &cleanup);
++        (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_TLMM_CTL(FUXI_BT_GPIO_BT_EN), board->bt_en_ctl, &cleanup);
++        (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_BT_EN),
++            board->bt_en_io & FUXI_BT_TLMM_OUT, &cleanup);
++        board->bt_en_changed = false;
++    }
++    if (board->pins_changed) {
++        for (unsigned index = 0; index < 4; index++) {
++            (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_TLMM_CTL(FUXI_BT_GPIO_UART_FIRST + index),
++                board->pin_ctl[index], &cleanup);
++        }
++        board->pins_changed = false;
++    }
++    if (board->rcg_changed) {
++        static const uint32_t offsets[] = {4, 8, 12, 16};
++        uint32_t command = 0;
++        bool updated = false;
++        for (unsigned index = 1; index < 4; index++) {
++            (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + offsets[index],
++                board->rcg_saved[index], &cleanup);
++        }
++        (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + 4,
++            board->rcg_saved[0], &cleanup);
++        if (board->io.read(board->io.context, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command) == FUXI_BT_OK &&
++            board->io.write(board->io.context, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD,
++                command | FUXI_BT_RCG_UPDATE) == FUXI_BT_OK) {
++            for (unsigned attempt = 0; attempt <= FUXI_BT_RCG_TIMEOUT_US / 10u; attempt++) {
++                if (board->io.read(board->io.context, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command) != FUXI_BT_OK) {
++                    break;
++                }
++                if (!(command & FUXI_BT_RCG_UPDATE)) {
++                    updated = true;
++                    break;
++                }
++                board->io.wait_us(board->io.context, 10);
++            }
++        }
++        if (!updated && cleanup == FUXI_BT_OK) {
++            cleanup = FUXI_BT_TIMEOUT;
++        }
++        board->rcg_changed = false;
++    }
++    if (board->votes_changed) {
++        uint32_t vote = 0;
++        if (board->io.read(board->io.context, FUXI_BT_GCC_BASE + FUXI_BT_VOTE_REG, &vote) != FUXI_BT_OK) {
++            if (cleanup == FUXI_BT_OK) {
++                cleanup = FUXI_BT_IO;
++            }
++        } else {
++            (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_GCC_BASE + FUXI_BT_VOTE_REG,
++                vote & ~board->added_votes, &cleanup);
++        }
++        board->votes_changed = false;
++    }
++    return cleanup;
++}
++
++static enum fuxi_bt_status fuxi_bt_board_se_read(void *context, uint32_t reg, uint32_t *value)
++{
++    struct fuxi_bt_board *board = context;
++    if ((reg & 3u) || reg >= 0x4000u) {
++        return FUXI_BT_ARGUMENT;
++    }
++    return board->io.read(board->io.context, FUXI_BT_UART_BASE + reg, value);
++}
++
++static enum fuxi_bt_status fuxi_bt_board_se_write(void *context, uint32_t reg, uint32_t value)
++{
++    struct fuxi_bt_board *board = context;
++    if ((reg & 3u) || reg >= 0x4000u) {
++        return FUXI_BT_ARGUMENT;
++    }
++    return board->io.write(board->io.context, FUXI_BT_UART_BASE + reg, value);
++}
++
++static uint64_t fuxi_bt_board_now(void *context)
++{
++    struct fuxi_bt_board *board = context;
++    return board->io.now_us(board->io.context);
++}
++
++static void fuxi_bt_board_wait(void *context, unsigned microseconds)
++{
++    struct fuxi_bt_board *board = context;
++    board->io.wait_us(board->io.context, microseconds);
++}
++
++static enum fuxi_bt_status fuxi_bt_board_acquire(void *context, unsigned baud)
++{
++    struct fuxi_bt_board *board = context;
++    const struct fuxi_bt_geni_fifo_io io = {
++        board, fuxi_bt_board_se_read, fuxi_bt_board_se_write, fuxi_bt_board_now
++    };
++    const struct fuxi_bt_geni_fifo_config config = {1, true, board->qup_version, FUXI_BT_SE_HZ};
++    enum fuxi_bt_status status;
++    if (baud != FUXI_BT_BOOT_BAUD) {
++        return FUXI_BT_ARGUMENT;
++    }
++    if (board->fifo_used) {
++        return FUXI_BT_BUSY;
++    }
++    if (board->stage != FUXI_BT_STAGE_READY) {
++        return FUXI_BT_NO_UART;
++    }
++    board->fifo_used = true;
++    status = fuxi_bt_geni_fifo_open(&board->fifo, &io, &config);
++    for (unsigned poll = 0; status == FUXI_BT_AGAIN && poll < FUXI_BT_ACQUIRE_POLLS; poll++) {
++        board->io.wait_us(board->io.context, 10);
++        status = fuxi_bt_geni_fifo_poll(&board->fifo);
++    }
++    return status == FUXI_BT_AGAIN ? FUXI_BT_TIMEOUT : status;
++}
++
++static enum fuxi_bt_status fuxi_bt_board_uart_write(void *context, const uint8_t *bytes,
++    size_t size, size_t *accepted)
++{
++    struct fuxi_bt_board *board = context;
++    return fuxi_bt_geni_fifo_write(&board->fifo, bytes, size, accepted);
++}
++
++static enum fuxi_bt_status fuxi_bt_board_uart_read(void *context, uint8_t *bytes,
++    size_t capacity, size_t *received)
++{
++    struct fuxi_bt_board *board = context;
++    return fuxi_bt_geni_fifo_read(&board->fifo, bytes, capacity, received);
++}
++
++static enum fuxi_bt_status fuxi_bt_board_release(void *context)
++{
++    struct fuxi_bt_board *board = context;
++    enum fuxi_bt_status status;
++    if (!board->fifo_used) {
++        return FUXI_BT_OK;
++    }
++    status = fuxi_bt_geni_fifo_close_poll(&board->fifo);
++    for (unsigned poll = 0; status == FUXI_BT_AGAIN && poll < FUXI_BT_RELEASE_POLLS; poll++) {
++        board->io.wait_us(board->io.context, 10);
++        status = fuxi_bt_geni_fifo_close_poll(&board->fifo);
++    }
++    board->fifo_used = false;
++    return status == FUXI_BT_AGAIN ? FUXI_BT_TIMEOUT : status;
++}
++
++void fuxi_bt_board_uart_ops(struct fuxi_bt_board *board, struct fuxi_bt_uart_ops *ops)
++{
++    if (!ops) {
++        return;
++    }
++    memset(ops, 0, sizeof(*ops));
++    if (!board) {
++        return;
++    }
++    ops->context = board;
++    ops->acquire = fuxi_bt_board_acquire;
++    ops->write = fuxi_bt_board_uart_write;
++    ops->read = fuxi_bt_board_uart_read;
++    ops->release = fuxi_bt_board_release;
++    ops->now_us = fuxi_bt_board_now;
++    ops->wait_us = fuxi_bt_board_wait;
++}
+diff --git a/xnu/fuxi-bluetooth/fuxi_bt_board.h b/xnu/fuxi-bluetooth/fuxi_bt_board.h
+new file mode 100644
+index 0000000..a17708f
+--- /dev/null
++++ b/xnu/fuxi-bluetooth/fuxi_bt_board.h
+@@ -0,0 +1,95 @@
++#ifndef FUXI_BT_BOARD_H
++#define FUXI_BT_BOARD_H
++
++/*
++ * WCN7850 藍牙 UART 的板級準備（fuxi,bt=3）：
++ * QUP2 SE6 時脈投票、SE6 RCG 設成 7.3728 MHz（GPLL0_OUT_EVEN 300 MHz × 384/15625，與 Linux gcc-sm8550 相同）、
++ * gpio76–79 切成 qup2_se6、BT_EN（gpio81）拉高。前提是 WLAN 已把 WCN 的電源軌和 WLAN_EN（gpio80）打開。
++ * 純 C；MMIO 經由呼叫端提供的 read/write（XNU 走 fault-safe 存取，主機測試走模擬模型）。
++ * power_off 依旗標逆序還原 power_on 改過的東西，不論 power_on 成功或失敗都要呼叫。
++ */
++#include "fuxi_bt.h"
++#include "fuxi_bt_geni_fifo.h"
++
++#define FUXI_BT_SE_HZ 7372800u
++#define FUXI_BT_GPIO_UART_FIRST 76u /* 76 CTS、77 RFR、78 TX、79 RX */
++#define FUXI_BT_GPIO_WLAN_EN 80u
++#define FUXI_BT_GPIO_BT_EN 81u
++#define FUXI_BT_GPIO_SW_CTRL 82u
++#define FUXI_BT_VOTE_REG 0x52010u
++#define FUXI_BT_VOTE_BITS 0x40fu /* core、s_ahb、m_ahb、core_2x、se6 */
++#define FUXI_BT_RCG_CMD 0x1e760u
++#define FUXI_BT_GPLL0_MODE 0x0u
++#define FUXI_BT_GPLL0_USER 0x18u
++#define FUXI_BT_GPLL0_VOTE 0x52018u
++#define FUXI_BT_BRANCH_TIMEOUT_US 2000u
++#define FUXI_BT_RCG_TIMEOUT_US 2000u
++#define FUXI_BT_BT_EN_LOW_US 50000u
++#define FUXI_BT_POWERUP_US 100000u /* pwrseq-qcom-wcn：WCN7850 pwup_delay_ms 100 */
++#define FUXI_BT_ACQUIRE_POLLS 2000u
++#define FUXI_BT_RELEASE_POLLS 20000u
++
++enum fuxi_bt_board_stage {
++    FUXI_BT_STAGE_IDLE = 0,
++    FUXI_BT_STAGE_WLAN,
++    FUXI_BT_STAGE_GPLL0,
++    FUXI_BT_STAGE_VOTE,
++    FUXI_BT_STAGE_BRANCH,
++    FUXI_BT_STAGE_RCG,
++    FUXI_BT_STAGE_WRAPPER,
++    FUXI_BT_STAGE_ENGINE,
++    FUXI_BT_STAGE_PINS,
++    FUXI_BT_STAGE_BT_EN,
++    FUXI_BT_STAGE_READY
++};
++
++struct fuxi_bt_board_io {
++    void *context;
++    enum fuxi_bt_status (*read)(void *, uint64_t, uint32_t *);
++    enum fuxi_bt_status (*write)(void *, uint64_t, uint32_t);
++    uint64_t (*now_us)(void *);
++    void (*wait_us)(void *, unsigned);
++};
++
++struct fuxi_bt_board {
++    struct fuxi_bt_board_io io;
++    enum fuxi_bt_board_stage stage;
++    enum fuxi_bt_status error;
++    uint32_t failed_value;
++    uint32_t gpll0_mode;
++    uint32_t gpll0_user;
++    uint32_t vote;
++    uint32_t added_votes;
++    uint32_t rcg_saved[4]; /* cfg、m、n、d */
++    uint32_t rcg_cfg;
++    uint32_t qup_version;
++    uint32_t firmware;
++    uint32_t pin_ctl[4];
++    uint32_t bt_en_ctl;
++    uint32_t bt_en_io;
++    uint32_t sw_ctrl_before;
++    uint32_t sw_ctrl_after;
++    bool votes_changed;
++    bool rcg_changed;
++    bool pins_changed;
++    bool bt_en_changed;
++    bool fifo_used;
++    struct fuxi_bt_geni_fifo fifo;
++};
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++const char *fuxi_bt_board_stage_name(enum fuxi_bt_board_stage stage);
++enum fuxi_bt_status fuxi_bt_board_wlan_ready(const struct fuxi_bt_board_io *io, bool *ready);
++enum fuxi_bt_status fuxi_bt_board_power_on(struct fuxi_bt_board *board,
++    const struct fuxi_bt_board_io *io);
++enum fuxi_bt_status fuxi_bt_board_power_off(struct fuxi_bt_board *board);
++void fuxi_bt_board_uart_ops(struct fuxi_bt_board *board, struct fuxi_bt_uart_ops *ops);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.c b/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.c
 new file mode 100644
 index 0000000..5c11589
@@ -29852,19 +31275,23 @@ index 0000000..35331b3
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_xnu.c b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
 new file mode 100644
-index 0000000..d5578d4
+index 0000000..d97b555
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,331 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <kern/thread.h>
++#include <kern/clock.h>
 +#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
 +#include <vm/vm_kern.h>
 +#include <vm/pmap.h>
++#include <string.h>
 +#include "fuxi_bt.h"
++#include "fuxi_bt_board.h"
 +
 +extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t,
 +    uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t, unsigned, void *);
@@ -29885,8 +31312,10 @@ index 0000000..d5578d4
 +    {0x150000, 0x4000, 0},
 +    {0xf14c000, 0x8000, 0},
 +    {FUXI_BT_UART_BASE, 0x4000, 0},
-+    {FUXI_BT_WRAPPER_BASE, 0x4000, 0}
++    {FUXI_BT_WRAPPER_BASE, 0x4000, 0},
++    {FUXI_BT_GCC_BASE, 0x4000, 0} /* GPLL0 MODE／USER_CTL（fuxi,bt=3） */
 +};
++static struct fuxi_bt_board fuxi_bt_board_state;
 +static struct fuxi_bt_uart_ops fuxi_bt_uart;
 +static unsigned fuxi_bt_registration;
 +static unsigned fuxi_bt_started;
@@ -29974,6 +31403,127 @@ index 0000000..d5578d4
 +    return FUXI_BT_ARGUMENT;
 +}
 +
++static enum fuxi_bt_status fuxi_bt_write32(void *context,
++    uint64_t pa, uint32_t value)
++{
++    (void)context;
++    if (pa & 3) {
++        return FUXI_BT_ARGUMENT;
++    }
++    for (unsigned index = 0; index < sizeof(fuxi_bt_windows) / sizeof(fuxi_bt_windows[0]); index++) {
++        struct fuxi_bt_window *window = &fuxi_bt_windows[index];
++        if (pa >= window->pa && pa - window->pa <= window->size - 4) {
++            uint64_t raw = value;
++            enum fuxi_bt_status status = fuxi_bt_map(window);
++            if (status != FUXI_BT_OK) {
++                return status;
++            }
++            if (fuxi_gpu_access(window->va + (uintptr_t)(pa - window->pa), &raw, 1, 0)) {
++                printf("FUXI BT: write fault pa=%#llx\n", pa);
++                return FUXI_BT_IO;
++            }
++            return FUXI_BT_OK;
++        }
++    }
++    return FUXI_BT_ARGUMENT;
++}
++
++static uint64_t fuxi_bt_now_us(void *context)
++{
++    uint64_t absolute, nanoseconds;
++    (void)context;
++    clock_get_uptime(&absolute);
++    absolutetime_to_nanoseconds(absolute, &nanoseconds);
++    return nanoseconds / 1000u;
++}
++
++static void fuxi_bt_wait_us(void *context, unsigned microseconds)
++{
++    (void)context;
++    delay((int)microseconds);
++}
++
++static void fuxi_bt_print_probe(enum fuxi_bt_status status, const struct fuxi_bt_result *result)
++{
++    printf("FUXI BT: probe status=%s cleanup=%s tx=%u rx=%u drained=%u frames=%u ignored=%u polls=%u elapsed_us=%llu controller_status=%#x valid=%u\n",
++        fuxi_bt_status_name(status), fuxi_bt_status_name(result->cleanup),
++        result->tx_bytes, result->rx_bytes, result->drained_bytes, result->frames,
++        result->ignored_frames, result->polls, result->elapsed_us,
++        (unsigned)result->controller_status, (unsigned)result->version_valid);
++    if (result->version_valid) {
++        printf("FUXI BT: QCA version product=%#x soc=%#x rom=%#x patch=%#x\n",
++            result->version.product, result->version.soc,
++            (unsigned)result->version.rom, (unsigned)result->version.patch);
++    }
++}
++
++/*
++ * fuxi,bt=3：等 WLAN_EN 穩定拉高（WCN 電源軌由 WLAN 開好）連續 15 秒，最多等 300 秒；
++ * 之後開 SE6 時脈與腳位、拉 BT_EN、以 115200 送 QCA 版本查詢，結束後全部還原。
++ */
++#define FUXI_BT_WLAN_STEADY_US 15000000ull
++#define FUXI_BT_WLAN_DEADLINE_US 300000000ull
++#define FUXI_BT_WLAN_POLL_US 250000u
++
++static void fuxi_bt_board_session(void)
++{
++    const struct fuxi_bt_board_io io = {
++        NULL, fuxi_bt_read32, fuxi_bt_write32, fuxi_bt_now_us, fuxi_bt_wait_us
++    };
++    struct fuxi_bt_board *board = &fuxi_bt_board_state;
++    struct fuxi_bt_uart_ops ops;
++    struct fuxi_bt_result result;
++    enum fuxi_bt_status status, cleanup;
++    const uint64_t start = fuxi_bt_now_us(NULL);
++    uint64_t steady = 0, now = start;
++    bool steady_seen = false;
++    for (;;) {
++        bool ready = false;
++        status = fuxi_bt_board_wlan_ready(&io, &ready);
++        now = fuxi_bt_now_us(NULL);
++        if (status != FUXI_BT_OK) {
++            printf("FUXI BT: board WLAN_EN read status=%s; BT_EN untouched\n",
++                fuxi_bt_status_name(status));
++            return;
++        }
++        if (!ready) {
++            steady_seen = false;
++        } else if (!steady_seen) {
++            steady_seen = true;
++            steady = now;
++        }
++        if (steady_seen && now - steady >= FUXI_BT_WLAN_STEADY_US) {
++            break;
++        }
++        if (now - start >= FUXI_BT_WLAN_DEADLINE_US) {
++            printf("FUXI BT: board WLAN_EN not steady high for 15 s within 300 s; BT_EN untouched\n");
++            return;
++        }
++        fuxi_bt_wait_us(NULL, FUXI_BT_WLAN_POLL_US);
++    }
++    printf("FUXI BT: board WLAN_EN steady after %llu ms\n", (now - start) / 1000u);
++    status = fuxi_bt_board_power_on(board, &io);
++    printf("FUXI BT: board power status=%s stage=%s value=%#x gpll0_mode=%#x gpll0_user=%#x vote=%#x added=%#x rcg_cfg=%#x->%#x qup=%#x fw=%#x sw_ctrl=%u->%u\n",
++        fuxi_bt_status_name(status), fuxi_bt_board_stage_name(board->stage),
++        board->failed_value, board->gpll0_mode, board->gpll0_user, board->vote,
++        board->added_votes, board->rcg_saved[0], board->rcg_cfg, board->qup_version,
++        board->firmware, board->sw_ctrl_before, board->sw_ctrl_after);
++    if (status == FUXI_BT_OK) {
++        fuxi_bt_board_uart_ops(board, &ops);
++        status = fuxi_bt_probe_run(1, &ops, &result);
++        fuxi_bt_print_probe(status, &result);
++        printf("FUXI BT: fifo state=%u error=%s cleanup=%s fault=%u reg=%#x%s tx=%llu/%llu rx=%llu discarded=%llu m_irq=%#x s_irq=%#x depth=%u/%u\n",
++            (unsigned)board->fifo.state, fuxi_bt_status_name(board->fifo.error),
++            fuxi_bt_status_name(board->fifo.cleanup), (unsigned)board->fifo.io_fault,
++            board->fifo.failed_register, board->fifo.failed_write ? " write" : "",
++            board->fifo.tx_accepted, board->fifo.tx_completed, board->fifo.rx_delivered,
++            board->fifo.rx_discarded, board->fifo.master_irq, board->fifo.secondary_irq,
++            board->fifo.tx_depth, board->fifo.rx_depth);
++    }
++    cleanup = fuxi_bt_board_power_off(board);
++    printf("FUXI BT: board restore status=%s\n", fuxi_bt_status_name(cleanup));
++}
++
 +static void fuxi_bt_worker(void *argument, wait_result_t wait_result)
 +{
 +    struct fuxi_bt_snapshot snapshot;
@@ -30010,18 +31560,27 @@ index 0000000..d5578d4
 +            ops = &fuxi_bt_uart;
 +        }
 +        status = fuxi_bt_probe_run(1, ops, &result);
-+        printf("FUXI BT: probe status=%s cleanup=%s tx=%u rx=%u drained=%u frames=%u ignored=%u polls=%u elapsed_us=%llu controller_status=%#x valid=%u\n",
-+            fuxi_bt_status_name(status), fuxi_bt_status_name(result.cleanup),
-+            result.tx_bytes, result.rx_bytes, result.drained_bytes, result.frames,
-+            result.ignored_frames, result.polls, result.elapsed_us,
-+            (unsigned)result.controller_status, (unsigned)result.version_valid);
-+        if (result.version_valid) {
-+            printf("FUXI BT: QCA version product=%#x soc=%#x rom=%#x patch=%#x\n",
-+                result.version.product, result.version.soc,
-+                (unsigned)result.version.rom, (unsigned)result.version.patch);
-+        }
++        fuxi_bt_print_probe(status, &result);
++    } else if (status == FUXI_BT_OK && fuxi_bt_mode == 3) {
++        fuxi_bt_board_session();
++        fuxi_bt_unmap();
 +    }
 +    thread_terminate(current_thread());
++}
++
++/* 命令列已滿：沒有 fuxibt 時讀 ADT /chosen 的 u32 "fuxi,bt"。 */
++static int fuxi_bt_adt_mode(void)
++{
++    DTEntry chosen;
++    const void *property = NULL;
++    unsigned int bytes = 0;
++    uint32_t value = 0;
++    if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++        SecureDTGetProperty(chosen, "fuxi,bt", &property, &bytes) == kSuccess &&
++        property && bytes == sizeof(value)) {
++        memcpy(&value, property, sizeof(value));
++    }
++    return value > 0x7fffffffu ? -1 : (int)value;
 +}
 +
 +void fuxi_bt_init(void)
@@ -30029,11 +31588,14 @@ index 0000000..d5578d4
 +    int mode = 0;
 +    unsigned expected = 0;
 +    thread_t worker;
-+    if (!PE_parse_boot_argn("fuxibt", &mode, sizeof(mode)) || mode == 0) {
++    if (!PE_parse_boot_argn("fuxibt", &mode, sizeof(mode))) {
++        mode = fuxi_bt_adt_mode();
++    }
++    if (mode == 0) {
 +        return;
 +    }
-+    if (mode != 1 && mode != 2) {
-+        printf("FUXI BT: argument fuxibt=%d rejected\n", mode);
++    if (mode != 1 && mode != 2 && mode != 3) {
++        printf("FUXI BT: mode %d rejected (fuxibt / fuxi,bt)\n", mode);
 +        return;
 +    }
 +    if (!__atomic_compare_exchange_n(&fuxi_bt_started, &expected, 1,
@@ -40656,13 +42218,13 @@ index 8349337..ed20c83 100644
  +}
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..4af397a
+index 0000000..266109e
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,8697 @@
+@@ -0,0 +1,10202 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
-+@@ -121,6 +121,29 @@
++@@ -121,6 +121,31 @@
 + bsd/dev/sweet_rpmh.c			standard
 + bsd/dev/sweet_spmi.c			standard
 + bsd/dev/sweet_usb.c			standard
@@ -40686,6 +42248,8 @@ index 0000000..4af397a
 ++bsd/dev/GeniI2c.c			standard
 ++bsd/dev/fuxi_bt.c			standard
 ++bsd/dev/fuxi_bt_xnu.c			standard
+++bsd/dev/fuxi_bt_geni_fifo.c		standard
+++bsd/dev/fuxi_bt_board.c			standard
 ++bsd/dev/fuxi_battery_freshness.c	standard
 ++bsd/dev/fuxi_audio_spf.c		standard
 ++bsd/dev/fuxi_audio_prep_gpr.c		standard
@@ -46111,16 +47675,20 @@ index 0000000..4af397a
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_xnu.c
-+@@ -0,0 +1,192 @@
++@@ -0,0 +1,331 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
 ++#include <sys/systm.h>
 ++#include <kern/thread.h>
+++#include <kern/clock.h>
 ++#include <pexpert/pexpert.h>
+++#include <pexpert/device_tree.h>
 ++#include <vm/vm_kern.h>
 ++#include <vm/pmap.h>
+++#include <string.h>
 ++#include "fuxi_bt.h"
+++#include "fuxi_bt_board.h"
 ++
 ++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t,
 ++    uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t, unsigned, void *);
@@ -46141,8 +47709,10 @@ index 0000000..4af397a
 ++    {0x150000, 0x4000, 0},
 ++    {0xf14c000, 0x8000, 0},
 ++    {FUXI_BT_UART_BASE, 0x4000, 0},
-++    {FUXI_BT_WRAPPER_BASE, 0x4000, 0}
+++    {FUXI_BT_WRAPPER_BASE, 0x4000, 0},
+++    {FUXI_BT_GCC_BASE, 0x4000, 0} /* GPLL0 MODE／USER_CTL（fuxi,bt=3） */
 ++};
+++static struct fuxi_bt_board fuxi_bt_board_state;
 ++static struct fuxi_bt_uart_ops fuxi_bt_uart;
 ++static unsigned fuxi_bt_registration;
 ++static unsigned fuxi_bt_started;
@@ -46230,6 +47800,127 @@ index 0000000..4af397a
 ++    return FUXI_BT_ARGUMENT;
 ++}
 ++
+++static enum fuxi_bt_status fuxi_bt_write32(void *context,
+++    uint64_t pa, uint32_t value)
+++{
+++    (void)context;
+++    if (pa & 3) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    for (unsigned index = 0; index < sizeof(fuxi_bt_windows) / sizeof(fuxi_bt_windows[0]); index++) {
+++        struct fuxi_bt_window *window = &fuxi_bt_windows[index];
+++        if (pa >= window->pa && pa - window->pa <= window->size - 4) {
+++            uint64_t raw = value;
+++            enum fuxi_bt_status status = fuxi_bt_map(window);
+++            if (status != FUXI_BT_OK) {
+++                return status;
+++            }
+++            if (fuxi_gpu_access(window->va + (uintptr_t)(pa - window->pa), &raw, 1, 0)) {
+++                printf("FUXI BT: write fault pa=%#llx\n", pa);
+++                return FUXI_BT_IO;
+++            }
+++            return FUXI_BT_OK;
+++        }
+++    }
+++    return FUXI_BT_ARGUMENT;
+++}
+++
+++static uint64_t fuxi_bt_now_us(void *context)
+++{
+++    uint64_t absolute, nanoseconds;
+++    (void)context;
+++    clock_get_uptime(&absolute);
+++    absolutetime_to_nanoseconds(absolute, &nanoseconds);
+++    return nanoseconds / 1000u;
+++}
+++
+++static void fuxi_bt_wait_us(void *context, unsigned microseconds)
+++{
+++    (void)context;
+++    delay((int)microseconds);
+++}
+++
+++static void fuxi_bt_print_probe(enum fuxi_bt_status status, const struct fuxi_bt_result *result)
+++{
+++    printf("FUXI BT: probe status=%s cleanup=%s tx=%u rx=%u drained=%u frames=%u ignored=%u polls=%u elapsed_us=%llu controller_status=%#x valid=%u\n",
+++        fuxi_bt_status_name(status), fuxi_bt_status_name(result->cleanup),
+++        result->tx_bytes, result->rx_bytes, result->drained_bytes, result->frames,
+++        result->ignored_frames, result->polls, result->elapsed_us,
+++        (unsigned)result->controller_status, (unsigned)result->version_valid);
+++    if (result->version_valid) {
+++        printf("FUXI BT: QCA version product=%#x soc=%#x rom=%#x patch=%#x\n",
+++            result->version.product, result->version.soc,
+++            (unsigned)result->version.rom, (unsigned)result->version.patch);
+++    }
+++}
+++
+++/*
+++ * fuxi,bt=3：等 WLAN_EN 穩定拉高（WCN 電源軌由 WLAN 開好）連續 15 秒，最多等 300 秒；
+++ * 之後開 SE6 時脈與腳位、拉 BT_EN、以 115200 送 QCA 版本查詢，結束後全部還原。
+++ */
+++#define FUXI_BT_WLAN_STEADY_US 15000000ull
+++#define FUXI_BT_WLAN_DEADLINE_US 300000000ull
+++#define FUXI_BT_WLAN_POLL_US 250000u
+++
+++static void fuxi_bt_board_session(void)
+++{
+++    const struct fuxi_bt_board_io io = {
+++        NULL, fuxi_bt_read32, fuxi_bt_write32, fuxi_bt_now_us, fuxi_bt_wait_us
+++    };
+++    struct fuxi_bt_board *board = &fuxi_bt_board_state;
+++    struct fuxi_bt_uart_ops ops;
+++    struct fuxi_bt_result result;
+++    enum fuxi_bt_status status, cleanup;
+++    const uint64_t start = fuxi_bt_now_us(NULL);
+++    uint64_t steady = 0, now = start;
+++    bool steady_seen = false;
+++    for (;;) {
+++        bool ready = false;
+++        status = fuxi_bt_board_wlan_ready(&io, &ready);
+++        now = fuxi_bt_now_us(NULL);
+++        if (status != FUXI_BT_OK) {
+++            printf("FUXI BT: board WLAN_EN read status=%s; BT_EN untouched\n",
+++                fuxi_bt_status_name(status));
+++            return;
+++        }
+++        if (!ready) {
+++            steady_seen = false;
+++        } else if (!steady_seen) {
+++            steady_seen = true;
+++            steady = now;
+++        }
+++        if (steady_seen && now - steady >= FUXI_BT_WLAN_STEADY_US) {
+++            break;
+++        }
+++        if (now - start >= FUXI_BT_WLAN_DEADLINE_US) {
+++            printf("FUXI BT: board WLAN_EN not steady high for 15 s within 300 s; BT_EN untouched\n");
+++            return;
+++        }
+++        fuxi_bt_wait_us(NULL, FUXI_BT_WLAN_POLL_US);
+++    }
+++    printf("FUXI BT: board WLAN_EN steady after %llu ms\n", (now - start) / 1000u);
+++    status = fuxi_bt_board_power_on(board, &io);
+++    printf("FUXI BT: board power status=%s stage=%s value=%#x gpll0_mode=%#x gpll0_user=%#x vote=%#x added=%#x rcg_cfg=%#x->%#x qup=%#x fw=%#x sw_ctrl=%u->%u\n",
+++        fuxi_bt_status_name(status), fuxi_bt_board_stage_name(board->stage),
+++        board->failed_value, board->gpll0_mode, board->gpll0_user, board->vote,
+++        board->added_votes, board->rcg_saved[0], board->rcg_cfg, board->qup_version,
+++        board->firmware, board->sw_ctrl_before, board->sw_ctrl_after);
+++    if (status == FUXI_BT_OK) {
+++        fuxi_bt_board_uart_ops(board, &ops);
+++        status = fuxi_bt_probe_run(1, &ops, &result);
+++        fuxi_bt_print_probe(status, &result);
+++        printf("FUXI BT: fifo state=%u error=%s cleanup=%s fault=%u reg=%#x%s tx=%llu/%llu rx=%llu discarded=%llu m_irq=%#x s_irq=%#x depth=%u/%u\n",
+++            (unsigned)board->fifo.state, fuxi_bt_status_name(board->fifo.error),
+++            fuxi_bt_status_name(board->fifo.cleanup), (unsigned)board->fifo.io_fault,
+++            board->fifo.failed_register, board->fifo.failed_write ? " write" : "",
+++            board->fifo.tx_accepted, board->fifo.tx_completed, board->fifo.rx_delivered,
+++            board->fifo.rx_discarded, board->fifo.master_irq, board->fifo.secondary_irq,
+++            board->fifo.tx_depth, board->fifo.rx_depth);
+++    }
+++    cleanup = fuxi_bt_board_power_off(board);
+++    printf("FUXI BT: board restore status=%s\n", fuxi_bt_status_name(cleanup));
+++}
+++
 ++static void fuxi_bt_worker(void *argument, wait_result_t wait_result)
 ++{
 ++    struct fuxi_bt_snapshot snapshot;
@@ -46266,18 +47957,27 @@ index 0000000..4af397a
 ++            ops = &fuxi_bt_uart;
 ++        }
 ++        status = fuxi_bt_probe_run(1, ops, &result);
-++        printf("FUXI BT: probe status=%s cleanup=%s tx=%u rx=%u drained=%u frames=%u ignored=%u polls=%u elapsed_us=%llu controller_status=%#x valid=%u\n",
-++            fuxi_bt_status_name(status), fuxi_bt_status_name(result.cleanup),
-++            result.tx_bytes, result.rx_bytes, result.drained_bytes, result.frames,
-++            result.ignored_frames, result.polls, result.elapsed_us,
-++            (unsigned)result.controller_status, (unsigned)result.version_valid);
-++        if (result.version_valid) {
-++            printf("FUXI BT: QCA version product=%#x soc=%#x rom=%#x patch=%#x\n",
-++                result.version.product, result.version.soc,
-++                (unsigned)result.version.rom, (unsigned)result.version.patch);
-++        }
+++        fuxi_bt_print_probe(status, &result);
+++    } else if (status == FUXI_BT_OK && fuxi_bt_mode == 3) {
+++        fuxi_bt_board_session();
+++        fuxi_bt_unmap();
 ++    }
 ++    thread_terminate(current_thread());
+++}
+++
+++/* 命令列已滿：沒有 fuxibt 時讀 ADT /chosen 的 u32 "fuxi,bt"。 */
+++static int fuxi_bt_adt_mode(void)
+++{
+++    DTEntry chosen;
+++    const void *property = NULL;
+++    unsigned int bytes = 0;
+++    uint32_t value = 0;
+++    if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+++        SecureDTGetProperty(chosen, "fuxi,bt", &property, &bytes) == kSuccess &&
+++        property && bytes == sizeof(value)) {
+++        memcpy(&value, property, sizeof(value));
+++    }
+++    return value > 0x7fffffffu ? -1 : (int)value;
 ++}
 ++
 ++void fuxi_bt_init(void)
@@ -46285,11 +47985,14 @@ index 0000000..4af397a
 ++    int mode = 0;
 ++    unsigned expected = 0;
 ++    thread_t worker;
-++    if (!PE_parse_boot_argn("fuxibt", &mode, sizeof(mode)) || mode == 0) {
+++    if (!PE_parse_boot_argn("fuxibt", &mode, sizeof(mode))) {
+++        mode = fuxi_bt_adt_mode();
+++    }
+++    if (mode == 0) {
 ++        return;
 ++    }
-++    if (mode != 1 && mode != 2) {
-++        printf("FUXI BT: argument fuxibt=%d rejected\n", mode);
+++    if (mode != 1 && mode != 2 && mode != 3) {
+++        printf("FUXI BT: mode %d rejected (fuxibt / fuxi,bt)\n", mode);
 ++        return;
 ++    }
 ++    if (!__atomic_compare_exchange_n(&fuxi_bt_started, &expected, 1,
@@ -46304,6 +48007,1123 @@ index 0000000..4af397a
 ++    thread_deallocate(worker);
 ++}
 ++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_bt_geni_fifo.c
++@@ -0,0 +1,610 @@
+++#include "fuxi_bt_geni_fifo.h"
+++#include <string.h>
+++
+++#define FUXI_BT_FIFO_MASTER_ACTIVE 1u
+++#define FUXI_BT_FIFO_SECONDARY_ACTIVE (1u << 12)
+++#define FUXI_BT_FIFO_COMMAND_DONE 1u
+++#define FUXI_BT_FIFO_COMMAND_CANCEL (1u << 4)
+++#define FUXI_BT_FIFO_COMMAND_ABORT (1u << 5)
+++#define FUXI_BT_FIFO_CONTROL_CANCEL 4u
+++#define FUXI_BT_FIFO_CONTROL_ABORT 2u
+++#define FUXI_BT_FIFO_MASTER_ERRORS (0xeu | (3u << 24) | (3u << 28))
+++#define FUXI_BT_FIFO_SECONDARY_ERRORS (0xeu | (15u << 9) | (3u << 24))
+++#define FUXI_BT_FIFO_RX_EVENTS ((1u << 26) | (1u << 27))
+++
+++static const uint32_t fuxi_bt_fifo_saved_registers[] = {
+++    FUXI_BT_FIFO_IRQ_ENABLE,
+++    FUXI_BT_FIFO_MASTER_IRQ_ENABLE,
+++    FUXI_BT_FIFO_SECONDARY_IRQ_ENABLE,
+++    FUXI_BT_FIFO_CLOCK_GATING,
+++    FUXI_BT_FIFO_OUTPUT_CTRL,
+++    FUXI_BT_FIFO_MASTER_CLOCK,
+++    FUXI_BT_FIFO_SECONDARY_CLOCK,
+++    FUXI_BT_FIFO_CLOCK_SELECT,
+++    FUXI_BT_FIFO_LOOPBACK,
+++    FUXI_BT_FIFO_BYTE_GRANULARITY,
+++    FUXI_BT_FIFO_TX_CONFIG,
+++    FUXI_BT_FIFO_TX_PACKING0,
+++    FUXI_BT_FIFO_TX_PACKING1,
+++    FUXI_BT_FIFO_TX_WORD_LENGTH,
+++    FUXI_BT_FIFO_TX_STOP_LENGTH,
+++    FUXI_BT_FIFO_RX_CONFIG,
+++    FUXI_BT_FIFO_RX_PACKING0,
+++    FUXI_BT_FIFO_RX_PACKING1,
+++    FUXI_BT_FIFO_RX_WORD_LENGTH,
+++    FUXI_BT_FIFO_RX_STALE,
+++    FUXI_BT_FIFO_MANUAL_RFR,
+++    FUXI_BT_FIFO_TX_PARITY,
+++    FUXI_BT_FIFO_RX_PARITY,
+++    FUXI_BT_FIFO_TX_WATERMARK,
+++    FUXI_BT_FIFO_RX_WATERMARK,
+++    FUXI_BT_FIFO_RX_RFR_WATERMARK,
+++    FUXI_BT_FIFO_TX_LENGTH
+++};
+++
+++_Static_assert(sizeof(fuxi_bt_fifo_saved_registers) / sizeof(fuxi_bt_fifo_saved_registers[0]) ==
+++    FUXI_BT_FIFO_SAVED_REGISTERS, "FIFO saved-register count");
+++
+++static enum fuxi_bt_status fuxi_bt_fifo_fail(struct fuxi_bt_geni_fifo *fifo,
+++    enum fuxi_bt_status status)
+++{
+++    if (fifo->error == FUXI_BT_OK) {
+++        fifo->error = status;
+++    }
+++    fifo->state = FUXI_BT_FIFO_FAULT;
+++    return fifo->error;
+++}
+++
+++static bool fuxi_bt_fifo_read32(struct fuxi_bt_geni_fifo *fifo,
+++    uint32_t reg, uint32_t *value)
+++{
+++    if (fifo->io.read(fifo->io.context, reg, value) == FUXI_BT_OK) {
+++        return true;
+++    }
+++    fifo->io_fault = true;
+++    fifo->failed_register = reg;
+++    fifo->failed_write = false;
+++    return false;
+++}
+++
+++static bool fuxi_bt_fifo_write32(struct fuxi_bt_geni_fifo *fifo,
+++    uint32_t reg, uint32_t value)
+++{
+++    if (fifo->io.write(fifo->io.context, reg, value) == FUXI_BT_OK) {
+++        return true;
+++    }
+++    fifo->io_fault = true;
+++    fifo->failed_register = reg;
+++    fifo->failed_write = true;
+++    return false;
+++}
+++
+++static bool fuxi_bt_fifo_now(struct fuxi_bt_geni_fifo *fifo, uint64_t *now)
+++{
+++    *now = fifo->io.now_us(fifo->io.context);
+++    if (*now < fifo->last_us) {
+++        return false;
+++    }
+++    fifo->last_us = *now;
+++    return true;
+++}
+++
+++static bool fuxi_bt_fifo_irqs(struct fuxi_bt_geni_fifo *fifo)
+++{
+++    return fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_MASTER_IRQ, &fifo->master_irq) &&
+++        fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_SECONDARY_IRQ, &fifo->secondary_irq);
+++}
+++
+++enum fuxi_bt_status fuxi_bt_geni_fifo_open(struct fuxi_bt_geni_fifo *fifo,
+++    const struct fuxi_bt_geni_fifo_io *io, const struct fuxi_bt_geni_fifo_config *config)
+++{
+++    uint32_t status, tx_status, rx_status, events, hw_tx, hw_rx;
+++    uint32_t master_control, secondary_control;
+++    uint32_t divider, sampling, depth_mask;
+++    unsigned major, minor;
+++    if (!fifo || !config) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    if (!config->opt_in) {
+++        return FUXI_BT_OFF;
+++    }
+++    if (config->opt_in != 1 || !config->resources_owned ||
+++        !config->qup_version || !io || !io->read || !io->write || !io->now_us) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    if (fifo->modified) {
+++        return FUXI_BT_BUSY;
+++    }
+++    sampling = config->qup_version >= 0x20050000u ? 16u : 32u;
+++    if (!config->source_hz || config->source_hz % (FUXI_BT_BOOT_BAUD * sampling)) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    divider = config->source_hz / (FUXI_BT_BOOT_BAUD * sampling);
+++    if (!divider || divider > 4095) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    memset(fifo, 0, sizeof(*fifo));
+++    fifo->io = *io;
+++    fifo->last_us = io->now_us(io->context);
+++    if (!fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_IF_DISABLE, &fifo->interface_disable)) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++    }
+++    if (fifo->interface_disable & 1u) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_NO_UART);
+++    }
+++    if (!fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_FIRMWARE, &fifo->firmware) ||
+++        !fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_DMA_MODE, &fifo->dma_mode) ||
+++        !fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_GSI_EVENTS, &events) ||
+++        !fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_STATUS, &status) ||
+++        !fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_TX_STATUS, &tx_status) ||
+++        !fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_RX_STATUS, &rx_status) ||
+++        !fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_HW_TX, &hw_tx) ||
+++        !fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_HW_RX, &hw_rx) ||
+++        !fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_MASTER_CONTROL, &master_control) ||
+++        !fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_SECONDARY_CONTROL, &secondary_control) ||
+++        !fuxi_bt_fifo_irqs(fifo)) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++    }
+++    if (((fifo->firmware >> 8) & 0xffu) != 2) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_NO_UART);
+++    }
+++    if ((fifo->dma_mode & 1u) || events ||
+++        (status & (FUXI_BT_FIFO_MASTER_ACTIVE | FUXI_BT_FIFO_SECONDARY_ACTIVE)) ||
+++        (tx_status & 0xfffffffu) || (rx_status & 0x1ffffffu) ||
+++        ((master_control | secondary_control) & 7u)) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_BUSY);
+++    }
+++    major = (config->qup_version >> 28) & 0xfu;
+++    minor = (config->qup_version >> 16) & 0xfffu;
+++    depth_mask = (major > 3 || (major == 3 && minor >= 10)) ? 0xffu : 0x3fu;
+++    fifo->tx_depth = (hw_tx >> 16) & depth_mask;
+++    fifo->rx_depth = (hw_rx >> 16) & depth_mask;
+++    if (((hw_tx >> 24) & 0x3fu) != 32 || ((hw_rx >> 24) & 0x3fu) != 32 ||
+++        !fifo->tx_depth || fifo->rx_depth < 3) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_NO_UART);
+++    }
+++    for (unsigned index = 0; index < FUXI_BT_FIFO_SAVED_REGISTERS; index++) {
+++        if (!fuxi_bt_fifo_read32(fifo, fuxi_bt_fifo_saved_registers[index], &fifo->saved[index])) {
+++            return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++        }
+++    }
+++    fifo->startup_master_irq = fifo->master_irq;
+++    fifo->startup_secondary_irq = fifo->secondary_irq;
+++    fifo->modified = true;
+++    if (!fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_IRQ_ENABLE, 0) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MANUAL_RFR, 0x80000002u) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MASTER_IRQ_CLEAR, 0xffffffffu) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_SECONDARY_IRQ_CLEAR, 0xffffffffu) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_CLOCK_GATING, fifo->saved[3] | 0x7fu) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_OUTPUT_CTRL, 0x7f) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_CLOCK_SELECT, fifo->saved[7] & ~7u) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MASTER_CLOCK, (divider << 4) | 1u) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_SECONDARY_CLOCK, (divider << 4) | 1u) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_LOOPBACK, 0) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_BYTE_GRANULARITY, 0) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_TX_PACKING0, 0x4380e) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_TX_PACKING1, 0xc3e0e) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_RX_PACKING0, 0x4380e) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_RX_PACKING1, 0xc3e0e) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_TX_WORD_LENGTH, 8) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_RX_WORD_LENGTH, 8) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_TX_STOP_LENGTH, 0) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_TX_PARITY, fifo->saved[21] & ~1u) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_RX_PARITY, fifo->saved[22] & ~1u) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_TX_CONFIG, fifo->saved[10] & ~3u) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_RX_CONFIG, fifo->saved[15] & ~(1u << 4)) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_RX_STALE, 160) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_TX_WATERMARK,
+++            fifo->tx_depth > 2 ? 2 : fifo->tx_depth - 1) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_RX_WATERMARK, 2) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_RX_RFR_WATERMARK, fifo->rx_depth - 2) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MASTER_IRQ_ENABLE,
+++            FUXI_BT_FIFO_MASTER_ERRORS | 0x31u | (1u << 30)) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_SECONDARY_IRQ_ENABLE,
+++            FUXI_BT_FIFO_SECONDARY_ERRORS | 0x31u | FUXI_BT_FIFO_RX_EVENTS)) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++    }
+++    fifo->owns_secondary = true;
+++    if (!fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_SECONDARY_COMMAND, 1u << 27) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MANUAL_RFR, 0)) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++    }
+++    fifo->state = FUXI_BT_FIFO_STARTING;
+++    fifo->start_us = fifo->last_us;
+++    return fuxi_bt_geni_fifo_poll(fifo);
+++}
+++
+++enum fuxi_bt_status fuxi_bt_geni_fifo_poll(struct fuxi_bt_geni_fifo *fifo)
+++{
+++    uint32_t status, tx_status;
+++    uint64_t now;
+++    if (!fifo) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    if (fifo->state == FUXI_BT_FIFO_FAULT) {
+++        return fifo->error;
+++    }
+++    if (fifo->state != FUXI_BT_FIFO_OPEN && fifo->state != FUXI_BT_FIFO_STARTING) {
+++        return FUXI_BT_OFF;
+++    }
+++    if (!fuxi_bt_fifo_now(fifo, &now)) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++    }
+++    if (!fuxi_bt_fifo_irqs(fifo) ||
+++        !fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_STATUS, &status)) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++    }
+++    if (!fuxi_bt_fifo_now(fifo, &now)) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++    }
+++    if ((fifo->master_irq & FUXI_BT_FIFO_MASTER_ERRORS) ||
+++        (fifo->secondary_irq & FUXI_BT_FIFO_SECONDARY_ERRORS)) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++    }
+++    if ((fifo->master_irq | fifo->secondary_irq) &
+++        (FUXI_BT_FIFO_COMMAND_CANCEL | FUXI_BT_FIFO_COMMAND_ABORT)) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_PROTOCOL);
+++    }
+++    if (fifo->state == FUXI_BT_FIFO_STARTING) {
+++        if (++fifo->start_polls >= FUXI_BT_FIFO_MAX_POLLS ||
+++            now - fifo->start_us >= FUXI_BT_FIFO_STOP_TIMEOUT_US) {
+++            return fuxi_bt_fifo_fail(fifo, FUXI_BT_TIMEOUT);
+++        }
+++        if (!(status & FUXI_BT_FIFO_SECONDARY_ACTIVE)) {
+++            return FUXI_BT_AGAIN;
+++        }
+++        fifo->state = FUXI_BT_FIFO_OPEN;
+++    } else if (!(status & FUXI_BT_FIFO_SECONDARY_ACTIVE)) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_PROTOCOL);
+++    }
+++    if (fifo->owns_master) {
+++        if (++fifo->tx_polls >= FUXI_BT_FIFO_MAX_POLLS ||
+++            now - fifo->tx_started_us >= FUXI_BT_FIFO_TX_TIMEOUT_US) {
+++            return fuxi_bt_fifo_fail(fifo, FUXI_BT_TIMEOUT);
+++        }
+++        if (!fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_TX_STATUS, &tx_status)) {
+++            return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++        }
+++        if ((tx_status & 0xfffffffu) > fifo->tx_depth) {
+++            return fuxi_bt_fifo_fail(fifo, FUXI_BT_PROTOCOL);
+++        }
+++        if (!fuxi_bt_fifo_now(fifo, &now)) {
+++            return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++        }
+++        if (now - fifo->tx_started_us >= FUXI_BT_FIFO_TX_TIMEOUT_US) {
+++            return fuxi_bt_fifo_fail(fifo, FUXI_BT_TIMEOUT);
+++        }
+++        if (!(status & FUXI_BT_FIFO_MASTER_ACTIVE)) {
+++            if (!(fifo->master_irq & FUXI_BT_FIFO_COMMAND_DONE)) {
+++                return FUXI_BT_AGAIN;
+++            }
+++            if (fifo->tx_remaining || (tx_status & 0xfffffffu)) {
+++                return fuxi_bt_fifo_fail(fifo, FUXI_BT_PROTOCOL);
+++            }
+++            if (!fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MASTER_IRQ_CLEAR,
+++                FUXI_BT_FIFO_COMMAND_DONE)) {
+++                return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++            }
+++            fifo->tx_completed += fifo->tx_size;
+++            fifo->owns_master = false;
+++        }
+++    } else if (status & FUXI_BT_FIFO_MASTER_ACTIVE) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_BUSY);
+++    }
+++    return FUXI_BT_OK;
+++}
+++
+++enum fuxi_bt_status fuxi_bt_geni_fifo_write(struct fuxi_bt_geni_fifo *fifo,
+++    const uint8_t *bytes, size_t size, size_t *accepted)
+++{
+++    uint32_t status;
+++    unsigned available;
+++    enum fuxi_bt_status result;
+++    if (!accepted) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    *accepted = 0;
+++    if (!fifo || (!bytes && size) || size > FUXI_BT_FIFO_MAX_TX) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    result = fuxi_bt_geni_fifo_poll(fifo);
+++    if (result != FUXI_BT_OK || !size) {
+++        return result;
+++    }
+++    if (fifo->owns_master && !fifo->tx_remaining) {
+++        return FUXI_BT_AGAIN;
+++    }
+++    if (fifo->owns_master && size != fifo->tx_remaining) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    if (!fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_TX_STATUS, &status)) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++    }
+++    status &= 0xfffffffu;
+++    if (status > fifo->tx_depth) {
+++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_PROTOCOL);
+++    }
+++    available = fifo->tx_depth - status;
+++    if (!available) {
+++        return FUXI_BT_AGAIN;
+++    }
+++    if (!fifo->owns_master) {
+++        if (status) {
+++            return fuxi_bt_fifo_fail(fifo, FUXI_BT_PROTOCOL);
+++        }
+++        fifo->tx_size = (unsigned)size;
+++        fifo->tx_remaining = (unsigned)size;
+++        fifo->tx_polls = 0;
+++        fifo->tx_started_us = fifo->last_us;
+++        if (!fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MASTER_IRQ_CLEAR, 0x31u) ||
+++            !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_TX_LENGTH, (uint32_t)size)) {
+++            return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++        }
+++        fifo->owns_master = true;
+++        if (!fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MASTER_COMMAND, 1u << 27)) {
+++            return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++        }
+++    }
+++    for (unsigned index = 0; index < available && index < FUXI_BT_FIFO_WORD_BUDGET; index++) {
+++        uint32_t word = 0;
+++        const unsigned count = fifo->tx_remaining < 4 ? fifo->tx_remaining : 4;
+++        for (unsigned byte = 0; byte < count; byte++) {
+++            word |= (uint32_t)bytes[*accepted + byte] << (8 * byte);
+++        }
+++        if (!fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_TX, word)) {
+++            (void)fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++            return *accepted ? FUXI_BT_OK : fifo->error;
+++        }
+++        *accepted += count;
+++        fifo->tx_remaining -= count;
+++        fifo->tx_accepted += count;
+++        if (!fifo->tx_remaining) {
+++            break;
+++        }
+++    }
+++    if (!fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MASTER_IRQ_CLEAR, 1u << 30)) {
+++        (void)fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
+++    }
+++    return *accepted ? FUXI_BT_OK : fifo->error;
+++}
+++
+++static unsigned fuxi_bt_fifo_pending(struct fuxi_bt_geni_fifo *fifo,
+++    uint8_t *bytes, size_t capacity)
+++{
+++    unsigned delivered = 0;
+++    while (fifo->rx_pending_offset < fifo->rx_pending_size && delivered < capacity) {
+++        bytes[delivered++] = fifo->rx_pending[fifo->rx_pending_offset++];
+++    }
+++    if (fifo->rx_pending_offset == fifo->rx_pending_size) {
+++        fifo->rx_pending_offset = fifo->rx_pending_size = 0;
+++    }
+++    return delivered;
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_fifo_rx_count(struct fuxi_bt_geni_fifo *fifo,
+++    uint32_t status, unsigned *words, unsigned *last_bytes)
+++{
+++    *words = status & 0x1ffffffu;
+++    *last_bytes = 4;
+++    if (*words > fifo->rx_depth) {
+++        return FUXI_BT_PROTOCOL;
+++    }
+++    if (*words && (status & (1u << 31))) {
+++        const unsigned valid = (status >> 28) & 7u;
+++        if (valid > 4) {
+++            return FUXI_BT_PROTOCOL;
+++        }
+++        if (valid) {
+++            *last_bytes = valid;
+++        }
+++    }
+++    return FUXI_BT_OK;
+++}
+++
+++enum fuxi_bt_status fuxi_bt_geni_fifo_read(struct fuxi_bt_geni_fifo *fifo,
+++    uint8_t *bytes, size_t capacity, size_t *received)
+++{
+++    uint32_t status, word;
+++    unsigned words, last_bytes;
+++    enum fuxi_bt_status result;
+++    if (!received) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    *received = 0;
+++    if (!fifo || (!bytes && capacity)) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    result = fuxi_bt_geni_fifo_poll(fifo);
+++    if (result != FUXI_BT_OK || !capacity) {
+++        return result;
+++    }
+++    *received = fuxi_bt_fifo_pending(fifo, bytes, capacity);
+++    if (*received == capacity) {
+++        fifo->rx_delivered += *received;
+++        return FUXI_BT_OK;
+++    }
+++    if (!fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_RX_STATUS, &status)) {
+++        result = FUXI_BT_IO;
+++        goto failed;
+++    }
+++    result = fuxi_bt_fifo_rx_count(fifo, status, &words, &last_bytes);
+++    if (result != FUXI_BT_OK) {
+++        goto failed;
+++    }
+++    for (unsigned index = 0; index < words && index < FUXI_BT_FIFO_WORD_BUDGET; index++) {
+++        const unsigned valid = index + 1 == words ? last_bytes : 4;
+++        if (!fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_RX, &word)) {
+++            result = FUXI_BT_IO;
+++            goto failed;
+++        }
+++        for (unsigned byte = 0; byte < valid; byte++) {
+++            fifo->rx_pending[byte] = (uint8_t)(word >> (8 * byte));
+++        }
+++        fifo->rx_pending_size = valid;
+++        *received += fuxi_bt_fifo_pending(fifo, bytes + *received, capacity - *received);
+++        if (index + 1 == words) {
+++            if (!fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_SECONDARY_IRQ_CLEAR,
+++                FUXI_BT_FIFO_RX_EVENTS)) {
+++                result = FUXI_BT_IO;
+++                goto failed;
+++            }
+++        }
+++        if (*received == capacity) {
+++            break;
+++        }
+++    }
+++    fifo->rx_delivered += *received;
+++    return *received ? FUXI_BT_OK : FUXI_BT_AGAIN;
+++
+++failed:
+++    (void)fuxi_bt_fifo_fail(fifo, result);
+++    fifo->rx_delivered += *received;
+++    return *received ? FUXI_BT_OK : fifo->error;
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_fifo_close_fail(struct fuxi_bt_geni_fifo *fifo,
+++    enum fuxi_bt_status status)
+++{
+++    fifo->cleanup = status;
+++    fifo->state = FUXI_BT_FIFO_CLOSE_FAILED;
+++    return status;
+++}
+++
+++static bool fuxi_bt_fifo_stop_request(struct fuxi_bt_geni_fifo *fifo,
+++    uint32_t status, uint32_t control)
+++{
+++    if (fifo->owns_master && (status & FUXI_BT_FIFO_MASTER_ACTIVE)) {
+++        if (!fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MASTER_IRQ_CLEAR, 0x31u) ||
+++            !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MASTER_CONTROL, control)) {
+++            return false;
+++        }
+++    }
+++    if (fifo->owns_secondary && (status & FUXI_BT_FIFO_SECONDARY_ACTIVE)) {
+++        if (!fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_SECONDARY_IRQ_CLEAR, 0x31u) ||
+++            !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_SECONDARY_CONTROL, control)) {
+++            return false;
+++        }
+++    }
+++    return true;
+++}
+++
+++enum fuxi_bt_status fuxi_bt_geni_fifo_close_poll(struct fuxi_bt_geni_fifo *fifo)
+++{
+++    uint32_t status, master_control, secondary_control, tx_status, rx_status, word;
+++    uint64_t now;
+++    unsigned words, last_bytes;
+++    enum fuxi_bt_status result;
+++    if (!fifo) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    if (fifo->state == FUXI_BT_FIFO_CLOSE_FAILED) {
+++        return fifo->cleanup;
+++    }
+++    if (!fifo->modified || fifo->state == FUXI_BT_FIFO_CLOSED) {
+++        return FUXI_BT_OK;
+++    }
+++    if (fifo->io_fault || !fuxi_bt_fifo_now(fifo, &now)) {
+++        return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_IO);
+++    }
+++    if (++fifo->stop_polls >= FUXI_BT_FIFO_MAX_POLLS) {
+++        return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_TIMEOUT);
+++    }
+++    if (!fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_STATUS, &status)) {
+++        return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_IO);
+++    }
+++    if (!fuxi_bt_fifo_now(fifo, &now)) {
+++        return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_IO);
+++    }
+++    if ((!fifo->owns_master && (status & FUXI_BT_FIFO_MASTER_ACTIVE)) ||
+++        (!fifo->owns_secondary && (status & FUXI_BT_FIFO_SECONDARY_ACTIVE))) {
+++        return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_BUSY);
+++    }
+++    if (fifo->state == FUXI_BT_FIFO_OPEN || fifo->state == FUXI_BT_FIFO_STARTING ||
+++        fifo->state == FUXI_BT_FIFO_FAULT) {
+++        if (!fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MANUAL_RFR, 0x80000002u) ||
+++            !fuxi_bt_fifo_stop_request(fifo, status, FUXI_BT_FIFO_CONTROL_CANCEL)) {
+++            return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_IO);
+++        }
+++        fifo->state = FUXI_BT_FIFO_CANCEL;
+++        fifo->stop_started_us = now;
+++        return FUXI_BT_AGAIN;
+++    }
+++    if (now - fifo->stop_started_us >= FUXI_BT_FIFO_STOP_TIMEOUT_US) {
+++        if (fifo->state == FUXI_BT_FIFO_CANCEL) {
+++            if (!fuxi_bt_fifo_stop_request(fifo, status, FUXI_BT_FIFO_CONTROL_ABORT)) {
+++                return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_IO);
+++            }
+++            fifo->state = FUXI_BT_FIFO_ABORT;
+++            fifo->stop_started_us = now;
+++            return FUXI_BT_AGAIN;
+++        }
+++        return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_TIMEOUT);
+++    }
+++    if (!fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_MASTER_CONTROL, &master_control) ||
+++        !fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_SECONDARY_CONTROL, &secondary_control) ||
+++        !fuxi_bt_fifo_irqs(fifo)) {
+++        return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_IO);
+++    }
+++    if ((status & (FUXI_BT_FIFO_MASTER_ACTIVE | FUXI_BT_FIFO_SECONDARY_ACTIVE)) ||
+++        ((master_control | secondary_control) & 6u)) {
+++        return FUXI_BT_AGAIN;
+++    }
+++    if ((fifo->owns_master && !(fifo->master_irq & 0x31u)) ||
+++        (fifo->owns_secondary && !(fifo->secondary_irq & 0x31u))) {
+++        return FUXI_BT_AGAIN;
+++    }
+++    if (!fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_TX_STATUS, &tx_status) ||
+++        !fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_RX_STATUS, &rx_status)) {
+++        return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_IO);
+++    }
+++    if (tx_status & 0xfffffffu) {
+++        return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_CLEANUP);
+++    }
+++    result = fuxi_bt_fifo_rx_count(fifo, rx_status, &words, &last_bytes);
+++    if (result != FUXI_BT_OK) {
+++        return fuxi_bt_fifo_close_fail(fifo, result);
+++    }
+++    fifo->rx_discarded += fifo->rx_pending_size - fifo->rx_pending_offset;
+++    fifo->rx_pending_size = fifo->rx_pending_offset = 0;
+++    fifo->state = FUXI_BT_FIFO_DRAIN;
+++    for (unsigned index = 0; index < words && index < FUXI_BT_FIFO_WORD_BUDGET; index++) {
+++        if (!fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_RX, &word)) {
+++            return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_IO);
+++        }
+++        fifo->rx_discarded += index + 1 == words ? last_bytes : 4;
+++    }
+++    if (words) {
+++        return FUXI_BT_AGAIN;
+++    }
+++    fifo->quiescent = true;
+++    if (!fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_MASTER_IRQ_CLEAR, fifo->master_irq) ||
+++        !fuxi_bt_fifo_write32(fifo, FUXI_BT_FIFO_SECONDARY_IRQ_CLEAR, fifo->secondary_irq)) {
+++        return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_IO);
+++    }
+++    for (unsigned index = FUXI_BT_FIFO_SAVED_REGISTERS; index > 0; index--) {
+++        if (!fuxi_bt_fifo_write32(fifo, fuxi_bt_fifo_saved_registers[index - 1], fifo->saved[index - 1])) {
+++            return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_IO);
+++        }
+++    }
+++    for (unsigned index = 0; index < FUXI_BT_FIFO_SAVED_REGISTERS; index++) {
+++        uint32_t value;
+++        if (!fuxi_bt_fifo_read32(fifo, fuxi_bt_fifo_saved_registers[index], &value)) {
+++            return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_IO);
+++        }
+++        if (value != fifo->saved[index]) {
+++            return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_CLEANUP);
+++        }
+++    }
+++    if (!fuxi_bt_fifo_now(fifo, &now)) {
+++        return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_IO);
+++    }
+++    if (now - fifo->stop_started_us >= FUXI_BT_FIFO_STOP_TIMEOUT_US) {
+++        return fuxi_bt_fifo_close_fail(fifo, FUXI_BT_TIMEOUT);
+++    }
+++    fifo->restored = true;
+++    fifo->modified = false;
+++    fifo->owns_master = fifo->owns_secondary = false;
+++    fifo->state = FUXI_BT_FIFO_CLOSED;
+++    fifo->cleanup = FUXI_BT_OK;
+++    return FUXI_BT_OK;
+++}
++--- /dev/null
+++++ b/bsd/dev/fuxi_bt_board.c
++@@ -0,0 +1,501 @@
+++#include "fuxi_bt_board.h"
+++#include <string.h>
+++
+++/* TLMM：每支腳 0x1000；CTL 的 pull [1:0]、func [5:2]、drive [8:6]、OE bit 9；IO 的 IN bit 0、OUT bit 1。 */
+++#define FUXI_BT_TLMM_CTL(pin) (FUXI_BT_TLMM_BASE + (uint64_t)(pin) * 0x1000u)
+++#define FUXI_BT_TLMM_IO(pin) (FUXI_BT_TLMM_CTL(pin) + 4u)
+++#define FUXI_BT_TLMM_FIELDS 0x3ffu
+++#define FUXI_BT_PULL_DOWN 1u
+++#define FUXI_BT_PULL_UP 3u
+++#define FUXI_BT_TLMM_OE (1u << 9)
+++#define FUXI_BT_TLMM_OUT 2u
+++#define FUXI_BT_TLMM_IN 1u
+++
+++#define FUXI_BT_BRANCH_OFF (1u << 31)
+++#define FUXI_BT_BRANCH_HWCG (1u << 1)
+++#define FUXI_BT_RCG_UPDATE 1u
+++#define FUXI_BT_RCG_ROOT_OFF (1u << 31)
+++/* hid 除頻 [4:0]、來源 [10:8]、MND 模式 [13:12]；bit 20（HW_CLK_CTRL）保留 XBL 的設定。 */
+++#define FUXI_BT_RCG_CFG_FIELDS 0x371fu
+++/* F(7372800, P_GCC_GPLL0_OUT_EVEN, 1, 384, 15625)：pre_div 2*1-1、parent_map_8 來源 6、雙沿 MND。 */
+++#define FUXI_BT_RCG_CFG_VALUE (1u | (6u << 8) | (2u << 12))
+++#define FUXI_BT_MND_MASK 0xffffu
+++#define FUXI_BT_MND_M 384u
+++#define FUXI_BT_MND_N 15625u
+++
+++static const uint32_t fuxi_bt_board_branches[] = {0x233d4, 0x233d0, 0x233cc, 0x23004, 0x1e754};
+++
+++const char *fuxi_bt_board_stage_name(enum fuxi_bt_board_stage stage)
+++{
+++    static const char *const names[] = {
+++        "idle", "wlan", "gpll0", "vote", "branch", "rcg", "wrapper",
+++        "engine", "pins", "bt-en", "ready"
+++    };
+++    if ((unsigned)stage >= sizeof(names) / sizeof(names[0])) {
+++        return "unknown";
+++    }
+++    return names[stage];
+++}
+++
+++static bool fuxi_bt_board_read(struct fuxi_bt_board *board, uint64_t pa, uint32_t *value)
+++{
+++    if (board->io.read(board->io.context, pa, value) == FUXI_BT_OK) {
+++        return true;
+++    }
+++    if (board->error == FUXI_BT_OK) {
+++        board->error = FUXI_BT_IO;
+++        board->failed_value = (uint32_t)pa;
+++    }
+++    return false;
+++}
+++
+++static bool fuxi_bt_board_write(struct fuxi_bt_board *board, uint64_t pa, uint32_t value)
+++{
+++    if (board->io.write(board->io.context, pa, value) == FUXI_BT_OK) {
+++        return true;
+++    }
+++    if (board->error == FUXI_BT_OK) {
+++        board->error = FUXI_BT_IO;
+++        board->failed_value = (uint32_t)pa;
+++    }
+++    return false;
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_board_fail(struct fuxi_bt_board *board,
+++    enum fuxi_bt_status status, uint32_t value)
+++{
+++    if (board->error == FUXI_BT_OK) {
+++        board->error = status;
+++        board->failed_value = value;
+++    }
+++    return board->error;
+++}
+++
+++enum fuxi_bt_status fuxi_bt_board_wlan_ready(const struct fuxi_bt_board_io *io, bool *ready)
+++{
+++    uint32_t ctl, value;
+++    enum fuxi_bt_status status;
+++    if (!io || !io->read || !ready) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    *ready = false;
+++    status = io->read(io->context, FUXI_BT_TLMM_CTL(FUXI_BT_GPIO_WLAN_EN), &ctl);
+++    if (status != FUXI_BT_OK) {
+++        return status;
+++    }
+++    status = io->read(io->context, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_WLAN_EN), &value);
+++    if (status != FUXI_BT_OK) {
+++        return status;
+++    }
+++    *ready = !((ctl >> 2) & 0xfu) && (ctl & FUXI_BT_TLMM_OE) && (value & FUXI_BT_TLMM_OUT);
+++    return FUXI_BT_OK;
+++}
+++
+++/* 投票後等五個分支開：hwcg 開著的分支（s_ahb、m_ahb）閒置時可能仍回報 off，比照 Linux 跳過。 */
+++static enum fuxi_bt_status fuxi_bt_board_branches_wait(struct fuxi_bt_board *board)
+++{
+++    for (unsigned attempt = 0; attempt <= FUXI_BT_BRANCH_TIMEOUT_US / 10u; attempt++) {
+++        uint32_t pending = 0, value = 0;
+++        for (unsigned index = 0; index < 5; index++) {
+++            if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + fuxi_bt_board_branches[index], &value)) {
+++                return board->error;
+++            }
+++            if ((value & FUXI_BT_BRANCH_OFF) && !(value & FUXI_BT_BRANCH_HWCG)) {
+++                pending = value;
+++            }
+++        }
+++        if (!pending) {
+++            return FUXI_BT_OK;
+++        }
+++        if (attempt == FUXI_BT_BRANCH_TIMEOUT_US / 10u) {
+++            return fuxi_bt_board_fail(board, FUXI_BT_TIMEOUT, pending);
+++        }
+++        board->io.wait_us(board->io.context, 10);
+++    }
+++    return fuxi_bt_board_fail(board, FUXI_BT_TIMEOUT, 0);
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_board_rcg_update(struct fuxi_bt_board *board)
+++{
+++    uint32_t command = 0;
+++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command) ||
+++        !fuxi_bt_board_write(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, command | FUXI_BT_RCG_UPDATE)) {
+++        return board->error;
+++    }
+++    for (unsigned attempt = 0; attempt <= FUXI_BT_RCG_TIMEOUT_US / 10u; attempt++) {
+++        if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command)) {
+++            return board->error;
+++        }
+++        if (!(command & FUXI_BT_RCG_UPDATE)) {
+++            return FUXI_BT_OK;
+++        }
+++        if (attempt < FUXI_BT_RCG_TIMEOUT_US / 10u) {
+++            board->io.wait_us(board->io.context, 10);
+++        }
+++    }
+++    return fuxi_bt_board_fail(board, FUXI_BT_TIMEOUT, command);
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_board_rcg(struct fuxi_bt_board *board)
+++{
+++    static const uint32_t offsets[] = {4, 8, 12, 16};
+++    uint32_t command = 0, values[4];
+++    enum fuxi_bt_status status;
+++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command)) {
+++        return board->error;
+++    }
+++    if (command & FUXI_BT_RCG_UPDATE) {
+++        return fuxi_bt_board_fail(board, FUXI_BT_BUSY, command);
+++    }
+++    for (unsigned index = 0; index < 4; index++) {
+++        if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + offsets[index],
+++            &board->rcg_saved[index])) {
+++            return board->error;
+++        }
+++    }
+++    values[0] = (board->rcg_saved[0] & ~FUXI_BT_RCG_CFG_FIELDS) | FUXI_BT_RCG_CFG_VALUE;
+++    values[1] = (board->rcg_saved[1] & ~FUXI_BT_MND_MASK) | FUXI_BT_MND_M;
+++    values[2] = (board->rcg_saved[2] & ~FUXI_BT_MND_MASK) |
+++        (~(FUXI_BT_MND_N - FUXI_BT_MND_M) & FUXI_BT_MND_MASK);
+++    values[3] = (board->rcg_saved[3] & ~FUXI_BT_MND_MASK) | (~FUXI_BT_MND_N & FUXI_BT_MND_MASK);
+++    board->rcg_changed = true;
+++    /* 和 Linux 一樣先寫 M/N/D 再寫 CFG，最後 CMD_UPDATE。 */
+++    for (unsigned index = 1; index < 4; index++) {
+++        if (!fuxi_bt_board_write(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + offsets[index], values[index])) {
+++            return board->error;
+++        }
+++    }
+++    if (!fuxi_bt_board_write(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + 4, values[0])) {
+++        return board->error;
+++    }
+++    status = fuxi_bt_board_rcg_update(board);
+++    if (status != FUXI_BT_OK) {
+++        return status;
+++    }
+++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + 4, &board->rcg_cfg) ||
+++        !fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command)) {
+++        return board->error;
+++    }
+++    if ((board->rcg_cfg & FUXI_BT_RCG_CFG_FIELDS) != FUXI_BT_RCG_CFG_VALUE) {
+++        return fuxi_bt_board_fail(board, FUXI_BT_IO, board->rcg_cfg);
+++    }
+++    if (command & FUXI_BT_RCG_ROOT_OFF) {
+++        return fuxi_bt_board_fail(board, FUXI_BT_OFF, command);
+++    }
+++    return FUXI_BT_OK;
+++}
+++
+++enum fuxi_bt_status fuxi_bt_board_power_on(struct fuxi_bt_board *board,
+++    const struct fuxi_bt_board_io *io)
+++{
+++    uint32_t value = 0;
+++    bool ready = false;
+++    enum fuxi_bt_status status;
+++    if (!board || !io || !io->read || !io->write || !io->now_us || !io->wait_us) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    memset(board, 0, sizeof(*board));
+++    board->io = *io;
+++
+++    board->stage = FUXI_BT_STAGE_WLAN;
+++    status = fuxi_bt_board_wlan_ready(io, &ready);
+++    if (status != FUXI_BT_OK) {
+++        return fuxi_bt_board_fail(board, status, 0);
+++    }
+++    if (!ready) {
+++        return fuxi_bt_board_fail(board, FUXI_BT_OFF, 0);
+++    }
+++
+++    board->stage = FUXI_BT_STAGE_GPLL0;
+++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_GPLL0_VOTE, &value) ||
+++        !fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_GPLL0_MODE, &board->gpll0_mode) ||
+++        !fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_GPLL0_USER, &board->gpll0_user)) {
+++        return board->error;
+++    }
+++    /* GPLL0 已投票、已鎖定，EVEN 輸出開著且後除 2（300 MHz）；不是就不動它。 */
+++    if (!(value & 1u) || !(board->gpll0_mode & (1u << 31)) ||
+++        !(board->gpll0_user & 2u) || ((board->gpll0_user >> 10) & 0xfu) != 1u) {
+++        return fuxi_bt_board_fail(board, FUXI_BT_NO_UART, board->gpll0_user);
+++    }
+++
+++    board->stage = FUXI_BT_STAGE_VOTE;
+++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_VOTE_REG, &board->vote)) {
+++        return board->error;
+++    }
+++    board->added_votes = FUXI_BT_VOTE_BITS & ~board->vote;
+++    if (board->added_votes) {
+++        board->votes_changed = true;
+++        if (!fuxi_bt_board_write(board, FUXI_BT_GCC_BASE + FUXI_BT_VOTE_REG,
+++            board->vote | FUXI_BT_VOTE_BITS)) {
+++            return board->error;
+++        }
+++    }
+++
+++    board->stage = FUXI_BT_STAGE_BRANCH;
+++    status = fuxi_bt_board_branches_wait(board);
+++    if (status != FUXI_BT_OK) {
+++        return status;
+++    }
+++
+++    board->stage = FUXI_BT_STAGE_RCG;
+++    status = fuxi_bt_board_rcg(board);
+++    if (status != FUXI_BT_OK) {
+++        return status;
+++    }
+++
+++    board->stage = FUXI_BT_STAGE_WRAPPER;
+++    if (!fuxi_bt_board_read(board, FUXI_BT_WRAPPER_BASE + 4, &board->qup_version)) {
+++        return board->error;
+++    }
+++    if (!board->qup_version || board->qup_version == 0xffffffffu) {
+++        return fuxi_bt_board_fail(board, FUXI_BT_NO_UART, board->qup_version);
+++    }
+++
+++    board->stage = FUXI_BT_STAGE_ENGINE;
+++    if (!fuxi_bt_board_read(board, FUXI_BT_UART_BASE + FUXI_BT_FIFO_FIRMWARE, &board->firmware) ||
+++        !fuxi_bt_board_read(board, FUXI_BT_UART_BASE + FUXI_BT_FIFO_IF_DISABLE, &value)) {
+++        return board->error;
+++    }
+++    if (((board->firmware >> 8) & 0xffu) != 2u) {
+++        return fuxi_bt_board_fail(board, FUXI_BT_NO_UART, board->firmware);
+++    }
+++    if (value & 1u) {
+++        return fuxi_bt_board_fail(board, FUXI_BT_NO_UART, value);
+++    }
+++
+++    /* sm8550.dtsi qup_uart14：CTS/RTS 下拉、TX/RX 上拉，2 mA，function qup2_se6（1）。 */
+++    board->stage = FUXI_BT_STAGE_PINS;
+++    for (unsigned index = 0; index < 4; index++) {
+++        const unsigned pin = FUXI_BT_GPIO_UART_FIRST + index;
+++        if (!fuxi_bt_board_read(board, FUXI_BT_TLMM_CTL(pin), &board->pin_ctl[index])) {
+++            return board->error;
+++        }
+++    }
+++    board->pins_changed = true;
+++    for (unsigned index = 0; index < 4; index++) {
+++        const unsigned pin = FUXI_BT_GPIO_UART_FIRST + index;
+++        const uint32_t wanted = (index < 2 ? FUXI_BT_PULL_DOWN : FUXI_BT_PULL_UP) | (1u << 2);
+++        uint32_t readback = 0;
+++        if (!fuxi_bt_board_write(board, FUXI_BT_TLMM_CTL(pin),
+++                (board->pin_ctl[index] & ~FUXI_BT_TLMM_FIELDS) | wanted) ||
+++            !fuxi_bt_board_read(board, FUXI_BT_TLMM_CTL(pin), &readback)) {
+++            return board->error;
+++        }
+++        if ((readback & FUXI_BT_TLMM_FIELDS) != wanted) {
+++            return fuxi_bt_board_fail(board, FUXI_BT_IO, readback);
+++        }
+++    }
+++
+++    board->stage = FUXI_BT_STAGE_BT_EN;
+++    if (!fuxi_bt_board_read(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_SW_CTRL), &value) ||
+++        !fuxi_bt_board_read(board, FUXI_BT_TLMM_CTL(FUXI_BT_GPIO_BT_EN), &board->bt_en_ctl) ||
+++        !fuxi_bt_board_read(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_BT_EN), &board->bt_en_io)) {
+++        return board->error;
+++    }
+++    board->sw_ctrl_before = value & FUXI_BT_TLMM_IN;
+++    board->bt_en_changed = true;
+++    if (!fuxi_bt_board_write(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_BT_EN), 0) ||
+++        !fuxi_bt_board_write(board, FUXI_BT_TLMM_CTL(FUXI_BT_GPIO_BT_EN),
+++            (board->bt_en_ctl & ~FUXI_BT_TLMM_FIELDS) | FUXI_BT_PULL_DOWN | FUXI_BT_TLMM_OE)) {
+++        return board->error;
+++    }
+++    board->io.wait_us(board->io.context, FUXI_BT_BT_EN_LOW_US);
+++    if (!fuxi_bt_board_write(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_BT_EN), FUXI_BT_TLMM_OUT)) {
+++        return board->error;
+++    }
+++    board->io.wait_us(board->io.context, FUXI_BT_POWERUP_US);
+++    if (!fuxi_bt_board_read(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_BT_EN), &value)) {
+++        return board->error;
+++    }
+++    if (!(value & FUXI_BT_TLMM_IN)) {
+++        return fuxi_bt_board_fail(board, FUXI_BT_IO, value);
+++    }
+++    if (!fuxi_bt_board_read(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_SW_CTRL), &value)) {
+++        return board->error;
+++    }
+++    board->sw_ctrl_after = value & FUXI_BT_TLMM_IN;
+++    board->stage = FUXI_BT_STAGE_READY;
+++    return FUXI_BT_OK;
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_board_cleanup_write(struct fuxi_bt_board *board,
+++    uint64_t pa, uint32_t value, enum fuxi_bt_status *cleanup)
+++{
+++    if (board->io.write(board->io.context, pa, value) != FUXI_BT_OK && *cleanup == FUXI_BT_OK) {
+++        *cleanup = FUXI_BT_IO;
+++    }
+++    return *cleanup;
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_board_release(void *context);
+++
+++enum fuxi_bt_status fuxi_bt_board_power_off(struct fuxi_bt_board *board)
+++{
+++    enum fuxi_bt_status cleanup = FUXI_BT_OK;
+++    if (!board || !board->io.read || !board->io.write || !board->io.wait_us) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    if (board->fifo_used) {
+++        cleanup = fuxi_bt_board_release(board);
+++    }
+++    if (board->bt_en_changed) {
+++        (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_BT_EN), 0, &cleanup);
+++        (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_TLMM_CTL(FUXI_BT_GPIO_BT_EN), board->bt_en_ctl, &cleanup);
+++        (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_TLMM_IO(FUXI_BT_GPIO_BT_EN),
+++            board->bt_en_io & FUXI_BT_TLMM_OUT, &cleanup);
+++        board->bt_en_changed = false;
+++    }
+++    if (board->pins_changed) {
+++        for (unsigned index = 0; index < 4; index++) {
+++            (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_TLMM_CTL(FUXI_BT_GPIO_UART_FIRST + index),
+++                board->pin_ctl[index], &cleanup);
+++        }
+++        board->pins_changed = false;
+++    }
+++    if (board->rcg_changed) {
+++        static const uint32_t offsets[] = {4, 8, 12, 16};
+++        uint32_t command = 0;
+++        bool updated = false;
+++        for (unsigned index = 1; index < 4; index++) {
+++            (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + offsets[index],
+++                board->rcg_saved[index], &cleanup);
+++        }
+++        (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + 4,
+++            board->rcg_saved[0], &cleanup);
+++        if (board->io.read(board->io.context, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command) == FUXI_BT_OK &&
+++            board->io.write(board->io.context, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD,
+++                command | FUXI_BT_RCG_UPDATE) == FUXI_BT_OK) {
+++            for (unsigned attempt = 0; attempt <= FUXI_BT_RCG_TIMEOUT_US / 10u; attempt++) {
+++                if (board->io.read(board->io.context, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command) != FUXI_BT_OK) {
+++                    break;
+++                }
+++                if (!(command & FUXI_BT_RCG_UPDATE)) {
+++                    updated = true;
+++                    break;
+++                }
+++                board->io.wait_us(board->io.context, 10);
+++            }
+++        }
+++        if (!updated && cleanup == FUXI_BT_OK) {
+++            cleanup = FUXI_BT_TIMEOUT;
+++        }
+++        board->rcg_changed = false;
+++    }
+++    if (board->votes_changed) {
+++        uint32_t vote = 0;
+++        if (board->io.read(board->io.context, FUXI_BT_GCC_BASE + FUXI_BT_VOTE_REG, &vote) != FUXI_BT_OK) {
+++            if (cleanup == FUXI_BT_OK) {
+++                cleanup = FUXI_BT_IO;
+++            }
+++        } else {
+++            (void)fuxi_bt_board_cleanup_write(board, FUXI_BT_GCC_BASE + FUXI_BT_VOTE_REG,
+++                vote & ~board->added_votes, &cleanup);
+++        }
+++        board->votes_changed = false;
+++    }
+++    return cleanup;
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_board_se_read(void *context, uint32_t reg, uint32_t *value)
+++{
+++    struct fuxi_bt_board *board = context;
+++    if ((reg & 3u) || reg >= 0x4000u) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    return board->io.read(board->io.context, FUXI_BT_UART_BASE + reg, value);
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_board_se_write(void *context, uint32_t reg, uint32_t value)
+++{
+++    struct fuxi_bt_board *board = context;
+++    if ((reg & 3u) || reg >= 0x4000u) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    return board->io.write(board->io.context, FUXI_BT_UART_BASE + reg, value);
+++}
+++
+++static uint64_t fuxi_bt_board_now(void *context)
+++{
+++    struct fuxi_bt_board *board = context;
+++    return board->io.now_us(board->io.context);
+++}
+++
+++static void fuxi_bt_board_wait(void *context, unsigned microseconds)
+++{
+++    struct fuxi_bt_board *board = context;
+++    board->io.wait_us(board->io.context, microseconds);
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_board_acquire(void *context, unsigned baud)
+++{
+++    struct fuxi_bt_board *board = context;
+++    const struct fuxi_bt_geni_fifo_io io = {
+++        board, fuxi_bt_board_se_read, fuxi_bt_board_se_write, fuxi_bt_board_now
+++    };
+++    const struct fuxi_bt_geni_fifo_config config = {1, true, board->qup_version, FUXI_BT_SE_HZ};
+++    enum fuxi_bt_status status;
+++    if (baud != FUXI_BT_BOOT_BAUD) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    if (board->fifo_used) {
+++        return FUXI_BT_BUSY;
+++    }
+++    if (board->stage != FUXI_BT_STAGE_READY) {
+++        return FUXI_BT_NO_UART;
+++    }
+++    board->fifo_used = true;
+++    status = fuxi_bt_geni_fifo_open(&board->fifo, &io, &config);
+++    for (unsigned poll = 0; status == FUXI_BT_AGAIN && poll < FUXI_BT_ACQUIRE_POLLS; poll++) {
+++        board->io.wait_us(board->io.context, 10);
+++        status = fuxi_bt_geni_fifo_poll(&board->fifo);
+++    }
+++    return status == FUXI_BT_AGAIN ? FUXI_BT_TIMEOUT : status;
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_board_uart_write(void *context, const uint8_t *bytes,
+++    size_t size, size_t *accepted)
+++{
+++    struct fuxi_bt_board *board = context;
+++    return fuxi_bt_geni_fifo_write(&board->fifo, bytes, size, accepted);
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_board_uart_read(void *context, uint8_t *bytes,
+++    size_t capacity, size_t *received)
+++{
+++    struct fuxi_bt_board *board = context;
+++    return fuxi_bt_geni_fifo_read(&board->fifo, bytes, capacity, received);
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_board_release(void *context)
+++{
+++    struct fuxi_bt_board *board = context;
+++    enum fuxi_bt_status status;
+++    if (!board->fifo_used) {
+++        return FUXI_BT_OK;
+++    }
+++    status = fuxi_bt_geni_fifo_close_poll(&board->fifo);
+++    for (unsigned poll = 0; status == FUXI_BT_AGAIN && poll < FUXI_BT_RELEASE_POLLS; poll++) {
+++        board->io.wait_us(board->io.context, 10);
+++        status = fuxi_bt_geni_fifo_close_poll(&board->fifo);
+++    }
+++    board->fifo_used = false;
+++    return status == FUXI_BT_AGAIN ? FUXI_BT_TIMEOUT : status;
+++}
+++
+++void fuxi_bt_board_uart_ops(struct fuxi_bt_board *board, struct fuxi_bt_uart_ops *ops)
+++{
+++    if (!ops) {
+++        return;
+++    }
+++    memset(ops, 0, sizeof(*ops));
+++    if (!board) {
+++        return;
+++    }
+++    ops->context = board;
+++    ops->acquire = fuxi_bt_board_acquire;
+++    ops->write = fuxi_bt_board_uart_write;
+++    ops->read = fuxi_bt_board_uart_read;
+++    ops->release = fuxi_bt_board_release;
+++    ops->now_us = fuxi_bt_board_now;
+++    ops->wait_us = fuxi_bt_board_wait;
+++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_battery_freshness.c
 +@@ -0,0 +1,168 @@
@@ -48341,6 +51161,253 @@ index 0000000..4af397a
 ++    void *context, struct fuxi_bt_snapshot *snapshot);
 ++enum fuxi_bt_status fuxi_bt_register_uart(const struct fuxi_bt_uart_ops *ops);
 ++void fuxi_bt_init(void);
+++
+++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_bt_geni_fifo.h
++@@ -0,0 +1,146 @@
+++#ifndef FUXI_BT_GENI_FIFO_H
+++#define FUXI_BT_GENI_FIFO_H
+++
+++#include "fuxi_bt.h"
+++
+++#define FUXI_BT_FIFO_MAX_TX 1024u
+++#define FUXI_BT_FIFO_WORD_BUDGET 16u
+++#define FUXI_BT_FIFO_TX_TIMEOUT_US 200000u
+++#define FUXI_BT_FIFO_STOP_TIMEOUT_US 20000u
+++#define FUXI_BT_FIFO_MAX_POLLS 2000u
+++#define FUXI_BT_FIFO_SAVED_REGISTERS 27u
+++
+++enum fuxi_bt_geni_fifo_register {
+++    FUXI_BT_FIFO_OUTPUT_CTRL = 0x24,
+++    FUXI_BT_FIFO_CLOCK_GATING = 0x28,
+++    FUXI_BT_FIFO_STATUS = 0x40,
+++    FUXI_BT_FIFO_MASTER_CLOCK = 0x48,
+++    FUXI_BT_FIFO_SECONDARY_CLOCK = 0x4c,
+++    FUXI_BT_FIFO_IF_DISABLE = 0x64,
+++    FUXI_BT_FIFO_FIRMWARE = 0x68,
+++    FUXI_BT_FIFO_CLOCK_SELECT = 0x7c,
+++    FUXI_BT_FIFO_LOOPBACK = 0x22c,
+++    FUXI_BT_FIFO_BYTE_GRANULARITY = 0x254,
+++    FUXI_BT_FIFO_DMA_MODE = 0x258,
+++    FUXI_BT_FIFO_TX_CONFIG = 0x25c,
+++    FUXI_BT_FIFO_TX_PACKING0 = 0x260,
+++    FUXI_BT_FIFO_TX_PACKING1 = 0x264,
+++    FUXI_BT_FIFO_TX_WORD_LENGTH = 0x268,
+++    FUXI_BT_FIFO_TX_STOP_LENGTH = 0x26c,
+++    FUXI_BT_FIFO_TX_LENGTH = 0x270,
+++    FUXI_BT_FIFO_RX_CONFIG = 0x280,
+++    FUXI_BT_FIFO_RX_PACKING0 = 0x284,
+++    FUXI_BT_FIFO_RX_PACKING1 = 0x288,
+++    FUXI_BT_FIFO_RX_WORD_LENGTH = 0x28c,
+++    FUXI_BT_FIFO_RX_STALE = 0x294,
+++    FUXI_BT_FIFO_TX_PARITY = 0x2a4,
+++    FUXI_BT_FIFO_RX_PARITY = 0x2a8,
+++    FUXI_BT_FIFO_MANUAL_RFR = 0x2ac,
+++    FUXI_BT_FIFO_MASTER_COMMAND = 0x600,
+++    FUXI_BT_FIFO_MASTER_CONTROL = 0x604,
+++    FUXI_BT_FIFO_MASTER_IRQ = 0x610,
+++    FUXI_BT_FIFO_MASTER_IRQ_ENABLE = 0x614,
+++    FUXI_BT_FIFO_MASTER_IRQ_CLEAR = 0x618,
+++    FUXI_BT_FIFO_SECONDARY_COMMAND = 0x630,
+++    FUXI_BT_FIFO_SECONDARY_CONTROL = 0x634,
+++    FUXI_BT_FIFO_SECONDARY_IRQ = 0x640,
+++    FUXI_BT_FIFO_SECONDARY_IRQ_ENABLE = 0x644,
+++    FUXI_BT_FIFO_SECONDARY_IRQ_CLEAR = 0x648,
+++    FUXI_BT_FIFO_TX = 0x700,
+++    FUXI_BT_FIFO_RX = 0x780,
+++    FUXI_BT_FIFO_TX_STATUS = 0x800,
+++    FUXI_BT_FIFO_RX_STATUS = 0x804,
+++    FUXI_BT_FIFO_TX_WATERMARK = 0x80c,
+++    FUXI_BT_FIFO_RX_WATERMARK = 0x810,
+++    FUXI_BT_FIFO_RX_RFR_WATERMARK = 0x814,
+++    FUXI_BT_FIFO_GSI_EVENTS = 0xe18,
+++    FUXI_BT_FIFO_IRQ_ENABLE = 0xe1c,
+++    FUXI_BT_FIFO_HW_TX = 0xe24,
+++    FUXI_BT_FIFO_HW_RX = 0xe28
+++};
+++
+++enum fuxi_bt_geni_fifo_state {
+++    FUXI_BT_FIFO_ZERO = 0,
+++    FUXI_BT_FIFO_STARTING,
+++    FUXI_BT_FIFO_OPEN,
+++    FUXI_BT_FIFO_FAULT,
+++    FUXI_BT_FIFO_CANCEL,
+++    FUXI_BT_FIFO_ABORT,
+++    FUXI_BT_FIFO_DRAIN,
+++    FUXI_BT_FIFO_CLOSED,
+++    FUXI_BT_FIFO_CLOSE_FAILED
+++};
+++
+++struct fuxi_bt_geni_fifo_io {
+++    void *context;
+++    enum fuxi_bt_status (*read)(void *, uint32_t, uint32_t *);
+++    enum fuxi_bt_status (*write)(void *, uint32_t, uint32_t);
+++    uint64_t (*now_us)(void *);
+++};
+++
+++struct fuxi_bt_geni_fifo_config {
+++    unsigned opt_in;
+++    bool resources_owned;
+++    uint32_t qup_version;
+++    uint32_t source_hz;
+++};
+++
+++struct fuxi_bt_geni_fifo {
+++    struct fuxi_bt_geni_fifo_io io;
+++    enum fuxi_bt_geni_fifo_state state;
+++    enum fuxi_bt_status error;
+++    enum fuxi_bt_status cleanup;
+++    bool modified;
+++    bool owns_master;
+++    bool owns_secondary;
+++    bool io_fault;
+++    bool quiescent;
+++    bool restored;
+++    uint32_t failed_register;
+++    bool failed_write;
+++    uint32_t firmware;
+++    uint32_t interface_disable;
+++    uint32_t dma_mode;
+++    uint32_t master_irq;
+++    uint32_t secondary_irq;
+++    uint32_t startup_master_irq;
+++    uint32_t startup_secondary_irq;
+++    unsigned tx_depth;
+++    unsigned rx_depth;
+++    uint32_t saved[FUXI_BT_FIFO_SAVED_REGISTERS];
+++    uint64_t start_us;
+++    unsigned start_polls;
+++    unsigned tx_size;
+++    unsigned tx_remaining;
+++    unsigned tx_polls;
+++    uint64_t tx_started_us;
+++    uint64_t tx_accepted;
+++    uint64_t tx_completed;
+++    uint8_t rx_pending[4];
+++    unsigned rx_pending_size;
+++    unsigned rx_pending_offset;
+++    uint64_t rx_delivered;
+++    uint64_t rx_discarded;
+++    uint64_t last_us;
+++    uint64_t stop_started_us;
+++    unsigned stop_polls;
+++};
+++
+++#ifdef __cplusplus
+++extern "C" {
+++#endif
+++
+++enum fuxi_bt_status fuxi_bt_geni_fifo_open(struct fuxi_bt_geni_fifo *fifo,
+++    const struct fuxi_bt_geni_fifo_io *io, const struct fuxi_bt_geni_fifo_config *config);
+++enum fuxi_bt_status fuxi_bt_geni_fifo_poll(struct fuxi_bt_geni_fifo *fifo);
+++enum fuxi_bt_status fuxi_bt_geni_fifo_write(struct fuxi_bt_geni_fifo *fifo,
+++    const uint8_t *bytes, size_t size, size_t *accepted);
+++enum fuxi_bt_status fuxi_bt_geni_fifo_read(struct fuxi_bt_geni_fifo *fifo,
+++    uint8_t *bytes, size_t capacity, size_t *received);
+++enum fuxi_bt_status fuxi_bt_geni_fifo_close_poll(struct fuxi_bt_geni_fifo *fifo);
+++
+++#ifdef __cplusplus
+++}
+++#endif
+++
+++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_bt_board.h
++@@ -0,0 +1,95 @@
+++#ifndef FUXI_BT_BOARD_H
+++#define FUXI_BT_BOARD_H
+++
+++/*
+++ * WCN7850 藍牙 UART 的板級準備（fuxi,bt=3）：
+++ * QUP2 SE6 時脈投票、SE6 RCG 設成 7.3728 MHz（GPLL0_OUT_EVEN 300 MHz × 384/15625，與 Linux gcc-sm8550 相同）、
+++ * gpio76–79 切成 qup2_se6、BT_EN（gpio81）拉高。前提是 WLAN 已把 WCN 的電源軌和 WLAN_EN（gpio80）打開。
+++ * 純 C；MMIO 經由呼叫端提供的 read/write（XNU 走 fault-safe 存取，主機測試走模擬模型）。
+++ * power_off 依旗標逆序還原 power_on 改過的東西，不論 power_on 成功或失敗都要呼叫。
+++ */
+++#include "fuxi_bt.h"
+++#include "fuxi_bt_geni_fifo.h"
+++
+++#define FUXI_BT_SE_HZ 7372800u
+++#define FUXI_BT_GPIO_UART_FIRST 76u /* 76 CTS、77 RFR、78 TX、79 RX */
+++#define FUXI_BT_GPIO_WLAN_EN 80u
+++#define FUXI_BT_GPIO_BT_EN 81u
+++#define FUXI_BT_GPIO_SW_CTRL 82u
+++#define FUXI_BT_VOTE_REG 0x52010u
+++#define FUXI_BT_VOTE_BITS 0x40fu /* core、s_ahb、m_ahb、core_2x、se6 */
+++#define FUXI_BT_RCG_CMD 0x1e760u
+++#define FUXI_BT_GPLL0_MODE 0x0u
+++#define FUXI_BT_GPLL0_USER 0x18u
+++#define FUXI_BT_GPLL0_VOTE 0x52018u
+++#define FUXI_BT_BRANCH_TIMEOUT_US 2000u
+++#define FUXI_BT_RCG_TIMEOUT_US 2000u
+++#define FUXI_BT_BT_EN_LOW_US 50000u
+++#define FUXI_BT_POWERUP_US 100000u /* pwrseq-qcom-wcn：WCN7850 pwup_delay_ms 100 */
+++#define FUXI_BT_ACQUIRE_POLLS 2000u
+++#define FUXI_BT_RELEASE_POLLS 20000u
+++
+++enum fuxi_bt_board_stage {
+++    FUXI_BT_STAGE_IDLE = 0,
+++    FUXI_BT_STAGE_WLAN,
+++    FUXI_BT_STAGE_GPLL0,
+++    FUXI_BT_STAGE_VOTE,
+++    FUXI_BT_STAGE_BRANCH,
+++    FUXI_BT_STAGE_RCG,
+++    FUXI_BT_STAGE_WRAPPER,
+++    FUXI_BT_STAGE_ENGINE,
+++    FUXI_BT_STAGE_PINS,
+++    FUXI_BT_STAGE_BT_EN,
+++    FUXI_BT_STAGE_READY
+++};
+++
+++struct fuxi_bt_board_io {
+++    void *context;
+++    enum fuxi_bt_status (*read)(void *, uint64_t, uint32_t *);
+++    enum fuxi_bt_status (*write)(void *, uint64_t, uint32_t);
+++    uint64_t (*now_us)(void *);
+++    void (*wait_us)(void *, unsigned);
+++};
+++
+++struct fuxi_bt_board {
+++    struct fuxi_bt_board_io io;
+++    enum fuxi_bt_board_stage stage;
+++    enum fuxi_bt_status error;
+++    uint32_t failed_value;
+++    uint32_t gpll0_mode;
+++    uint32_t gpll0_user;
+++    uint32_t vote;
+++    uint32_t added_votes;
+++    uint32_t rcg_saved[4]; /* cfg、m、n、d */
+++    uint32_t rcg_cfg;
+++    uint32_t qup_version;
+++    uint32_t firmware;
+++    uint32_t pin_ctl[4];
+++    uint32_t bt_en_ctl;
+++    uint32_t bt_en_io;
+++    uint32_t sw_ctrl_before;
+++    uint32_t sw_ctrl_after;
+++    bool votes_changed;
+++    bool rcg_changed;
+++    bool pins_changed;
+++    bool bt_en_changed;
+++    bool fifo_used;
+++    struct fuxi_bt_geni_fifo fifo;
+++};
+++
+++#ifdef __cplusplus
+++extern "C" {
+++#endif
+++
+++const char *fuxi_bt_board_stage_name(enum fuxi_bt_board_stage stage);
+++enum fuxi_bt_status fuxi_bt_board_wlan_ready(const struct fuxi_bt_board_io *io, bool *ready);
+++enum fuxi_bt_status fuxi_bt_board_power_on(struct fuxi_bt_board *board,
+++    const struct fuxi_bt_board_io *io);
+++enum fuxi_bt_status fuxi_bt_board_power_off(struct fuxi_bt_board *board);
+++void fuxi_bt_board_uart_ops(struct fuxi_bt_board *board, struct fuxi_bt_uart_ops *ops);
+++
+++#ifdef __cplusplus
+++}
+++#endif
 ++
 ++#endif
 +--- /dev/null
