@@ -1,0 +1,60 @@
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -420,4 +420,17 @@
+ static VkResult
++darwin_reclaim_import_cache(struct tu_device *dev, bool *released)
++{
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   pthread_mutex_lock(&retire->lock);
++   const uint64_t before = retire->cache_bytes;
++   darwin_cache_flush(dev, retire);
++   *released = retire->cache_bytes < before;
++   VkResult result = retire->failure;
++   pthread_mutex_unlock(&retire->lock);
++   return result;
++}
++
++static VkResult
+ darwin_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer, uint64_t size)
+ {
+    *out_bo = NULL;
+@@ -433,16 +446,31 @@
+    if (collected != VK_SUCCESS)
+       return collected;
+    uint64_t iova;
+-   VkResult result = darwin_allocate_iova(dev, size, 0, TU_BO_ALLOC_NO_FLAGS, &iova);
+-   if (result != VK_SUCCESS)
+-      return result;
+-
+    NativeAdrenoAbiBoImport import = {.address = (uint64_t)(uintptr_t)pointer, .bytes = size};
+    NativeAdrenoAbiBoAllocReply reply = {};
+-   kern_return_t kr = dw_call(NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
+-   if (kr != KERN_SUCCESS) {
+-      darwin_free_iova(dev, iova, size);
+-      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE, "BoImport failed: 0x%x", kr);
++   kern_return_t kr;
++   for (bool reclaimed = false;;) {
++      VkResult result = darwin_allocate_iova(dev, size, 0, TU_BO_ALLOC_NO_FLAGS, &iova);
++      if (result != VK_SUCCESS) {
++         if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY || reclaimed)
++            return result;
++      } else {
++         kr = dw_call(NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
++         if (kr == KERN_SUCCESS)
++            break;
++         darwin_free_iova(dev, iova, size);
++         if (kr != kIOReturnNoMemory && kr != kIOReturnNoResources)
++            return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE, "BoImport failed: 0x%x", kr);
++         if (reclaimed)
++            return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoImport failed: 0x%x", kr);
++      }
++      reclaimed = true;
++      bool released = false;
++      VkResult cleanup = darwin_reclaim_import_cache(dev, &released);
++      if (cleanup != VK_SUCCESS)
++         return cleanup;
++      if (!released)
++         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    }
+    NativeAdrenoAbiBoMap map = {.handle = reply.handle, .iova = iova, .permissions = 3u, .writeback = 0, .shareability = 2};
+    NativeAdrenoAbiBoMapReply mapped = {};

@@ -12,6 +12,7 @@ on:
     paths:
       - .github/workflows/turnip-rebuild.yml
       - patches/mesa-hyb-*.patch
+      - tests/test-turnip-import-reclaim.py
   workflow_dispatch:
 permissions:
   contents: read
@@ -71,6 +72,16 @@ jobs:
           cd source
           xcodebuild -version
           bash tools/ci/build.sh mesa
+      - name: Check host-import cache reclaim and resource error handling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tests/test-turnip-import-reclaim.py \
+            --turnip-inputs source/tools/out/ci/mesa/patches \
+            --patch harness/patches/mesa-hyb-hostimport-reclaim.patch \
+            --abi source/xnu/fuxi-adreno \
+            --source source/deps/ci-work-mesa/mesa/src/freedreno/vulkan/tu_knl_darwin.cc
+          cp harness/patches/mesa-hyb-*.patch source/tools/out/ci/mesa/patches/
       - name: Compare with the deployed dylib
         shell: bash
         run: |
