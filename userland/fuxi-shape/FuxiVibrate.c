@@ -612,6 +612,8 @@ static void vb_install_supports(void)
 static IMP vb_feedback_engine_original, vb_feedback_play_original, vb_feedback_now_original;
 static unsigned vb_feedback_engine_done, vb_feedback_play_done, vb_feedback_now_done;
 static unsigned vb_feedback_engine_calls, vb_feedback_play_calls, vb_feedback_now_calls;
+static IMP vb_feedback_core_init_original, vb_feedback_core_finish_original, vb_feedback_request_original;
+static unsigned vb_feedback_core_init_calls, vb_feedback_core_finish_calls, vb_feedback_request_calls;
 
 static intptr_t vb_feedback_integer(id target, const char *name)
 {
@@ -622,8 +624,91 @@ static intptr_t vb_feedback_integer(id target, const char *name)
     if (method == NULL || method_getNumberOfArguments(method) != 2) return -1;
     method_getReturnType(method, type, sizeof(type));
     const char *result = vb_skip_qualifiers(type);
-    if (*result == '\0' || strchr("cCiIsSlLqQB", *result) == NULL) return -1;
-    return ((intptr_t (*)(id, SEL))method_getImplementation(method))(target, selector);
+    IMP implementation = method_getImplementation(method);
+    switch (*result) {
+        case 'c': return ((int8_t (*)(id, SEL))implementation)(target, selector);
+        case 'C': return ((uint8_t (*)(id, SEL))implementation)(target, selector);
+        case 's': return ((int16_t (*)(id, SEL))implementation)(target, selector);
+        case 'S': return ((uint16_t (*)(id, SEL))implementation)(target, selector);
+        case 'i': return ((int32_t (*)(id, SEL))implementation)(target, selector);
+        case 'I': return ((uint32_t (*)(id, SEL))implementation)(target, selector);
+        case 'l': case 'q': return ((intptr_t (*)(id, SEL))implementation)(target, selector);
+        case 'L': case 'Q': return (intptr_t)((uintptr_t (*)(id, SEL))implementation)(target, selector);
+        case 'B': return ((bool (*)(id, SEL))implementation)(target, selector);
+        default: return -1;
+    }
+}
+
+static bool vb_feedback_core_init(id self, SEL selector)
+{
+    bool result = ((bool (*)(id, SEL))vb_feedback_core_init_original)(self, selector);
+    unsigned call = __atomic_fetch_add(&vb_feedback_core_init_calls, 1u, __ATOMIC_RELAXED);
+    if (call < VB_PLAY_LOGS)
+        vb_say("feedback core init call=%u uptime-ms=%llu engine=%s initialized=%u enabled=%ld suspended=%ld "
+            "state=%ld\n", call + 1, (unsigned long long)vb_now_ms(), object_getClassName(self), result,
+            (long)vb_feedback_integer(self, "isEnabled"),
+            (long)vb_feedback_integer(self, "_internal_isSuspended"), (long)vb_feedback_integer(self, "_state"));
+    return result;
+}
+
+static void vb_feedback_core_finish(id self, SEL selector, id error, id completion)
+{
+    unsigned call = __atomic_fetch_add(&vb_feedback_core_finish_calls, 1u, __ATOMIC_RELAXED);
+    if (call < VB_PLAY_LOGS)
+        vb_say("feedback core finish call=%u uptime-ms=%llu engine=%s error-present=%u error=%ld state=%ld\n",
+            call + 1, (unsigned long long)vb_now_ms(), object_getClassName(self), error != NULL,
+            (long)vb_feedback_integer(error, "code"), (long)vb_feedback_integer(self, "_state"));
+    ((void (*)(id, SEL, id, id))vb_feedback_core_finish_original)(self, selector, error, completion);
+}
+
+static void vb_feedback_request(id self, SEL selector, id feedback, double interval, double *since, bool regular)
+{
+    unsigned call = __atomic_fetch_add(&vb_feedback_request_calls, 1u, __ATOMIC_RELAXED);
+    if (call < 32)
+        vb_say("feedback request call=%u uptime-ms=%llu generator=%s feedback=%s enabled=%ld muted=%ld "
+            "output=%ld active=%ld interval=%.3f regular=%u\n", call + 1, (unsigned long long)vb_now_ms(),
+            object_getClassName(self), feedback ? object_getClassName(feedback) : "nil",
+            (long)vb_feedback_integer(self, "_isEnabled"), (long)vb_feedback_integer(self, "_isMuted"),
+            (long)vb_feedback_integer(self, "_outputMode"), (long)vb_feedback_integer(self, "activationCount"),
+            interval, regular);
+    ((void (*)(id, SEL, id, double, double *, bool))vb_feedback_request_original)(
+        self, selector, feedback, interval, since, regular);
+}
+
+static void vb_install_core_feedback(void)
+{
+    static struct {
+        const char *target, *selector, *types;
+        IMP replacement, *original;
+        unsigned done;
+    } hooks[] = {
+        {"_UIFeedbackCoreHapticsEngine", "_internal_initializeCoreHapticsEngine", "b",
+            (IMP)vb_feedback_core_init, &vb_feedback_core_init_original, 0},
+        {"_UIFeedbackCoreHapticsEngine", "_internal_coreHapticsEngineFinishedWithError:completion:", "v@@",
+            (IMP)vb_feedback_core_finish, &vb_feedback_core_finish_original, 0},
+        {"UIFeedbackGenerator", "_playFeedback:withMinimumIntervalPassed:since:prefersRegularPace:", "v@d^b",
+            (IMP)vb_feedback_request, &vb_feedback_request_original, 0}
+    };
+    for (unsigned index = 0; index < sizeof(hooks) / sizeof(hooks[0]); index++) {
+        if (__atomic_load_n(&hooks[index].done, __ATOMIC_ACQUIRE)) continue;
+        Class target = objc_getClass(hooks[index].target);
+        Method method = target ? class_getInstanceMethod(target, sel_registerName(hooks[index].selector)) : NULL;
+        if (method == NULL || __atomic_exchange_n(&hooks[index].done, 1u, __ATOMIC_ACQ_REL)) continue;
+        size_t count = strlen(hooks[index].types);
+        bool usable = method_getNumberOfArguments(method) == count + 1;
+        for (unsigned argument = 0; usable && argument < count; argument++) {
+            char type[64];
+            if (argument == 0) method_getReturnType(method, type, sizeof(type));
+            else method_getArgumentType(method, argument + 1, type, sizeof(type));
+            char actual = vb_skip_qualifiers(type)[0];
+            char expected = hooks[index].types[argument];
+            usable = expected == 'b' ? actual == 'B' || actual == 'c' : actual == expected;
+        }
+        vb_say("feedback core hook %s %s\n", hooks[index].selector, usable ? "installed" : "refused ABI");
+        if (!usable) continue;
+        *hooks[index].original = method_getImplementation(method);
+        (void)method_setImplementation(method, hooks[index].replacement);
+    }
 }
 
 static id vb_feedback_engine(id self, SEL selector, id feedback)
@@ -669,6 +754,7 @@ static void vb_feedback_now(id self, SEL selector, id data, id feedback, id opti
 
 static void vb_install_feedback(void)
 {
+    vb_install_core_feedback();
     Class target = objc_getClass("_UIFeedbackEngine");
     if (target == NULL) return;
     if (!__atomic_load_n(&vb_feedback_engine_done, __ATOMIC_ACQUIRE)) {
