@@ -129,6 +129,7 @@ jobs:
           (cd source && python3 tools/test-fuxi-haptic-survey.py --cc clang)
           (cd source && python3 tools/test-fuxi-haptic-survey.py --cc clang --syntax-only)
           (cd source && python3 tools/test-fuxi-audio-prep.py --sanitize)
+          (cd source && python3 tools/test-fuxi-audio-spf.py)
           (cd source && python3 tools/test-fuxi-battery-prep.py --sanitize)
           (cd source && python3 tools/test-fuxi-battery-publication.py --sanitize)
           (cd source && python3 tools/test-fuxi-rtc-read.py)
@@ -146,7 +147,7 @@ jobs:
         with:
           name: fuxi-ath12k-objects
           path: ath12k-out
-          run-id: 44002779624
+          run-id: 44010197996
           github-token: ${{ github.token }}
       - name: Verify the optional ath12k link input
         if: ${{ inputs.ath12k }}

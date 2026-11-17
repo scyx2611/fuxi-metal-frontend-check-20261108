@@ -331,6 +331,31 @@ index 0000000..359d1dd
 +測試包含獨立 hard-coded wire golden vectors、全部 0–536 bytes payload roundtrip、256 組 domain、32-bit port/token、24–60 bytes header、所有截斷長度的精確 heap buffer、尾隨資料、reserved/version/size、SIZE_MAX、output 前後 canary、兩個方向的 payload overlap，以及 SPF 假路由/過期 token/錯 opcode/短長 payload/basic acknowledgement/remote error。另逐一變異 header 的每個 byte 的 256 個值，檢查成功 view 的 extent 與 SPF 接收條件。
 +
 +尚待下一階段驗證的部分為 kernel build 接線、GPR 在 fuxi firmware 的 40-byte query 接受情況、hardware audio、iOS HAL load 與實際 app 路由。
+diff --git a/docs-lanes/audio.md b/docs-lanes/audio.md
+index 0d93161..ec765f7 100644
+--- a/docs-lanes/audio.md
++++ b/docs-lanes/audio.md
+@@ -273,6 +273,20 @@ sent, capture 200 of 200 periods). Sheng is an SM8550-class board, so most of th
+ 
+ ## 9. Steps, dependencies, firmware and gates
+ 
++2026-11-17 update: the production ADSP owner in `xnu/fuxi-adsp/fuxi_adsp.c` already boots the DSP,
++serves QRTR and publishes battery data. `fuxi_audio_spf.c` now registers a third, query-only client on
++`adsp_apps` (512-byte receive intents, count 20, remote initiator). ADT `/chosen` `fuxi,audio-spf=1`
++or `fuxiaudiospf=1` enables it; absent, malformed or other values leave it off. Patch 0117 includes
++this client and the strict `fuxi-audio-prep` codec. The older P-AU plan below is historical.
++
++The owner polls the client outside GLINK callbacks. Callbacks only validate and retain bounded reply
++state; they never send or wait. One 40-byte APM GET_SPF_STATE request has a 15-second channel deadline
++and a four-second reply deadline. Route, token, opcode and payload validation precede acceptance.
++Disconnect and queue failure stop that attempt; there is no automatic retry. This preparation has
++production ASan/UBSan coverage in `tools/test-fuxi-audio-spf.py`, including the disabled gate and
++callbacks being forbidden from sending. Hardware response remains unverified. It does not configure
++speaker graphs, PRM clocks, amplifiers, microphones or an iOS audio device.
++
+ Sources and licenses: UniXNU-sheng commit `08cde20edc32` (BSD-2-Clause-Patent), files under `package/` named in each ported
+ header. hackios (APSL) was read for ideas only (its single RSC mutex).
+ 
 diff --git a/docs-lanes/battery-freshness.md b/docs-lanes/battery-freshness.md
 new file mode 100644
 index 0000000..e6cee9f
@@ -5230,10 +5255,10 @@ index efb83f1..745d165 100644
          uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
 diff --git a/tools/ci/ath12k-link.py b/tools/ci/ath12k-link.py
 new file mode 100644
-index 0000000..8743ce2
+index 0000000..e500ef0
 --- /dev/null
 +++ b/tools/ci/ath12k-link.py
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,157 @@
 +import argparse
 +import hashlib
 +import json
@@ -5241,9 +5266,9 @@ index 0000000..8743ce2
 +import struct
 +import subprocess
 +
-+OBJECT_SHA256 = 'fbfdc220a37eca52e0db0a8f85a918bbfbbe512e6e4d698144e5a036587cff67'
++OBJECT_SHA256 = 'dc0694f49e8557b6dce943fe07711e272579b8ffc0e67196499d6f6ec3b83931'
 +LOCK_SHA256 = 'f23882695f1c136c27b3f9cb36673bebad9ae1fc2af3fa787a98bd4add76c3c9'
-+SCAN_DWELL_SHA256 = 'a12107927728e05f4c9e31820a9562cb581355c65d50b9ffa0c2b48d7d503804'
++SCAN_DWELL_SHA256 = '4abc2793df722c3fc03fd098118cc1731301b5523a5c8f8b28d04228b8ec95bb'
 +ENTRY_POINTS = (
 +    '_nw_wifi_start', '_nw_wifi_step', '_nw_wifi_stop', '_nw_wifi_poll',
 +    '_nw_wifi_irq_mode', '_nw_wifi_scan', '_nw_wifi_bss_count',
@@ -5320,6 +5345,9 @@ index 0000000..8743ce2
 +            dwell.get('feature_bit') == 1 << 31 and dwell.get('attribute') == 46 and
 +            dwell.get('maximum_requested_ms') == 1000 and
 +            dwell.get('maximum_scan_budget_ms') == 19000 and
++            dwell.get('passive_ssids_null') is True and
++            dwell.get('linux_rdev_ops_sha256') ==
++            'bfa4934811cbe41355ec4be5c713f31564df9432648bb65def782fd10214e06e' and
 +            dwell.get('hardware_verified') is False, 'ath12k scan dwell ABI differs')
 +    for suffix in ('/src/nw_cfg80211_control.c', '/out/ath12k-src/mac.c'):
 +        objects = [item for item in report.get('objects', [])
@@ -5352,8 +5380,8 @@ index 0000000..8743ce2
 +        'scan_dwell': dwell,
 +        'entry_points': list(ENTRY_POINTS),
 +        'imports': sorted(IMPORTS),
-+        'source_run': 44002779624,
-+        'source_commit': '9b5cfcd75e3250a5cc56a54cf2be14b982bc9f86',
++        'source_run': 44010197996,
++        'source_commit': 'b2876c666c76af54be793a41830596a6b604a063',
 +        'kernel_build_target': KERNEL_TARGET,
 +        'macho_platform': KERNEL_PLATFORM[0],
 +        'minimum_os': '15.5',
@@ -8232,10 +8260,10 @@ index 90d7242..54eacf5 100644
  @@ -745,6 +745,10 @@
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..41f6b5b
+index 0000000..03ba302
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,164 @@
 +#!/usr/bin/env python3
 +"""Generate/check patch 0117 (fuxi-adsp): the audio DSP owner (boot-arg fuxiadsp) and its battery manager client.
 +
@@ -8280,6 +8308,12 @@ index 0000000..41f6b5b
 +    'fuxi_battery_poll_pause.h': ROOT / 'xnu/fuxi-battery-prep/fuxi_battery_poll_pause.h',
 +})
 +HEADERS += ('fuxi_torch_steady.h',)
++SOURCES += ('fuxi_audio_spf.c', 'fuxi_audio_prep_gpr.c')
++HEADERS += ('fuxi_audio_prep_gpr.h',)
++SOURCE_PATHS.update({
++    'fuxi_audio_prep_gpr.c': ROOT / 'xnu/fuxi-audio-prep/fuxi_audio_prep_gpr.c',
++    'fuxi_audio_prep_gpr.h': ROOT / 'xnu/fuxi-audio-prep/fuxi_audio_prep_gpr.h',
++})
 +FILES = SOURCES + HEADERS
 +BEFORE = ('bsd/dev/sweet_rpmh.c\t\t\tstandard', 'bsd/dev/sweet_spmi.c\t\t\tstandard', 'bsd/dev/sweet_usb.c\t\t\tstandard')
 +AFTER = ('bsd/dev/mem.c\t\t\t\tstandard', 'bsd/dev/munge.c \t\t\toptional config_requires_u32_munging',
@@ -8461,10 +8495,10 @@ index 0000000..df484bd
 +print('PASS: fuxi-wlan canonical source matches 0099')
 diff --git a/tools/test-fuxi-ath12k-link.py b/tools/test-fuxi-ath12k-link.py
 new file mode 100644
-index 0000000..03f86da
+index 0000000..5ed251f
 --- /dev/null
 +++ b/tools/test-fuxi-ath12k-link.py
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,110 @@
 +import argparse
 +import json
 +from pathlib import Path
@@ -8558,14 +8592,16 @@ index 0000000..03f86da
 +                rejected(lambda: GATE['validate_bundle'](copied))
 +                path.write_bytes(original)
 +                checks += 1
-+            report = json.loads(report_path.read_text())
-+            for item in report['objects']:
-+                if item.get('source', '').endswith('/out/ath12k-src/mac.c'):
-+                    item['source_sha256'] = '0' * 64
-+            report_path.write_text(json.dumps(report), encoding='utf-8')
-+            rejected(lambda: GATE['validate_bundle'](copied))
-+            report_path.write_bytes((arguments.bundle / 'fuxi_ath12k.build-report.json').read_bytes())
-+            checks += 1
++            original = report_path.read_bytes()
++            for suffix in ('/out/ath12k-src/mac.c', '/src/nw_cfg80211_control.c'):
++                report = json.loads(original)
++                for item in report['objects']:
++                    if item.get('source', '').endswith(suffix):
++                        item['source_sha256'] = '0' * 64
++                report_path.write_text(json.dumps(report), encoding='utf-8')
++                rejected(lambda: GATE['validate_bundle'](copied))
++                report_path.write_bytes(original)
++                checks += 1
 +            GATE['validate_bundle'](copied)
 +            checks += 1
 +    print(f'PASS ath12k link inputs: {checks} platform and bundle checks')
@@ -8651,6 +8687,166 @@ index 0000000..d74473c
 +
 +
 +if __name__ == "__main__":
++    main()
+diff --git a/tools/test-fuxi-audio-spf.py b/tools/test-fuxi-audio-spf.py
+new file mode 100644
+index 0000000..b542507
+--- /dev/null
++++ b/tools/test-fuxi-audio-spf.py
+@@ -0,0 +1,154 @@
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[1]
++SOURCE = ROOT / 'xnu/fuxi-adsp'
++PREP = ROOT / 'xnu/fuxi-audio-prep'
++
++HOST = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "ShengAdsp.h"
++#include "fuxi_audio_prep_gpr.h"
++typedef void *DTEntry;
++#define kSuccess 0
++#define NSEC_PER_MSEC 1000000u
++static uint64_t now;
++static unsigned argument, adt_value, adt_bytes, registrations, sends, callback_depth;
++static bool have_argument, have_adt, register_failure;
++static int send_error;
++static ShengAdspClient callbacks;
++static uint8_t sent[40];
++struct ShengAdspChannel { unsigned marker; };
++static struct ShengAdspChannel channel;
++static uint64_t mach_absolute_time(void) { return now; }
++static void clock_interval_to_deadline(unsigned interval,unsigned scale,uint64_t *deadline) {
++    *deadline=now+(uint64_t)interval*scale;
++}
++static int PE_parse_boot_argn(const char *name,void *value,unsigned bytes) {
++    assert(!strcmp(name,"fuxiaudiospf") && bytes==4);
++    memcpy(value,&argument,bytes); return have_argument;
++}
++static int SecureDTLookupEntry(void *root,const char *name,DTEntry *entry) {
++    assert(!root && !strcmp(name,"/chosen")); *entry=&adt_value; return have_adt?0:1;
++}
++static int SecureDTGetProperty(DTEntry entry,const char *name,const void **property,unsigned *bytes) {
++    assert(entry==&adt_value && !strcmp(name,"fuxi,audio-spf"));
++    *property=&adt_value; *bytes=adt_bytes; return 0;
++}
++ShengAdspChannel *sheng_adsp_channel(const char *name,uint32_t size,uint32_t count,int initiator,
++    const ShengAdspClient *client,void *context) {
++    assert(!strcmp(name,"adsp_apps") && size==512 && count==20 && !initiator && !context);
++    assert(!callback_depth); callbacks=*client; registrations++;
++    return register_failure?NULL:&channel;
++}
++int sheng_adsp_send(ShengAdspChannel *target,const void *data,uint32_t length) {
++    assert(target==&channel && length==40 && !callback_depth);
++    memcpy(sent,data,length); sends++; return send_error;
++}
++#include "fuxi_audio_spf.c"
++static void reset(void) {
++    memset(&gSpf,0,sizeof(gSpf)); memset(&callbacks,0,sizeof(callbacks));
++    now=0; argument=0; adt_value=0; adt_bytes=4;
++    registrations=0; sends=0; callback_depth=0;
++    have_argument=false; have_adt=false; register_failure=false; send_error=0;
++}
++static void state(int up) {
++    callback_depth++; callbacks.state(NULL,up); callback_depth--;
++}
++static void deliver(uint32_t opcode,uint32_t token,uint32_t status) {
++    uint8_t packet[512]={0}, payload[8]={0}; size_t length=0;
++    FuxiAudioPrepGprFields fields={3,2,1,FUXI_SPF_PORT,token,opcode};
++    unsigned bytes=4;
++    if(opcode==FUXI_AUDIO_PREP_BASIC_RESULT) {
++        uint32_t command=FUXI_AUDIO_PREP_GET_SPF_STATE;
++        memcpy(payload,&command,4); memcpy(payload+4,&status,4); bytes=8;
++    } else memcpy(payload,&status,4);
++    assert(!fuxi_audio_prep_gpr_encode(packet,sizeof(packet),&fields,payload,bytes,&length));
++    callback_depth++; callbacks.receive(NULL,packet,(uint32_t)length); callback_depth--;
++}
++static void begin(void) {
++    reset(); have_adt=true; adt_value=1; fuxi_audio_spf_start();
++    assert(registrations==1 && !sends); state(1); fuxi_audio_spf_poll();
++    assert(sends==1 && gSpf.attempted && !gSpf.done);
++    FuxiAudioPrepGprView query;
++    assert(!fuxi_audio_prep_gpr_decode(sent,sizeof(sent),&query));
++    assert(query.fields.opcode==FUXI_AUDIO_PREP_GET_SPF_STATE &&
++           query.fields.src_port==FUXI_SPF_PORT && query.fields.token==FUXI_SPF_TOKEN &&
++           query.payload_bytes==16);
++    for(unsigned index=0;index<16;index++) assert(!query.payload[index]);
++}
++int main(void) {
++    reset(); fuxi_audio_spf_start(); fuxi_audio_spf_poll(); assert(!registrations && !sends);
++    for(unsigned value=0;value<4;value++) {
++        reset(); have_adt=true; adt_value=value; fuxi_audio_spf_start();
++        assert(registrations==(value==1));
++    }
++    reset(); have_adt=true; adt_value=1; adt_bytes=8;
++    fuxi_audio_spf_start(); assert(!registrations);
++    reset(); have_adt=true; adt_value=1; have_argument=true; argument=0;
++    fuxi_audio_spf_start(); assert(!registrations);
++    reset(); have_argument=true; argument=1;
++    fuxi_audio_spf_start(); fuxi_audio_spf_start(); assert(registrations==1);
++    reset(); have_adt=true; adt_value=1; register_failure=true;
++    fuxi_audio_spf_start(); fuxi_audio_spf_start(); assert(registrations==1 && gSpf.done);
++    reset(); have_adt=true; adt_value=1; fuxi_audio_spf_start();
++    now=15000ull*NSEC_PER_MSEC; fuxi_audio_spf_poll(); assert(gSpf.done && !sends);
++    begin(); deliver(FUXI_AUDIO_PREP_BASIC_RESULT,FUXI_SPF_TOKEN,0);
++    fuxi_audio_spf_poll(); assert(gSpf.accepted && !gSpf.done && sends==1);
++    deliver(FUXI_AUDIO_PREP_SPF_STATE_REPLY,FUXI_SPF_TOKEN,1);
++    fuxi_audio_spf_poll(); assert(gSpf.done && gSpf.reply.state==1 && sends==1);
++    state(0); state(1); fuxi_audio_spf_poll(); assert(sends==1);
++    begin();
++    for(unsigned index=0;index<10;index++)
++        deliver(FUXI_AUDIO_PREP_SPF_STATE_REPLY,FUXI_SPF_TOKEN+1,1);
++    assert(gSpf.invalid==4 && !gSpf.reply_ready);
++    uint8_t oversized[513]={0};
++    callbacks.receive(NULL,oversized,sizeof(oversized));
++    assert(gSpf.invalid==4);
++    now=4000ull*NSEC_PER_MSEC; fuxi_audio_spf_poll(); assert(gSpf.done && sends==1);
++    begin(); deliver(FUXI_AUDIO_PREP_BASIC_RESULT,FUXI_SPF_TOKEN,5);
++    fuxi_audio_spf_poll(); assert(gSpf.done && gSpf.reply.status==5);
++    begin(); state(0); state(1); fuxi_audio_spf_poll(); assert(gSpf.done && sends==1);
++    begin(); now=4000ull*NSEC_PER_MSEC;
++    deliver(FUXI_AUDIO_PREP_SPF_STATE_REPLY,FUXI_SPF_TOKEN,1);
++    fuxi_audio_spf_poll(); assert(gSpf.done && !gSpf.reply_ready && sends==1);
++    reset(); have_adt=true; adt_value=1; send_error=-1;
++    fuxi_audio_spf_start(); state(1); fuxi_audio_spf_poll();
++    assert(gSpf.done && sends==1); fuxi_audio_spf_poll(); assert(sends==1);
++    puts("PASS production audio SPF client: default off, ADT gate, exact query, callback send exclusion, reply route/token, bounded rejection, one attempt, deadlines and disconnect; DSP simulated");
++}
++'''
++
++
++def main():
++    owner = (SOURCE / 'fuxi_adsp.c').read_text()
++    assert owner.count('fuxi_audio_spf_start();') == 1
++    assert owner.count('fuxi_audio_spf_poll();') == 1
++    assert owner.index('gStarted = 1;') < owner.index('fuxi_audio_spf_start();')
++    assert owner.index('fuxi_audio_spf_start();') < owner.index('kernel_thread_start(adspThread')
++    with tempfile.TemporaryDirectory(prefix='fuxi-audio-spf-') as temporary:
++        directory = Path(temporary)
++        for name in ('pexpert/arm64/board_config.h', 'sys/systm.h', 'kern/clock.h',
++                     'pexpert/pexpert.h', 'pexpert/device_tree.h'):
++            header = directory / name
++            header.parent.mkdir(parents=True, exist_ok=True)
++            header.write_text('')
++        source = directory / 'host.c'
++        source.write_text(HOST)
++        executable = directory / 'host'
++        subprocess.run([os.environ.get('CC', 'clang'), '-std=c11', '-O1', '-g', '-DFUXI',
++                        '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
++                        '-fno-omit-frame-pointer', '-I', str(directory), '-I', str(SOURCE),
++                        '-I', str(PREP), str(source), str(PREP / 'fuxi_audio_prep_gpr.c'),
++                        '-o', str(executable)], check=True)
++        subprocess.run([str(executable)], check=True, timeout=20)
++
++
++if __name__ == '__main__':
 +    main()
 diff --git a/tools/test-fuxi-battery-pause.py b/tools/test-fuxi-battery-pause.py
 new file mode 100644
@@ -22739,10 +22935,10 @@ index 0000000..72eedb5
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp.c b/xnu/fuxi-adsp/fuxi_adsp.c
 new file mode 100644
-index 0000000..430d5fd
+index 0000000..e52cc6f
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp.c
-@@ -0,0 +1,919 @@
+@@ -0,0 +1,923 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 + *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -22816,6 +23012,8 @@ index 0000000..430d5fd
 +extern void fuxi_pmic_init(void);
 +extern void fuxi_ramtest_init(void);
 +extern void fuxi_bt_init(void);
++extern void fuxi_audio_spf_start(void);
++extern void fuxi_audio_spf_poll(void);
 +extern volatile int32_t native_qrtr_stats[16];
 +extern char native_qrtr_text[96];
 +void fuxi_adsp_init(void);
@@ -23531,6 +23729,7 @@ index 0000000..430d5fd
 +            const uint32_t count = __atomic_load_n(&gClientCount, __ATOMIC_ACQUIRE);
 +            for (unsigned i = 0; i < count; ++i) pending |= gClients[i].count != 0;
 +            service(waitEvents(fast || pending ? 50 : 200, fast || pending ? 2 : 200) | (pending ? EV_SEND : 0));
++            fuxi_audio_spf_poll();
 +            if (mach_absolute_time() >= next_report) {
 +                report();
 +                clock_interval_to_deadline(++reports < 10 ? 30000u : 600000u, NSEC_PER_MSEC, &next_report);
@@ -23653,6 +23852,7 @@ index 0000000..430d5fd
 +    if (run >= 2) {
 +        sheng_qrtr_start();               /* the router link registers before the DSP can open it */
 +        fuxi_adsp_battery_start(run >= 3); /* PMIC_RTR_ADSP_APPS */
++        fuxi_audio_spf_start();
 +    }
 +    if (kernel_thread_start(adspThread, (void *)(uintptr_t)run, &thread) != KERN_SUCCESS) {
 +        fail(StMapped, -7);
@@ -24684,6 +24884,152 @@ index 0000000..09ce08d
 +    printf("FUXI AMP: started mode %u\n", mode > 2 ? 2 : mode);
 +}
 +#endif /* FUXI */
+diff --git a/xnu/fuxi-adsp/fuxi_audio_spf.c b/xnu/fuxi-adsp/fuxi_audio_spf.c
+new file mode 100644
+index 0000000..78617f5
+--- /dev/null
++++ b/xnu/fuxi-adsp/fuxi_audio_spf.c
+@@ -0,0 +1,140 @@
++#include <pexpert/arm64/board_config.h>
++#if defined(FUXI)
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include "ShengAdsp.h"
++#include "fuxi_audio_prep_gpr.h"
++
++#define FUXI_SPF_PORT 0x1000u
++#define FUXI_SPF_TOKEN 0x53504601u
++#define FUXI_SPF_INTENT_BYTES 512u
++
++static struct {
++    ShengAdspChannel *channel;
++    uint64_t deadline;
++    FuxiAudioPrepSpfReply reply;
++    unsigned invalid, reported_invalid;
++    int up, attempted, done, accepted, reported_accepted, reply_ready, disconnected;
++} gSpf;
++
++void fuxi_audio_spf_start(void);
++void fuxi_audio_spf_poll(void);
++
++static int enabled(void)
++{
++    uint32_t value = 0;
++    DTEntry chosen;
++    const void *property;
++    unsigned bytes;
++    if (PE_parse_boot_argn("fuxiaudiospf", &value, sizeof(value)))
++        return value == 1;
++    if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++        SecureDTGetProperty(chosen, "fuxi,audio-spf", &property, &bytes) == kSuccess &&
++        bytes == sizeof(value))
++        memcpy(&value, property, sizeof(value));
++    return value == 1;
++}
++
++static void channel_state(void *context, int up)
++{
++    (void)context;
++    gSpf.up = up != 0;
++    if (!up && gSpf.attempted && !gSpf.done)
++        gSpf.disconnected = 1;
++}
++
++static void channel_receive(void *context, const uint8_t *data, uint32_t length)
++{
++    FuxiAudioPrepSpfReply reply;
++    (void)context;
++    if (!gSpf.attempted || gSpf.done || !gSpf.up || gSpf.disconnected ||
++        mach_absolute_time() >= gSpf.deadline)
++        return;
++    if (length > FUXI_SPF_INTENT_BYTES ||
++        fuxi_audio_prep_spf_reply(data, length, FUXI_SPF_PORT, FUXI_SPF_TOKEN, &reply)) {
++        if (gSpf.invalid < 4)
++            gSpf.invalid++;
++        return;
++    }
++    if (reply.kind == FuxiAudioPrepSpfAccepted) {
++        gSpf.accepted = 1;
++    } else if (!gSpf.reply_ready) {
++        gSpf.reply = reply;
++        gSpf.reply_ready = 1;
++    }
++}
++
++void fuxi_audio_spf_start(void)
++{
++    const ShengAdspClient client = {channel_state, channel_receive};
++    if (gSpf.channel || gSpf.done || !enabled())
++        return;
++    gSpf.channel = sheng_adsp_channel("adsp_apps", FUXI_SPF_INTENT_BYTES, 20, 0, &client, NULL);
++    if (!gSpf.channel) {
++        gSpf.done = 1;
++        printf("FUXI AUDIO SPF: channel registration failed\n");
++        return;
++    }
++    clock_interval_to_deadline(15000, NSEC_PER_MSEC, &gSpf.deadline);
++    printf("FUXI AUDIO SPF: registered adsp_apps query-only client\n");
++}
++
++void fuxi_audio_spf_poll(void)
++{
++    uint8_t packet[40];
++    size_t length = 0;
++    int result;
++    if (!gSpf.channel || gSpf.done)
++        return;
++    if (gSpf.disconnected) {
++        gSpf.done = 1;
++        printf("FUXI AUDIO SPF: channel closed before state reply\n");
++        return;
++    }
++    if (gSpf.invalid != gSpf.reported_invalid) {
++        gSpf.reported_invalid = gSpf.invalid;
++        printf("FUXI AUDIO SPF: rejected replies %u\n", gSpf.invalid);
++    }
++    if (gSpf.accepted && !gSpf.reported_accepted) {
++        gSpf.reported_accepted = 1;
++        printf("FUXI AUDIO SPF: query accepted, awaiting state\n");
++    }
++    if (gSpf.reply_ready) {
++        gSpf.done = 1;
++        if (gSpf.reply.kind == FuxiAudioPrepSpfRemoteError)
++            printf("FUXI AUDIO SPF: remote error %u\n", gSpf.reply.status);
++        else
++            printf("FUXI AUDIO SPF: state %u, playback untested\n", gSpf.reply.state);
++        return;
++    }
++    if (mach_absolute_time() >= gSpf.deadline) {
++        gSpf.done = 1;
++        printf("FUXI AUDIO SPF: %s timeout\n", gSpf.attempted ? "reply" : "channel");
++        return;
++    }
++    if (gSpf.attempted) {
++        if (!gSpf.up) {
++            gSpf.done = 1;
++            printf("FUXI AUDIO SPF: channel closed before state reply\n");
++        }
++        return;
++    }
++    if (!gSpf.up)
++        return;
++    gSpf.attempted = 1;
++    result = fuxi_audio_prep_spf_query(packet, sizeof(packet), FUXI_SPF_PORT, FUXI_SPF_TOKEN, &length);
++    if (!result && length == sizeof(packet))
++        result = sheng_adsp_send(gSpf.channel, packet, (uint32_t)length);
++    else if (!result)
++        result = FuxiAudioPrepLength;
++    if (result) {
++        gSpf.done = 1;
++        printf("FUXI AUDIO SPF: query queue failed %d\n", result);
++        return;
++    }
++    clock_interval_to_deadline(4000, NSEC_PER_MSEC, &gSpf.deadline);
++    printf("FUXI AUDIO SPF: state query queued bytes %u\n", (unsigned)length);
++}
++#endif
 diff --git a/xnu/fuxi-adsp/fuxi_haptic_pulse.h b/xnu/fuxi-adsp/fuxi_haptic_pulse.h
 new file mode 100644
 index 0000000..442bfbf
@@ -39469,13 +39815,13 @@ index 8349337..ed20c83 100644
  +}
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..4304d45
+index 0000000..af0889c
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,7884 @@
+@@ -0,0 +1,8269 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
-+@@ -121,6 +121,27 @@
++@@ -121,6 +121,29 @@
 + bsd/dev/sweet_rpmh.c			standard
 + bsd/dev/sweet_spmi.c			standard
 + bsd/dev/sweet_usb.c			standard
@@ -39500,12 +39846,14 @@ index 0000000..4304d45
 ++bsd/dev/fuxi_bt.c			standard
 ++bsd/dev/fuxi_bt_xnu.c			standard
 ++bsd/dev/fuxi_battery_freshness.c	standard
+++bsd/dev/fuxi_audio_spf.c		standard
+++bsd/dev/fuxi_audio_prep_gpr.c		standard
 + bsd/dev/mem.c				standard
 + bsd/dev/munge.c 			optional config_requires_u32_munging
 + bsd/dev/unix_startup.c			standard
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp.c
-+@@ -0,0 +1,919 @@
++@@ -0,0 +1,923 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 ++ *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -39579,6 +39927,8 @@ index 0000000..4304d45
 ++extern void fuxi_pmic_init(void);
 ++extern void fuxi_ramtest_init(void);
 ++extern void fuxi_bt_init(void);
+++extern void fuxi_audio_spf_start(void);
+++extern void fuxi_audio_spf_poll(void);
 ++extern volatile int32_t native_qrtr_stats[16];
 ++extern char native_qrtr_text[96];
 ++void fuxi_adsp_init(void);
@@ -40294,6 +40644,7 @@ index 0000000..4304d45
 ++            const uint32_t count = __atomic_load_n(&gClientCount, __ATOMIC_ACQUIRE);
 ++            for (unsigned i = 0; i < count; ++i) pending |= gClients[i].count != 0;
 ++            service(waitEvents(fast || pending ? 50 : 200, fast || pending ? 2 : 200) | (pending ? EV_SEND : 0));
+++            fuxi_audio_spf_poll();
 ++            if (mach_absolute_time() >= next_report) {
 ++                report();
 ++                clock_interval_to_deadline(++reports < 10 ? 30000u : 600000u, NSEC_PER_MSEC, &next_report);
@@ -40416,6 +40767,7 @@ index 0000000..4304d45
 ++    if (run >= 2) {
 ++        sheng_qrtr_start();               /* the router link registers before the DSP can open it */
 ++        fuxi_adsp_battery_start(run >= 3); /* PMIC_RTR_ADSP_APPS */
+++        fuxi_audio_spf_start();
 ++    }
 ++    if (kernel_thread_start(adspThread, (void *)(uintptr_t)run, &thread) != KERN_SUCCESS) {
 ++        fail(StMapped, -7);
@@ -45078,6 +45430,303 @@ index 0000000..4304d45
 ++    shown->stale = incoming->stale;
 ++}
 +--- /dev/null
+++++ b/bsd/dev/fuxi_audio_spf.c
++@@ -0,0 +1,140 @@
+++#include <pexpert/arm64/board_config.h>
+++#if defined(FUXI)
+++#include <sys/systm.h>
+++#include <kern/clock.h>
+++#include <pexpert/pexpert.h>
+++#include <pexpert/device_tree.h>
+++#include "ShengAdsp.h"
+++#include "fuxi_audio_prep_gpr.h"
+++
+++#define FUXI_SPF_PORT 0x1000u
+++#define FUXI_SPF_TOKEN 0x53504601u
+++#define FUXI_SPF_INTENT_BYTES 512u
+++
+++static struct {
+++    ShengAdspChannel *channel;
+++    uint64_t deadline;
+++    FuxiAudioPrepSpfReply reply;
+++    unsigned invalid, reported_invalid;
+++    int up, attempted, done, accepted, reported_accepted, reply_ready, disconnected;
+++} gSpf;
+++
+++void fuxi_audio_spf_start(void);
+++void fuxi_audio_spf_poll(void);
+++
+++static int enabled(void)
+++{
+++    uint32_t value = 0;
+++    DTEntry chosen;
+++    const void *property;
+++    unsigned bytes;
+++    if (PE_parse_boot_argn("fuxiaudiospf", &value, sizeof(value)))
+++        return value == 1;
+++    if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+++        SecureDTGetProperty(chosen, "fuxi,audio-spf", &property, &bytes) == kSuccess &&
+++        bytes == sizeof(value))
+++        memcpy(&value, property, sizeof(value));
+++    return value == 1;
+++}
+++
+++static void channel_state(void *context, int up)
+++{
+++    (void)context;
+++    gSpf.up = up != 0;
+++    if (!up && gSpf.attempted && !gSpf.done)
+++        gSpf.disconnected = 1;
+++}
+++
+++static void channel_receive(void *context, const uint8_t *data, uint32_t length)
+++{
+++    FuxiAudioPrepSpfReply reply;
+++    (void)context;
+++    if (!gSpf.attempted || gSpf.done || !gSpf.up || gSpf.disconnected ||
+++        mach_absolute_time() >= gSpf.deadline)
+++        return;
+++    if (length > FUXI_SPF_INTENT_BYTES ||
+++        fuxi_audio_prep_spf_reply(data, length, FUXI_SPF_PORT, FUXI_SPF_TOKEN, &reply)) {
+++        if (gSpf.invalid < 4)
+++            gSpf.invalid++;
+++        return;
+++    }
+++    if (reply.kind == FuxiAudioPrepSpfAccepted) {
+++        gSpf.accepted = 1;
+++    } else if (!gSpf.reply_ready) {
+++        gSpf.reply = reply;
+++        gSpf.reply_ready = 1;
+++    }
+++}
+++
+++void fuxi_audio_spf_start(void)
+++{
+++    const ShengAdspClient client = {channel_state, channel_receive};
+++    if (gSpf.channel || gSpf.done || !enabled())
+++        return;
+++    gSpf.channel = sheng_adsp_channel("adsp_apps", FUXI_SPF_INTENT_BYTES, 20, 0, &client, NULL);
+++    if (!gSpf.channel) {
+++        gSpf.done = 1;
+++        printf("FUXI AUDIO SPF: channel registration failed\n");
+++        return;
+++    }
+++    clock_interval_to_deadline(15000, NSEC_PER_MSEC, &gSpf.deadline);
+++    printf("FUXI AUDIO SPF: registered adsp_apps query-only client\n");
+++}
+++
+++void fuxi_audio_spf_poll(void)
+++{
+++    uint8_t packet[40];
+++    size_t length = 0;
+++    int result;
+++    if (!gSpf.channel || gSpf.done)
+++        return;
+++    if (gSpf.disconnected) {
+++        gSpf.done = 1;
+++        printf("FUXI AUDIO SPF: channel closed before state reply\n");
+++        return;
+++    }
+++    if (gSpf.invalid != gSpf.reported_invalid) {
+++        gSpf.reported_invalid = gSpf.invalid;
+++        printf("FUXI AUDIO SPF: rejected replies %u\n", gSpf.invalid);
+++    }
+++    if (gSpf.accepted && !gSpf.reported_accepted) {
+++        gSpf.reported_accepted = 1;
+++        printf("FUXI AUDIO SPF: query accepted, awaiting state\n");
+++    }
+++    if (gSpf.reply_ready) {
+++        gSpf.done = 1;
+++        if (gSpf.reply.kind == FuxiAudioPrepSpfRemoteError)
+++            printf("FUXI AUDIO SPF: remote error %u\n", gSpf.reply.status);
+++        else
+++            printf("FUXI AUDIO SPF: state %u, playback untested\n", gSpf.reply.state);
+++        return;
+++    }
+++    if (mach_absolute_time() >= gSpf.deadline) {
+++        gSpf.done = 1;
+++        printf("FUXI AUDIO SPF: %s timeout\n", gSpf.attempted ? "reply" : "channel");
+++        return;
+++    }
+++    if (gSpf.attempted) {
+++        if (!gSpf.up) {
+++            gSpf.done = 1;
+++            printf("FUXI AUDIO SPF: channel closed before state reply\n");
+++        }
+++        return;
+++    }
+++    if (!gSpf.up)
+++        return;
+++    gSpf.attempted = 1;
+++    result = fuxi_audio_prep_spf_query(packet, sizeof(packet), FUXI_SPF_PORT, FUXI_SPF_TOKEN, &length);
+++    if (!result && length == sizeof(packet))
+++        result = sheng_adsp_send(gSpf.channel, packet, (uint32_t)length);
+++    else if (!result)
+++        result = FuxiAudioPrepLength;
+++    if (result) {
+++        gSpf.done = 1;
+++        printf("FUXI AUDIO SPF: query queue failed %d\n", result);
+++        return;
+++    }
+++    clock_interval_to_deadline(4000, NSEC_PER_MSEC, &gSpf.deadline);
+++    printf("FUXI AUDIO SPF: state query queued bytes %u\n", (unsigned)length);
+++}
+++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_audio_prep_gpr.c
++@@ -0,0 +1,151 @@
+++#include "fuxi_audio_prep_gpr.h"
+++
+++#include <string.h>
+++
+++static uint32_t read_le32(const uint8_t *input)
+++{
+++    return (uint32_t)input[0] | ((uint32_t)input[1] << 8) |
+++        ((uint32_t)input[2] << 16) | ((uint32_t)input[3] << 24);
+++}
+++
+++static void write_le32(uint8_t *output, uint32_t value)
+++{
+++    output[0] = (uint8_t)value;
+++    output[1] = (uint8_t)(value >> 8);
+++    output[2] = (uint8_t)(value >> 16);
+++    output[3] = (uint8_t)(value >> 24);
+++}
+++
+++int fuxi_audio_prep_gpr_encode(uint8_t *output, size_t capacity,
+++    const FuxiAudioPrepGprFields *fields, const void *payload,
+++    size_t payload_bytes, size_t *written)
+++{
+++    FuxiAudioPrepGprFields header;
+++    size_t packet_bytes;
+++
+++    if (!output || !fields || !written || (payload_bytes && !payload)) {
+++        return FuxiAudioPrepArgument;
+++    }
+++    if (fields->dst_domain > UINT8_MAX || fields->src_domain > UINT8_MAX ||
+++        payload_bytes > FUXI_AUDIO_PREP_GPR_MAX_BYTES - FUXI_AUDIO_PREP_GPR_HEADER_BYTES) {
+++        return FuxiAudioPrepRange;
+++    }
+++    packet_bytes = FUXI_AUDIO_PREP_GPR_HEADER_BYTES + payload_bytes;
+++    if (packet_bytes > capacity) {
+++        return FuxiAudioPrepCapacity;
+++    }
+++
+++    header = *fields;
+++    if (payload_bytes) {
+++        memmove(output + FUXI_AUDIO_PREP_GPR_HEADER_BYTES, payload, payload_bytes);
+++    }
+++    write_le32(output, ((uint32_t)packet_bytes << 8) | 0x60u);
+++    write_le32(output + 4, header.dst_domain | (header.src_domain << 8));
+++    write_le32(output + 8, header.src_port);
+++    write_le32(output + 12, header.dst_port);
+++    write_le32(output + 16, header.token);
+++    write_le32(output + 20, header.opcode);
+++    *written = packet_bytes;
+++    return FuxiAudioPrepOk;
+++}
+++
+++int fuxi_audio_prep_gpr_decode(const uint8_t *input, size_t length,
+++    FuxiAudioPrepGprView *view)
+++{
+++    FuxiAudioPrepGprView decoded;
+++    uint32_t size_word;
+++    uint32_t domain_word;
+++
+++    if (!input || !view) {
+++        return FuxiAudioPrepArgument;
+++    }
+++    if (length < FUXI_AUDIO_PREP_GPR_HEADER_BYTES) {
+++        return FuxiAudioPrepShort;
+++    }
+++    if (length > FUXI_AUDIO_PREP_GPR_MAX_BYTES) {
+++        return FuxiAudioPrepLength;
+++    }
+++    size_word = read_le32(input);
+++    domain_word = read_le32(input + 4);
+++    if ((size_word & 0xfu) != 0) {
+++        return FuxiAudioPrepVersion;
+++    }
+++    decoded.header_bytes = ((size_word >> 4) & 0xfu) * 4u;
+++    decoded.packet_bytes = size_word >> 8;
+++    if (decoded.header_bytes < FUXI_AUDIO_PREP_GPR_HEADER_BYTES) {
+++        return FuxiAudioPrepHeader;
+++    }
+++    if (decoded.packet_bytes != length || decoded.header_bytes > length) {
+++        return FuxiAudioPrepLength;
+++    }
+++    if (domain_word >> 16) {
+++        return FuxiAudioPrepReserved;
+++    }
+++    decoded.fields.dst_domain = domain_word & 0xffu;
+++    decoded.fields.src_domain = (domain_word >> 8) & 0xffu;
+++    decoded.fields.src_port = read_le32(input + 8);
+++    decoded.fields.dst_port = read_le32(input + 12);
+++    decoded.fields.token = read_le32(input + 16);
+++    decoded.fields.opcode = read_le32(input + 20);
+++    decoded.payload = input + decoded.header_bytes;
+++    decoded.payload_bytes = length - decoded.header_bytes;
+++    *view = decoded;
+++    return FuxiAudioPrepOk;
+++}
+++
+++int fuxi_audio_prep_spf_query(uint8_t *output, size_t capacity,
+++    uint32_t local_port, uint32_t token, size_t *written)
+++{
+++    const uint8_t command_header[FUXI_AUDIO_PREP_APM_HEADER_BYTES] = {0};
+++    const FuxiAudioPrepGprFields fields = {
+++        FUXI_AUDIO_PREP_DOMAIN_ADSP, FUXI_AUDIO_PREP_DOMAIN_APPS,
+++        local_port, FUXI_AUDIO_PREP_APM_PORT, token, FUXI_AUDIO_PREP_GET_SPF_STATE
+++    };
+++
+++    return fuxi_audio_prep_gpr_encode(output, capacity, &fields,
+++        command_header, sizeof(command_header), written);
+++}
+++
+++int fuxi_audio_prep_spf_reply(const uint8_t *input, size_t length,
+++    uint32_t local_port, uint32_t token, FuxiAudioPrepSpfReply *reply)
+++{
+++    FuxiAudioPrepGprView view;
+++    FuxiAudioPrepSpfReply decoded = {FuxiAudioPrepSpfState, 0, 0};
+++    int result;
+++
+++    if (!reply) {
+++        return FuxiAudioPrepArgument;
+++    }
+++    result = fuxi_audio_prep_gpr_decode(input, length, &view);
+++    if (result != FuxiAudioPrepOk) {
+++        return result;
+++    }
+++    if (view.fields.src_domain != FUXI_AUDIO_PREP_DOMAIN_ADSP ||
+++        view.fields.dst_domain != FUXI_AUDIO_PREP_DOMAIN_APPS ||
+++        view.fields.src_port != FUXI_AUDIO_PREP_APM_PORT ||
+++        view.fields.dst_port != local_port || view.fields.token != token) {
+++        return FuxiAudioPrepRoute;
+++    }
+++    switch (view.fields.opcode) {
+++    case FUXI_AUDIO_PREP_SPF_STATE_REPLY:
+++        if (view.payload_bytes != 4) {
+++            return FuxiAudioPrepPayload;
+++        }
+++        decoded.state = read_le32(view.payload);
+++        break;
+++    case FUXI_AUDIO_PREP_BASIC_RESULT:
+++        if (view.payload_bytes != 8) {
+++            return FuxiAudioPrepPayload;
+++        }
+++        if (read_le32(view.payload) != FUXI_AUDIO_PREP_GET_SPF_STATE) {
+++            return FuxiAudioPrepOpcode;
+++        }
+++        decoded.status = read_le32(view.payload + 4);
+++        decoded.kind = decoded.status ? FuxiAudioPrepSpfRemoteError : FuxiAudioPrepSpfAccepted;
+++        break;
+++    default:
+++        return FuxiAudioPrepOpcode;
+++    }
+++    *reply = decoded;
+++    return FuxiAudioPrepOk;
+++}
++--- /dev/null
 ++++ b/bsd/dev/fuxi_torch_audit.h
 +@@ -0,0 +1,45 @@
 ++#ifndef FUXI_TORCH_AUDIT_H
@@ -46958,6 +47607,88 @@ index 0000000..4304d45
 ++    }
 ++    return result;
 ++}
+++#endif
++--- /dev/null
+++++ b/bsd/dev/fuxi_audio_prep_gpr.h
++@@ -0,0 +1,79 @@
+++#ifndef FUXI_AUDIO_PREP_GPR_H
+++#define FUXI_AUDIO_PREP_GPR_H
+++
+++#include <stddef.h>
+++#include <stdint.h>
+++
+++#ifdef __cplusplus
+++extern "C" {
+++#endif
+++
+++#define FUXI_AUDIO_PREP_GPR_HEADER_BYTES 24u
+++#define FUXI_AUDIO_PREP_GPR_MAX_BYTES 560u
+++#define FUXI_AUDIO_PREP_APM_HEADER_BYTES 16u
+++#define FUXI_AUDIO_PREP_DOMAIN_ADSP 2u
+++#define FUXI_AUDIO_PREP_DOMAIN_APPS 3u
+++#define FUXI_AUDIO_PREP_APM_PORT 1u
+++#define FUXI_AUDIO_PREP_GET_SPF_STATE 0x01001021u
+++#define FUXI_AUDIO_PREP_SPF_STATE_REPLY 0x02001007u
+++#define FUXI_AUDIO_PREP_BASIC_RESULT 0x02001005u
+++
+++enum FuxiAudioPrepResult {
+++    FuxiAudioPrepOk = 0,
+++    FuxiAudioPrepArgument = -1,
+++    FuxiAudioPrepShort = -2,
+++    FuxiAudioPrepVersion = -3,
+++    FuxiAudioPrepHeader = -4,
+++    FuxiAudioPrepLength = -5,
+++    FuxiAudioPrepReserved = -6,
+++    FuxiAudioPrepRoute = -7,
+++    FuxiAudioPrepOpcode = -8,
+++    FuxiAudioPrepPayload = -9,
+++    FuxiAudioPrepCapacity = -10,
+++    FuxiAudioPrepRange = -11
+++};
+++
+++typedef struct {
+++    uint32_t dst_domain;
+++    uint32_t src_domain;
+++    uint32_t src_port;
+++    uint32_t dst_port;
+++    uint32_t token;
+++    uint32_t opcode;
+++} FuxiAudioPrepGprFields;
+++
+++typedef struct {
+++    FuxiAudioPrepGprFields fields;
+++    size_t header_bytes;
+++    size_t packet_bytes;
+++    const uint8_t *payload;
+++    size_t payload_bytes;
+++} FuxiAudioPrepGprView;
+++
+++enum FuxiAudioPrepSpfReplyKind {
+++    FuxiAudioPrepSpfState,
+++    FuxiAudioPrepSpfAccepted,
+++    FuxiAudioPrepSpfRemoteError
+++};
+++
+++typedef struct {
+++    enum FuxiAudioPrepSpfReplyKind kind;
+++    uint32_t state;
+++    uint32_t status;
+++} FuxiAudioPrepSpfReply;
+++
+++int fuxi_audio_prep_gpr_encode(uint8_t *output, size_t capacity,
+++    const FuxiAudioPrepGprFields *fields, const void *payload,
+++    size_t payload_bytes, size_t *written);
+++int fuxi_audio_prep_gpr_decode(const uint8_t *input, size_t length,
+++    FuxiAudioPrepGprView *view);
+++int fuxi_audio_prep_spf_query(uint8_t *output, size_t capacity,
+++    uint32_t local_port, uint32_t token, size_t *written);
+++int fuxi_audio_prep_spf_reply(const uint8_t *input, size_t length,
+++    uint32_t local_port, uint32_t token, FuxiAudioPrepSpfReply *reply);
+++
+++#ifdef __cplusplus
+++}
+++#endif
+++
 ++#endif
 +--- a/iokit/Kernel/arm/SweetBattery.cpp
 ++++ b/iokit/Kernel/arm/SweetBattery.cpp
