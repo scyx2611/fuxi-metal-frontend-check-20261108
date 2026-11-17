@@ -36,6 +36,7 @@
 #include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
+#include "FuxiErrorAudit.h"
 #include "FuxiVibePattern.h"
 
 typedef mach_port_t vb_io_object_t;
@@ -614,6 +615,8 @@ static unsigned vb_feedback_engine_done, vb_feedback_play_done, vb_feedback_now_
 static unsigned vb_feedback_engine_calls, vb_feedback_play_calls, vb_feedback_now_calls;
 static IMP vb_feedback_core_init_original, vb_feedback_core_finish_original, vb_feedback_request_original;
 static unsigned vb_feedback_core_init_calls, vb_feedback_core_finish_calls, vb_feedback_request_calls;
+static IMP vb_feedback_core_create_original;
+static unsigned vb_feedback_core_create_calls;
 
 static intptr_t vb_feedback_integer(id target, const char *name)
 {
@@ -651,6 +654,23 @@ static bool vb_feedback_core_init(id self, SEL selector)
     return result;
 }
 
+static id vb_feedback_core_create(id self, SEL selector)
+{
+    id error = ((id (*)(id, SEL))vb_feedback_core_create_original)(self, selector);
+    unsigned call = __atomic_fetch_add(&vb_feedback_core_create_calls, 1u, __ATOMIC_RELAXED);
+    if (call < VB_PLAY_LOGS) {
+        vb_say("feedback core create call=%u uptime-ms=%llu engine=%s error-present=%u error=%ld\n",
+            call + 1, (unsigned long long)vb_now_ms(), object_getClassName(self), error != NULL,
+            (long)vb_feedback_integer(error, "code"));
+        FuxiErrorAuditEntry entries[FUXI_ERROR_AUDIT_DEPTH];
+        unsigned count = fuxi_error_audit((CFTypeRef)error, entries);
+        for (unsigned depth = 0; depth < count; depth++)
+            vb_say("feedback core error call=%u depth=%u domain-id=%08x code=%ld reason=%s\n",
+                call + 1, depth, entries[depth].domain, (long)entries[depth].code, entries[depth].reason);
+    }
+    return error;
+}
+
 static void vb_feedback_core_finish(id self, SEL selector, id error, id completion)
 {
     unsigned call = __atomic_fetch_add(&vb_feedback_core_finish_calls, 1u, __ATOMIC_RELAXED);
@@ -684,6 +704,8 @@ static void vb_install_core_feedback(void)
     } hooks[] = {
         {"_UIFeedbackCoreHapticsEngine", "_internal_initializeCoreHapticsEngine", "b",
             (IMP)vb_feedback_core_init, &vb_feedback_core_init_original, 0},
+        {"_UIFeedbackCoreHapticsEngine", "_internal_createCoreHapticsEngine", "@",
+            (IMP)vb_feedback_core_create, &vb_feedback_core_create_original, 0},
         {"_UIFeedbackCoreHapticsEngine", "_internal_coreHapticsEngineFinishedWithError:completion:", "v@@",
             (IMP)vb_feedback_core_finish, &vb_feedback_core_finish_original, 0},
         {"UIFeedbackGenerator", "_playFeedback:withMinimumIntervalPassed:since:prefersRegularPace:", "v@d^b",

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "FuxiErrorAudit.h"
 
 static IMP wifi_audit_result_original, wifi_audit_parameters_original;
 static unsigned wifi_audit_result_done, wifi_audit_parameters_done;
@@ -257,6 +258,14 @@ static bool wifi_audit_allow(id self, SEL selector, id scan, intptr_t trigger, b
             "error-present=%u error=%ld\n", call + 1, wifi_audit_ssid(scan), (long)trigger, result,
             deferred ? (int)*deferred : -1, failure != NULL, (long)wifi_audit_integer(failure, "code"));
         if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+        FuxiErrorAuditEntry entries[FUXI_ERROR_AUDIT_DEPTH];
+        unsigned count = fuxi_error_audit((CFTypeRef)failure, entries);
+        for (unsigned depth = 0; depth < count; depth++) {
+            length = snprintf(line, sizeof(line),
+                "fuxi: wifid: join error call=%u depth=%u domain-id=%08x code=%ld reason=%s\n",
+                call + 1, depth, entries[depth].domain, (long)entries[depth].code, entries[depth].reason);
+            if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+        }
     }
     return result;
 }
