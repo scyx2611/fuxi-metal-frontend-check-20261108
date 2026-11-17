@@ -332,10 +332,10 @@ index 0000000..359d1dd
 +
 +尚待下一階段驗證的部分為 kernel build 接線、GPR 在 fuxi firmware 的 40-byte query 接受情況、hardware audio、iOS HAL load 與實際 app 路由。
 diff --git a/docs-lanes/audio.md b/docs-lanes/audio.md
-index 0d93161..29a88c3 100644
+index 0d93161..8166386 100644
 --- a/docs-lanes/audio.md
 +++ b/docs-lanes/audio.md
-@@ -273,6 +273,29 @@ sent, capture 200 of 200 periods). Sheng is an SM8550-class board, so most of th
+@@ -273,6 +273,33 @@ sent, capture 200 of 200 periods). Sheng is an SM8550-class board, so most of th
  
  ## 9. Steps, dependencies, firmware and gates
  
@@ -346,9 +346,13 @@ index 0d93161..29a88c3 100644
 +this client and the strict `fuxi-audio-prep` codec. The older P-AU plan below is historical.
 +
 +The owner polls the client outside GLINK callbacks. Callbacks only validate and retain bounded reply
-+state; they never send or wait. One 40-byte APM GET_SPF_STATE request has a 15-second channel deadline
-+and a four-second reply deadline. Route, token, opcode and payload validation precede acceptance.
-+Disconnect and queue failure stop that attempt; there is no automatic retry. This preparation has
++state; they never send or wait. The channel has a 15-second deadline. Like the Sheng reference's
++`dspReady`, the client then asks at most 100 times: each GET_SPF_STATE query has its own token and a
++one-second reply deadline, and a not-ready state, a remote error or a timeout schedules the next query
++no sooner than 100 ms later. State 1 ends the probe. Route, token, opcode and payload validation precede
++acceptance, so a late reply to an earlier token is rejected. Disconnect and queue failure stop the probe.
++The console prints the first answer and a final summary with the query, not-ready, error and timeout
++counts, not one line per query. This preparation has
 +production ASan/UBSan coverage in `tools/test-fuxi-audio-spf.py`, including the disabled gate and
 +callbacks being forbidden from sending. Hardware response remains unverified. It does not configure
 +speaker graphs, PRM clocks, amplifiers, microphones or an iOS audio device.
@@ -8699,10 +8703,10 @@ index 0000000..d74473c
 +    main()
 diff --git a/tools/test-fuxi-audio-spf.py b/tools/test-fuxi-audio-spf.py
 new file mode 100644
-index 0000000..f82df24
+index 0000000..c057925
 --- /dev/null
 +++ b/tools/test-fuxi-audio-spf.py
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,215 @@
 +import os
 +from pathlib import Path
 +import subprocess
@@ -8828,17 +8832,66 @@ index 0000000..f82df24
 +    uint8_t oversized[513]={0};
 +    callbacks.receive(NULL,oversized,sizeof(oversized));
 +    assert(gSpf.invalid==4);
-+    now=4000ull*NSEC_PER_MSEC; fuxi_audio_spf_poll(); assert(gSpf.done && sends==1);
-+    begin(); deliver(FUXI_AUDIO_PREP_BASIC_RESULT,FUXI_SPF_TOKEN,5);
-+    fuxi_audio_spf_poll(); assert(gSpf.done && gSpf.reply.status==5);
-+    begin(); state(0); state(1); fuxi_audio_spf_poll(); assert(gSpf.done && sends==1);
-+    begin(); now=4000ull*NSEC_PER_MSEC;
++    /* 回覆期限 1 秒：逾時後等 100 ms 才重問，下一次用新 token。 */
++    now=999ull*NSEC_PER_MSEC; fuxi_audio_spf_poll(); assert(!gSpf.timeouts && sends==1);
++    now=1000ull*NSEC_PER_MSEC; fuxi_audio_spf_poll();
++    assert(gSpf.timeouts==1 && !gSpf.waiting && !gSpf.done && sends==1);
++    now=1099ull*NSEC_PER_MSEC; fuxi_audio_spf_poll(); assert(sends==1);
++    now=1100ull*NSEC_PER_MSEC; fuxi_audio_spf_poll();
++    assert(sends==2 && gSpf.waiting && gSpf.token==FUXI_SPF_TOKEN+1);
++    FuxiAudioPrepGprView second;
++    assert(!fuxi_audio_prep_gpr_decode(sent,sizeof(sent),&second) && second.fields.token==FUXI_SPF_TOKEN+1);
 +    deliver(FUXI_AUDIO_PREP_SPF_STATE_REPLY,FUXI_SPF_TOKEN,1);
-+    fuxi_audio_spf_poll(); assert(gSpf.done && !gSpf.reply_ready && sends==1);
++    assert(!gSpf.reply_ready);
++    deliver(FUXI_AUDIO_PREP_SPF_STATE_REPLY,FUXI_SPF_TOKEN+1,1);
++    fuxi_audio_spf_poll(); assert(gSpf.done && gSpf.queries==2 && gSpf.timeouts==1);
++    /* 遠端錯誤與未就緒都重問，直到 state 1。 */
++    begin(); deliver(FUXI_AUDIO_PREP_BASIC_RESULT,FUXI_SPF_TOKEN,5);
++    fuxi_audio_spf_poll();
++    assert(!gSpf.done && gSpf.errors==1 && gSpf.last_status==5 && gSpf.reported_first && sends==1);
++    for(unsigned index=1;index<4;index++) {
++        now+=100ull*NSEC_PER_MSEC; fuxi_audio_spf_poll();
++        assert(sends==index+1 && gSpf.token==FUXI_SPF_TOKEN+index);
++        deliver(FUXI_AUDIO_PREP_SPF_STATE_REPLY,FUXI_SPF_TOKEN+index,index==3?1:0);
++        fuxi_audio_spf_poll();
++    }
++    assert(gSpf.done && gSpf.queries==4 && gSpf.not_ready==2 && gSpf.errors==1 && gSpf.last_state==1);
++    now+=1000ull*NSEC_PER_MSEC; fuxi_audio_spf_poll(); assert(sends==4);
++    /* 一律未就緒：第 100 次後停止，不再送。 */
++    begin();
++    for(unsigned index=0;index<FUXI_SPF_MAX_QUERIES;index++) {
++        assert(sends==index+1);
++        deliver(FUXI_AUDIO_PREP_SPF_STATE_REPLY,FUXI_SPF_TOKEN+index,0);
++        fuxi_audio_spf_poll();
++        now+=100ull*NSEC_PER_MSEC; fuxi_audio_spf_poll();
++    }
++    assert(gSpf.done && sends==FUXI_SPF_MAX_QUERIES && gSpf.not_ready==FUXI_SPF_MAX_QUERIES);
++    now+=10000ull*NSEC_PER_MSEC; fuxi_audio_spf_poll(); assert(sends==FUXI_SPF_MAX_QUERIES);
++    /* 一律逾時：同樣在第 100 次後停止。 */
++    begin();
++    for(unsigned index=0;index<2*FUXI_SPF_MAX_QUERIES+5;index++) {
++        now+=1000ull*NSEC_PER_MSEC; fuxi_audio_spf_poll();
++    }
++    assert(gSpf.done && sends==FUXI_SPF_MAX_QUERIES && gSpf.timeouts==FUXI_SPF_MAX_QUERIES);
++    /* 兩次查詢之間斷線就結束。 */
++    begin(); deliver(FUXI_AUDIO_PREP_SPF_STATE_REPLY,FUXI_SPF_TOKEN,0); fuxi_audio_spf_poll();
++    assert(!gSpf.done && !gSpf.waiting);
++    state(0); fuxi_audio_spf_poll(); assert(gSpf.done);
++    state(1); now+=1000ull*NSEC_PER_MSEC; fuxi_audio_spf_poll(); assert(sends==1);
++    begin(); state(0); state(1); fuxi_audio_spf_poll(); assert(gSpf.done && sends==1);
++    begin(); now=1000ull*NSEC_PER_MSEC;
++    deliver(FUXI_AUDIO_PREP_SPF_STATE_REPLY,FUXI_SPF_TOKEN,1);
++    assert(!gSpf.reply_ready);
++    fuxi_audio_spf_poll(); assert(!gSpf.done && gSpf.timeouts==1 && sends==1);
 +    reset(); have_adt=true; adt_value=1; send_error=-1;
 +    fuxi_audio_spf_start(); state(1); fuxi_audio_spf_poll();
 +    assert(gSpf.done && sends==1); fuxi_audio_spf_poll(); assert(sends==1);
-+    puts("PASS production audio SPF client: default off, ADT gate, exact query, callback send exclusion, reply route/token, bounded rejection, one attempt, deadlines and disconnect; DSP simulated");
++    /* 之後的重問送出失敗也結束。 */
++    begin(); deliver(FUXI_AUDIO_PREP_SPF_STATE_REPLY,FUXI_SPF_TOKEN,0); fuxi_audio_spf_poll();
++    send_error=-1; now+=100ull*NSEC_PER_MSEC; fuxi_audio_spf_poll();
++    assert(gSpf.done && sends==2 && gSpf.queries==1);
++    now+=1000ull*NSEC_PER_MSEC; fuxi_audio_spf_poll(); assert(sends==2);
++    puts("PASS production audio SPF client: default off, ADT gate, exact query, callback send exclusion, reply route/token, bounded rejection, at most 100 spaced queries with fresh tokens, per-query deadlines and disconnect; DSP simulated");
 +}
 +'''
 +
@@ -24907,10 +24960,10 @@ index 0000000..09ce08d
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_audio_spf.c b/xnu/fuxi-adsp/fuxi_audio_spf.c
 new file mode 100644
-index 0000000..74b705e
+index 0000000..a3b1e7a
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_audio_spf.c
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,216 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/systm.h>
@@ -24923,17 +24976,24 @@ index 0000000..74b705e
 +#define FUXI_SPF_PORT 0x1000u
 +#define FUXI_SPF_TOKEN 0x53504601u
 +#define FUXI_SPF_INTENT_BYTES 512u
++/* 與 Sheng 參考實作相同：DSP 剛起來時常回「未就緒」，最多問 100 次，每次等 1 秒回覆、間隔至少 100 ms。 */
++#define FUXI_SPF_MAX_QUERIES 100u
++#define FUXI_SPF_REPLY_MS 1000u
++#define FUXI_SPF_GAP_MS 100u
 +
 +static struct {
 +    ShengAdspChannel *channel;
-+    uint64_t deadline;
++    uint64_t deadline;   /* 第一次查詢前是 channel 期限，之後是目前這次查詢的回覆期限 */
++    uint64_t next_query; /* 未就緒、錯誤或逾時後，下一次查詢最早的時間 */
 +    FuxiAudioPrepSpfReply reply;
 +    struct {
 +        uint32_t length, header[6];
 +        int result;
 +    } rejected[4];
 +    unsigned invalid, reported_invalid, format;
-+    int up, attempted, done, accepted, reported_accepted, reply_ready, disconnected;
++    unsigned queries, not_ready, errors, timeouts;
++    uint32_t token, last_state, last_status;
++    int up, attempted, waiting, done, accepted, reported_accepted, reported_first, reply_ready, disconnected;
 +} gSpf;
 +
 +void fuxi_audio_spf_start(void);
@@ -24967,11 +25027,11 @@ index 0000000..74b705e
 +    FuxiAudioPrepSpfReply reply;
 +    int result;
 +    (void)context;
-+    if (!gSpf.attempted || gSpf.done || !gSpf.up || gSpf.disconnected ||
++    if (!gSpf.waiting || gSpf.done || !gSpf.up || gSpf.disconnected || gSpf.reply_ready ||
 +        mach_absolute_time() >= gSpf.deadline)
 +        return;
 +    result = length > FUXI_SPF_INTENT_BYTES ? FuxiAudioPrepLength :
-+        fuxi_audio_prep_spf_reply(data, length, FUXI_SPF_PORT, FUXI_SPF_TOKEN, &reply);
++        fuxi_audio_prep_spf_reply(data, length, FUXI_SPF_PORT, gSpf.token, &reply);
 +    if (result) {
 +        if (gSpf.invalid < 4) {
 +            gSpf.rejected[gSpf.invalid].length = length;
@@ -24984,7 +25044,7 @@ index 0000000..74b705e
 +    }
 +    if (reply.kind == FuxiAudioPrepSpfAccepted) {
 +        gSpf.accepted = 1;
-+    } else if (!gSpf.reply_ready) {
++    } else {
 +        gSpf.reply = reply;
 +        gSpf.reply_ready = 1;
 +    }
@@ -25006,6 +25066,18 @@ index 0000000..74b705e
 +    }
 +    clock_interval_to_deadline(15000, NSEC_PER_MSEC, &gSpf.deadline);
 +    printf("FUXI AUDIO SPF: registered adsp_apps query-only client\n");
++}
++
++static void retry_or_stop(void)
++{
++    gSpf.waiting = 0;
++    if (gSpf.queries >= FUXI_SPF_MAX_QUERIES) {
++        gSpf.done = 1;
++        printf("FUXI AUDIO SPF: not ready after %u queries (not ready %u, errors %u, timeouts %u, last state %u status %u)\n",
++            gSpf.queries, gSpf.not_ready, gSpf.errors, gSpf.timeouts, gSpf.last_state, gSpf.last_status);
++        return;
++    }
++    clock_interval_to_deadline(FUXI_SPF_GAP_MS, NSEC_PER_MSEC, &gSpf.next_query);
 +}
 +
 +void fuxi_audio_spf_poll(void)
@@ -25032,48 +25104,80 @@ index 0000000..74b705e
 +        printf("FUXI AUDIO SPF: query accepted, awaiting state\n");
 +    }
 +    if (gSpf.reply_ready) {
-+        gSpf.done = 1;
-+        if (gSpf.reply.kind == FuxiAudioPrepSpfRemoteError)
-+            printf("FUXI AUDIO SPF: remote error %u\n", gSpf.reply.status);
-+        else
-+            printf("FUXI AUDIO SPF: state %u, playback untested\n", gSpf.reply.state);
++        gSpf.reply_ready = 0;
++        if (gSpf.reply.kind == FuxiAudioPrepSpfRemoteError) {
++            gSpf.errors++;
++            gSpf.last_status = gSpf.reply.status;
++        } else {
++            gSpf.last_state = gSpf.reply.state;
++            if (gSpf.reply.state == 1) {
++                gSpf.done = 1;
++                gSpf.waiting = 0;
++                printf("FUXI AUDIO SPF: state 1 after %u queries (not ready %u, errors %u, timeouts %u), playback untested\n",
++                    gSpf.queries, gSpf.not_ready, gSpf.errors, gSpf.timeouts);
++                return;
++            }
++            gSpf.not_ready++;
++        }
++        if (!gSpf.reported_first) {
++            gSpf.reported_first = 1;
++            if (gSpf.reply.kind == FuxiAudioPrepSpfRemoteError)
++                printf("FUXI AUDIO SPF: first answer remote error %u, retrying\n", gSpf.reply.status);
++            else
++                printf("FUXI AUDIO SPF: first answer state %u, retrying\n", gSpf.reply.state);
++        }
++        retry_or_stop();
 +        return;
 +    }
-+    if (mach_absolute_time() >= gSpf.deadline) {
-+        gSpf.done = 1;
-+        printf("FUXI AUDIO SPF: %s timeout\n", gSpf.attempted ? "reply" : "channel");
-+        return;
-+    }
-+    if (gSpf.attempted) {
++    if (gSpf.waiting) {
 +        if (!gSpf.up) {
++            gSpf.done = 1;
++            printf("FUXI AUDIO SPF: channel closed before state reply\n");
++        } else if (mach_absolute_time() >= gSpf.deadline) {
++            gSpf.timeouts++;
++            retry_or_stop();
++        }
++        return;
++    }
++    if (!gSpf.attempted && mach_absolute_time() >= gSpf.deadline) {
++        gSpf.done = 1;
++        printf("FUXI AUDIO SPF: channel timeout\n");
++        return;
++    }
++    if (!gSpf.up) {
++        if (gSpf.attempted) {
 +            gSpf.done = 1;
 +            printf("FUXI AUDIO SPF: channel closed before state reply\n");
 +        }
 +        return;
 +    }
-+    if (!gSpf.up)
++    if (gSpf.attempted && mach_absolute_time() < gSpf.next_query)
 +        return;
-+    gSpf.attempted = 1;
++    gSpf.token = FUXI_SPF_TOKEN + gSpf.queries;
 +    if (gSpf.format == 2) {
 +        const FuxiAudioPrepGprFields fields = {
 +            FUXI_AUDIO_PREP_DOMAIN_ADSP, FUXI_AUDIO_PREP_DOMAIN_APPS,
-+            FUXI_SPF_PORT, FUXI_AUDIO_PREP_APM_PORT, FUXI_SPF_TOKEN, FUXI_AUDIO_PREP_GET_SPF_STATE
++            FUXI_SPF_PORT, FUXI_AUDIO_PREP_APM_PORT, gSpf.token, FUXI_AUDIO_PREP_GET_SPF_STATE
 +        };
 +        result = fuxi_audio_prep_gpr_encode(packet, sizeof(packet), &fields, NULL, 0, &length);
 +    } else {
-+        result = fuxi_audio_prep_spf_query(packet, sizeof(packet), FUXI_SPF_PORT, FUXI_SPF_TOKEN, &length);
++        result = fuxi_audio_prep_spf_query(packet, sizeof(packet), FUXI_SPF_PORT, gSpf.token, &length);
 +    }
 +    if (!result && length == (gSpf.format == 2 ? 24u : 40u))
 +        result = sheng_adsp_send(gSpf.channel, packet, (uint32_t)length);
 +    else if (!result)
 +        result = FuxiAudioPrepLength;
++    gSpf.attempted = 1;
 +    if (result) {
 +        gSpf.done = 1;
-+        printf("FUXI AUDIO SPF: query queue failed %d\n", result);
++        printf("FUXI AUDIO SPF: query queue failed %d after %u queries\n", result, gSpf.queries);
 +        return;
 +    }
-+    clock_interval_to_deadline(4000, NSEC_PER_MSEC, &gSpf.deadline);
-+    printf("FUXI AUDIO SPF: state query queued bytes %u\n", (unsigned)length);
++    gSpf.queries++;
++    gSpf.waiting = 1;
++    clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gSpf.deadline);
++    if (gSpf.queries == 1)
++        printf("FUXI AUDIO SPF: state query queued bytes %u\n", (unsigned)length);
 +}
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_haptic_pulse.h b/xnu/fuxi-adsp/fuxi_haptic_pulse.h
@@ -39876,10 +39980,10 @@ index 8349337..ed20c83 100644
  +}
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..5a7b34d
+index 0000000..54e6ddf
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,8296 @@
+@@ -0,0 +1,8347 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,29 @@
@@ -45492,7 +45596,7 @@ index 0000000..5a7b34d
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_audio_spf.c
-+@@ -0,0 +1,165 @@
++@@ -0,0 +1,216 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/systm.h>
@@ -45505,17 +45609,24 @@ index 0000000..5a7b34d
 ++#define FUXI_SPF_PORT 0x1000u
 ++#define FUXI_SPF_TOKEN 0x53504601u
 ++#define FUXI_SPF_INTENT_BYTES 512u
+++/* 與 Sheng 參考實作相同：DSP 剛起來時常回「未就緒」，最多問 100 次，每次等 1 秒回覆、間隔至少 100 ms。 */
+++#define FUXI_SPF_MAX_QUERIES 100u
+++#define FUXI_SPF_REPLY_MS 1000u
+++#define FUXI_SPF_GAP_MS 100u
 ++
 ++static struct {
 ++    ShengAdspChannel *channel;
-++    uint64_t deadline;
+++    uint64_t deadline;   /* 第一次查詢前是 channel 期限，之後是目前這次查詢的回覆期限 */
+++    uint64_t next_query; /* 未就緒、錯誤或逾時後，下一次查詢最早的時間 */
 ++    FuxiAudioPrepSpfReply reply;
 ++    struct {
 ++        uint32_t length, header[6];
 ++        int result;
 ++    } rejected[4];
 ++    unsigned invalid, reported_invalid, format;
-++    int up, attempted, done, accepted, reported_accepted, reply_ready, disconnected;
+++    unsigned queries, not_ready, errors, timeouts;
+++    uint32_t token, last_state, last_status;
+++    int up, attempted, waiting, done, accepted, reported_accepted, reported_first, reply_ready, disconnected;
 ++} gSpf;
 ++
 ++void fuxi_audio_spf_start(void);
@@ -45549,11 +45660,11 @@ index 0000000..5a7b34d
 ++    FuxiAudioPrepSpfReply reply;
 ++    int result;
 ++    (void)context;
-++    if (!gSpf.attempted || gSpf.done || !gSpf.up || gSpf.disconnected ||
+++    if (!gSpf.waiting || gSpf.done || !gSpf.up || gSpf.disconnected || gSpf.reply_ready ||
 ++        mach_absolute_time() >= gSpf.deadline)
 ++        return;
 ++    result = length > FUXI_SPF_INTENT_BYTES ? FuxiAudioPrepLength :
-++        fuxi_audio_prep_spf_reply(data, length, FUXI_SPF_PORT, FUXI_SPF_TOKEN, &reply);
+++        fuxi_audio_prep_spf_reply(data, length, FUXI_SPF_PORT, gSpf.token, &reply);
 ++    if (result) {
 ++        if (gSpf.invalid < 4) {
 ++            gSpf.rejected[gSpf.invalid].length = length;
@@ -45566,7 +45677,7 @@ index 0000000..5a7b34d
 ++    }
 ++    if (reply.kind == FuxiAudioPrepSpfAccepted) {
 ++        gSpf.accepted = 1;
-++    } else if (!gSpf.reply_ready) {
+++    } else {
 ++        gSpf.reply = reply;
 ++        gSpf.reply_ready = 1;
 ++    }
@@ -45588,6 +45699,18 @@ index 0000000..5a7b34d
 ++    }
 ++    clock_interval_to_deadline(15000, NSEC_PER_MSEC, &gSpf.deadline);
 ++    printf("FUXI AUDIO SPF: registered adsp_apps query-only client\n");
+++}
+++
+++static void retry_or_stop(void)
+++{
+++    gSpf.waiting = 0;
+++    if (gSpf.queries >= FUXI_SPF_MAX_QUERIES) {
+++        gSpf.done = 1;
+++        printf("FUXI AUDIO SPF: not ready after %u queries (not ready %u, errors %u, timeouts %u, last state %u status %u)\n",
+++            gSpf.queries, gSpf.not_ready, gSpf.errors, gSpf.timeouts, gSpf.last_state, gSpf.last_status);
+++        return;
+++    }
+++    clock_interval_to_deadline(FUXI_SPF_GAP_MS, NSEC_PER_MSEC, &gSpf.next_query);
 ++}
 ++
 ++void fuxi_audio_spf_poll(void)
@@ -45614,48 +45737,80 @@ index 0000000..5a7b34d
 ++        printf("FUXI AUDIO SPF: query accepted, awaiting state\n");
 ++    }
 ++    if (gSpf.reply_ready) {
-++        gSpf.done = 1;
-++        if (gSpf.reply.kind == FuxiAudioPrepSpfRemoteError)
-++            printf("FUXI AUDIO SPF: remote error %u\n", gSpf.reply.status);
-++        else
-++            printf("FUXI AUDIO SPF: state %u, playback untested\n", gSpf.reply.state);
+++        gSpf.reply_ready = 0;
+++        if (gSpf.reply.kind == FuxiAudioPrepSpfRemoteError) {
+++            gSpf.errors++;
+++            gSpf.last_status = gSpf.reply.status;
+++        } else {
+++            gSpf.last_state = gSpf.reply.state;
+++            if (gSpf.reply.state == 1) {
+++                gSpf.done = 1;
+++                gSpf.waiting = 0;
+++                printf("FUXI AUDIO SPF: state 1 after %u queries (not ready %u, errors %u, timeouts %u), playback untested\n",
+++                    gSpf.queries, gSpf.not_ready, gSpf.errors, gSpf.timeouts);
+++                return;
+++            }
+++            gSpf.not_ready++;
+++        }
+++        if (!gSpf.reported_first) {
+++            gSpf.reported_first = 1;
+++            if (gSpf.reply.kind == FuxiAudioPrepSpfRemoteError)
+++                printf("FUXI AUDIO SPF: first answer remote error %u, retrying\n", gSpf.reply.status);
+++            else
+++                printf("FUXI AUDIO SPF: first answer state %u, retrying\n", gSpf.reply.state);
+++        }
+++        retry_or_stop();
 ++        return;
 ++    }
-++    if (mach_absolute_time() >= gSpf.deadline) {
-++        gSpf.done = 1;
-++        printf("FUXI AUDIO SPF: %s timeout\n", gSpf.attempted ? "reply" : "channel");
-++        return;
-++    }
-++    if (gSpf.attempted) {
+++    if (gSpf.waiting) {
 ++        if (!gSpf.up) {
+++            gSpf.done = 1;
+++            printf("FUXI AUDIO SPF: channel closed before state reply\n");
+++        } else if (mach_absolute_time() >= gSpf.deadline) {
+++            gSpf.timeouts++;
+++            retry_or_stop();
+++        }
+++        return;
+++    }
+++    if (!gSpf.attempted && mach_absolute_time() >= gSpf.deadline) {
+++        gSpf.done = 1;
+++        printf("FUXI AUDIO SPF: channel timeout\n");
+++        return;
+++    }
+++    if (!gSpf.up) {
+++        if (gSpf.attempted) {
 ++            gSpf.done = 1;
 ++            printf("FUXI AUDIO SPF: channel closed before state reply\n");
 ++        }
 ++        return;
 ++    }
-++    if (!gSpf.up)
+++    if (gSpf.attempted && mach_absolute_time() < gSpf.next_query)
 ++        return;
-++    gSpf.attempted = 1;
+++    gSpf.token = FUXI_SPF_TOKEN + gSpf.queries;
 ++    if (gSpf.format == 2) {
 ++        const FuxiAudioPrepGprFields fields = {
 ++            FUXI_AUDIO_PREP_DOMAIN_ADSP, FUXI_AUDIO_PREP_DOMAIN_APPS,
-++            FUXI_SPF_PORT, FUXI_AUDIO_PREP_APM_PORT, FUXI_SPF_TOKEN, FUXI_AUDIO_PREP_GET_SPF_STATE
+++            FUXI_SPF_PORT, FUXI_AUDIO_PREP_APM_PORT, gSpf.token, FUXI_AUDIO_PREP_GET_SPF_STATE
 ++        };
 ++        result = fuxi_audio_prep_gpr_encode(packet, sizeof(packet), &fields, NULL, 0, &length);
 ++    } else {
-++        result = fuxi_audio_prep_spf_query(packet, sizeof(packet), FUXI_SPF_PORT, FUXI_SPF_TOKEN, &length);
+++        result = fuxi_audio_prep_spf_query(packet, sizeof(packet), FUXI_SPF_PORT, gSpf.token, &length);
 ++    }
 ++    if (!result && length == (gSpf.format == 2 ? 24u : 40u))
 ++        result = sheng_adsp_send(gSpf.channel, packet, (uint32_t)length);
 ++    else if (!result)
 ++        result = FuxiAudioPrepLength;
+++    gSpf.attempted = 1;
 ++    if (result) {
 ++        gSpf.done = 1;
-++        printf("FUXI AUDIO SPF: query queue failed %d\n", result);
+++        printf("FUXI AUDIO SPF: query queue failed %d after %u queries\n", result, gSpf.queries);
 ++        return;
 ++    }
-++    clock_interval_to_deadline(4000, NSEC_PER_MSEC, &gSpf.deadline);
-++    printf("FUXI AUDIO SPF: state query queued bytes %u\n", (unsigned)length);
+++    gSpf.queries++;
+++    gSpf.waiting = 1;
+++    clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gSpf.deadline);
+++    if (gSpf.queries == 1)
+++        printf("FUXI AUDIO SPF: state query queued bytes %u\n", (unsigned)length);
 ++}
 ++#endif
 +--- /dev/null
