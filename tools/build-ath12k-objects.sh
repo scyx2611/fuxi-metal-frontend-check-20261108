@@ -44,6 +44,20 @@ old = '"sparse-checkout", "add", *source["paths"]'
 new = '"sparse-checkout", "add", "--skip-checks", *paths'
 if text.count(old) != 1:
     raise SystemExit("pinned sparse-checkout fetcher changed")
+text = text.replace(old, new)
+old = '''        subprocess.run(["git", "clone", "--depth", "1", "--branch", source["ref"],
+                        "--filter=blob:none", "--sparse", source["url"], str(directory)], check=True)
+'''
+new = '''        directory.mkdir(parents=True)
+        subprocess.run(["git", "-C", str(directory), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(directory), "remote", "add", "origin", source["url"]], check=True)
+        subprocess.run(["git", "-C", str(directory), "sparse-checkout", "init", "--cone"], check=True)
+        subprocess.run(["git", "-C", str(directory), "fetch", "--depth=1", "--filter=blob:none",
+                        "origin", source["commit"]], check=True)
+        subprocess.run(["git", "-C", str(directory), "checkout", "-q", "--detach", "FETCH_HEAD"], check=True)
+'''
+if text.count(old) != 1:
+    raise SystemExit("pinned dependency clone changed")
 path.write_text(text.replace(old, new))
 path = Path(sys.argv[2])
 text = path.read_text()
