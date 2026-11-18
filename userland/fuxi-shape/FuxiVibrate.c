@@ -15,6 +15,9 @@
  *   ADT fuxi,haptic=3（開機自測）時，30 秒後經系統路徑各試一次 AudioServicesPlaySystemSound。
  * mediaserverd 在 fuxi,haptic=3 時另跑探針：10 秒與 75 秒各讀一次震動器建立的關卡，77 秒直接呼叫
  *   CMSessionMgrVibrateForSystemSoundWithOptions 看回傳值。
+ * 一般 App（Preferences 經 fuxi,inject bit 4；其他 App 要 bit 0 且 libfuxi-app.dylib 是這份）：
+ *   CoreHaptics engine 建不起來時，UIFeedbackGenerator 每次要播到 CoreHaptics engine 就改送
+ *   AudioServicesPlaySystemSound(1519)（mediaserverd 轉成 15 ms Atoms 震動；App 沒有 kern.fuxivibrate 寫入權）。
  *
  * 參數一律以 method_getTypeEncoding 驗證後原樣傳遞；不認得的簽名就不掛。紀錄寫到 stderr
  * （mediaserverd 要配 loader --stderr-log mediaserverd 才進核心紀錄）。
@@ -25,6 +28,7 @@
 #include <errno.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
+#include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -45,7 +49,7 @@ extern CFTypeRef IORegistryEntryCreateCFProperty(vb_io_object_t entry, CFStringR
     uint32_t options);
 extern kern_return_t IOObjectRelease(vb_io_object_t object);
 
-enum { VB_NONE, VB_MEDIA, VB_SPRINGBOARD };
+enum { VB_NONE, VB_MEDIA, VB_SPRINGBOARD, VB_APP };
 enum { VB_LOG, VB_PULSE, VB_CANCEL };
 enum { VB_LOG_CALLS = 6, VB_PLAY_LOGS = 12, VB_ERROR_LOGS = 8, VB_TAP_MS = 15, VB_FALLBACK_MS = 15 };
 
@@ -55,13 +59,15 @@ static const char *vb_name = "?";
  * ADT /chosen 開關（預設關，2026-11-17）：
  *   fuxi,haptic-ui  SpringBoard：CoreHaptics engine 從未建成時（mediaserverd 的 AVHapticServer 起不來，
  *                   client 回 -4810），每次 UI 播放改用 kern.fuxivibrate 輕觸這麼多毫秒（8..40）。
+ *                   一般 App：非 0 才回退（讀不到 ADT 時視為開，例如沙盒擋 IORegistry）；長度由 mediaserverd 決定。
  *   fuxi,haptic-env mediaserverd：Atoms 依 Envelope 面積換成等效全開時間（FuxiVibePattern.h）。
  *   fuxi,haptic-amp 兩者：核心 DIRECT_PLAY 振幅上限（1..255，需要帶振幅欄位的核心）。mediaserverd 照 Envelope
  *                   逐 10 ms 調振幅（優先於 haptic-env），並乘上 Intensity 與 gain；SpringBoard 的輕觸用這個值。
  *                   沒設時一律送 0，核心沿用 Android 留下的振幅（舊行為）。
  */
 static unsigned vb_ui_ms, vb_envelope, vb_envelope_logs, vb_amp_max;
-static unsigned vb_core_ok; /* SpringBoard：任一 CoreHaptics engine 建成過就不再回退 */
+static unsigned vb_app_fallback; /* 一般 App：經系統聲音 1519 回退 */
+static unsigned vb_core_ok; /* SpringBoard／App：任一 CoreHaptics engine 建成過就不再回退 */
 
 __attribute__((format(printf, 1, 2))) static void vb_say(const char *format, ...)
 {
@@ -79,6 +85,14 @@ __attribute__((format(printf, 1, 2))) static void vb_say(const char *format, ...
         line[length - 1] = '\n';
     }
     (void)write(2, line, length);
+}
+
+/* iOS 16.7（20H392）shared cache 的未滑動位址；slide 由匯出符號算（見各處核對） */
+static const uint64_t VB_ME_VIBRATE = 0x195ad742cULL;  /* _CMSessionMgrVibrateForSystemSoundWithOptions */
+
+static uintptr_t vb_strip(const void *pointer)
+{
+    return (uintptr_t)pointer & 0x0000007fffffffffULL;
 }
 
 /* ---- 核心介面 ---- */
@@ -720,6 +734,74 @@ static intptr_t vb_feedback_integer(id target, const char *name)
     }
 }
 
+/*
+ * ---- UI 回退（fuxi,haptic-ui）----
+ * CoreHaptics engine 啟動失敗時，UIKit 不會走到 -[_UIFeedbackEngine _playFeedback:atTime:withCompletionBlock:]
+ * （2026-11-17 各趟 CoreHaptics engine 的播放紀錄都是 0 次），所以改在 UIFeedbackGenerator 的請求層判斷：
+ * 問 +[_UIFeedbackEngine engineForFeedback:] 這次會交給誰，是 CoreHaptics 家族才補震；SystemSound engine
+ * 已經經 mediaserverd 的 VibeSynth 震，不重複。40 ms 內的連續請求合併成一次。
+ */
+enum { VB_UI_GAP_MS = 40, VB_UI_LOGS = 24, VB_APP_SOUND = 1519 };
+static unsigned vb_ui_calls, vb_ui_pulses;
+static uint64_t vb_ui_last_ms;
+typedef void (*vb_sound_t)(uint32_t);
+static dispatch_once_t vb_sound_once;
+static vb_sound_t vb_sound_play;
+
+static void vb_sound_resolve(void *context)
+{
+    (void)context;
+    void *toolbox = dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", RTLD_LAZY);
+    vb_sound_play = toolbox ? (vb_sound_t)dlsym(toolbox, "AudioServicesPlaySystemSound") : NULL;
+}
+
+static void vb_app_sound(void *context)
+{
+    (void)context;
+    dispatch_once_f(&vb_sound_once, NULL, vb_sound_resolve);
+    if (vb_sound_play) vb_sound_play(VB_APP_SOUND);
+}
+
+static id vb_engine_for(id feedback)
+{
+    Class target = objc_getClass("_UIFeedbackEngine");
+    SEL selector = sel_registerName("engineForFeedback:");
+    Method method = target && feedback ? class_getClassMethod(target, selector) : NULL;
+    char result[8];
+    if (method == NULL || method_getNumberOfArguments(method) != 3) return NULL;
+    method_getReturnType(method, result, sizeof(result));
+    if (vb_skip_qualifiers(result)[0] != '@') return NULL;
+    IMP implementation = vb_feedback_engine_original ? vb_feedback_engine_original : method_getImplementation(method);
+    return ((id (*)(id, SEL, id))implementation)((id)target, selector, feedback);
+}
+
+static void vb_ui_fallback(id generator, id feedback)
+{
+    bool app = vb_role == VB_APP;
+    unsigned ms = __atomic_load_n(&vb_ui_ms, __ATOMIC_RELAXED);
+    if (app ? !__atomic_load_n(&vb_app_fallback, __ATOMIC_RELAXED) : !ms) return;
+    if (__atomic_load_n(&vb_core_ok, __ATOMIC_ACQUIRE)) return;
+    if (vb_feedback_integer(generator, "_isEnabled") == 0 || vb_feedback_integer(generator, "_isMuted") == 1) return;
+    id engine = vb_engine_for(feedback);
+    const char *name = engine ? object_getClassName(engine) : NULL;
+    if (name == NULL || strstr(name, "CoreHaptics") == NULL) return;
+    uint64_t now = vb_now_ms();
+    uint64_t last = __atomic_load_n(&vb_ui_last_ms, __ATOMIC_RELAXED);
+    const char *outcome = "coalesced";
+    if ((last == 0 || now - last >= VB_UI_GAP_MS) &&
+        __atomic_compare_exchange_n(&vb_ui_last_ms, &last, now, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        if (app) dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), NULL, vb_app_sound);
+        else vb_pulse(ms);
+        (void)__atomic_fetch_add(&vb_ui_pulses, 1u, __ATOMIC_RELAXED);
+        outcome = app ? "sound-1519" : "pulse";
+    }
+    if (__atomic_fetch_add(&vb_ui_calls, 1u, __ATOMIC_RELAXED) < VB_UI_LOGS)
+        vb_say("ui fallback uptime-ms=%llu generator=%s feedback=%s engine=%s result=%s pulses=%u\n",
+            (unsigned long long)now, object_getClassName(generator),
+            feedback ? object_getClassName(feedback) : "nil", name, outcome,
+            __atomic_load_n(&vb_ui_pulses, __ATOMIC_RELAXED));
+}
+
 static bool vb_feedback_core_init(id self, SEL selector)
 {
     bool result = ((bool (*)(id, SEL))vb_feedback_core_init_original)(self, selector);
@@ -770,6 +852,7 @@ static void vb_feedback_request(id self, SEL selector, id feedback, double inter
             (long)vb_feedback_integer(self, "_isEnabled"), (long)vb_feedback_integer(self, "_isMuted"),
             (long)vb_feedback_integer(self, "_outputMode"), (long)vb_feedback_integer(self, "activationCount"),
             interval, regular);
+    vb_ui_fallback(self, feedback); /* 原實作可能同步等 CoreHaptics 的 1 秒逾時，先震 */
     ((void (*)(id, SEL, id, double, double *, bool))vb_feedback_request_original)(
         self, selector, feedback, interval, since, regular);
 }
@@ -806,44 +889,23 @@ static void vb_install_typed(const char *label, vb_typed_hook *hooks, size_t tot
     }
 }
 
-/* ---- SpringBoard：UI 回退脈衝（fuxi,haptic-ui） ---- */
-enum { VB_UI_GAP_MS = 40, VB_UI_LOGS = 24 };
+/* ---- engine 層播放紀錄（只記；回退在 vb_ui_fallback） ---- */
 static IMP vb_engine_play_original;
-static unsigned vb_engine_play_calls, vb_ui_pulses;
-static uint64_t vb_ui_last_ms;
+static unsigned vb_engine_play_calls;
 
 /*
- * -[_UIFeedbackEngine _playFeedback:atTime:withCompletionBlock:] 只在基底類別實作（UIKitCore 20H392 核對過），
- * 所有 engine 的 UI 播放都經過這裡；CoreHaptics 家族在 engine 啟動失敗時不會走到 _internal_playFeedbackData。
- * SystemSound engine 已經經 mediaserverd 的 VibeSynth 震，不重複。
+ * -[_UIFeedbackEngine _playFeedback:atTime:withCompletionBlock:] 只在基底類別實作（UIKitCore 20H392 核對過）。
+ * engine 啟動成功才會走到這裡，所以 CoreHaptics 失敗時看不到；留著確認 SystemSound／修好後的 CoreHaptics 路徑。
  */
 static void vb_engine_play(id self, SEL selector, id feedback, double when, id completion)
 {
     unsigned call = __atomic_fetch_add(&vb_engine_play_calls, 1u, __ATOMIC_RELAXED);
     const char *engine = object_getClassName(self);
-    bool core = engine && strstr(engine, "CoreHaptics") != NULL;
-    unsigned ms = __atomic_load_n(&vb_ui_ms, __ATOMIC_RELAXED);
-    const char *fallback = "off";
-    if (core && ms && !__atomic_load_n(&vb_core_ok, __ATOMIC_ACQUIRE)) {
-        uint64_t now = vb_now_ms();
-        uint64_t last = __atomic_load_n(&vb_ui_last_ms, __ATOMIC_RELAXED);
-        fallback = "coalesced";
-        if ((last == 0 || now - last >= VB_UI_GAP_MS) &&
-            __atomic_compare_exchange_n(&vb_ui_last_ms, &last, now, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-            vb_pulse(ms);
-            (void)__atomic_fetch_add(&vb_ui_pulses, 1u, __ATOMIC_RELAXED);
-            fallback = "pulse";
-        }
-    } else if (core && ms) {
-        fallback = "core-ok";
-    } else if (!core) {
-        fallback = "not-core";
-    }
     if (call < VB_UI_LOGS)
-        vb_say("feedback engine play call=%u uptime-ms=%llu engine=%s feedback=%s at=%.3f state=%ld fallback=%s "
+        vb_say("feedback engine play call=%u uptime-ms=%llu engine=%s feedback=%s at=%.3f state=%ld core-ok=%u "
             "pulses=%u\n", call + 1, (unsigned long long)vb_now_ms(), engine ? engine : "?",
             feedback ? object_getClassName(feedback) : "nil", when, (long)vb_feedback_integer(self, "_state"),
-            fallback, __atomic_load_n(&vb_ui_pulses, __ATOMIC_RELAXED));
+            __atomic_load_n(&vb_core_ok, __ATOMIC_ACQUIRE), __atomic_load_n(&vb_ui_pulses, __ATOMIC_RELAXED));
     ((void (*)(id, SEL, id, double, id))vb_engine_play_original)(self, selector, feedback, when, completion);
 }
 
@@ -975,14 +1037,199 @@ static void vb_install_feedback(void)
 static IMP vb_server_init_original, vb_server_setup_original, vb_server_increment_original, vb_server_accept_original;
 static unsigned vb_server_init_calls, vb_server_setup_calls, vb_server_increment_calls, vb_server_accept_calls;
 
+/*
+ * -init 在 27 ms 內回 nil 且沒走到 setupSSSClient：HapticSynth 建構子丟了 C++ 例外（AudioToolbox 20H392
+ * -[AVHapticServer init] 0x1a0942208 先 new HapticSynth 0x1a09f5860，catch 後回 nil）。要知道是哪一個 throw，
+ * 在第一、二次 -init 期間暫時把 shared cache 統一 GOT 裡的 __cxa_throw 指到記錄函式（只記這條執行緒），
+ * 結束就放回原值。動手前逐一核對：__cxa_throw 與 MediaExperience 算出的 slide 相同、AudioToolbox 的
+ * __cxa_throw stub 三個指令字、GOT 現值等於 __cxa_throw；任一不符就不碰。
+ */
+static const uint64_t VB_CXA_THROW = 0x1d1ae0cdcULL;     /* libc++abi ___cxa_throw */
+static const uint64_t VB_CXA_GOT = 0x1dad0db80ULL;       /* AudioToolbox __cxa_throw stub 讀的 GOT */
+static const uint64_t VB_CXA_STUB = 0x1a0a88938ULL;      /* adrp x16 / ldr x16,[x16,#0xb80] / br x16 */
+static const uint32_t VB_CXA_STUB_WORDS[3] = {0xb01d1430U, 0xf945c210U, 0xd61f0200U};
+static const uint64_t VB_HS_FLAG_A = 0x1dd5833e1ULL;     /* ProductSupportsClosedLoopHaptics 快取 */
+static const uint64_t VB_HS_ONCE_A = 0x1e1f81be8ULL;
+static const uint64_t VB_HS_FLAG_B = 0x1e1f81bf0ULL;     /* 手機／手錶／audio_only_haptic_server */
+static const uint64_t VB_HS_ONCE_B = 0x1e1f81bf8ULL;
+typedef void (*vb_throw_t)(void *, void *, void (*)(void *));
+static vb_throw_t vb_throw_real;
+static uintptr_t vb_throw_slide;
+static pthread_t vb_throw_thread;
+static unsigned vb_throw_armed, vb_throw_seen, vb_throw_other;
+
+/* 讀別人的記憶體一律先複製（位址不可讀時回 false，不會當掉） */
+static bool vb_copy(const void *from, void *to, size_t size)
+{
+    vm_size_t got = 0;
+    return from != NULL && vm_read_overwrite(mach_task_self(), (vm_address_t)from, size, (vm_address_t)to, &got) ==
+        KERN_SUCCESS && got == size;
+}
+
+/* 複製一段 C 字串到 out（最多 size-1 個字元）；不可讀就回 false */
+static bool vb_copy_string(const void *from, char *out, size_t size)
+{
+    for (size_t want = size - 1; want >= 16; want /= 2) {
+        if (vb_copy(from, out, want)) {
+            out[want] = '\0';
+            return true;
+        }
+    }
+    out[0] = '\0';
+    return false;
+}
+
+/* shared cache 是不是 20H392 這份：__cxa_throw 與 MediaExperience 的 slide 相同，且 AudioToolbox stub 三字相符 */
+static bool vb_cache_slide(uintptr_t *slide_out)
+{
+    uintptr_t real = vb_strip(dlsym(RTLD_DEFAULT, "__cxa_throw"));
+    uintptr_t media = vb_strip(dlsym(RTLD_DEFAULT, "CMSessionMgrVibrateForSystemSoundWithOptions"));
+    uintptr_t slide = real - (uintptr_t)VB_CXA_THROW;
+    uint32_t words[3];
+    bool layout = real && media && (slide & 0x3fff) == 0 && media - (uintptr_t)VB_ME_VIBRATE == slide &&
+        vb_copy((const void *)((uintptr_t)VB_CXA_STUB + slide), words, sizeof(words));
+    for (unsigned k = 0; layout && k < 3; k++) layout = words[k] == VB_CXA_STUB_WORDS[k];
+    *slide_out = layout ? slide : 0;
+    return layout;
+}
+
+__attribute__((noinline)) static void vb_throw_log(void *thrown, void *type, uintptr_t from)
+{
+    unsigned index = __atomic_fetch_add(&vb_throw_seen, 1u, __ATOMIC_RELAXED);
+    if (index >= VB_LOG_CALLS) return;
+    char name[96] = "?";
+    uintptr_t raw = 0;
+    if (type && vb_copy((const char *)type + 8, &raw, sizeof(raw)))
+        (void)vb_copy_string((const void *)(raw & 0x7fffffffffffffffULL), name, sizeof(name)); /* 最高位＝非唯一 RTTI */
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    const char *image = "?";
+    uintptr_t offset = 0;
+    if (dladdr((const void *)from, &info) && info.dli_fname) {
+        const char *slash = strrchr(info.dli_fname, '/');
+        image = slash ? slash + 1 : info.dli_fname;
+        offset = from - (uintptr_t)info.dli_fbase;
+    }
+    char detail[220] = "";
+    if (strstr(name, "CAXException") && thrown) {
+        struct { char operation[256]; int32_t status; } copy; /* PublicUtility CAXException：無 vtable */
+        if (vb_copy(thrown, &copy, sizeof(copy))) {
+            uint32_t code = (uint32_t)copy.status;
+            char fourcc[5] = {(char)(code >> 24), (char)(code >> 16), (char)(code >> 8), (char)code, 0};
+            for (unsigned k = 0; k < 4; k++) if (fourcc[k] < 32 || fourcc[k] > 126) fourcc[k] = '.';
+            copy.operation[sizeof(copy.operation) - 1] = '\0';
+            (void)snprintf(detail, sizeof(detail), " status=%d fourcc=%s op=%.150s", (int)copy.status, fourcc,
+                copy.operation);
+        }
+    } else if (thrown && (strcmp(name, "St13runtime_error") == 0 || strcmp(name, "St11logic_error") == 0 ||
+        strcmp(name, "St16invalid_argument") == 0 || strcmp(name, "St12out_of_range") == 0 ||
+        strcmp(name, "St11range_error") == 0 || strcmp(name, "St12length_error") == 0)) {
+        uintptr_t message = 0; /* vptr 之後是 __libcpp_refstring 的字元指標 */
+        char text[160];
+        if (vb_copy((const char *)thrown + 8, &message, sizeof(message)) &&
+            vb_copy_string((const void *)message, text, sizeof(text)))
+            (void)snprintf(detail, sizeof(detail), " what=%s", text);
+    }
+    vb_say("haptic throw %u from=%s+%#lx static=%#llx type=%s%s\n", index + 1, image, (unsigned long)offset,
+        (unsigned long long)(from - vb_throw_slide), name, detail);
+}
+
+static void vb_throw_hook(void *thrown, void *type, void (*destructor)(void *))
+{
+    uintptr_t from = (uintptr_t)__builtin_return_address(0) - 4; /* 呼叫 stub 的 bl */
+    if (__atomic_load_n(&vb_throw_armed, __ATOMIC_ACQUIRE) && pthread_equal(pthread_self(), vb_throw_thread))
+        vb_throw_log(thrown, type, from);
+    else
+        (void)__atomic_fetch_add(&vb_throw_other, 1u, __ATOMIC_RELAXED);
+    __attribute__((musttail)) return vb_throw_real(thrown, type, destructor);
+}
+
+/* arm=true：核對後換成記錄函式；false：放回原值。回傳 GOT 位址（0＝沒換）。 */
+static uintptr_t vb_throw_trace(bool arm, uintptr_t slot_address)
+{
+    if (!arm) {
+        if (slot_address == 0) return 0;
+        __atomic_store_n(&vb_throw_armed, 0u, __ATOMIC_RELEASE);
+        uintptr_t *slot = (uintptr_t *)slot_address;
+        if (__atomic_load_n(slot, __ATOMIC_ACQUIRE) == (uintptr_t)vb_throw_hook)
+            __atomic_store_n(slot, (uintptr_t)vb_throw_real, __ATOMIC_RELEASE);
+        vm_address_t page = slot_address & ~(uintptr_t)(vm_page_size - 1);
+        kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, false, VM_PROT_READ);
+        vb_say("haptic throw trace restored got=%#lx protect=%d other-threads=%u\n", (unsigned long)slot_address, kr,
+            __atomic_load_n(&vb_throw_other, __ATOMIC_RELAXED));
+        return 0;
+    }
+    uintptr_t slide = 0, current = 0;
+    bool layout = vb_cache_slide(&slide);
+    uintptr_t real = (uintptr_t)VB_CXA_THROW + slide;
+    uintptr_t *slot = (uintptr_t *)((uintptr_t)VB_CXA_GOT + slide);
+    layout = layout && vb_copy(slot, &current, sizeof(current)) && current == real;
+    if (!layout) {
+        vb_say("haptic throw trace refused layout (slide-match/stub/got)\n");
+        return 0;
+    }
+    vm_address_t page = (uintptr_t)slot & ~(uintptr_t)(vm_page_size - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, false,
+        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        vb_say("haptic throw trace vm_protect failed kr=%d\n", kr);
+        return 0;
+    }
+    vb_throw_real = (vb_throw_t)real;
+    vb_throw_slide = slide;
+    vb_throw_thread = pthread_self();
+    __atomic_store_n(&vb_throw_armed, 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(slot, (uintptr_t)vb_throw_hook, __ATOMIC_RELEASE);
+    return (uintptr_t)slot;
+}
+
+/* -init 失敗後：建構子用到的旗標與 HapticSynth AU（aumu/hsyn/appl）自己問一次 */
+static void vb_server_explain(void)
+{
+    typedef unsigned char (*mg_bool_t)(CFStringRef);
+    typedef int32_t (*mg_int_t)(CFStringRef, int32_t);
+    typedef bool (*feature_t)(const char *, const char *);
+    typedef struct { uint32_t type, subtype, manufacturer, flags, mask; } vb_component_t;
+    typedef void *(*find_t)(void *, const vb_component_t *);
+    typedef int32_t (*new_t)(void *, void **);
+    typedef int32_t (*dispose_t)(void *);
+    mg_bool_t mg = (mg_bool_t)dlsym(RTLD_DEFAULT, "MGGetBoolAnswer");
+    mg_int_t mg_int = (mg_int_t)dlsym(RTLD_DEFAULT, "MGGetSInt32Answer");
+    feature_t feature = (feature_t)dlsym(RTLD_DEFAULT, "_os_feature_enabled_impl");
+    uintptr_t slide = 0;
+    bool layout = vb_cache_slide(&slide);
+    vb_say("haptic server explain closed-loop=%d device-class=%d audio-only-feature=%d layout=%u "
+        "flag-a=%d once-a=%ld flag-b=%d once-b=%ld\n", mg ? mg(CFSTR("gqDnklGQnpv5ilgh5uHckw")) : -1,
+        mg_int ? (int)mg_int(CFSTR("DeviceClassNumber"), 0) : -1,
+        feature ? feature("CoreAudioServices", "audio_only_haptic_server") : -1, layout,
+        layout ? *(volatile const uint8_t *)((uintptr_t)VB_HS_FLAG_A + slide) : -1,
+        layout ? *(volatile const long *)((uintptr_t)VB_HS_ONCE_A + slide) : 0,
+        layout ? *(volatile const uint8_t *)((uintptr_t)VB_HS_FLAG_B + slide) : -1,
+        layout ? *(volatile const long *)((uintptr_t)VB_HS_ONCE_B + slide) : 0);
+    find_t find = (find_t)dlsym(RTLD_DEFAULT, "AudioComponentFindNext");
+    new_t create = (new_t)dlsym(RTLD_DEFAULT, "AudioComponentInstanceNew");
+    dispose_t dispose = (dispose_t)dlsym(RTLD_DEFAULT, "AudioComponentInstanceDispose");
+    const vb_component_t synth = {0x61756d75U /* aumu */, 0x6873796eU /* hsyn */, 0x6170706cU /* appl */, 0, 0};
+    void *component = find ? find(NULL, &synth) : NULL;
+    void *instance = NULL;
+    int32_t rc = component && create ? create(component, &instance) : -1;
+    vb_say("haptic server explain hsyn component=%u instance-rc=%d instance=%u\n", component != NULL, (int)rc,
+        instance != NULL);
+    if (instance && dispose) (void)dispose(instance);
+}
+
 static id vb_server_init(id self, SEL selector)
 {
     unsigned call = __atomic_fetch_add(&vb_server_init_calls, 1u, __ATOMIC_RELAXED);
+    uintptr_t traced = call < 2 ? vb_throw_trace(true, 0) : 0;
     uint64_t start = vb_now_ms();
     id result = ((id (*)(id, SEL))vb_server_init_original)(self, selector);
+    uint64_t elapsed = vb_now_ms() - start;
+    (void)vb_throw_trace(false, traced);
     if (call < VB_LOG_CALLS)
-        vb_say("haptic server init call=%u uptime-ms=%llu elapsed-ms=%llu result=%s\n", call + 1,
-            (unsigned long long)start, (unsigned long long)(vb_now_ms() - start), result ? "object" : "nil");
+        vb_say("haptic server init call=%u uptime-ms=%llu elapsed-ms=%llu result=%s traced=%u\n", call + 1,
+            (unsigned long long)start, (unsigned long long)elapsed, result ? "object" : "nil", traced != 0);
+    if (call == 0 && result == NULL) vb_server_explain();
     return result;
 }
 
@@ -1050,10 +1297,52 @@ static void vb_image_added(const struct mach_header *header, intptr_t slide)
         vb_install_supports();
         vb_install_feedback();
     }
+    if (vb_role == VB_APP) vb_install_core_feedback();
     for (unsigned index = 0; index < VB_HOOKS; index++) vb_install(index);
 }
 
-/* ---- SpringBoard 自測（fuxi,haptic=3） ---- */
+/* ---- 自測（fuxi,haptic=3）：公開 UIFeedbackGenerator → 回退路徑 ---- */
+typedef id (*vb_msg_id_t)(id, SEL);
+typedef id (*vb_msg_long_t)(id, SEL, long);
+typedef void (*vb_msg_void_t)(id, SEL);
+
+static void vb_generator_fire(void *context)
+{
+    const char *kind = context;
+    bool impact = strcmp(kind, "impact") == 0;
+    Class target = objc_getClass(impact ? "UIImpactFeedbackGenerator" : "UISelectionFeedbackGenerator");
+    if (target == NULL) {
+        vb_say("haptic selftest %s generator class missing\n", kind);
+        return;
+    }
+    /* 自測只做幾次，物件刻意不釋放，避免播放前被回收 */
+    id generator = ((vb_msg_id_t)objc_msgSend)((id)target, sel_registerName("alloc"));
+    generator = impact ? ((vb_msg_long_t)objc_msgSend)(generator, sel_registerName("initWithStyle:"), 1L)
+                       : ((vb_msg_id_t)objc_msgSend)(generator, sel_registerName("init"));
+    if (generator == NULL) return;
+    ((vb_msg_void_t)objc_msgSend)(generator, sel_registerName("prepare"));
+    ((vb_msg_void_t)objc_msgSend)(generator, sel_registerName(impact ? "impactOccurred" : "selectionChanged"));
+    vb_say("haptic selftest %s generator fired uptime-ms=%llu pulses=%u\n", kind, (unsigned long long)vb_now_ms(),
+        __atomic_load_n(&vb_ui_pulses, __ATOMIC_RELAXED));
+}
+
+static void vb_generator_selftest(const char *who)
+{
+    vb_say("haptic selftest %s: UIImpactFeedbackGenerator now, UISelectionFeedbackGenerator in 1.5 s\n", who);
+    dispatch_async_f(dispatch_get_main_queue(), (void *)"impact", vb_generator_fire);
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), dispatch_get_main_queue(),
+        (void *)"selection", vb_generator_fire);
+}
+
+static void vb_open_settings(void)
+{
+    Class workspace = objc_getClass("LSApplicationWorkspace");
+    id shared = workspace ? ((vb_msg_id_t)objc_msgSend)((id)workspace, sel_registerName("defaultWorkspace")) : NULL;
+    bool opened = shared && ((bool (*)(id, SEL, id))objc_msgSend)(shared,
+        sel_registerName("openApplicationWithBundleID:"), (id)CFSTR("com.apple.Preferences"));
+    vb_say("haptic selftest open Preferences workspace=%u opened=%u\n", shared != NULL, opened);
+}
+
 static unsigned vb_adt_u32(CFStringRef key)
 {
     vb_io_object_t chosen = IORegistryEntryFromPath(MACH_PORT_NULL, "IODeviceTree:/chosen");
@@ -1114,6 +1403,19 @@ static void *vb_selftest(void *argument)
         play(1519); /* Peek：Taptic 的短脈衝系統聲音 */
         vb_say("vibe selftest 3 AudioServicesPlaySystemSound(1519) sent\n");
     }
+    sleep(4);
+    vb_generator_selftest("springboard");
+    sleep(4);
+    vb_open_settings();
+    return NULL;
+}
+
+/* App（Preferences 由 SpringBoard 自測打開）：啟動 8 秒後同樣經 UIFeedbackGenerator 觸發 */
+static void *vb_app_selftest(void *argument)
+{
+    (void)argument;
+    sleep(8);
+    vb_generator_selftest("app");
     return NULL;
 }
 
@@ -1124,7 +1426,6 @@ static void *vb_selftest(void *argument)
  * 不成立再找名為 "vibrator" 的 IOService。建立後的震動器存在一個全域指標。這幾個值沒有匯出，
  * 只能用 iOS 16.7 這份 shared cache 的未滑動位址讀：先用匯出符號算 slide，再比對關卡函式開頭的指令，不符就不讀。
  */
-static const uint64_t VB_ME_VIBRATE = 0x195ad742cULL;  /* _CMSessionMgrVibrateForSystemSoundWithOptions */
 static const uint64_t VB_ME_GATE = 0x195a93ab0ULL;     /* 關卡函式；開頭是 stp x20, x19, [sp, #-0x20]! */
 static const uint32_t VB_ME_GATE_WORD = 0xa9be4ff4U;
 static const uint64_t VB_ME_ONCE = 0x1dd2ef740ULL;     /* dispatch_once 的 predicate（做完是 -1） */
@@ -1132,11 +1433,6 @@ static const uint64_t VB_ME_HW = 0x1dd2efcf8ULL;       /* HasHardwareSupport 的
 static const uint64_t VB_ME_HANDLE = 0x1dd2efa68ULL;   /* libVibeSynthEngine 的 dlopen handle（不支援時會被清掉） */
 static const uint64_t VB_ME_VIBRATOR = 0x1dd2efcb8ULL; /* 建立好的震動器 */
 #define VB_ENGINE_PATH "/System/Library/Frameworks/AudioToolbox.framework/libVibeSynthEngine.dylib"
-
-static uintptr_t vb_strip(const void *pointer)
-{
-    return (uintptr_t)pointer & 0x0000007fffffffffULL;
-}
 
 static unsigned vb_native_calls;
 static unsigned vb_native_cancels;
@@ -1321,10 +1617,25 @@ __attribute__((constructor)) static void fuxi_vibrate_init(void)
 {
     const char *name = getprogname();
     if (name == NULL) return;
+    const char *path = _dyld_get_image_name(0);
     if (strcmp(name, "mediaserverd") == 0) vb_role = VB_MEDIA;
     else if (strcmp(name, "SpringBoard") == 0) vb_role = VB_SPRINGBOARD;
+    else if (path && strstr(path, ".app/")) vb_role = VB_APP;
     else return;
     vb_name = name;
+    if (vb_role == VB_APP) {
+        /* 沙盒可能擋 IORegistry：讀得到 fuxi,inject（注入我們的就是它）才算 ADT 可讀，讀不到就照預設開 */
+        bool readable = vb_adt_u32(CFSTR("fuxi,inject")) != 0;
+        unsigned ui = readable ? vb_adt_u32(CFSTR("fuxi,haptic-ui")) : 1;
+        __atomic_store_n(&vb_app_fallback, ui != 0, __ATOMIC_RELAXED);
+        vb_say("app haptic fallback=%u adt-readable=%u (UIFeedbackGenerator -> system sound %u)\n", ui != 0,
+            readable, (unsigned)VB_APP_SOUND);
+        if (ui == 0) return;
+        _dyld_register_func_for_add_image(vb_image_added);
+        if (readable && vb_adt_u32(CFSTR("fuxi,haptic")) == 3)
+            vb_spawn(vb_app_selftest, "app haptic selftest scheduled in 8 s (fuxi,haptic=3)");
+        return;
+    }
     int error = 0;
     if (!vb_ready(&error)) {
         vb_say("vibrate kern.fuxivibrate unavailable errno=%d; haptic hooks skipped\n", error);

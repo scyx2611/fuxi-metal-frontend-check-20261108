@@ -138,6 +138,7 @@ jobs:
           (cd source && python3 tools/test-fuxi-ram-inventory.py)
           (cd source && python3 tools/test-fuxi-bluetooth.py --sanitize)
           (cd source && python3 tools/test-fuxi-bluetooth-xnu.py --sanitize)
+          (cd source && python3 tools/test-fuxi-bluetooth-setup.py --sanitize)
           (cd source && python3 tools/test-fuxi-bt-geni-fifo.py --sanitize)
           (cd source && python3 tools/test-fuxi-bt-board.py --sanitize)
           (cd source && python3 tools/sync-fuxi-h1.py --check && python3 tools/test-fuxi-tap-command.py)

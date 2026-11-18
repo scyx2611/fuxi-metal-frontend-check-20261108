@@ -8350,10 +8350,10 @@ index 90d7242..54eacf5 100644
  @@ -745,6 +745,10 @@
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..d0a59cb
+index 0000000..a74d3d4
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,175 @@
 +#!/usr/bin/env python3
 +"""Generate/check patch 0117 (fuxi-adsp): the audio DSP owner (boot-arg fuxiadsp) and its battery manager client.
 +
@@ -8395,6 +8395,10 @@ index 0000000..d0a59cb
 +HEADERS += ('fuxi_bt_geni_fifo.h', 'fuxi_bt_board.h')
 +SOURCE_PATHS.update({name: BLUETOOTH_SOURCE / name for name in
 +                     ('fuxi_bt_geni_fifo.c', 'fuxi_bt_board.c', 'fuxi_bt_geni_fifo.h', 'fuxi_bt_board.h')})
++# WCN7850 控制器初始化：rampatch／NVM 下載與 HCI reset（fuxi,bt=4）
++SOURCES += ('fuxi_bt_setup.c',)
++HEADERS += ('fuxi_bt_setup.h',)
++SOURCE_PATHS.update({name: BLUETOOTH_SOURCE / name for name in ('fuxi_bt_setup.c', 'fuxi_bt_setup.h')})
 +SOURCES += ('fuxi_battery_freshness.c',)
 +HEADERS += ('fuxi_battery_freshness.h', 'fuxi_battery_poll_pause.h')
 +SOURCE_PATHS.update({
@@ -10630,12 +10634,578 @@ index 0000000..922f6a1
 +
 +if __name__ == "__main__":
 +    main()
+diff --git a/tools/test-fuxi-bluetooth-setup.py b/tools/test-fuxi-bluetooth-setup.py
+new file mode 100644
+index 0000000..cd0b4db
+--- /dev/null
++++ b/tools/test-fuxi-bluetooth-setup.py
+@@ -0,0 +1,560 @@
++#!/usr/bin/env python3
++"""Compile and run the WCN7850 controller setup (rampatch/NVM/HCI reset) against a simulated controller."""
++
++import argparse
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++
++
++ROOT = Path(__file__).resolve().parents[1]
++SOURCE = ROOT / "xnu" / "fuxi-bluetooth"
++
++HARNESS = r'''
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "fuxi_bt_setup.h"
++
++#define PATCH_CAP 8192
++#define NVM_CAP 512
++
++struct sim {
++    struct fuxi_bt_uart_ops ops;
++    uint64_t clock;
++    uint8_t command[300];
++    unsigned command_size;
++    uint8_t out[1 << 17];
++    size_t out_head, out_tail;
++    unsigned rx_chunk, tx_chunk, write_calls, stall_every;
++    uint8_t patch_mode;
++    size_t patch_size;
++    bool skip_final_ack, silent, ibs_after_nvm, reset_error, vendor_noise, board_error;
++    bool bad_framing;
++    int fail_segment, fail_stale_segment;
++    uint16_t board_id;
++    uint8_t got_patch[PATCH_CAP];
++    size_t got_patch_size;
++    uint8_t got_nvm[NVM_CAP];
++    size_t got_nvm_size;
++    bool board_seen;
++    unsigned segments, acquires, releases, commands;
++    uint32_t random;
++};
++
++struct files {
++    uint8_t patch[PATCH_CAP];
++    size_t patch_size;
++    bool patch_present;
++    uint8_t nvm[NVM_CAP];
++    size_t nvm_size;
++    const char *nvm_present;
++    unsigned loads, releases;
++    char asked[8][FUXI_BT_SETUP_NAME];
++    unsigned asked_count;
++    size_t oversize;
++};
++
++static void push(struct sim *s, const uint8_t *bytes, size_t size)
++{
++    assert(s->out_tail + size <= sizeof(s->out));
++    memcpy(s->out + s->out_tail, bytes, size);
++    s->out_tail += size;
++}
++
++static void vendor_complete(struct sim *s, uint8_t cresp, uint8_t rtype, const uint8_t *data, unsigned size)
++{
++    uint8_t event[300] = {4, 0x0e, (uint8_t)(5 + size), 1, 0x00, 0xfc, cresp, rtype};
++    if (s->vendor_noise) {
++        static const uint8_t noise[] = {4, 0xff, 3, 0x01, 0x02, 0x03};
++        push(s, noise, sizeof(noise));
++    }
++    if (size) memcpy(event + 8, data, size);
++    push(s, event, 8 + size);
++}
++
++static void complete(struct sim *s, uint16_t opcode, const uint8_t *params, unsigned size)
++{
++    uint8_t event[300] = {4, 0x0e, (uint8_t)(3 + size), 1, (uint8_t)opcode, (uint8_t)(opcode >> 8)};
++    memcpy(event + 6, params, size);
++    push(s, event, 6 + size);
++}
++
++static void handle(struct sim *s)
++{
++    const uint8_t *c = s->command;
++    const uint16_t opcode = (uint16_t)(c[1] | c[2] << 8);
++    const uint8_t *p = c + 4;
++    s->commands++;
++    if (s->silent) {
++        return;
++    }
++    if (opcode == 0xfc00 && p[0] == 0x19) {
++        static const uint8_t version[] = {0x0c, 0x19, 0, 0, 0, 0xfb, 0x43, 0x00, 0x02, 0x00, 0x02, 0x17, 0x40};
++        vendor_complete(s, 0, 0x19, version, sizeof(version));
++    } else if (opcode == 0xfc00 && p[0] == 0x1e) {
++        const unsigned size = p[1];
++        const unsigned index = s->segments++;
++        assert(c[3] == size + 2 && size >= 1 && size <= FUXI_BT_TLV_SEGMENT);
++        if (!s->board_seen) {
++            assert(s->got_patch_size + size <= PATCH_CAP);
++            memcpy(s->got_patch + s->got_patch_size, p + 2, size);
++            s->got_patch_size += size;
++            if ((int)index == s->fail_segment) {
++                vendor_complete(s, 0x01, 0x1e, NULL, 0);
++            } else if ((int)index == s->fail_stale_segment) {
++                vendor_complete(s, 0x11, 0x1e, NULL, 0);
++            } else if (s->patch_mode == 0 ||
++                       (s->got_patch_size == s->patch_size && !s->skip_final_ack)) {
++                vendor_complete(s, 0, 0x1e, NULL, 0);
++            }
++        } else {
++            assert(s->got_nvm_size + size <= NVM_CAP);
++            memcpy(s->got_nvm + s->got_nvm_size, p + 2, size);
++            s->got_nvm_size += size;
++            vendor_complete(s, 0, 0x1e, NULL, 0);
++        }
++    } else if (opcode == 0xfc00 && p[0] == 0x23) {
++        const uint8_t bid[] = {2, (uint8_t)(s->board_id >> 8), (uint8_t)s->board_id};
++        s->board_seen = true;
++        vendor_complete(s, s->board_error ? 0x01 : 0, 0x23, bid, sizeof(bid));
++    } else if (opcode == 0xfc00 && p[0] == 0x20) {
++        static const uint8_t info[] = {10, 'B', 'T', 'F', 'M', '.', 'H', 'M', 'T', 0x01, 0};
++        if (s->ibs_after_nvm) {
++            static const uint8_t sleep[] = {0xfe};
++            push(s, sleep, 1);
++        }
++        vendor_complete(s, 0, 0x20, info, sizeof(info));
++    } else if (opcode == 0x0c03) {
++        const uint8_t status = s->reset_error ? 0x0c : 0;
++        complete(s, opcode, &status, 1);
++    } else if (opcode == 0x1001) {
++        static const uint8_t version[] = {0, 0x0d, 0x00, 0x00, 0x0d, 0x1d, 0x00, 0x34, 0x12};
++        complete(s, opcode, version, sizeof(version));
++    } else if (opcode == 0x1009) {
++        static const uint8_t address[] = {0, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11};
++        complete(s, opcode, address, sizeof(address));
++    } else {
++        assert(!"unexpected command");
++    }
++}
++
++static enum fuxi_bt_status sim_acquire(void *context, unsigned baud)
++{
++    struct sim *s = context;
++    assert(baud == FUXI_BT_BOOT_BAUD);
++    s->acquires++;
++    return FUXI_BT_OK;
++}
++
++static enum fuxi_bt_status sim_write(void *context, const uint8_t *bytes, size_t size, size_t *accepted)
++{
++    struct sim *s = context;
++    size_t count = size < s->tx_chunk ? size : s->tx_chunk;
++    s->write_calls++;
++    *accepted = 0;
++    if (s->stall_every && s->write_calls % s->stall_every == 0) {
++        return FUXI_BT_AGAIN;
++    }
++    for (size_t index = 0; index < count; index++) {
++        if (!s->command_size) {
++            assert(bytes[index] == 1);
++        }
++        assert(s->command_size < sizeof(s->command));
++        s->command[s->command_size++] = bytes[index];
++        if (s->command_size >= 4 && s->command_size == 4u + s->command[3]) {
++            handle(s);
++            s->command_size = 0;
++        }
++    }
++    *accepted = count;
++    return FUXI_BT_OK;
++}
++
++static enum fuxi_bt_status sim_read(void *context, uint8_t *bytes, size_t capacity, size_t *received)
++{
++    struct sim *s = context;
++    size_t count = s->out_tail - s->out_head;
++    if (s->bad_framing && count == 0) {
++        s->random ^= s->random << 13;
++        s->random ^= s->random >> 17;
++        s->random ^= s->random << 5;
++        bytes[0] = (uint8_t)s->random;
++        *received = 1;
++        return FUXI_BT_OK;
++    }
++    if (count > capacity) count = capacity;
++    if (count > s->rx_chunk) count = s->rx_chunk;
++    memcpy(bytes, s->out + s->out_head, count);
++    s->out_head += count;
++    *received = count;
++    return count ? FUXI_BT_OK : FUXI_BT_AGAIN;
++}
++
++static enum fuxi_bt_status sim_release(void *context)
++{
++    struct sim *s = context;
++    s->releases++;
++    return FUXI_BT_OK;
++}
++
++static uint64_t sim_now(void *context)
++{
++    struct sim *s = context;
++    return s->clock += 3;
++}
++
++static void sim_wait(void *context, unsigned microseconds)
++{
++    struct sim *s = context;
++    s->clock += microseconds;
++}
++
++static enum fuxi_bt_status file_load(void *context, const char *name, size_t limit, struct fuxi_bt_blob *blob)
++{
++    struct files *f = context;
++    assert(fuxi_bt_setup_name_valid(name));
++    assert(f->asked_count < 8);
++    strcpy(f->asked[f->asked_count++], name);
++    if (!strcmp(name, "hmtbtfw20.tlv") && f->patch_present) {
++        assert(limit == FUXI_BT_PATCH_MAX);
++        blob->data = malloc(f->patch_size + f->oversize);
++        memcpy(blob->data, f->patch, f->patch_size);
++        blob->size = f->patch_size + f->oversize;
++        f->loads++;
++        return FUXI_BT_OK;
++    }
++    if (f->nvm_present && !strcmp(name, f->nvm_present)) {
++        assert(limit == FUXI_BT_NVM_MAX);
++        blob->data = malloc(f->nvm_size);
++        memcpy(blob->data, f->nvm, f->nvm_size);
++        blob->size = f->nvm_size;
++        f->loads++;
++        return FUXI_BT_OK;
++    }
++    return FUXI_BT_OFF;
++}
++
++static void file_release(void *context, struct fuxi_bt_blob *blob)
++{
++    struct files *f = context;
++    free(blob->data);
++    blob->data = NULL;
++    f->releases++;
++}
++
++static void put32(uint8_t *b, uint32_t v) { b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); b[2] = (uint8_t)(v >> 16); b[3] = (uint8_t)(v >> 24); }
++
++static size_t make_patch(uint8_t *b, size_t total, uint8_t mode)
++{
++    memset(b, 0, total);
++    put32(b, 1u | (uint32_t)(total - 4) << 8);
++    put32(b + 4, (uint32_t)total);
++    b[4 + 10] = mode;
++    b[4 + 12] = 0x19;
++    b[4 + 14] = 0x00; b[4 + 15] = 0x02;
++    b[4 + 16] = 0xfb; b[4 + 17] = 0x43;
++    for (size_t index = 28; index < total; index++) b[index] = (uint8_t)(index * 7 + 3);
++    return total;
++}
++
++static size_t add_tag(uint8_t *b, size_t at, uint16_t tag, const uint8_t *data, uint16_t size)
++{
++    b[at] = (uint8_t)tag; b[at + 1] = (uint8_t)(tag >> 8);
++    b[at + 2] = (uint8_t)size; b[at + 3] = (uint8_t)(size >> 8);
++    memset(b + at + 4, 0xaa, 8);
++    memcpy(b + at + 12, data, size);
++    return at + 12 + size;
++}
++
++static size_t make_nvm(uint8_t *b, bool hci, bool sleep)
++{
++    static const uint8_t address[] = {1, 2, 3, 4, 5, 6};
++    static const uint8_t hci_value[] = {0x8e, 0x0f, 0x55, 0x01};
++    static const uint8_t sleep_value[] = {0x03};
++    static const uint8_t other[10] = {9, 9, 9, 9, 9, 9, 9, 9, 9, 9};
++    size_t at = 4;
++    memset(b, 0, NVM_CAP);
++    at = add_tag(b, at, 2, address, sizeof(address));
++    if (hci) at = add_tag(b, at, 17, hci_value, sizeof(hci_value));
++    if (sleep) at = add_tag(b, at, 27, sleep_value, sizeof(sleep_value));
++    at = add_tag(b, at, 100, other, sizeof(other));
++    put32(b, 2u | (uint32_t)(at - 4) << 8);
++    return at;
++}
++
++static void sim_init(struct sim *s, unsigned rx_chunk, unsigned tx_chunk)
++{
++    memset(s, 0, sizeof(*s));
++    s->ops.context = s;
++    s->ops.acquire = sim_acquire;
++    s->ops.write = sim_write;
++    s->ops.read = sim_read;
++    s->ops.release = sim_release;
++    s->ops.now_us = sim_now;
++    s->ops.wait_us = sim_wait;
++    s->rx_chunk = rx_chunk;
++    s->tx_chunk = tx_chunk;
++    s->fail_segment = -1;
++    s->fail_stale_segment = -1;
++    s->board_id = 0x010a;
++    s->random = 0x78501234;
++}
++
++static void files_init(struct files *f, size_t patch_size, uint8_t mode, const char *nvm_name)
++{
++    memset(f, 0, sizeof(*f));
++    f->patch_size = make_patch(f->patch, patch_size, mode);
++    f->patch_present = true;
++    f->nvm_size = make_nvm(f->nvm, true, true);
++    f->nvm_present = nvm_name;
++}
++
++static struct fuxi_bt_files files_ops(struct files *f)
++{
++    struct fuxi_bt_files ops = {f, file_load, file_release};
++    return ops;
++}
++
++static void expect_nvm(const struct sim *s, const struct files *f)
++{
++    uint8_t expected[NVM_CAP];
++    memcpy(expected, f->nvm, f->nvm_size);
++    /* tag 17 在 4+18 起：資料 4+18+12 */
++    expected[4 + 18 + 12] = 0x0e;
++    expected[4 + 18 + 12 + 1] = 0x00;
++    expected[4 + 18 + 16 + 12] = 0x02;
++    assert(s->got_nvm_size == f->nvm_size);
++    assert(!memcmp(s->got_nvm, expected, f->nvm_size));
++}
++
++static void run_good(unsigned rx_chunk, unsigned tx_chunk, unsigned stall, uint8_t mode, size_t patch_size,
++    const char *nvm_name, bool noise)
++{
++    struct sim s;
++    struct files f;
++    struct fuxi_bt_files ops;
++    struct fuxi_bt_setup_result r;
++    sim_init(&s, rx_chunk, tx_chunk);
++    s.stall_every = stall;
++    s.vendor_noise = noise;
++    files_init(&f, patch_size, mode, nvm_name);
++    s.patch_mode = mode;
++    s.patch_size = f.patch_size;
++    ops = files_ops(&f);
++    assert(fuxi_bt_setup_run(&s.ops, &ops, &r) == FUXI_BT_OK);
++    assert(r.stage == FUXI_BT_SETUP_DONE && r.cleanup == FUXI_BT_OK);
++    assert(s.acquires == 1 && s.releases == 1 && f.loads == f.releases && f.loads == 2);
++    assert(r.version.soc == 0x40170200 && r.version.rom == 0x200 && r.version.patch == 0x43fb && r.rom_ver == 0x20);
++    assert(!strcmp(r.patch_name, "hmtbtfw20.tlv"));
++    assert(!strcmp(r.nvm_name, nvm_name));
++    assert(s.got_patch_size == f.patch_size && !memcmp(s.got_patch, f.patch, f.patch_size));
++    expect_nvm(&s, &f);
++    assert(r.patch.segments == (f.patch_size + 242) / 243);
++    assert(r.patch.acks == (mode == 0 ? r.patch.segments : 1u) && r.patch.final_ack);
++    assert(r.patch.download_mode == mode && r.patch.product == 0x19 && r.patch.rom == 0x200 && r.patch.patch == 0x43fb);
++    assert(r.nvm.hci_tag && r.nvm.hci_before[0] == 0x8e && r.nvm.hci_after[0] == 0x0e && r.nvm.hci_after[1] == 0);
++    assert(r.nvm.sleep_tag && r.nvm.sleep_before == 3 && r.nvm.sleep_after == 2 && r.nvm.tags == 4);
++    assert(r.board_id_valid && r.board_id == 0x010a && r.board_id_status == FUXI_BT_OK);
++    assert(!strcmp(r.build_info, "BTFM.HMT?"));
++    assert(r.local_version_valid && r.manufacturer == 0x1d && r.lmp_subversion == 0x1234 && r.hci_version == 0x0d);
++    assert(r.bdaddr_valid && r.bdaddr[0] == 0x66 && r.bdaddr[5] == 0x11);
++    assert(r.vendor_events == (noise ? (mode == 0 ? r.patch.segments : 1u) + r.nvm.segments + 3u : 0u));
++    assert(r.elapsed_us < FUXI_BT_SETUP_TIMEOUT_US);
++}
++
++static struct fuxi_bt_setup_result run_case(struct sim *s, struct files *f)
++{
++    struct fuxi_bt_files ops = files_ops(f);
++    struct fuxi_bt_setup_result r;
++    s->patch_size = f->patch_size + f->oversize;
++    (void)fuxi_bt_setup_run(&s->ops, &ops, &r);
++    assert(s->acquires == s->releases);
++    assert(f->loads == f->releases);
++    assert(r.elapsed_us <= FUXI_BT_SETUP_TIMEOUT_US + 1000000u);
++    return r;
++}
++
++static void test_failures(void)
++{
++    struct sim s;
++    struct files f;
++    struct fuxi_bt_setup_result r;
++
++    /* 省略回應模式，最後一段也不回：記 final_ack=0，後續命令正常就算完成 */
++    sim_init(&s, 64, 64); files_init(&f, 1801, 3, "hmtnv20.b10a"); s.patch_mode = 3; s.skip_final_ack = true;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_OK && !r.patch.final_ack && r.patch.acks == 0);
++
++    /* 檔名對照 Linux qca_get_nvm_name_by_board 的 "%s%02x.b%02x"：低於 0x100 補到兩位，否則照實際位數 */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.b0a"); s.patch_mode = 0; s.board_id = 0x000a;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_OK && !strcmp(r.nvm_name, "hmtnv20.b0a"));
++    assert(f.asked_count == 2 && !strcmp(f.asked[0], "hmtbtfw20.tlv") && !strcmp(f.asked[1], "hmtnv20.b0a"));
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.b14"); s.patch_mode = 0; s.board_id = 0x0014;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_OK && !strcmp(r.nvm_name, "hmtnv20.b14") && f.asked_count == 2);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.b1234"); s.patch_mode = 0; s.board_id = 0x1234;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_OK && !strcmp(r.nvm_name, "hmtnv20.b1234") && f.asked_count == 2);
++    /* 板級檔不存在才改讀 .bin（Linux qca_get_alt_nvm_file） */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.patch_mode = 0;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_OK && !strcmp(r.nvm_name, "hmtnv20.bin") && f.asked_count == 3);
++    assert(!strcmp(f.asked[1], "hmtnv20.b10a") && !strcmp(f.asked[2], "hmtnv20.bin"));
++    /* board ID 0 或 0xffff 直接用 .bin */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.patch_mode = 0; s.board_id = 0;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_OK && f.asked_count == 2 && r.board_id_valid && !r.board_id);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.patch_mode = 0; s.board_id = 0xffff;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_OK && f.asked_count == 2 && r.board_id_valid && r.board_id == 0xffff);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.patch_mode = 0; s.board_error = true;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_OK && r.board_id_status == FUXI_BT_CONTROLLER && !r.board_id_valid);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.c0a"); s.patch_mode = 0;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_OFF && r.stage == FUXI_BT_SETUP_NVM_LOAD);
++
++    /* 缺 rampatch */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); f.patch_present = false;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_OFF && r.stage == FUXI_BT_SETUP_PATCH_LOAD && s.segments == 0);
++
++    /* 控制器拒絕第 5 段（每段都等）；省略模式下中途回錯 */
++    sim_init(&s, 64, 64); files_init(&f, 1801, 0, "hmtnv20.bin"); s.patch_mode = 0; s.fail_segment = 5;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_CONTROLLER && r.stage == FUXI_BT_SETUP_PATCH_SEND && r.controller_status == 1 && r.patch.segments == 6);
++    sim_init(&s, 64, 64); files_init(&f, 1801, 3, "hmtnv20.bin"); s.patch_mode = 3; s.fail_stale_segment = 2;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_CONTROLLER && r.stage == FUXI_BT_SETUP_PATCH_SEND && r.controller_status == 0x11);
++
++    /* IBS 位元組、reset 失敗、完全不回應 */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.patch_mode = 0; s.ibs_after_nvm = true;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_IBS && r.stage == FUXI_BT_SETUP_BUILD_INFO);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.patch_mode = 0; s.reset_error = true;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_CONTROLLER && r.stage == FUXI_BT_SETUP_RESET && r.controller_status == 0x0c);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.silent = true;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_TIMEOUT && r.stage == FUXI_BT_SETUP_VERSION && f.loads == 0);
++
++    /* 檔案格式 */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); f.patch[0] = 2;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_PROTOCOL && r.stage == FUXI_BT_SETUP_PATCH_PARSE && s.segments == 0);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); memcpy(f.patch, "\177ELF", 4);
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_PROTOCOL && r.stage == FUXI_BT_SETUP_PATCH_PARSE);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); f.patch[4 + 10] = 4;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_PROTOCOL && r.stage == FUXI_BT_SETUP_PATCH_PARSE);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); put32(f.patch, 1u | 972u << 8);
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_PROTOCOL && r.stage == FUXI_BT_SETUP_PATCH_PARSE);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); f.nvm_size = make_nvm(f.nvm, false, true);
++    s.patch_mode = 0;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_PROTOCOL && r.stage == FUXI_BT_SETUP_NVM_PARSE && s.got_nvm_size == 0);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); f.nvm[4 + 2] = 0xff; s.patch_mode = 0;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_PROTOCOL && r.stage == FUXI_BT_SETUP_NVM_PARSE);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); f.oversize = FUXI_BT_PATCH_MAX;
++    r = run_case(&s, &f);
++    assert(r.status == FUXI_BT_IO && r.stage == FUXI_BT_SETUP_PATCH_LOAD);
++
++    /* 參數 */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin");
++    {
++        struct fuxi_bt_files bad = {&f, NULL, file_release};
++        assert(fuxi_bt_setup_run(&s.ops, &bad, &r) == FUXI_BT_ARGUMENT && s.acquires == 0);
++        assert(fuxi_bt_setup_run(NULL, &bad, &r) == FUXI_BT_NO_UART);
++        assert(fuxi_bt_setup_run(&s.ops, &bad, NULL) == FUXI_BT_ARGUMENT);
++    }
++}
++
++static void test_fuzz(void)
++{
++    for (unsigned trial = 0; trial < 3000; trial++) {
++        struct sim s;
++        struct files f;
++        struct fuxi_bt_setup_result r;
++        sim_init(&s, trial % 7 + 1, trial % 5 + 1);
++        s.random ^= trial * 2654435761u;
++        s.bad_framing = true;
++        s.silent = true;
++        files_init(&f, 972, 0, "hmtnv20.bin");
++        r = run_case(&s, &f);
++        assert(r.status != FUXI_BT_OK && r.frames <= FUXI_BT_SETUP_MAX_FRAMES);
++    }
++}
++
++int main(void)
++{
++    static const unsigned chunks[] = {1, 2, 3, 7, 64};
++    unsigned runs = 0;
++    for (unsigned rx = 0; rx < 5; rx++) {
++        for (unsigned tx = 0; tx < 5; tx++) {
++            run_good(chunks[rx], chunks[tx], (rx + tx) % 3 ? 0 : 3, 0, 1801, "hmtnv20.b10a", false);
++            run_good(chunks[rx], chunks[tx], 0, 3, 1801, "hmtnv20.b10a", (rx + tx) & 1);
++            runs += 2;
++        }
++    }
++    run_good(64, 64, 0, 0, 972, "hmtnv20.b10a", true);
++    run_good(64, 64, 0, 1, 243, "hmtnv20.b10a", false);
++    run_good(64, 64, 0, 3, 28, "hmtnv20.b10a", false);
++    runs += 3;
++    test_failures();
++    test_fuzz();
++    assert(fuxi_bt_setup_name_valid("hmtbtfw20.tlv") && !fuxi_bt_setup_name_valid("../x") &&
++           !fuxi_bt_setup_name_valid(".hidden") && !fuxi_bt_setup_name_valid("a/b") &&
++           !fuxi_bt_setup_name_valid("") && !fuxi_bt_setup_name_valid("0123456789012345678901234"));
++    assert(!strcmp(fuxi_bt_setup_stage_name(FUXI_BT_SETUP_DONE), "done") &&
++           !strcmp(fuxi_bt_setup_stage_name((enum fuxi_bt_setup_stage)99), "unknown"));
++    printf("PASS bt setup: %u good runs (RX/TX chunking, FIFO stalls, download modes 0/1/3, vendor noise), "
++           "NVM fallback names, 6 controller faults, 8 malformed inputs, 3000 fuzz trials\n", runs);
++    return 0;
++}
++'''
++
++
++def compiler_configuration(explicit):
++    if explicit:
++        return explicit
++    for name in ("clang", "gcc", "cc"):
++        compiler = shutil.which(name)
++        if compiler:
++            return [compiler]
++    raise SystemExit("A C11 compiler (clang or gcc) is required. Pass --cc COMPILER [ARG ...].")
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--sanitize", action="store_true")
++    parser.add_argument("--cc", nargs="+")
++    args = parser.parse_args()
++    compiler = compiler_configuration(args.cc)
++    with tempfile.TemporaryDirectory(prefix="fuxi-bt-setup-") as temporary:
++        directory = Path(temporary)
++        harness = directory / "test.c"
++        harness.write_text(HARNESS, encoding="utf-8")
++        executable = directory / ("test.exe" if os.name == "nt" else "test")
++        command = compiler + [
++            "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
++            "-I", str(SOURCE), str(SOURCE / "fuxi_bt.c"), str(SOURCE / "fuxi_bt_setup.c"), str(harness),
++            "-o", str(executable)
++        ]
++        if args.sanitize:
++            command += ["-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
++        subprocess.run(command, cwd=directory, check=True)
++        subprocess.run([str(executable)], cwd=directory, check=True, timeout=300)
++        print(f"Compiler {compiler[0]}")
++        print(f"Sanitizers {'ASan/UBSan' if args.sanitize else 'disabled'}")
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/tools/test-fuxi-bluetooth-xnu.py b/tools/test-fuxi-bluetooth-xnu.py
 new file mode 100644
-index 0000000..b7d102d
+index 0000000..30276b9
 --- /dev/null
 +++ b/tools/test-fuxi-bluetooth-xnu.py
-@@ -0,0 +1,580 @@
+@@ -0,0 +1,770 @@
 +#!/usr/bin/env python3
 +"""Exercise the production XNU entry using host declarations and simulated MMIO."""
 +
@@ -10654,7 +11224,9 @@ index 0000000..b7d102d
 +STUBS = r'''
 +#include <stdlib.h>
 +#include <stdarg.h>
++#include <errno.h>
 +#include "fuxi_bt_board.h"
++#include "fuxi_bt_setup.h"
 +#ifdef _MSC_VER
 +#include <intrin.h>
 +#define __ATOMIC_ACQUIRE 0
@@ -10693,6 +11265,8 @@ index 0000000..b7d102d
 +#define KMA_VAONLY 1u
 +#define KMA_KOBJECT 2u
 +#define KMA_NOPAGEWAIT 4u
++#define KMA_DATA 8u
++#define KMA_ZERO 16u
 +#define VM_KERN_MEMORY_IOKIT 1u
 +#define VM_PROT_READ 1u
 +#define VM_PROT_WRITE 2u
@@ -10811,7 +11385,8 @@ index 0000000..b7d102d
 +    vm_size_t size, unsigned flags, unsigned tag)
 +{
 +    (void)map;
-+    assert(flags == 7 && tag == VM_KERN_MEMORY_IOKIT);
++    /* 7：MMIO 視窗（VA only）；28：fuxi,bt=4 韌體檔資料 */
++    assert((flags == 7 || flags == (KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT)) && tag == VM_KERN_MEMORY_IOKIT);
 +    test_allocations++;
 +    if (test_alloc_failure == test_allocations) {
 +        return 1;
@@ -10958,6 +11533,87 @@ index 0000000..b7d102d
 +    test_terminations++;
 +    return 0;
 +}
++
++/* fuxi,bt=4 讀韌體檔：假 vnode。 */
++typedef char *caddr_t;
++struct test_vnode { int unused; };
++typedef struct test_vnode *vnode_t;
++typedef void *vfs_context_t;
++struct vnode_attr { uint64_t va_data_size; unsigned wanted; unsigned supported; };
++#define VATTR_INIT(a) memset((a), 0, sizeof(*(a)))
++#define VATTR_WANTED(a, field) ((a)->wanted = 1u)
++#define VATTR_IS_SUPPORTED(a, field) ((a)->supported)
++#define VREG 1
++#define FREAD 1
++#define O_NOFOLLOW 0x100
++#define O_NONBLOCK 4
++#define UIO_READ 0
++#define UIO_SYSSPACE 1
++#define round_page(x) (((x) + (vm_size_t)PAGE_MASK) & ~(vm_size_t)PAGE_MASK)
++struct test_file {
++    const char *path;
++    const uint8_t *data;
++    uint64_t size;
++    int open_error, type, read_error, residual, close_error;
++};
++static struct test_file test_files[4];
++static struct test_vnode test_vnodes[4];
++static unsigned test_file_count, test_opens, test_closes;
++static int test_vfs_context;
++
++static vfs_context_t vfs_context_kernel(void) { return &test_vfs_context; }
++static void *vfs_context_ucred(vfs_context_t context) { assert(context == &test_vfs_context); return NULL; }
++static void *vfs_context_proc(vfs_context_t context) { assert(context == &test_vfs_context); return NULL; }
++
++static int vnode_open(const char *path, int flags, int mode, int ioflags, vnode_t *vnode, vfs_context_t context)
++{
++    assert(flags == (FREAD | O_NOFOLLOW | O_NONBLOCK) && !mode && !ioflags && context == &test_vfs_context);
++    for (unsigned index = 0; index < test_file_count; index++) {
++        if (!strcmp(path, test_files[index].path)) {
++            if (test_files[index].open_error) {
++                return test_files[index].open_error;
++            }
++            test_opens++;
++            *vnode = &test_vnodes[index];
++            return 0;
++        }
++    }
++    return ENOENT;
++}
++
++static int vnode_getattr(vnode_t vnode, struct vnode_attr *attributes, vfs_context_t context)
++{
++    assert(context == &test_vfs_context && attributes->wanted);
++    attributes->va_data_size = test_files[vnode - test_vnodes].size;
++    attributes->supported = 1;
++    return 0;
++}
++
++static int vnode_vtype(vnode_t vnode)
++{
++    return test_files[vnode - test_vnodes].type;
++}
++
++static int vn_rdwr(int direction, vnode_t vnode, caddr_t base, int length, long long offset, int segment,
++    int ioflags, void *credential, int *residual, void *process)
++{
++    const struct test_file *file = &test_files[vnode - test_vnodes];
++    assert(direction == UIO_READ && segment == UIO_SYSSPACE && !offset && !ioflags && !credential && !process);
++    assert(length >= 0 && (uint64_t)length == file->size);
++    if (file->read_error) {
++        return file->read_error;
++    }
++    memcpy(base, file->data, (size_t)(length - file->residual));
++    *residual = file->residual;
++    return 0;
++}
++
++static int vnode_close(vnode_t vnode, int flags, vfs_context_t context)
++{
++    assert(flags == FREAD && context == &test_vfs_context);
++    test_closes++;
++    return test_files[vnode - test_vnodes].close_error;
++}
 +'''
 +
 +TESTS = r'''
@@ -10977,6 +11633,7 @@ index 0000000..b7d102d
 +    test_clock_us = 0;
 +    test_gpll0_ok = test_adt_present = false;
 +    test_adt_value = test_adt_size = 0;
++    test_file_count = test_opens = test_closes = 0;
 +}
 +
 +static uint32_t test_written_value(uint64_t pa)
@@ -11021,7 +11678,14 @@ index 0000000..b7d102d
 +    test_adt_value = 4;
 +    test_adt_size = 4;
 +    fuxi_bt_init();
-+    assert(!test_threads && strstr(test_log, "mode 4 rejected"));
++    assert(test_threads == 1 && fuxi_bt_mode == 4);
++    test_entry_reset(0);
++    test_arg_present = false;
++    test_adt_present = true;
++    test_adt_value = 5;
++    test_adt_size = 4;
++    fuxi_bt_init();
++    assert(!test_threads && strstr(test_log, "mode 5 rejected"));
 +    test_entry_reset(0);
 +    test_adt_present = true;
 +    test_adt_value = 3;
@@ -11073,15 +11737,110 @@ index 0000000..b7d102d
 +        assert(test_written_value(FUXI_BT_GCC_BASE + restored[index]) == 0);
 +    }
 +    assert(!strstr(test_log, "probe status="));
++
++    /* fuxi,bt=4：同一條上電路徑；wrapper 讀不到時不跑 setup、照樣還原。 */
++    test_entry_reset(4);
++    test_wlan = 1;
++    test_gpll0_ok = true;
++    fuxi_bt_init();
++    fuxi_bt_worker(NULL, 0);
++    assert(fuxi_bt_mode == 4 && strstr(test_log, "board power status=no-uart stage=wrapper value=0 "));
++    assert(strstr(test_log, "board restore status=ok") && !strstr(test_log, "setup status="));
++    assert(test_writes == 12 && test_allocations == test_frees && !test_opens);
++}
++
++static void test_setup_files(void)
++{
++    static const uint8_t bytes[] = {1, 2, 3, 4, 5};
++    static struct fuxi_bt_setup_result setup;
++    struct fuxi_bt_blob blob = {(uint8_t *)bytes, 9};
++    char expected[64];
++    test_entry_reset(0);
++    /* 不存在：OFF，不配置；不合法名稱：不開檔 */
++    assert(fuxi_bt_file_load(NULL, "hmtbtfw20.tlv", 100, &blob) == FUXI_BT_OFF && !blob.data && !blob.size);
++    assert(!test_allocations && !test_opens && !test_log_size);
++    assert(fuxi_bt_file_load(NULL, "../x", 100, &blob) == FUXI_BT_ARGUMENT && !test_opens);
++    test_files[0] = (struct test_file){"/usr/local/share/fuxi/bt/hmtbtfw20.tlv", bytes, sizeof(bytes), 0, VREG, 0, 0, 0};
++    test_file_count = 1;
++    assert(fuxi_bt_file_load(NULL, "hmtbtfw20.tlv", 100, &blob) == FUXI_BT_OK);
++    assert(blob.size == sizeof(bytes) && !memcmp(blob.data, bytes, sizeof(bytes)));
++    assert(test_allocations == 1 && test_opens == 1 && test_closes == 1);
++    assert(strstr(test_log, "setup file /usr/local/share/fuxi/bt/hmtbtfw20.tlv bytes=5"));
++    fuxi_bt_file_release(NULL, &blob);
++    assert(!blob.data && !blob.size && test_frees == 1);
++    fuxi_bt_file_release(NULL, &blob);
++    assert(test_frees == 1);
++    /* 超過上限、空檔、不是一般檔：不配置 */
++    assert(fuxi_bt_file_load(NULL, "hmtbtfw20.tlv", 4, &blob) == FUXI_BT_IO && !blob.data && test_allocations == 1);
++    assert(strstr(test_log, "size=5 limit=4 rejected"));
++    test_files[0].size = 0;
++    assert(fuxi_bt_file_load(NULL, "hmtbtfw20.tlv", 100, &blob) == FUXI_BT_IO && test_allocations == 1);
++    test_files[0].size = sizeof(bytes);
++    test_files[0].type = 2;
++    assert(fuxi_bt_file_load(NULL, "hmtbtfw20.tlv", 100, &blob) == FUXI_BT_IO && test_allocations == 1);
++    test_files[0].type = VREG;
++    /* 讀錯、短讀、關檔錯：配置的記憶體都還回去 */
++    test_files[0].read_error = 5;
++    assert(fuxi_bt_file_load(NULL, "hmtbtfw20.tlv", 100, &blob) == FUXI_BT_IO && !blob.data);
++    assert(test_allocations == 2 && test_frees == 2 && strstr(test_log, "read errno=5 residual=0"));
++    test_files[0].read_error = 0;
++    test_files[0].residual = 1;
++    assert(fuxi_bt_file_load(NULL, "hmtbtfw20.tlv", 100, &blob) == FUXI_BT_IO && test_frees == 3);
++    test_files[0].residual = 0;
++    test_files[0].close_error = 1;
++    assert(fuxi_bt_file_load(NULL, "hmtbtfw20.tlv", 100, &blob) == FUXI_BT_IO && test_frees == 4);
++    test_files[0].close_error = 0;
++    /* 開檔權限錯：IO（不是 OFF，免得換下一個檔名蓋過問題） */
++    test_files[0].open_error = EACCES;
++    snprintf(expected, sizeof(expected), "open errno=%d", EACCES);
++    assert(fuxi_bt_file_load(NULL, "hmtbtfw20.tlv", 100, &blob) == FUXI_BT_IO && strstr(test_log, expected));
++    test_files[0].open_error = 0;
++    /* 配置失敗 */
++    test_alloc_failure = test_allocations + 1;
++    assert(fuxi_bt_file_load(NULL, "hmtbtfw20.tlv", 100, &blob) == FUXI_BT_IO && !blob.data);
++    assert(test_opens == test_closes && test_frees + 1 == test_allocations);
++
++    /* 結果輸出：BD 位址不寫進紀錄 */
++    test_entry_reset(0);
++    memset(&setup, 0, sizeof(setup));
++    setup.stage = FUXI_BT_SETUP_DONE;
++    setup.version.soc = 0x40170200;
++    setup.rom_ver = 0x20;
++    setup.patch.file_bytes = 5;
++    setup.patch.segments = 1;
++    strcpy(setup.patch_name, "hmtbtfw20.tlv");
++    setup.nvm.file_bytes = 3;
++    setup.nvm.hci_tag = true;
++    setup.nvm.hci_before[0] = 0x8e;
++    setup.nvm.hci_after[0] = 0x0e;
++    strcpy(setup.nvm_name, "hmtnv20.bin");
++    strcpy(setup.build_info, "BTFM");
++    setup.local_version_valid = true;
++    setup.manufacturer = 0x1d;
++    setup.bdaddr_valid = true;
++    memset(setup.bdaddr, 0x5a, sizeof(setup.bdaddr));
++    setup.last_event_size = sizeof(setup.last_event);
++    memset(setup.last_event, 0xab, sizeof(setup.last_event));
++    fuxi_bt_print_setup(FUXI_BT_OK, &setup);
++    assert(strstr(test_log, "setup status=ok stage=done cleanup=ok"));
++    assert(strstr(test_log, "soc=0x40170200 rom=0 patch=0 rom_ver=0x20"));
++    assert(strstr(test_log, "setup rampatch hmtbtfw20.tlv file=5"));
++    assert(strstr(test_log, "setup nvm hmtnv20.bin file=3"));
++    assert(strstr(test_log, "hci_tag=1 8e0000->0e0000"));
++    assert(strstr(test_log, "build_info status=ok \"BTFM\""));
++    assert(strstr(test_log, "manufacturer=0x1d"));
++    assert(strstr(test_log, "bdaddr valid (not logged)") && !strstr(test_log, "5a5a"));
++    assert(strstr(test_log, "last_event abababababababababababababababababababababababab\n"));
++    assert(!strstr(test_log, "last_vendor"));
 +}
 +
 +static void test_entry(void)
 +{
 +    struct fake_uart uart;
-+    for (int mode = -1; mode <= 3; mode++) {
++    for (int mode = -1; mode <= 5; mode++) {
 +        test_entry_reset(mode);
 +        fuxi_bt_init();
-+        if (mode < 1 || mode > 3) {
++        if (mode < 1 || mode > 4) {
 +            assert(!test_threads && !test_allocations && !test_mmio);
 +        } else {
 +            assert(test_threads == 1 && test_thread_refs == 1);
@@ -11153,8 +11912,9 @@ index 0000000..b7d102d
 +        assert(strstr(test_log, "read fault pa="));
 +    }
 +    test_board_mode();
++    test_setup_files();
 +    test_entry_reset(0);
-+    puts("PASS XNU host model: default-off/invalid args, ADT fuxi,bt fallback, one-shot startup, registration, survey gates, QCA worker, board mode WLAN_EN gate/GPLL0 refusal/write+restore, 6 allocation/7 pmap/35 MMIO failure cleanup paths");
++    puts("PASS XNU host model: default-off/invalid args, ADT fuxi,bt fallback, one-shot startup, registration, survey gates, QCA worker, board mode WLAN_EN gate/GPLL0 refusal/write+restore, mode 4 firmware files (missing/limit/type/read/close/alloc) and result log, 6 allocation/7 pmap/35 MMIO failure cleanup paths");
 +}
 +
 +int main(void)
@@ -11196,14 +11956,14 @@ index 0000000..b7d102d
 +            command = compiler + [
 +                "/nologo", "/std:c11", "/W4", "/WX", "/Od", "/D_CRT_SECURE_NO_WARNINGS",
 +                f"/I{SOURCE}", str(SOURCE / "fuxi_bt.c"), str(SOURCE / "fuxi_bt_geni_fifo.c"),
-+                str(SOURCE / "fuxi_bt_board.c"), str(generated),
++                str(SOURCE / "fuxi_bt_board.c"), str(SOURCE / "fuxi_bt_setup.c"), str(generated),
 +                f"/Fe{executable}"
 +            ]
 +        else:
 +            command = compiler + [
 +                "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
 +                "-I", str(SOURCE), str(SOURCE / "fuxi_bt.c"), str(SOURCE / "fuxi_bt_geni_fifo.c"),
-+                str(SOURCE / "fuxi_bt_board.c"), str(generated),
++                str(SOURCE / "fuxi_bt_board.c"), str(SOURCE / "fuxi_bt_setup.c"), str(generated),
 +                "-o", str(executable)
 +            ]
 +            if args.sanitize:
@@ -14682,10 +15442,10 @@ index 0000000..3144cfe
 +    main()
 diff --git a/tools/test-fuxi-haptic-runtime.py b/tools/test-fuxi-haptic-runtime.py
 new file mode 100644
-index 0000000..1f4e0be
+index 0000000..5146b2f
 --- /dev/null
 +++ b/tools/test-fuxi-haptic-runtime.py
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,304 @@
 +import os
 +from pathlib import Path
 +import subprocess
@@ -14706,7 +15466,7 @@ index 0000000..1f4e0be
 +    unsigned disable_delay;   /* 關掉 PLAY 後還要幾次 wait 才回 0 */
 +    unsigned pending;
 +    int stuck;                /* 1：PLAY 關掉也不回 0；2：連關開模組都不回 0 */
-+    int write_fail, verify_lie;
++    int write_fail, verify_lie, fault_sticky;
 +    unsigned writes, waits;
 +    unsigned written[64];
 +} Model;
@@ -14731,10 +15491,15 @@ index 0000000..1f4e0be
 +{
 +    Model *model = context;
 +    assert(fuxi_haptic_writable(address));
-+    assert(address == 0xf04c || address == 0xf046 || address == 0xf126);
++    assert(address == 0xf04c || address == 0xf046 || address == 0xf126 || address == 0xf066);
 +    if (model->writes < 64) model->written[model->writes] = address;
 +    model->writes++;
 +    if (model->write_fail) return -1;
++    if (address == 0xf066) {
++        /* FAULT_CLR 寫一清除，讀回永遠 0 */
++        if (!model->fault_sticky) model->reg[0x0c] &= (uint8_t)~value;
++        return 0;
++    }
 +    model->reg[address - 0xf000] = model->verify_lie ? (uint8_t)(value ^ 0x40) : value;
 +    if (address == 0xf04c) {
 +        if (value & 0x80u) {
@@ -14789,6 +15554,7 @@ index 0000000..1f4e0be
 +    FuxiHapticIo io;
 +    unsigned polls = 0, toggled = 0;
 +    uint8_t fault = 0, hpwr = 0;
++    unsigned cleared = 0;
 +
 +    /* 呼叫者 */
 +    assert(fuxi_vibrate_caller_allowed(1, 0, NULL));
@@ -14873,7 +15639,7 @@ index 0000000..1f4e0be
 +
 +    /* 正常一下：0x81 開、READY、0x01 關、三次輪詢後 DISABLED，不動模組 */
 +    android(&model);
-+    assert(fuxi_vibrate_start(&io) == FUXI_HAPTIC_OK);
++    assert(fuxi_vibrate_start(&io, &cleared) == FUXI_HAPTIC_OK);
 +    assert(model.reg[0x4c] == 0x81 && model.reg[0x0b] == 3);
 +    assert(fuxi_vibrate_health(&io, &fault, &hpwr) == FUXI_HAPTIC_OK && hpwr == 3 && !fault);
 +    assert(fuxi_vibrate_stop(&io, &polls, &toggled) == FUXI_HAPTIC_OK);
@@ -14883,45 +15649,72 @@ index 0000000..1f4e0be
 +
 +    /* 立刻 DISABLED：只輪詢一次 */
 +    android(&model); model.disable_delay = 0;
-+    assert(!fuxi_vibrate_start(&io));
++    assert(!fuxi_vibrate_start(&io, &cleared));
 +    assert(!fuxi_vibrate_stop(&io, &polls, &toggled) && polls == 1 && !toggled);
 +
-+    /* 播放中出現 fault */
++    /* 播放中 AUTO_RES_ERROR（低振幅實機 0x2）：照常播放，只回報；SC、HPWR_RDY、未知位元才是 fault */
 +    android(&model);
-+    assert(!fuxi_vibrate_start(&io));
++    assert(!fuxi_vibrate_start(&io, &cleared) && !cleared);
 +    model.reg[0x0c] = 0x02;
-+    assert(fuxi_vibrate_health(&io, &fault, &hpwr) == FUXI_HAPTIC_FAULT && fault == 2);
++    assert(fuxi_vibrate_health(&io, &fault, &hpwr) == FUXI_HAPTIC_OK && fault == 2 && hpwr == 3);
++    model.reg[0x0c] = 0x04;
++    assert(fuxi_vibrate_health(&io, &fault, &hpwr) == FUXI_HAPTIC_FAULT && fault == 4);
++    model.reg[0x0c] = 0x06;
++    assert(fuxi_vibrate_health(&io, &fault, &hpwr) == FUXI_HAPTIC_FAULT);
++    model.reg[0x0c] = 0x01;
++    assert(fuxi_vibrate_health(&io, &fault, &hpwr) == FUXI_HAPTIC_FAULT);
++    model.reg[0x0c] = 0x08;
++    assert(fuxi_vibrate_health(&io, &fault, &hpwr) == FUXI_HAPTIC_FAULT);
++
++    /* 上一次留下 AUTO_RES_ERROR：開播前寫 FAULT_CLR=0x02、確認歸零才寫 PLAY */
++    android(&model); model.reg[0x0c] = 0x02; cleared = 0;
++    assert(fuxi_vibrate_start(&io, &cleared) == FUXI_HAPTIC_OK && cleared == 1);
++    assert(model.writes == 2 && model.written[0] == 0xf066 && model.written[1] == 0xf04c);
++    assert(!model.reg[0x0c] && model.reg[0x4c] == 0x81);
++    /* 清不掉：不開 */
++    android(&model); model.reg[0x0c] = 0x02; model.fault_sticky = 1; cleared = 0;
++    assert(fuxi_vibrate_start(&io, &cleared) == FUXI_HAPTIC_FAULT && cleared == 1);
++    assert(model.writes == 1 && model.reg[0x4c] == 0x01);
++    /* SC 跟 AUTO_RES 一起：不清、不開 */
++    android(&model); model.reg[0x0c] = 0x06; cleared = 0;
++    assert(fuxi_vibrate_start(&io, &cleared) == FUXI_HAPTIC_FAULT && !cleared && !model.writes);
++    /* owner 換人：不清、不開 */
++    android(&model); model.reg[0x0c] = 0x02; model.owners[0] = 2; cleared = 0;
++    assert(fuxi_vibrate_start(&io, &cleared) == FUXI_HAPTIC_HARDWARE && !cleared && !model.writes);
++    /* 清除寫入失敗 */
++    android(&model); model.reg[0x0c] = 0x02; model.write_fail = 1; cleared = 0;
++    assert(fuxi_vibrate_start(&io, &cleared) == FUXI_HAPTIC_IO && !cleared && model.reg[0x4c] == 0x01);
 +
 +    /* 有 fault 就不開 */
 +    android(&model); model.reg[0x0c] = 0x01;
-+    assert(fuxi_vibrate_start(&io) == FUXI_HAPTIC_FAULT && model.writes == 0 && model.reg[0x4c] == 0x01);
++    assert(fuxi_vibrate_start(&io, &cleared) == FUXI_HAPTIC_FAULT && model.writes == 0 && model.reg[0x4c] == 0x01);
 +
 +    /* HPWR 卡住：照 Linux 關開模組一次，之後回 DISABLED，模組留在開 */
 +    android(&model); model.stuck = 1;
-+    assert(!fuxi_vibrate_start(&io));
++    assert(!fuxi_vibrate_start(&io, &cleared));
 +    assert(fuxi_vibrate_stop(&io, &polls, &toggled) == FUXI_HAPTIC_OK);
 +    assert(toggled && polls == FUXI_VIBRATE_STOP_POLLS + 1 && model.reg[0x46] == 0x80 && !model.reg[0x0b]);
 +    assert(model.writes == 4 && model.written[2] == 0xf046 && model.written[3] == 0xf046);
 +
 +    /* 連關開模組都停不下來：回逾時，呼叫端鎖死 */
 +    android(&model); model.stuck = 2;
-+    assert(!fuxi_vibrate_start(&io));
++    assert(!fuxi_vibrate_start(&io, &cleared));
 +    assert(fuxi_vibrate_stop(&io, &polls, &toggled) == FUXI_HAPTIC_TIMEOUT);
 +    assert(toggled && polls == 2 * FUXI_VIBRATE_STOP_POLLS);
 +
 +    /* 寫入讀回不符 */
 +    android(&model); model.verify_lie = 1;
-+    assert(fuxi_vibrate_start(&io) == FUXI_HAPTIC_VERIFY);
++    assert(fuxi_vibrate_start(&io, &cleared) == FUXI_HAPTIC_VERIFY);
 +
 +    /* 寫入失敗時停止仍會輪詢、走退路，結果不得是 OK */
 +    android(&model);
-+    assert(!fuxi_vibrate_start(&io));
++    assert(!fuxi_vibrate_start(&io, &cleared));
 +    model.write_fail = 1;
 +    assert(fuxi_vibrate_stop(&io, &polls, &toggled) != FUXI_HAPTIC_OK);
 +
 +    /* owner 改變時停止直接回硬體錯誤（不寫） */
 +    android(&model);
-+    assert(!fuxi_vibrate_start(&io));
++    assert(!fuxi_vibrate_start(&io, &cleared));
 +    model.owners[0] = 2;
 +    unsigned before = model.writes;
 +    assert(fuxi_vibrate_stop(&io, &polls, &toggled) == FUXI_HAPTIC_HARDWARE && model.writes == before);
@@ -14935,7 +15728,7 @@ index 0000000..1f4e0be
 +    assert(!fuxi_vibrate_amplitude(&io, 0xff, &current, &amplitude_writes) && !amplitude_writes && !model.writes);
 +    assert(!fuxi_vibrate_amplitude(&io, 0x60, &current, &amplitude_writes));
 +    assert(current == 0x60 && model.reg[0x126] == 0x60 && amplitude_writes == 1 && model.written[0] == 0xf126);
-+    assert(!fuxi_vibrate_start(&io));
++    assert(!fuxi_vibrate_start(&io, &cleared));
 +    assert(!fuxi_vibrate_amplitude(&io, 0x30, &current, &amplitude_writes) && current == 0x30 && model.reg[0x4c] == 0x81);
 +    assert(!fuxi_vibrate_stop(&io, &polls, &toggled) && model.reg[0x126] == 0x30);
 +    assert(fuxi_vibrate_amplitude(&io, 0x100, &current, &amplitude_writes) == FUXI_HAPTIC_INVALID && current == 0x30);
@@ -14945,7 +15738,7 @@ index 0000000..1f4e0be
 +    assert(fuxi_vibrate_amplitude(&io, 0x60, &current, &amplitude_writes) == FUXI_HAPTIC_HARDWARE);
 +    assert(current == 0xff && !model.writes && model.reg[0x126] == 0xff);
 +
-+    puts("PASS: HAP525 DIRECT_PLAY runtime caller policy, lease, amplitude field, Android-state check, start/stop/HPWR poll, module toggle fallback, fault and verify paths");
++    puts("PASS: HAP525 DIRECT_PLAY runtime caller policy, lease, amplitude field, Android-state check, start/stop/HPWR poll, module toggle fallback, AUTO_RES clear/tolerate, fault and verify paths");
 +    return 0;
 +}
 +'''
@@ -27206,7 +27999,7 @@ index 0000000..a3b1e7a
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_haptic_pulse.h b/xnu/fuxi-adsp/fuxi_haptic_pulse.h
 new file mode 100644
-index 0000000..38479c4
+index 0000000..dabc0eb
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_haptic_pulse.h
 @@ -0,0 +1,259 @@
@@ -27259,7 +28052,7 @@ index 0000000..38479c4
 +static inline int fuxi_haptic_writable(unsigned address)
 +{
 +    return address == 0xf046 || address == 0xf048 || address == 0xf04b ||
-+        address == 0xf04c || address == 0xf04e || address == 0xf063 ||
++        address == 0xf04c || address == 0xf04e || address == 0xf063 || address == 0xf066 ||
 +        address == 0xf126 || address == 0xf130 || address == 0xf131 ||
 +        (address >= 0xf134 && address <= 0xf14b);
 +}
@@ -27471,10 +28264,10 @@ index 0000000..38479c4
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_haptic_runtime.h b/xnu/fuxi-adsp/fuxi_haptic_runtime.h
 new file mode 100644
-index 0000000..e67f8ce
+index 0000000..64a1ff3
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_haptic_runtime.h
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,200 @@
 +#ifndef FUXI_HAPTIC_RUNTIME_H
 +#define FUXI_HAPTIC_RUNTIME_H
 +/*
@@ -27500,7 +28293,16 @@ index 0000000..e67f8ce
 +    FUXI_VIBRATE_MODULE_ON = 0x80,
 +    FUXI_VIBRATE_VMAX_LIMIT = 0x1c, /* 50 mV/碼，1400 mV：Android 留下的值，不接受更高 */
 +    FUXI_VIBRATE_LEVEL_SHIFT = 16,  /* sysctl 值：bit 0..15 毫秒，bit 16..23 振幅，其餘須為 0 */
-+    FUXI_VIBRATE_AMPLITUDE = 0xf126
++    FUXI_VIBRATE_AMPLITUDE = 0xf126,
++    /*
++     * FAULT_STATUS(0xf00c)：bit 2 SC、bit 1 AUTO_RES_ERROR、bit 0 HPWR_RDY_FAULT（Linux qcom-hv-haptics
++     * HAP_CFG_FAULT_STATUS_REG）。低振幅時反電動勢太弱，自動共振鎖不住會設 bit 1；Linux 播放中從不檢查它，
++     * 每次開播前 haptics_clear_fault 寫 FAULT_CLR(0xf066)。2026-11-18 實機：振幅 0x08..0x30 播放約 46 ms 就設 0x2，
++     * 舊版把它當致命錯誤，整個執行期鎖到重開機。現在只有 SC／HPWR_RDY／未知位元才停機鎖死；
++     * AUTO_RES_ERROR 只記錄，下次開播前清掉（只清這一位，SC 仍要人看）。
++     */
++    FUXI_VIBRATE_FAULT_CLEAR = 0xf066,
++    FUXI_VIBRATE_FAULT_AUTORES = 0x02
 +};
 +
 +typedef struct {
@@ -27608,17 +28410,32 @@ index 0000000..e67f8ce
 +    return fuxi_haptic_idle(io);
 +}
 +
++/* 播放中檢查：AUTO_RES_ERROR 只回報在 *fault，不算失敗；其他位元回 FAULT。 */
 +static inline int fuxi_vibrate_health(const FuxiHapticIo *io, uint8_t *fault, uint8_t *hpwr)
 +{
 +    if (io->read(io->context, 0xf00c, fault) || io->read(io->context, 0xf00b, hpwr)) return FUXI_HAPTIC_IO;
++    return *fault & (uint8_t)~FUXI_VIBRATE_FAULT_AUTORES ? FUXI_HAPTIC_FAULT : FUXI_HAPTIC_OK;
++}
++
++/* 只清 AUTO_RES_ERROR：FAULT_CLR 是寫一清除，不讀回比對，改讀 FAULT_STATUS 確認已歸零。 */
++static inline int fuxi_vibrate_clear_autores(const FuxiHapticIo *io, uint8_t *fault, unsigned *cleared)
++{
++    unsigned owner = 7;
++    if (*fault != FUXI_VIBRATE_FAULT_AUTORES) return *fault ? FUXI_HAPTIC_FAULT : FUXI_HAPTIC_OK;
++    if (io->owner(io->context, FUXI_VIBRATE_FAULT_CLEAR >> 8, &owner) || owner != 0) return FUXI_HAPTIC_HARDWARE;
++    if (io->write(io->context, FUXI_VIBRATE_FAULT_CLEAR, FUXI_VIBRATE_FAULT_AUTORES) ||
++        io->read(io->context, 0xf00c, fault))
++        return FUXI_HAPTIC_IO;
++    (*cleared)++;
 +    return *fault ? FUXI_HAPTIC_FAULT : FUXI_HAPTIC_OK;
 +}
 +
-+static inline int fuxi_vibrate_start(const FuxiHapticIo *io)
++static inline int fuxi_vibrate_start(const FuxiHapticIo *io, unsigned *cleared)
 +{
 +    uint8_t fault = 0;
 +    if (io->read(io->context, 0xf00c, &fault)) return FUXI_HAPTIC_IO;
-+    if (fault) return FUXI_HAPTIC_FAULT;
++    int result = fuxi_vibrate_clear_autores(io, &fault, cleared);
++    if (result) return result;
 +    return fuxi_haptic_write_checked(io, 0xf04c, FUXI_VIBRATE_PLAY);
 +}
 +
@@ -27653,10 +28470,10 @@ index 0000000..e67f8ce
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_pmic.c b/xnu/fuxi-adsp/fuxi_pmic.c
 new file mode 100644
-index 0000000..bd467e3
+index 0000000..4f1dcd9
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_pmic.c
-@@ -0,0 +1,844 @@
+@@ -0,0 +1,854 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
@@ -28194,6 +29011,7 @@ index 0000000..bd467e3
 +    (void)wait_result;
 +    const FuxiHapticIo io = {NULL, fp_haptic_owner, fp_haptic_read, fp_haptic_write, fp_flash_wait, 0};
 +    unsigned playing = 0, logged = 0, health_checks = 0, amplitude_writes = 0, amplitude_logged = 0;
++    unsigned autores_cleared = 0, autores_plays = 0, autores_logged = 0;
 +    uint8_t mid_hpwr = 0, mid_fault = 0, amplitude = fp_vibrate_android_amplitude, low = 0, high = 0;
 +    uint64_t started_ns = 0;
 +    for (;;) {
@@ -28238,7 +29056,7 @@ index 0000000..bd467e3
 +        }
 +        if (want && !playing) {
 +            low = high = amplitude;
-+            int result = fuxi_vibrate_start(&io);
++            int result = fuxi_vibrate_start(&io, &autores_cleared);
 +            if (result) {
 +                unsigned polls = 0, toggled = 0;
 +                int stop_result = fuxi_vibrate_stop(&io, &polls, &toggled);
@@ -28268,9 +29086,9 @@ index 0000000..bd467e3
 +            lck_mtx_unlock(&fp_vibrate_lock);
 +            if (logged < 16 || result || toggled) {
 +                logged++;
-+                printf("FUXI PMIC: vibrate play=%llu on-us=%llu checks=%u hpwr-mid=%#x fault-mid=%#x stop-rc=%d stop-polls=%u stop-us=%llu toggled=%u amp=%#x..%#x\n",
++                printf("FUXI PMIC: vibrate play=%llu on-us=%llu checks=%u hpwr-mid=%#x fault-mid=%#x stop-rc=%d stop-polls=%u stop-us=%llu toggled=%u amp=%#x..%#x autores-plays=%u cleared=%u\n",
 +                    plays, (stop_ns - started_ns) / 1000, health_checks, mid_hpwr, mid_fault, result, polls,
-+                    (stopped_ns - stop_ns) / 1000, toggled, low, high);
++                    (stopped_ns - stop_ns) / 1000, toggled, low, high, autores_plays, autores_cleared);
 +            }
 +            if (result) fp_vibrate_fail(&io, "stop unverified", result);
 +            continue;
@@ -28280,6 +29098,15 @@ index 0000000..bd467e3
 +            int result = fuxi_vibrate_health(&io, &fault, &hpwr);
 +            health_checks++;
 +            mid_hpwr = hpwr; /* 停止前最後一次看到的 HPWR；播放中應為 3（READY） */
++            if (!result && (fault & FUXI_VIBRATE_FAULT_AUTORES) && !(mid_fault & FUXI_VIBRATE_FAULT_AUTORES)) {
++                /* Linux 播放中不看這一位；照常播完，下次開播前清 */
++                autores_plays++;
++                if (autores_logged < 4) {
++                    autores_logged++;
++                    printf("FUXI PMIC: vibrate auto-resonance error while playing amp=%#x on-us=%llu hpwr=%#x; continuing, cleared before next play (count=%u)\n",
++                        amplitude, (fp_torch_now() - started_ns) / 1000, hpwr, autores_plays);
++                }
++            }
 +            mid_fault |= fault;
 +            if (result) {
 +                unsigned polls = 0, toggled = 0;
@@ -32238,16 +33065,905 @@ index 0000000..35331b3
 +#endif
 +
 +#endif
+diff --git a/xnu/fuxi-bluetooth/fuxi_bt_setup.c b/xnu/fuxi-bluetooth/fuxi_bt_setup.c
+new file mode 100644
+index 0000000..eccccaf
+--- /dev/null
++++ b/xnu/fuxi-bluetooth/fuxi_bt_setup.c
+@@ -0,0 +1,758 @@
++#include "fuxi_bt_setup.h"
++#include <string.h>
++
++/*
++ * WCN7850 控制器初始化。命令與回應格式參考 Linux btqca.c（qca_read_soc_version、qca_tlv_check_data、
++ * qca_tlv_send_segment、qca_read_fw_board_id、qca_read_fw_build_info、qca_uart_setup），程式自寫：
++ *  - vendor 命令 opcode 0xfc00，第一個位元組是子命令（0x19 版本、0x1e TLV 段、0x23 board ID、0x20 build info）；
++ *  - WCN3991 以後回 Command Complete，回傳參數 [cresp][rtype][data…]，cresp=0 成功、rtype=子命令；
++ *  - rampatch/NVM 整個檔案依序切 243 位元組段送出；patch 標頭的 download_mode 非 0 時控制器只回最後一段；
++ *  - NVM tag 17（HCI）：data[0] bit 7＝軟體 IBS、data[1]＝baud（WCN3991 以後）；tag 27 bit 0＝deep sleep。
++ *    Linux 會打開 IBS 並設成工作 baud；這裡關掉 IBS／deep sleep、baud 設 115200（列舉值 0），
++ *    因為本驅動是輪詢式 UART、沒有 IBS 狀態機，也不切換 baud。
++ */
++
++struct fuxi_bt_link {
++    const struct fuxi_bt_uart_ops *ops;
++    struct fuxi_bt_setup_result *result;
++    uint64_t start;
++    uint8_t rx[64];
++    unsigned rx_offset;
++    unsigned rx_size;
++    uint8_t header[5];
++    unsigned header_size;
++    unsigned header_need;
++    unsigned body_size;
++    unsigned body_need;
++    uint8_t event[258];
++    unsigned event_size;
++};
++
++static uint16_t fuxi_bt_setup_le16(const uint8_t *bytes)
++{
++    return (uint16_t)((uint16_t)bytes[0] | (uint16_t)bytes[1] << 8);
++}
++
++static uint32_t fuxi_bt_setup_le32(const uint8_t *bytes)
++{
++    return (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8 |
++        (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24;
++}
++
++const char *fuxi_bt_setup_stage_name(enum fuxi_bt_setup_stage stage)
++{
++    static const char *const names[] = {
++        "start", "version", "patch-load", "patch-parse", "patch-send", "board-id",
++        "nvm-load", "nvm-parse", "nvm-send", "build-info", "reset", "local-version",
++        "bdaddr", "done"
++    };
++    if ((unsigned)stage >= sizeof(names) / sizeof(names[0])) {
++        return "unknown";
++    }
++    return names[stage];
++}
++
++bool fuxi_bt_setup_name_valid(const char *name)
++{
++    if (!name || !name[0] || name[0] == '.') {
++        return false;
++    }
++    for (unsigned index = 0; index < FUXI_BT_SETUP_NAME; index++) {
++        const char c = name[index];
++        if (!c) {
++            return true;
++        }
++        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
++              c == '.' || c == '_' || c == '-')) {
++            return false;
++        }
++    }
++    return false;
++}
++
++/* 檔名組字：stem＋兩位十六進位 rom＋尾碼；bid_digits=0 表示不帶 board ID。 */
++static void fuxi_bt_setup_name(char out[FUXI_BT_SETUP_NAME], const char *stem, unsigned rom,
++    const char *middle, unsigned bid, unsigned bid_digits, const char *tail)
++{
++    static const char digits[] = "0123456789abcdef";
++    unsigned at = 0;
++    char hex[8];
++    unsigned count = 0;
++    memset(out, 0, FUXI_BT_SETUP_NAME);
++    for (const char *p = stem; *p && at + 1 < FUXI_BT_SETUP_NAME; p++) {
++        out[at++] = *p;
++    }
++    if (at + 3 < FUXI_BT_SETUP_NAME) {
++        out[at++] = digits[(rom >> 4) & 15];
++        out[at++] = digits[rom & 15];
++    }
++    for (const char *p = middle; p && *p && at + 1 < FUXI_BT_SETUP_NAME; p++) {
++        out[at++] = *p;
++    }
++    if (bid_digits) {
++        unsigned value = bid;
++        do {
++            hex[count++] = digits[value & 15];
++            value >>= 4;
++        } while (value && count < sizeof(hex));
++        while (count < bid_digits && count < sizeof(hex)) {
++            hex[count++] = '0';
++        }
++        while (count && at + 1 < FUXI_BT_SETUP_NAME) {
++            out[at++] = hex[--count];
++        }
++    }
++    for (const char *p = tail; p && *p && at + 1 < FUXI_BT_SETUP_NAME; p++) {
++        out[at++] = *p;
++    }
++    out[FUXI_BT_SETUP_NAME - 1] = 0;
++}
++
++static enum fuxi_bt_status fuxi_bt_link_time(struct fuxi_bt_link *link)
++{
++    const uint64_t now = link->ops->now_us(link->ops->context);
++    if (now < link->start || now - link->start < link->result->elapsed_us) {
++        return FUXI_BT_IO;
++    }
++    link->result->elapsed_us = now - link->start;
++    return link->result->elapsed_us >= FUXI_BT_SETUP_TIMEOUT_US ? FUXI_BT_TIMEOUT : FUXI_BT_OK;
++}
++
++static void fuxi_bt_link_note(uint8_t *destination, unsigned *destination_size,
++    const uint8_t *event, unsigned size)
++{
++    const unsigned count = size < 24u ? size : 24u;
++    memcpy(destination, event, count);
++    *destination_size = count;
++}
++
++/* 開始前把 UART 裡的殘留位元組讀掉（不解析，避免從半個封包開始）。 */
++static enum fuxi_bt_status fuxi_bt_link_drain(struct fuxi_bt_link *link)
++{
++    unsigned drained = 0;
++    for (;;) {
++        size_t count = 0;
++        enum fuxi_bt_status status = fuxi_bt_link_time(link);
++        if (status != FUXI_BT_OK) {
++            return status;
++        }
++        status = link->ops->read(link->ops->context, link->rx, sizeof(link->rx), &count);
++        if (count > sizeof(link->rx) || (status != FUXI_BT_OK && count)) {
++            return FUXI_BT_IO;
++        }
++        if (status == FUXI_BT_AGAIN || (status == FUXI_BT_OK && !count)) {
++            return FUXI_BT_OK;
++        }
++        if (status != FUXI_BT_OK) {
++            return status;
++        }
++        drained += (unsigned)count;
++        if (drained > FUXI_BT_MAX_DRAIN) {
++            return FUXI_BT_BUDGET;
++        }
++    }
++}
++
++/* 取下一個完整 HCI 事件放進 link->event（[0]=0x04）。暫時沒有資料回 AGAIN，不等待。 */
++static enum fuxi_bt_status fuxi_bt_link_event(struct fuxi_bt_link *link)
++{
++    struct fuxi_bt_setup_result *result = link->result;
++    for (;;) {
++        if (link->rx_offset == link->rx_size) {
++            size_t count = 0;
++            enum fuxi_bt_status status = link->ops->read(link->ops->context, link->rx,
++                sizeof(link->rx), &count);
++            if (count > sizeof(link->rx) || (status != FUXI_BT_OK && count)) {
++                return FUXI_BT_IO;
++            }
++            if (status == FUXI_BT_AGAIN || (status == FUXI_BT_OK && !count)) {
++                return FUXI_BT_AGAIN;
++            }
++            if (status != FUXI_BT_OK) {
++                return status;
++            }
++            result->rx_bytes += (unsigned)count;
++            link->rx_offset = 0;
++            link->rx_size = (unsigned)count;
++        }
++        while (link->rx_offset < link->rx_size) {
++            const uint8_t byte = link->rx[link->rx_offset++];
++            if (!link->header_size) {
++                switch (byte) {
++                    case 2:
++                    case 5:
++                        link->header_need = 5;
++                        break;
++                    case 3:
++                        link->header_need = 4;
++                        break;
++                    case 4:
++                        link->header_need = 3;
++                        break;
++                    case 0xfc:
++                    case 0xfd:
++                    case 0xfe:
++                        return FUXI_BT_IBS;
++                    default:
++                        return FUXI_BT_PROTOCOL;
++                }
++            }
++            if (link->header_size < link->header_need) {
++                link->header[link->header_size++] = byte;
++                if (link->header_size != link->header_need) {
++                    continue;
++                }
++                if (link->header[0] == 4) {
++                    link->body_need = link->header[2];
++                    memcpy(link->event, link->header, link->header_need);
++                } else if (link->header[0] == 3) {
++                    link->body_need = link->header[3];
++                } else {
++                    link->body_need = fuxi_bt_setup_le16(link->header + 3);
++                    if (link->header[0] == 5) {
++                        link->body_need &= 0x3fffu;
++                    }
++                }
++                if (link->body_need > FUXI_BT_MAX_RX) {
++                    return FUXI_BT_BUDGET;
++                }
++            } else {
++                if (link->header[0] == 4) {
++                    link->event[link->header_need + link->body_size] = byte;
++                }
++                link->body_size++;
++            }
++            if (link->body_size == link->body_need) {
++                const bool event = link->header[0] == 4;
++                const unsigned size = link->header_need + link->body_need;
++                link->header_size = link->header_need = 0;
++                link->body_size = link->body_need = 0;
++                if (++result->frames > FUXI_BT_SETUP_MAX_FRAMES) {
++                    return FUXI_BT_BUDGET;
++                }
++                if (event) {
++                    link->event_size = size;
++                    fuxi_bt_link_note(result->last_event, &result->last_event_size, link->event, size);
++                    return FUXI_BT_OK;
++                }
++                result->ignored_frames++;
++            }
++        }
++    }
++}
++
++/* 不是正在等的事件：vendor 事件計數，沒等的 TLV 段回應若帶錯誤就中止，硬體錯誤事件中止。 */
++static enum fuxi_bt_status fuxi_bt_link_other(struct fuxi_bt_link *link)
++{
++    struct fuxi_bt_setup_result *result = link->result;
++    const uint8_t *event = link->event;
++    if (event[1] == 0xff) {
++        result->vendor_events++;
++        fuxi_bt_link_note(result->last_vendor, &result->last_vendor_size, event, link->event_size);
++        return FUXI_BT_OK;
++    }
++    if (event[1] == 0x0e && event[2] >= 5 && fuxi_bt_setup_le16(event + 4) == 0xfc00 &&
++        event[7] == 0x1e) {
++        if (event[6]) {
++            result->controller_status = event[6];
++            return FUXI_BT_CONTROLLER;
++        }
++        result->stale_acks++;
++        return FUXI_BT_OK;
++    }
++    if (event[1] == 0x10) {
++        result->controller_status = event[2] ? event[3] : 0;
++        return FUXI_BT_CONTROLLER;
++    }
++    result->ignored_frames++;
++    return FUXI_BT_OK;
++}
++
++static enum fuxi_bt_status fuxi_bt_link_poll(struct fuxi_bt_link *link)
++{
++    for (;;) {
++        enum fuxi_bt_status status = fuxi_bt_link_event(link);
++        if (status == FUXI_BT_AGAIN) {
++            return FUXI_BT_OK;
++        }
++        if (status != FUXI_BT_OK) {
++            return status;
++        }
++        status = fuxi_bt_link_other(link);
++        if (status != FUXI_BT_OK) {
++            return status;
++        }
++    }
++}
++
++static enum fuxi_bt_status fuxi_bt_link_write(struct fuxi_bt_link *link,
++    const uint8_t *bytes, size_t size)
++{
++    size_t sent = 0;
++    enum fuxi_bt_status status = fuxi_bt_link_time(link);
++    uint64_t begin;
++    if (status != FUXI_BT_OK) {
++        return status;
++    }
++    begin = link->result->elapsed_us;
++    while (sent < size) {
++        size_t count = 0;
++        status = link->ops->write(link->ops->context, bytes + sent, size - sent, &count);
++        if (count > size - sent || (status != FUXI_BT_OK && count)) {
++            return FUXI_BT_IO;
++        }
++        if (status != FUXI_BT_OK && status != FUXI_BT_AGAIN) {
++            return status;
++        }
++        sent += count;
++        link->result->tx_bytes += (unsigned)count;
++        if (sent < size && !count) {
++            /* TX FIFO 滿：先收 RX，免得控制器因我方 RFR 停住而互等 */
++            status = fuxi_bt_link_poll(link);
++            if (status != FUXI_BT_OK) {
++                return status;
++            }
++            link->ops->wait_us(link->ops->context, 100);
++        }
++        status = fuxi_bt_link_time(link);
++        if (status != FUXI_BT_OK) {
++            return status;
++        }
++        if (sent < size && link->result->elapsed_us - begin >= FUXI_BT_COMMAND_TIMEOUT_US) {
++            return FUXI_BT_TIMEOUT;
++        }
++    }
++    return FUXI_BT_OK;
++}
++
++/*
++ * 等 opcode 的 Command Complete。vendor 命令（0xfc00）回傳參數是 [cresp][rtype][data…]：rtype 不符當成
++ * 其他事件處理，cresp≠0 失敗；一般命令是 [status][…]，status≠0 失敗。成功時 *params 指向回傳參數。
++ */
++static enum fuxi_bt_status fuxi_bt_link_wait(struct fuxi_bt_link *link, uint16_t opcode,
++    uint8_t rtype, const uint8_t **params, unsigned *size)
++{
++    struct fuxi_bt_setup_result *result = link->result;
++    enum fuxi_bt_status status = fuxi_bt_link_time(link);
++    uint64_t begin;
++    if (status != FUXI_BT_OK) {
++        return status;
++    }
++    begin = result->elapsed_us;
++    for (;;) {
++        status = fuxi_bt_link_event(link);
++        if (status == FUXI_BT_OK) {
++            const uint8_t *event = link->event;
++            if (event[1] == 0x0e && event[2] >= 3 && fuxi_bt_setup_le16(event + 4) == opcode) {
++                const unsigned count = event[2] - 3u;
++                if (!count || (opcode == 0xfc00 && count < 2)) {
++                    return FUXI_BT_PROTOCOL;
++                }
++                if (opcode != 0xfc00 || event[7] == rtype) {
++                    if (event[6]) {
++                        result->controller_status = event[6];
++                        return FUXI_BT_CONTROLLER;
++                    }
++                    *params = event + 6;
++                    *size = count;
++                    return FUXI_BT_OK;
++                }
++            }
++            if (event[1] == 0x0f && event[2] == 4 && fuxi_bt_setup_le16(event + 5) == opcode &&
++                event[3]) {
++                result->controller_status = event[3];
++                return FUXI_BT_CONTROLLER;
++            }
++            status = fuxi_bt_link_other(link);
++            if (status != FUXI_BT_OK) {
++                return status;
++            }
++            continue;
++        }
++        if (status != FUXI_BT_AGAIN) {
++            return status;
++        }
++        status = fuxi_bt_link_time(link);
++        if (status != FUXI_BT_OK) {
++            return status;
++        }
++        if (result->elapsed_us - begin >= FUXI_BT_COMMAND_TIMEOUT_US) {
++            return FUXI_BT_TIMEOUT;
++        }
++        link->ops->wait_us(link->ops->context, 200);
++    }
++}
++
++static enum fuxi_bt_status fuxi_bt_link_command(struct fuxi_bt_link *link, uint16_t opcode,
++    const uint8_t *payload, uint8_t payload_size, uint8_t rtype,
++    const uint8_t **params, unsigned *size)
++{
++    uint8_t packet[4 + 255];
++    enum fuxi_bt_status status;
++    packet[0] = 1;
++    packet[1] = (uint8_t)(opcode & 0xff);
++    packet[2] = (uint8_t)(opcode >> 8);
++    packet[3] = payload_size;
++    if (payload_size) {
++        memcpy(packet + 4, payload, payload_size);
++    }
++    status = fuxi_bt_link_write(link, packet, 4u + payload_size);
++    if (status != FUXI_BT_OK) {
++        return status;
++    }
++    return fuxi_bt_link_wait(link, opcode, rtype, params, size);
++}
++
++/* rampatch 標頭：[type=1|len<<8] 後接 total_size、data_length、format、signature、download_mode、
++ * reserved、product_id、rom_build、patch_version、reserved、entry（共 24 位元組）。ELF 格式不支援。 */
++static enum fuxi_bt_status fuxi_bt_tlv_patch(const struct fuxi_bt_blob *blob,
++    struct fuxi_bt_tlv_info *info)
++{
++    const uint8_t *data = blob->data;
++    uint32_t type_len;
++    info->file_bytes = (uint32_t)blob->size;
++    if (blob->size < 28 || blob->size > FUXI_BT_PATCH_MAX) {
++        return FUXI_BT_PROTOCOL;
++    }
++    if (!memcmp(data, "\177ELF", 4)) {
++        return FUXI_BT_PROTOCOL;
++    }
++    type_len = fuxi_bt_setup_le32(data);
++    info->type = (uint8_t)(type_len & 0xff);
++    info->tlv_bytes = type_len >> 8;
++    info->total_size = fuxi_bt_setup_le32(data + 4);
++    info->download_mode = data[4 + 10];
++    info->product = fuxi_bt_setup_le16(data + 4 + 12);
++    info->rom = fuxi_bt_setup_le16(data + 4 + 14);
++    info->patch = fuxi_bt_setup_le16(data + 4 + 16);
++    if (info->type != 1 || info->tlv_bytes < 24 || info->tlv_bytes > blob->size - 4 ||
++        info->download_mode > 3) {
++        return FUXI_BT_PROTOCOL;
++    }
++    return FUXI_BT_OK;
++}
++
++/* NVM：[type=2|len<<8] 後接 tag（id u16、len u16、8 位元組保留、資料）。就地改 HCI 與 deep sleep tag。 */
++static enum fuxi_bt_status fuxi_bt_tlv_nvm(struct fuxi_bt_blob *blob, struct fuxi_bt_tlv_info *info)
++{
++    uint8_t *data = blob->data;
++    uint32_t type_len;
++    size_t length, index = 0;
++    info->file_bytes = (uint32_t)blob->size;
++    if (blob->size < 16 || blob->size > FUXI_BT_NVM_MAX) {
++        return FUXI_BT_PROTOCOL;
++    }
++    type_len = fuxi_bt_setup_le32(data);
++    info->type = (uint8_t)(type_len & 0xff);
++    info->tlv_bytes = type_len >> 8;
++    length = info->tlv_bytes;
++    if (info->type != 2 || length < 12 || length > blob->size - 4) {
++        return FUXI_BT_PROTOCOL;
++    }
++    data += 4;
++    /* Linux：while (idx < length - sizeof(struct tlv_type_nvm))；這裡另外檢查 tag 資料不超出範圍 */
++    while (index + 12 < length) {
++        const uint16_t tag = fuxi_bt_setup_le16(data + index);
++        const uint16_t tag_length = fuxi_bt_setup_le16(data + index + 2);
++        uint8_t *value = data + index + 12;
++        if (tag_length > length - index - 12) {
++            return FUXI_BT_PROTOCOL;
++        }
++        if (tag == 17 && tag_length >= 3 && !info->hci_tag) {
++            info->hci_tag = true;
++            memcpy(info->hci_before, value, 3);
++            value[0] &= 0x7f;
++            value[1] = 0;
++            memcpy(info->hci_after, value, 3);
++        } else if (tag == 27 && tag_length >= 1 && !info->sleep_tag) {
++            info->sleep_tag = true;
++            info->sleep_before = value[0];
++            value[0] &= 0xfe;
++            info->sleep_after = value[0];
++        }
++        if (++info->tags > 4096) {
++            return FUXI_BT_PROTOCOL;
++        }
++        index += 12u + tag_length;
++    }
++    /* 沒有 HCI tag 就無法確定控制器下載後的 baud／IBS，寧可不送。 */
++    return info->hci_tag ? FUXI_BT_OK : FUXI_BT_PROTOCOL;
++}
++
++static enum fuxi_bt_status fuxi_bt_send_tlv(struct fuxi_bt_link *link,
++    const struct fuxi_bt_blob *blob, uint8_t mode, struct fuxi_bt_tlv_info *info)
++{
++    uint8_t payload[2 + FUXI_BT_TLV_SEGMENT];
++    for (size_t offset = 0; offset < blob->size;) {
++        const size_t remaining = blob->size - offset;
++        const unsigned segment = remaining < FUXI_BT_TLV_SEGMENT ?
++            (unsigned)remaining : FUXI_BT_TLV_SEGMENT;
++        const bool last = segment == remaining;
++        uint8_t packet[4 + sizeof(payload)];
++        enum fuxi_bt_status status;
++        payload[0] = 0x1e;
++        payload[1] = (uint8_t)segment;
++        memcpy(payload + 2, blob->data + offset, segment);
++        packet[0] = 1;
++        packet[1] = 0x00;
++        packet[2] = 0xfc;
++        packet[3] = (uint8_t)(segment + 2);
++        memcpy(packet + 4, payload, segment + 2);
++        status = fuxi_bt_link_write(link, packet, 6u + segment);
++        if (status != FUXI_BT_OK) {
++            return status;
++        }
++        info->segments++;
++        if (last || mode == 0) {
++            const uint8_t *params = NULL;
++            unsigned size = 0;
++            status = fuxi_bt_link_wait(link, 0xfc00, 0x1e, &params, &size);
++            if (status == FUXI_BT_TIMEOUT && last && mode != 0 &&
++                fuxi_bt_link_time(link) == FUXI_BT_OK) {
++                /* 省略回應的模式下最後一段也可能不回（Linux 自己補 Command Complete）；
++                 * 之後的 board ID／HCI reset 會證明控制器是否正常。 */
++                info->final_ack = false;
++            } else if (status != FUXI_BT_OK) {
++                return status;
++            } else {
++                info->acks++;
++                info->final_ack = last;
++            }
++        } else {
++            status = fuxi_bt_link_poll(link);
++            if (status != FUXI_BT_OK) {
++                return status;
++            }
++        }
++        offset += segment;
++    }
++    return FUXI_BT_OK;
++}
++
++static bool fuxi_bt_soft_failure(enum fuxi_bt_status status)
++{
++    return status == FUXI_BT_CONTROLLER || status == FUXI_BT_TIMEOUT || status == FUXI_BT_PROTOCOL;
++}
++
++enum fuxi_bt_status fuxi_bt_setup_run(const struct fuxi_bt_uart_ops *ops,
++    const struct fuxi_bt_files *files, struct fuxi_bt_setup_result *result)
++{
++    struct fuxi_bt_link link;
++    struct fuxi_bt_blob patch = {NULL, 0}, nvm = {NULL, 0};
++    const uint8_t *params = NULL;
++    unsigned size = 0;
++    bool acquired = false;
++    enum fuxi_bt_status status;
++    uint64_t mark;
++    if (!result) {
++        return FUXI_BT_ARGUMENT;
++    }
++    memset(result, 0, sizeof(*result));
++    result->board_id_status = FUXI_BT_OFF;
++    result->build_info_status = FUXI_BT_OFF;
++    if (!fuxi_bt_uart_ops_valid(ops)) {
++        result->status = FUXI_BT_NO_UART;
++        return result->status;
++    }
++    if (!files || !files->load || !files->release) {
++        result->status = FUXI_BT_ARGUMENT;
++        return result->status;
++    }
++    memset(&link, 0, sizeof(link));
++    link.ops = ops;
++    link.result = result;
++    link.start = ops->now_us(ops->context);
++    status = ops->acquire(ops->context, FUXI_BT_BOOT_BAUD);
++    if (status != FUXI_BT_OK) {
++        goto finish;
++    }
++    acquired = true;
++    status = fuxi_bt_link_drain(&link);
++    if (status != FUXI_BT_OK) {
++        goto finish;
++    }
++
++    result->stage = FUXI_BT_SETUP_VERSION;
++    {
++        static const uint8_t request[] = {0x19};
++        status = fuxi_bt_link_command(&link, 0xfc00, request, 1, 0x19, &params, &size);
++    }
++    if (status != FUXI_BT_OK) {
++        goto finish;
++    }
++    /* [cresp][0x19][長度 12][product 4][patch 2][rom 2][soc 4] */
++    if (size < 15) {
++        status = FUXI_BT_PROTOCOL;
++        goto finish;
++    }
++    result->version.product = fuxi_bt_setup_le32(params + 3);
++    result->version.patch = fuxi_bt_setup_le16(params + 7);
++    result->version.rom = fuxi_bt_setup_le16(params + 9);
++    result->version.soc = fuxi_bt_setup_le32(params + 11);
++    if (!result->version.soc || !result->version.rom) {
++        status = FUXI_BT_VERSION;
++        goto finish;
++    }
++    result->rom_ver = (uint8_t)(((result->version.soc & 0xf00u) >> 4) | (result->version.soc & 0xfu));
++
++    result->stage = FUXI_BT_SETUP_PATCH_LOAD;
++    fuxi_bt_setup_name(result->patch_name, "hmtbtfw", result->rom_ver, NULL, 0, 0, ".tlv");
++    status = files->load(files->context, result->patch_name, FUXI_BT_PATCH_MAX, &patch);
++    if (status != FUXI_BT_OK) {
++        patch.data = NULL;
++        goto finish;
++    }
++    if (!patch.data || !patch.size || patch.size > FUXI_BT_PATCH_MAX) {
++        status = FUXI_BT_IO;
++        goto finish;
++    }
++    result->stage = FUXI_BT_SETUP_PATCH_PARSE;
++    status = fuxi_bt_tlv_patch(&patch, &result->patch);
++    if (status != FUXI_BT_OK) {
++        goto finish;
++    }
++    result->stage = FUXI_BT_SETUP_PATCH_SEND;
++    mark = result->elapsed_us;
++    status = fuxi_bt_send_tlv(&link, &patch, result->patch.download_mode, &result->patch);
++    result->patch_us = result->elapsed_us - mark;
++    files->release(files->context, &patch);
++    patch.data = NULL;
++    if (status != FUXI_BT_OK) {
++        goto finish;
++    }
++    /* Linux：給控制器 10 ms 準備接 NVM */
++    ops->wait_us(ops->context, 10000);
++
++    result->stage = FUXI_BT_SETUP_BOARD_ID;
++    {
++        static const uint8_t request[] = {0x23};
++        status = fuxi_bt_link_command(&link, 0xfc00, request, 1, 0x23, &params, &size);
++    }
++    result->board_id_status = status;
++    if (status == FUXI_BT_OK && size >= 5) {
++        result->board_id = (uint16_t)((uint16_t)params[3] << 8 | params[4]);
++        result->board_id_valid = true;
++    } else if (status != FUXI_BT_OK && !fuxi_bt_soft_failure(status)) {
++        goto finish;
++    }
++
++    result->stage = FUXI_BT_SETUP_NVM_LOAD;
++    status = FUXI_BT_OFF;
++    for (unsigned candidate = 0; candidate < 2 && status == FUXI_BT_OFF; candidate++) {
++        if (candidate == 0) {
++            if (!result->board_id_valid || result->board_id == 0 || result->board_id == 0xffffu) {
++                continue;
++            }
++            /*
++             * Linux qca_get_nvm_name_by_board 的 "%s%02x.b%02x"：bid 至少兩位、超過照實際位數
++             * （0x0a→b0a、0x10a→b10a）。2026-11-18 對照手機 /vendor/bt_firmware/image 的
++             * hmtnv20.b0a／b10a／b14 等檔名。
++             */
++            fuxi_bt_setup_name(result->nvm_name, "hmtnv", result->rom_ver, ".b", result->board_id, 2, NULL);
++        } else {
++            /* 板級檔不存在、board ID 為 0／0xffff 或讀不到：Linux qca_get_alt_nvm_file 改讀 .bin */
++            fuxi_bt_setup_name(result->nvm_name, "hmtnv", result->rom_ver, NULL, 0, 0, ".bin");
++        }
++        status = files->load(files->context, result->nvm_name, FUXI_BT_NVM_MAX, &nvm);
++        if (status != FUXI_BT_OK) {
++            nvm.data = NULL;
++        }
++    }
++    if (status != FUXI_BT_OK) {
++        goto finish;
++    }
++    if (!nvm.data || !nvm.size || nvm.size > FUXI_BT_NVM_MAX) {
++        status = FUXI_BT_IO;
++        goto finish;
++    }
++    result->stage = FUXI_BT_SETUP_NVM_PARSE;
++    status = fuxi_bt_tlv_nvm(&nvm, &result->nvm);
++    if (status != FUXI_BT_OK) {
++        goto finish;
++    }
++    result->stage = FUXI_BT_SETUP_NVM_SEND;
++    status = fuxi_bt_send_tlv(&link, &nvm, 0, &result->nvm);
++    files->release(files->context, &nvm);
++    nvm.data = NULL;
++    if (status != FUXI_BT_OK) {
++        goto finish;
++    }
++
++    result->stage = FUXI_BT_SETUP_BUILD_INFO;
++    {
++        static const uint8_t request[] = {0x20};
++        status = fuxi_bt_link_command(&link, 0xfc00, request, 1, 0x20, &params, &size);
++    }
++    result->build_info_status = status;
++    if (status == FUXI_BT_OK && size >= 3) {
++        unsigned length = params[2];
++        unsigned out = 0;
++        if (length > size - 3) {
++            length = size - 3;
++        }
++        for (unsigned index = 0; index < length && out + 1 < sizeof(result->build_info); index++) {
++            const uint8_t c = params[3 + index];
++            if (!c) {
++                break;
++            }
++            result->build_info[out++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
++        }
++    } else if (status != FUXI_BT_OK && !fuxi_bt_soft_failure(status)) {
++        goto finish;
++    }
++
++    result->stage = FUXI_BT_SETUP_RESET;
++    status = fuxi_bt_link_command(&link, 0x0c03, NULL, 0, 0, &params, &size);
++    if (status != FUXI_BT_OK) {
++        goto finish;
++    }
++
++    result->stage = FUXI_BT_SETUP_LOCAL_VERSION;
++    status = fuxi_bt_link_command(&link, 0x1001, NULL, 0, 0, &params, &size);
++    if (status != FUXI_BT_OK) {
++        goto finish;
++    }
++    if (size < 9) {
++        status = FUXI_BT_PROTOCOL;
++        goto finish;
++    }
++    result->hci_version = params[1];
++    result->hci_revision = fuxi_bt_setup_le16(params + 2);
++    result->lmp_version = params[4];
++    result->manufacturer = fuxi_bt_setup_le16(params + 5);
++    result->lmp_subversion = fuxi_bt_setup_le16(params + 7);
++    result->local_version_valid = true;
++
++    result->stage = FUXI_BT_SETUP_BDADDR;
++    status = fuxi_bt_link_command(&link, 0x1009, NULL, 0, 0, &params, &size);
++    if (status != FUXI_BT_OK) {
++        goto finish;
++    }
++    if (size < 7) {
++        status = FUXI_BT_PROTOCOL;
++        goto finish;
++    }
++    memcpy(result->bdaddr, params + 1, sizeof(result->bdaddr));
++    result->bdaddr_valid = true;
++    result->stage = FUXI_BT_SETUP_DONE;
++    status = FUXI_BT_OK;
++
++finish:
++    if (patch.data) {
++        files->release(files->context, &patch);
++    }
++    if (nvm.data) {
++        files->release(files->context, &nvm);
++    }
++    if (status == FUXI_BT_AGAIN) {
++        status = FUXI_BT_IO;
++    }
++    result->status = status;
++    if (acquired) {
++        result->cleanup = ops->release(ops->context);
++        if (result->status == FUXI_BT_OK && result->cleanup != FUXI_BT_OK) {
++            result->status = FUXI_BT_CLEANUP;
++        }
++    }
++    return result->status;
++}
+diff --git a/xnu/fuxi-bluetooth/fuxi_bt_setup.h b/xnu/fuxi-bluetooth/fuxi_bt_setup.h
+new file mode 100644
+index 0000000..bacd410
+--- /dev/null
++++ b/xnu/fuxi-bluetooth/fuxi_bt_setup.h
+@@ -0,0 +1,115 @@
++#ifndef FUXI_BT_SETUP_H
++#define FUXI_BT_SETUP_H
++
++/*
++ * WCN7850 藍牙控制器初始化（fuxi,bt=4）：版本查詢 → rampatch → board ID → NVM → build info → HCI reset
++ * → 讀本機版本與 BD 位址。流程對照 Linux drivers/bluetooth/btqca.c qca_uart_setup（只作流程參考，
++ * 程式自寫）。全程 115200 baud，不切 3.2 Mbaud；NVM 的 HCI tag 把 IBS 位元清掉、baud 欄位設 115200，
++ * deep sleep 位元清掉，讓輪詢式 UART 不必處理 0xfc/0xfd/0xfe。可攜程式，主機測試用假 UART 與假檔案。
++ */
++
++#include "fuxi_bt.h"
++
++#define FUXI_BT_TLV_SEGMENT 243u
++/* 115200 baud 約 11.5 KB/s：1 MiB 上限的 rampatch 要約 91 秒，加上每段等 ack，總上限 240 秒 */
++#define FUXI_BT_SETUP_TIMEOUT_US 240000000u
++#define FUXI_BT_COMMAND_TIMEOUT_US 2000000u
++#define FUXI_BT_PATCH_MAX (1024u * 1024u)
++#define FUXI_BT_NVM_MAX 65536u
++#define FUXI_BT_SETUP_MAX_FRAMES 16384u
++#define FUXI_BT_SETUP_NAME 24u
++
++enum fuxi_bt_setup_stage {
++    FUXI_BT_SETUP_START = 0,
++    FUXI_BT_SETUP_VERSION,
++    FUXI_BT_SETUP_PATCH_LOAD,
++    FUXI_BT_SETUP_PATCH_PARSE,
++    FUXI_BT_SETUP_PATCH_SEND,
++    FUXI_BT_SETUP_BOARD_ID,
++    FUXI_BT_SETUP_NVM_LOAD,
++    FUXI_BT_SETUP_NVM_PARSE,
++    FUXI_BT_SETUP_NVM_SEND,
++    FUXI_BT_SETUP_BUILD_INFO,
++    FUXI_BT_SETUP_RESET,
++    FUXI_BT_SETUP_LOCAL_VERSION,
++    FUXI_BT_SETUP_BDADDR,
++    FUXI_BT_SETUP_DONE
++};
++
++/* 讀檔回呼：name 是基本檔名；成功時 data 指向可寫緩衝區（NVM 會就地修改），直到 release。 */
++struct fuxi_bt_blob {
++    uint8_t *data;
++    size_t size;
++};
++
++struct fuxi_bt_files {
++    void *context;
++    enum fuxi_bt_status (*load)(void *, const char *, size_t, struct fuxi_bt_blob *);
++    void (*release)(void *, struct fuxi_bt_blob *);
++};
++
++struct fuxi_bt_tlv_info {
++    uint32_t file_bytes;
++    uint32_t tlv_bytes;
++    uint32_t total_size;
++    uint8_t type;
++    uint8_t download_mode;
++    uint16_t product;
++    uint16_t rom;
++    uint16_t patch;
++    uint16_t tags;
++    bool hci_tag;
++    uint8_t hci_before[3];
++    uint8_t hci_after[3];
++    bool sleep_tag;
++    uint8_t sleep_before;
++    uint8_t sleep_after;
++    uint32_t segments;
++    uint32_t acks;
++    bool final_ack;
++};
++
++struct fuxi_bt_setup_result {
++    enum fuxi_bt_status status;
++    enum fuxi_bt_status cleanup;
++    enum fuxi_bt_setup_stage stage;
++    struct fuxi_bt_version version;
++    uint8_t rom_ver;
++    char patch_name[FUXI_BT_SETUP_NAME];
++    char nvm_name[FUXI_BT_SETUP_NAME];
++    struct fuxi_bt_tlv_info patch;
++    struct fuxi_bt_tlv_info nvm;
++    uint16_t board_id;
++    bool board_id_valid;
++    enum fuxi_bt_status board_id_status;
++    char build_info[96];
++    enum fuxi_bt_status build_info_status;
++    uint8_t controller_status;
++    uint8_t hci_version;
++    uint16_t hci_revision;
++    uint8_t lmp_version;
++    uint16_t manufacturer;
++    uint16_t lmp_subversion;
++    bool local_version_valid;
++    uint8_t bdaddr[6];
++    bool bdaddr_valid;
++    uint8_t last_event[24];
++    unsigned last_event_size;
++    uint8_t last_vendor[24];
++    unsigned last_vendor_size;
++    unsigned tx_bytes;
++    unsigned rx_bytes;
++    unsigned frames;
++    unsigned ignored_frames;
++    unsigned vendor_events;
++    unsigned stale_acks;
++    uint64_t elapsed_us;
++    uint64_t patch_us;
++};
++
++const char *fuxi_bt_setup_stage_name(enum fuxi_bt_setup_stage stage);
++bool fuxi_bt_setup_name_valid(const char *name);
++enum fuxi_bt_status fuxi_bt_setup_run(const struct fuxi_bt_uart_ops *ops,
++    const struct fuxi_bt_files *files, struct fuxi_bt_setup_result *result);
++
++#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_xnu.c b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
 new file mode 100644
-index 0000000..48478dd
+index 0000000..77a7dc0
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,489 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/uio.h>
 +#include <kern/thread.h>
 +#include <kern/clock.h>
 +#include <pexpert/pexpert.h>
@@ -32257,6 +33973,7 @@ index 0000000..48478dd
 +#include <string.h>
 +#include "fuxi_bt.h"
 +#include "fuxi_bt_board.h"
++#include "fuxi_bt_setup.h"
 +
 +extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t,
 +    uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t, unsigned, void *);
@@ -32434,8 +34151,143 @@ index 0000000..48478dd
 +}
 +
 +/*
++ * fuxi,bt=4 的韌體檔：只讀 /usr/local/share/fuxi/bt/<基本檔名>（rampatch hmtbtfw20.tlv、NVM hmtnv20.*，
++ * 從手機 Android vendor 分區複製，不編進核心）。讀法同 fuxi_wlan.c wl14_read；不存在回 OFF 讓引擎試下一個名字。
++ */
++static enum fuxi_bt_status fuxi_bt_file_load(void *context, const char *name, size_t limit,
++    struct fuxi_bt_blob *blob)
++{
++    char path[96];
++    vnode_t file = NULL;
++    vfs_context_t vfs = vfs_context_kernel();
++    struct vnode_attr attributes;
++    vm_offset_t memory = 0;
++    enum fuxi_bt_status status = FUXI_BT_OK;
++    int residual = 0, error;
++    (void)context;
++    blob->data = NULL;
++    blob->size = 0;
++    if (!fuxi_bt_setup_name_valid(name)) {
++        return FUXI_BT_ARGUMENT;
++    }
++    snprintf(path, sizeof(path), "/usr/local/share/fuxi/bt/%s", name);
++    error = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &file, vfs);
++    if (error) {
++        if (error != ENOENT) {
++            printf("FUXI BT: setup file %s open errno=%d\n", path, error);
++        }
++        return error == ENOENT ? FUXI_BT_OFF : FUXI_BT_IO;
++    }
++    VATTR_INIT(&attributes);
++    VATTR_WANTED(&attributes, va_data_size);
++    error = vnode_getattr(file, &attributes, vfs);
++    if (error || vnode_vtype(file) != VREG || !VATTR_IS_SUPPORTED(&attributes, va_data_size) ||
++        !attributes.va_data_size || attributes.va_data_size > limit) {
++        printf("FUXI BT: setup file %s errno=%d size=%llu limit=%lu rejected\n", path, error,
++            (unsigned long long)attributes.va_data_size, (unsigned long)limit);
++        status = FUXI_BT_IO;
++    } else if (kmem_alloc(kernel_map, &memory, round_page((vm_size_t)attributes.va_data_size),
++        KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++        status = FUXI_BT_IO;
++        memory = 0;
++    } else {
++        error = vn_rdwr(UIO_READ, file, (caddr_t)memory, (int)attributes.va_data_size, 0,
++            UIO_SYSSPACE, 0, vfs_context_ucred(vfs), &residual, vfs_context_proc(vfs));
++        if (error || residual) {
++            printf("FUXI BT: setup file %s read errno=%d residual=%d\n", path, error, residual);
++            status = FUXI_BT_IO;
++        }
++    }
++    if (vnode_close(file, FREAD, vfs) && status == FUXI_BT_OK) {
++        status = FUXI_BT_IO;
++    }
++    if (status != FUXI_BT_OK) {
++        if (memory) {
++            kmem_free(kernel_map, memory, round_page((vm_size_t)attributes.va_data_size));
++        }
++        return status;
++    }
++    blob->data = (uint8_t *)memory;
++    blob->size = (size_t)attributes.va_data_size;
++    printf("FUXI BT: setup file %s bytes=%lu\n", path, (unsigned long)blob->size);
++    return FUXI_BT_OK;
++}
++
++static void fuxi_bt_file_release(void *context, struct fuxi_bt_blob *blob)
++{
++    (void)context;
++    if (blob->data) {
++        kmem_free(kernel_map, (vm_offset_t)blob->data, round_page((vm_size_t)blob->size));
++    }
++    blob->data = NULL;
++    blob->size = 0;
++}
++
++static void fuxi_bt_hex(const uint8_t *bytes, unsigned size, char *out, unsigned capacity)
++{
++    static const char digits[] = "0123456789abcdef";
++    unsigned index = 0;
++    for (; index < size && index * 2 + 2 < capacity; index++) {
++        out[index * 2] = digits[bytes[index] >> 4];
++        out[index * 2 + 1] = digits[bytes[index] & 15];
++    }
++    out[index * 2] = 0;
++}
++
++static void fuxi_bt_print_tlv(const char *what, const char *name, const struct fuxi_bt_tlv_info *info)
++{
++    printf("FUXI BT: setup %s %s file=%u tlv=%u type=%u mode=%u product=%#x rom=%#x patch=%#x tags=%u segments=%u acks=%u final_ack=%u\n",
++        what, name, info->file_bytes, info->tlv_bytes, (unsigned)info->type, (unsigned)info->download_mode,
++        (unsigned)info->product, (unsigned)info->rom, (unsigned)info->patch, (unsigned)info->tags,
++        info->segments, info->acks, (unsigned)info->final_ack);
++}
++
++static void fuxi_bt_print_setup(enum fuxi_bt_status status, const struct fuxi_bt_setup_result *result)
++{
++    char hex[sizeof(result->last_event) * 2 + 1];
++    printf("FUXI BT: setup status=%s stage=%s cleanup=%s controller_status=%#x elapsed_ms=%llu patch_ms=%llu tx=%u rx=%u frames=%u ignored=%u vendor=%u stale=%u\n",
++        fuxi_bt_status_name(status), fuxi_bt_setup_stage_name(result->stage),
++        fuxi_bt_status_name(result->cleanup), (unsigned)result->controller_status,
++        result->elapsed_us / 1000u, result->patch_us / 1000u, result->tx_bytes, result->rx_bytes,
++        result->frames, result->ignored_frames, result->vendor_events, result->stale_acks);
++    printf("FUXI BT: setup version product=%#x soc=%#x rom=%#x patch=%#x rom_ver=%#x\n",
++        result->version.product, result->version.soc, (unsigned)result->version.rom,
++        (unsigned)result->version.patch, (unsigned)result->rom_ver);
++    if (result->patch.file_bytes) {
++        fuxi_bt_print_tlv("rampatch", result->patch_name, &result->patch);
++    }
++    printf("FUXI BT: setup board_id=%#x valid=%u status=%s\n", (unsigned)result->board_id,
++        (unsigned)result->board_id_valid, fuxi_bt_status_name(result->board_id_status));
++    if (result->nvm.file_bytes) {
++        fuxi_bt_print_tlv("nvm", result->nvm_name, &result->nvm);
++        printf("FUXI BT: setup nvm hci_tag=%u %02x%02x%02x->%02x%02x%02x sleep_tag=%u %#x->%#x\n",
++            (unsigned)result->nvm.hci_tag, result->nvm.hci_before[0], result->nvm.hci_before[1],
++            result->nvm.hci_before[2], result->nvm.hci_after[0], result->nvm.hci_after[1],
++            result->nvm.hci_after[2], (unsigned)result->nvm.sleep_tag,
++            (unsigned)result->nvm.sleep_before, (unsigned)result->nvm.sleep_after);
++    }
++    printf("FUXI BT: setup build_info status=%s \"%s\"\n", fuxi_bt_status_name(result->build_info_status),
++        result->build_info);
++    if (result->local_version_valid) {
++        printf("FUXI BT: setup local hci=%#x rev=%#x lmp=%#x manufacturer=%#x subver=%#x\n",
++            (unsigned)result->hci_version, (unsigned)result->hci_revision, (unsigned)result->lmp_version,
++            (unsigned)result->manufacturer, (unsigned)result->lmp_subversion);
++    }
++    if (result->bdaddr_valid) {
++        printf("FUXI BT: setup bdaddr valid (not logged)\n");
++    }
++    fuxi_bt_hex(result->last_event, result->last_event_size, hex, sizeof(hex));
++    printf("FUXI BT: setup last_event %s\n", hex);
++    if (result->last_vendor_size) {
++        fuxi_bt_hex(result->last_vendor, result->last_vendor_size, hex, sizeof(hex));
++        printf("FUXI BT: setup last_vendor %s\n", hex);
++    }
++}
++
++/*
 + * fuxi,bt=3：等 WLAN_EN 穩定拉高（WCN 電源軌由 WLAN 開好）連續 15 秒，最多等 300 秒；
 + * 之後開 SE6 時脈與腳位、拉 BT_EN、以 115200 送 QCA 版本查詢，結束後全部還原。
++ * fuxi,bt=4：同樣上電，改跑 fuxi_bt_setup_run（rampatch→NVM→HCI reset），結束後同樣還原。
 + */
 +#define FUXI_BT_WLAN_STEADY_US 15000000ull
 +#define FUXI_BT_WLAN_DEADLINE_US 300000000ull
@@ -32486,8 +34338,15 @@ index 0000000..48478dd
 +        board->firmware, board->sw_ctrl_before, board->sw_ctrl_after);
 +    if (status == FUXI_BT_OK) {
 +        fuxi_bt_board_uart_ops(board, &ops);
-+        status = fuxi_bt_probe_run(1, &ops, &result);
-+        fuxi_bt_print_probe(status, &result);
++        if (fuxi_bt_mode == 4) {
++            static struct fuxi_bt_setup_result setup; /* 約 0.5 KB，不放核心堆疊 */
++            const struct fuxi_bt_files files = {NULL, fuxi_bt_file_load, fuxi_bt_file_release};
++            status = fuxi_bt_setup_run(&ops, &files, &setup);
++            fuxi_bt_print_setup(status, &setup);
++        } else {
++            status = fuxi_bt_probe_run(1, &ops, &result);
++            fuxi_bt_print_probe(status, &result);
++        }
 +        printf("FUXI BT: fifo state=%u error=%s cleanup=%s fault=%u reg=%#x%s tx=%llu/%llu rx=%llu discarded=%llu m_irq=%#x s_irq=%#x depth=%u/%u\n",
 +            (unsigned)board->fifo.state, fuxi_bt_status_name(board->fifo.error),
 +            fuxi_bt_status_name(board->fifo.cleanup), (unsigned)board->fifo.io_fault,
@@ -32537,7 +34396,7 @@ index 0000000..48478dd
 +        }
 +        status = fuxi_bt_probe_run(1, ops, &result);
 +        fuxi_bt_print_probe(status, &result);
-+    } else if (status == FUXI_BT_OK && fuxi_bt_mode == 3) {
++    } else if (status == FUXI_BT_OK && (fuxi_bt_mode == 3 || fuxi_bt_mode == 4)) {
 +        fuxi_bt_board_session();
 +        fuxi_bt_unmap();
 +    }
@@ -32570,7 +34429,7 @@ index 0000000..48478dd
 +    if (mode == 0) {
 +        return;
 +    }
-+    if (mode != 1 && mode != 2 && mode != 3) {
++    if (mode < 1 || mode > 4) {
 +        printf("FUXI BT: mode %d rejected (fuxibt / fuxi,bt)\n", mode);
 +        return;
 +    }
@@ -45306,13 +47165,13 @@ index 8349337..ed20c83 100644
  +}
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..a420483
+index 0000000..0686ab1
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,10285 @@
+@@ -0,0 +1,11346 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
-+@@ -121,6 +121,31 @@
++@@ -121,6 +121,32 @@
 + bsd/dev/sweet_rpmh.c			standard
 + bsd/dev/sweet_spmi.c			standard
 + bsd/dev/sweet_usb.c			standard
@@ -45338,6 +47197,7 @@ index 0000000..a420483
 ++bsd/dev/fuxi_bt_xnu.c			standard
 ++bsd/dev/fuxi_bt_geni_fifo.c		standard
 ++bsd/dev/fuxi_bt_board.c			standard
+++bsd/dev/fuxi_bt_setup.c			standard
 ++bsd/dev/fuxi_battery_freshness.c	standard
 ++bsd/dev/fuxi_audio_spf.c		standard
 ++bsd/dev/fuxi_audio_prep_gpr.c		standard
@@ -47241,7 +49101,7 @@ index 0000000..a420483
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_pmic.c
-+@@ -0,0 +1,844 @@
++@@ -0,0 +1,854 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
@@ -47779,6 +49639,7 @@ index 0000000..a420483
 ++    (void)wait_result;
 ++    const FuxiHapticIo io = {NULL, fp_haptic_owner, fp_haptic_read, fp_haptic_write, fp_flash_wait, 0};
 ++    unsigned playing = 0, logged = 0, health_checks = 0, amplitude_writes = 0, amplitude_logged = 0;
+++    unsigned autores_cleared = 0, autores_plays = 0, autores_logged = 0;
 ++    uint8_t mid_hpwr = 0, mid_fault = 0, amplitude = fp_vibrate_android_amplitude, low = 0, high = 0;
 ++    uint64_t started_ns = 0;
 ++    for (;;) {
@@ -47823,7 +49684,7 @@ index 0000000..a420483
 ++        }
 ++        if (want && !playing) {
 ++            low = high = amplitude;
-++            int result = fuxi_vibrate_start(&io);
+++            int result = fuxi_vibrate_start(&io, &autores_cleared);
 ++            if (result) {
 ++                unsigned polls = 0, toggled = 0;
 ++                int stop_result = fuxi_vibrate_stop(&io, &polls, &toggled);
@@ -47853,9 +49714,9 @@ index 0000000..a420483
 ++            lck_mtx_unlock(&fp_vibrate_lock);
 ++            if (logged < 16 || result || toggled) {
 ++                logged++;
-++                printf("FUXI PMIC: vibrate play=%llu on-us=%llu checks=%u hpwr-mid=%#x fault-mid=%#x stop-rc=%d stop-polls=%u stop-us=%llu toggled=%u amp=%#x..%#x\n",
+++                printf("FUXI PMIC: vibrate play=%llu on-us=%llu checks=%u hpwr-mid=%#x fault-mid=%#x stop-rc=%d stop-polls=%u stop-us=%llu toggled=%u amp=%#x..%#x autores-plays=%u cleared=%u\n",
 ++                    plays, (stop_ns - started_ns) / 1000, health_checks, mid_hpwr, mid_fault, result, polls,
-++                    (stopped_ns - stop_ns) / 1000, toggled, low, high);
+++                    (stopped_ns - stop_ns) / 1000, toggled, low, high, autores_plays, autores_cleared);
 ++            }
 ++            if (result) fp_vibrate_fail(&io, "stop unverified", result);
 ++            continue;
@@ -47865,6 +49726,15 @@ index 0000000..a420483
 ++            int result = fuxi_vibrate_health(&io, &fault, &hpwr);
 ++            health_checks++;
 ++            mid_hpwr = hpwr; /* 停止前最後一次看到的 HPWR；播放中應為 3（READY） */
+++            if (!result && (fault & FUXI_VIBRATE_FAULT_AUTORES) && !(mid_fault & FUXI_VIBRATE_FAULT_AUTORES)) {
+++                /* Linux 播放中不看這一位；照常播完，下次開播前清 */
+++                autores_plays++;
+++                if (autores_logged < 4) {
+++                    autores_logged++;
+++                    printf("FUXI PMIC: vibrate auto-resonance error while playing amp=%#x on-us=%llu hpwr=%#x; continuing, cleared before next play (count=%u)\n",
+++                        amplitude, (fp_torch_now() - started_ns) / 1000, hpwr, autores_plays);
+++                }
+++            }
 ++            mid_fault |= fault;
 ++            if (result) {
 ++                unsigned polls = 0, toggled = 0;
@@ -50801,11 +52671,15 @@ index 0000000..a420483
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_xnu.c
-+@@ -0,0 +1,342 @@
++@@ -0,0 +1,489 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
 ++#include <sys/systm.h>
+++#include <sys/errno.h>
+++#include <sys/fcntl.h>
+++#include <sys/vnode.h>
+++#include <sys/uio.h>
 ++#include <kern/thread.h>
 ++#include <kern/clock.h>
 ++#include <pexpert/pexpert.h>
@@ -50815,6 +52689,7 @@ index 0000000..a420483
 ++#include <string.h>
 ++#include "fuxi_bt.h"
 ++#include "fuxi_bt_board.h"
+++#include "fuxi_bt_setup.h"
 ++
 ++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t,
 ++    uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t, unsigned, void *);
@@ -50992,8 +52867,143 @@ index 0000000..a420483
 ++}
 ++
 ++/*
+++ * fuxi,bt=4 的韌體檔：只讀 /usr/local/share/fuxi/bt/<基本檔名>（rampatch hmtbtfw20.tlv、NVM hmtnv20.*，
+++ * 從手機 Android vendor 分區複製，不編進核心）。讀法同 fuxi_wlan.c wl14_read；不存在回 OFF 讓引擎試下一個名字。
+++ */
+++static enum fuxi_bt_status fuxi_bt_file_load(void *context, const char *name, size_t limit,
+++    struct fuxi_bt_blob *blob)
+++{
+++    char path[96];
+++    vnode_t file = NULL;
+++    vfs_context_t vfs = vfs_context_kernel();
+++    struct vnode_attr attributes;
+++    vm_offset_t memory = 0;
+++    enum fuxi_bt_status status = FUXI_BT_OK;
+++    int residual = 0, error;
+++    (void)context;
+++    blob->data = NULL;
+++    blob->size = 0;
+++    if (!fuxi_bt_setup_name_valid(name)) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    snprintf(path, sizeof(path), "/usr/local/share/fuxi/bt/%s", name);
+++    error = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &file, vfs);
+++    if (error) {
+++        if (error != ENOENT) {
+++            printf("FUXI BT: setup file %s open errno=%d\n", path, error);
+++        }
+++        return error == ENOENT ? FUXI_BT_OFF : FUXI_BT_IO;
+++    }
+++    VATTR_INIT(&attributes);
+++    VATTR_WANTED(&attributes, va_data_size);
+++    error = vnode_getattr(file, &attributes, vfs);
+++    if (error || vnode_vtype(file) != VREG || !VATTR_IS_SUPPORTED(&attributes, va_data_size) ||
+++        !attributes.va_data_size || attributes.va_data_size > limit) {
+++        printf("FUXI BT: setup file %s errno=%d size=%llu limit=%lu rejected\n", path, error,
+++            (unsigned long long)attributes.va_data_size, (unsigned long)limit);
+++        status = FUXI_BT_IO;
+++    } else if (kmem_alloc(kernel_map, &memory, round_page((vm_size_t)attributes.va_data_size),
+++        KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+++        status = FUXI_BT_IO;
+++        memory = 0;
+++    } else {
+++        error = vn_rdwr(UIO_READ, file, (caddr_t)memory, (int)attributes.va_data_size, 0,
+++            UIO_SYSSPACE, 0, vfs_context_ucred(vfs), &residual, vfs_context_proc(vfs));
+++        if (error || residual) {
+++            printf("FUXI BT: setup file %s read errno=%d residual=%d\n", path, error, residual);
+++            status = FUXI_BT_IO;
+++        }
+++    }
+++    if (vnode_close(file, FREAD, vfs) && status == FUXI_BT_OK) {
+++        status = FUXI_BT_IO;
+++    }
+++    if (status != FUXI_BT_OK) {
+++        if (memory) {
+++            kmem_free(kernel_map, memory, round_page((vm_size_t)attributes.va_data_size));
+++        }
+++        return status;
+++    }
+++    blob->data = (uint8_t *)memory;
+++    blob->size = (size_t)attributes.va_data_size;
+++    printf("FUXI BT: setup file %s bytes=%lu\n", path, (unsigned long)blob->size);
+++    return FUXI_BT_OK;
+++}
+++
+++static void fuxi_bt_file_release(void *context, struct fuxi_bt_blob *blob)
+++{
+++    (void)context;
+++    if (blob->data) {
+++        kmem_free(kernel_map, (vm_offset_t)blob->data, round_page((vm_size_t)blob->size));
+++    }
+++    blob->data = NULL;
+++    blob->size = 0;
+++}
+++
+++static void fuxi_bt_hex(const uint8_t *bytes, unsigned size, char *out, unsigned capacity)
+++{
+++    static const char digits[] = "0123456789abcdef";
+++    unsigned index = 0;
+++    for (; index < size && index * 2 + 2 < capacity; index++) {
+++        out[index * 2] = digits[bytes[index] >> 4];
+++        out[index * 2 + 1] = digits[bytes[index] & 15];
+++    }
+++    out[index * 2] = 0;
+++}
+++
+++static void fuxi_bt_print_tlv(const char *what, const char *name, const struct fuxi_bt_tlv_info *info)
+++{
+++    printf("FUXI BT: setup %s %s file=%u tlv=%u type=%u mode=%u product=%#x rom=%#x patch=%#x tags=%u segments=%u acks=%u final_ack=%u\n",
+++        what, name, info->file_bytes, info->tlv_bytes, (unsigned)info->type, (unsigned)info->download_mode,
+++        (unsigned)info->product, (unsigned)info->rom, (unsigned)info->patch, (unsigned)info->tags,
+++        info->segments, info->acks, (unsigned)info->final_ack);
+++}
+++
+++static void fuxi_bt_print_setup(enum fuxi_bt_status status, const struct fuxi_bt_setup_result *result)
+++{
+++    char hex[sizeof(result->last_event) * 2 + 1];
+++    printf("FUXI BT: setup status=%s stage=%s cleanup=%s controller_status=%#x elapsed_ms=%llu patch_ms=%llu tx=%u rx=%u frames=%u ignored=%u vendor=%u stale=%u\n",
+++        fuxi_bt_status_name(status), fuxi_bt_setup_stage_name(result->stage),
+++        fuxi_bt_status_name(result->cleanup), (unsigned)result->controller_status,
+++        result->elapsed_us / 1000u, result->patch_us / 1000u, result->tx_bytes, result->rx_bytes,
+++        result->frames, result->ignored_frames, result->vendor_events, result->stale_acks);
+++    printf("FUXI BT: setup version product=%#x soc=%#x rom=%#x patch=%#x rom_ver=%#x\n",
+++        result->version.product, result->version.soc, (unsigned)result->version.rom,
+++        (unsigned)result->version.patch, (unsigned)result->rom_ver);
+++    if (result->patch.file_bytes) {
+++        fuxi_bt_print_tlv("rampatch", result->patch_name, &result->patch);
+++    }
+++    printf("FUXI BT: setup board_id=%#x valid=%u status=%s\n", (unsigned)result->board_id,
+++        (unsigned)result->board_id_valid, fuxi_bt_status_name(result->board_id_status));
+++    if (result->nvm.file_bytes) {
+++        fuxi_bt_print_tlv("nvm", result->nvm_name, &result->nvm);
+++        printf("FUXI BT: setup nvm hci_tag=%u %02x%02x%02x->%02x%02x%02x sleep_tag=%u %#x->%#x\n",
+++            (unsigned)result->nvm.hci_tag, result->nvm.hci_before[0], result->nvm.hci_before[1],
+++            result->nvm.hci_before[2], result->nvm.hci_after[0], result->nvm.hci_after[1],
+++            result->nvm.hci_after[2], (unsigned)result->nvm.sleep_tag,
+++            (unsigned)result->nvm.sleep_before, (unsigned)result->nvm.sleep_after);
+++    }
+++    printf("FUXI BT: setup build_info status=%s \"%s\"\n", fuxi_bt_status_name(result->build_info_status),
+++        result->build_info);
+++    if (result->local_version_valid) {
+++        printf("FUXI BT: setup local hci=%#x rev=%#x lmp=%#x manufacturer=%#x subver=%#x\n",
+++            (unsigned)result->hci_version, (unsigned)result->hci_revision, (unsigned)result->lmp_version,
+++            (unsigned)result->manufacturer, (unsigned)result->lmp_subversion);
+++    }
+++    if (result->bdaddr_valid) {
+++        printf("FUXI BT: setup bdaddr valid (not logged)\n");
+++    }
+++    fuxi_bt_hex(result->last_event, result->last_event_size, hex, sizeof(hex));
+++    printf("FUXI BT: setup last_event %s\n", hex);
+++    if (result->last_vendor_size) {
+++        fuxi_bt_hex(result->last_vendor, result->last_vendor_size, hex, sizeof(hex));
+++        printf("FUXI BT: setup last_vendor %s\n", hex);
+++    }
+++}
+++
+++/*
 ++ * fuxi,bt=3：等 WLAN_EN 穩定拉高（WCN 電源軌由 WLAN 開好）連續 15 秒，最多等 300 秒；
 ++ * 之後開 SE6 時脈與腳位、拉 BT_EN、以 115200 送 QCA 版本查詢，結束後全部還原。
+++ * fuxi,bt=4：同樣上電，改跑 fuxi_bt_setup_run（rampatch→NVM→HCI reset），結束後同樣還原。
 ++ */
 ++#define FUXI_BT_WLAN_STEADY_US 15000000ull
 ++#define FUXI_BT_WLAN_DEADLINE_US 300000000ull
@@ -51044,8 +53054,15 @@ index 0000000..a420483
 ++        board->firmware, board->sw_ctrl_before, board->sw_ctrl_after);
 ++    if (status == FUXI_BT_OK) {
 ++        fuxi_bt_board_uart_ops(board, &ops);
-++        status = fuxi_bt_probe_run(1, &ops, &result);
-++        fuxi_bt_print_probe(status, &result);
+++        if (fuxi_bt_mode == 4) {
+++            static struct fuxi_bt_setup_result setup; /* 約 0.5 KB，不放核心堆疊 */
+++            const struct fuxi_bt_files files = {NULL, fuxi_bt_file_load, fuxi_bt_file_release};
+++            status = fuxi_bt_setup_run(&ops, &files, &setup);
+++            fuxi_bt_print_setup(status, &setup);
+++        } else {
+++            status = fuxi_bt_probe_run(1, &ops, &result);
+++            fuxi_bt_print_probe(status, &result);
+++        }
 ++        printf("FUXI BT: fifo state=%u error=%s cleanup=%s fault=%u reg=%#x%s tx=%llu/%llu rx=%llu discarded=%llu m_irq=%#x s_irq=%#x depth=%u/%u\n",
 ++            (unsigned)board->fifo.state, fuxi_bt_status_name(board->fifo.error),
 ++            fuxi_bt_status_name(board->fifo.cleanup), (unsigned)board->fifo.io_fault,
@@ -51095,7 +53112,7 @@ index 0000000..a420483
 ++        }
 ++        status = fuxi_bt_probe_run(1, ops, &result);
 ++        fuxi_bt_print_probe(status, &result);
-++    } else if (status == FUXI_BT_OK && fuxi_bt_mode == 3) {
+++    } else if (status == FUXI_BT_OK && (fuxi_bt_mode == 3 || fuxi_bt_mode == 4)) {
 ++        fuxi_bt_board_session();
 ++        fuxi_bt_unmap();
 ++    }
@@ -51128,7 +53145,7 @@ index 0000000..a420483
 ++    if (mode == 0) {
 ++        return;
 ++    }
-++    if (mode != 1 && mode != 2 && mode != 3) {
+++    if (mode < 1 || mode > 4) {
 ++        printf("FUXI BT: mode %d rejected (fuxibt / fuxi,bt)\n", mode);
 ++        return;
 ++    }
@@ -52262,6 +54279,767 @@ index 0000000..a420483
 ++    ops->wait_us = fuxi_bt_board_wait;
 ++}
 +--- /dev/null
+++++ b/bsd/dev/fuxi_bt_setup.c
++@@ -0,0 +1,758 @@
+++#include "fuxi_bt_setup.h"
+++#include <string.h>
+++
+++/*
+++ * WCN7850 控制器初始化。命令與回應格式參考 Linux btqca.c（qca_read_soc_version、qca_tlv_check_data、
+++ * qca_tlv_send_segment、qca_read_fw_board_id、qca_read_fw_build_info、qca_uart_setup），程式自寫：
+++ *  - vendor 命令 opcode 0xfc00，第一個位元組是子命令（0x19 版本、0x1e TLV 段、0x23 board ID、0x20 build info）；
+++ *  - WCN3991 以後回 Command Complete，回傳參數 [cresp][rtype][data…]，cresp=0 成功、rtype=子命令；
+++ *  - rampatch/NVM 整個檔案依序切 243 位元組段送出；patch 標頭的 download_mode 非 0 時控制器只回最後一段；
+++ *  - NVM tag 17（HCI）：data[0] bit 7＝軟體 IBS、data[1]＝baud（WCN3991 以後）；tag 27 bit 0＝deep sleep。
+++ *    Linux 會打開 IBS 並設成工作 baud；這裡關掉 IBS／deep sleep、baud 設 115200（列舉值 0），
+++ *    因為本驅動是輪詢式 UART、沒有 IBS 狀態機，也不切換 baud。
+++ */
+++
+++struct fuxi_bt_link {
+++    const struct fuxi_bt_uart_ops *ops;
+++    struct fuxi_bt_setup_result *result;
+++    uint64_t start;
+++    uint8_t rx[64];
+++    unsigned rx_offset;
+++    unsigned rx_size;
+++    uint8_t header[5];
+++    unsigned header_size;
+++    unsigned header_need;
+++    unsigned body_size;
+++    unsigned body_need;
+++    uint8_t event[258];
+++    unsigned event_size;
+++};
+++
+++static uint16_t fuxi_bt_setup_le16(const uint8_t *bytes)
+++{
+++    return (uint16_t)((uint16_t)bytes[0] | (uint16_t)bytes[1] << 8);
+++}
+++
+++static uint32_t fuxi_bt_setup_le32(const uint8_t *bytes)
+++{
+++    return (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8 |
+++        (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24;
+++}
+++
+++const char *fuxi_bt_setup_stage_name(enum fuxi_bt_setup_stage stage)
+++{
+++    static const char *const names[] = {
+++        "start", "version", "patch-load", "patch-parse", "patch-send", "board-id",
+++        "nvm-load", "nvm-parse", "nvm-send", "build-info", "reset", "local-version",
+++        "bdaddr", "done"
+++    };
+++    if ((unsigned)stage >= sizeof(names) / sizeof(names[0])) {
+++        return "unknown";
+++    }
+++    return names[stage];
+++}
+++
+++bool fuxi_bt_setup_name_valid(const char *name)
+++{
+++    if (!name || !name[0] || name[0] == '.') {
+++        return false;
+++    }
+++    for (unsigned index = 0; index < FUXI_BT_SETUP_NAME; index++) {
+++        const char c = name[index];
+++        if (!c) {
+++            return true;
+++        }
+++        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+++              c == '.' || c == '_' || c == '-')) {
+++            return false;
+++        }
+++    }
+++    return false;
+++}
+++
+++/* 檔名組字：stem＋兩位十六進位 rom＋尾碼；bid_digits=0 表示不帶 board ID。 */
+++static void fuxi_bt_setup_name(char out[FUXI_BT_SETUP_NAME], const char *stem, unsigned rom,
+++    const char *middle, unsigned bid, unsigned bid_digits, const char *tail)
+++{
+++    static const char digits[] = "0123456789abcdef";
+++    unsigned at = 0;
+++    char hex[8];
+++    unsigned count = 0;
+++    memset(out, 0, FUXI_BT_SETUP_NAME);
+++    for (const char *p = stem; *p && at + 1 < FUXI_BT_SETUP_NAME; p++) {
+++        out[at++] = *p;
+++    }
+++    if (at + 3 < FUXI_BT_SETUP_NAME) {
+++        out[at++] = digits[(rom >> 4) & 15];
+++        out[at++] = digits[rom & 15];
+++    }
+++    for (const char *p = middle; p && *p && at + 1 < FUXI_BT_SETUP_NAME; p++) {
+++        out[at++] = *p;
+++    }
+++    if (bid_digits) {
+++        unsigned value = bid;
+++        do {
+++            hex[count++] = digits[value & 15];
+++            value >>= 4;
+++        } while (value && count < sizeof(hex));
+++        while (count < bid_digits && count < sizeof(hex)) {
+++            hex[count++] = '0';
+++        }
+++        while (count && at + 1 < FUXI_BT_SETUP_NAME) {
+++            out[at++] = hex[--count];
+++        }
+++    }
+++    for (const char *p = tail; p && *p && at + 1 < FUXI_BT_SETUP_NAME; p++) {
+++        out[at++] = *p;
+++    }
+++    out[FUXI_BT_SETUP_NAME - 1] = 0;
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_link_time(struct fuxi_bt_link *link)
+++{
+++    const uint64_t now = link->ops->now_us(link->ops->context);
+++    if (now < link->start || now - link->start < link->result->elapsed_us) {
+++        return FUXI_BT_IO;
+++    }
+++    link->result->elapsed_us = now - link->start;
+++    return link->result->elapsed_us >= FUXI_BT_SETUP_TIMEOUT_US ? FUXI_BT_TIMEOUT : FUXI_BT_OK;
+++}
+++
+++static void fuxi_bt_link_note(uint8_t *destination, unsigned *destination_size,
+++    const uint8_t *event, unsigned size)
+++{
+++    const unsigned count = size < 24u ? size : 24u;
+++    memcpy(destination, event, count);
+++    *destination_size = count;
+++}
+++
+++/* 開始前把 UART 裡的殘留位元組讀掉（不解析，避免從半個封包開始）。 */
+++static enum fuxi_bt_status fuxi_bt_link_drain(struct fuxi_bt_link *link)
+++{
+++    unsigned drained = 0;
+++    for (;;) {
+++        size_t count = 0;
+++        enum fuxi_bt_status status = fuxi_bt_link_time(link);
+++        if (status != FUXI_BT_OK) {
+++            return status;
+++        }
+++        status = link->ops->read(link->ops->context, link->rx, sizeof(link->rx), &count);
+++        if (count > sizeof(link->rx) || (status != FUXI_BT_OK && count)) {
+++            return FUXI_BT_IO;
+++        }
+++        if (status == FUXI_BT_AGAIN || (status == FUXI_BT_OK && !count)) {
+++            return FUXI_BT_OK;
+++        }
+++        if (status != FUXI_BT_OK) {
+++            return status;
+++        }
+++        drained += (unsigned)count;
+++        if (drained > FUXI_BT_MAX_DRAIN) {
+++            return FUXI_BT_BUDGET;
+++        }
+++    }
+++}
+++
+++/* 取下一個完整 HCI 事件放進 link->event（[0]=0x04）。暫時沒有資料回 AGAIN，不等待。 */
+++static enum fuxi_bt_status fuxi_bt_link_event(struct fuxi_bt_link *link)
+++{
+++    struct fuxi_bt_setup_result *result = link->result;
+++    for (;;) {
+++        if (link->rx_offset == link->rx_size) {
+++            size_t count = 0;
+++            enum fuxi_bt_status status = link->ops->read(link->ops->context, link->rx,
+++                sizeof(link->rx), &count);
+++            if (count > sizeof(link->rx) || (status != FUXI_BT_OK && count)) {
+++                return FUXI_BT_IO;
+++            }
+++            if (status == FUXI_BT_AGAIN || (status == FUXI_BT_OK && !count)) {
+++                return FUXI_BT_AGAIN;
+++            }
+++            if (status != FUXI_BT_OK) {
+++                return status;
+++            }
+++            result->rx_bytes += (unsigned)count;
+++            link->rx_offset = 0;
+++            link->rx_size = (unsigned)count;
+++        }
+++        while (link->rx_offset < link->rx_size) {
+++            const uint8_t byte = link->rx[link->rx_offset++];
+++            if (!link->header_size) {
+++                switch (byte) {
+++                    case 2:
+++                    case 5:
+++                        link->header_need = 5;
+++                        break;
+++                    case 3:
+++                        link->header_need = 4;
+++                        break;
+++                    case 4:
+++                        link->header_need = 3;
+++                        break;
+++                    case 0xfc:
+++                    case 0xfd:
+++                    case 0xfe:
+++                        return FUXI_BT_IBS;
+++                    default:
+++                        return FUXI_BT_PROTOCOL;
+++                }
+++            }
+++            if (link->header_size < link->header_need) {
+++                link->header[link->header_size++] = byte;
+++                if (link->header_size != link->header_need) {
+++                    continue;
+++                }
+++                if (link->header[0] == 4) {
+++                    link->body_need = link->header[2];
+++                    memcpy(link->event, link->header, link->header_need);
+++                } else if (link->header[0] == 3) {
+++                    link->body_need = link->header[3];
+++                } else {
+++                    link->body_need = fuxi_bt_setup_le16(link->header + 3);
+++                    if (link->header[0] == 5) {
+++                        link->body_need &= 0x3fffu;
+++                    }
+++                }
+++                if (link->body_need > FUXI_BT_MAX_RX) {
+++                    return FUXI_BT_BUDGET;
+++                }
+++            } else {
+++                if (link->header[0] == 4) {
+++                    link->event[link->header_need + link->body_size] = byte;
+++                }
+++                link->body_size++;
+++            }
+++            if (link->body_size == link->body_need) {
+++                const bool event = link->header[0] == 4;
+++                const unsigned size = link->header_need + link->body_need;
+++                link->header_size = link->header_need = 0;
+++                link->body_size = link->body_need = 0;
+++                if (++result->frames > FUXI_BT_SETUP_MAX_FRAMES) {
+++                    return FUXI_BT_BUDGET;
+++                }
+++                if (event) {
+++                    link->event_size = size;
+++                    fuxi_bt_link_note(result->last_event, &result->last_event_size, link->event, size);
+++                    return FUXI_BT_OK;
+++                }
+++                result->ignored_frames++;
+++            }
+++        }
+++    }
+++}
+++
+++/* 不是正在等的事件：vendor 事件計數，沒等的 TLV 段回應若帶錯誤就中止，硬體錯誤事件中止。 */
+++static enum fuxi_bt_status fuxi_bt_link_other(struct fuxi_bt_link *link)
+++{
+++    struct fuxi_bt_setup_result *result = link->result;
+++    const uint8_t *event = link->event;
+++    if (event[1] == 0xff) {
+++        result->vendor_events++;
+++        fuxi_bt_link_note(result->last_vendor, &result->last_vendor_size, event, link->event_size);
+++        return FUXI_BT_OK;
+++    }
+++    if (event[1] == 0x0e && event[2] >= 5 && fuxi_bt_setup_le16(event + 4) == 0xfc00 &&
+++        event[7] == 0x1e) {
+++        if (event[6]) {
+++            result->controller_status = event[6];
+++            return FUXI_BT_CONTROLLER;
+++        }
+++        result->stale_acks++;
+++        return FUXI_BT_OK;
+++    }
+++    if (event[1] == 0x10) {
+++        result->controller_status = event[2] ? event[3] : 0;
+++        return FUXI_BT_CONTROLLER;
+++    }
+++    result->ignored_frames++;
+++    return FUXI_BT_OK;
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_link_poll(struct fuxi_bt_link *link)
+++{
+++    for (;;) {
+++        enum fuxi_bt_status status = fuxi_bt_link_event(link);
+++        if (status == FUXI_BT_AGAIN) {
+++            return FUXI_BT_OK;
+++        }
+++        if (status != FUXI_BT_OK) {
+++            return status;
+++        }
+++        status = fuxi_bt_link_other(link);
+++        if (status != FUXI_BT_OK) {
+++            return status;
+++        }
+++    }
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_link_write(struct fuxi_bt_link *link,
+++    const uint8_t *bytes, size_t size)
+++{
+++    size_t sent = 0;
+++    enum fuxi_bt_status status = fuxi_bt_link_time(link);
+++    uint64_t begin;
+++    if (status != FUXI_BT_OK) {
+++        return status;
+++    }
+++    begin = link->result->elapsed_us;
+++    while (sent < size) {
+++        size_t count = 0;
+++        status = link->ops->write(link->ops->context, bytes + sent, size - sent, &count);
+++        if (count > size - sent || (status != FUXI_BT_OK && count)) {
+++            return FUXI_BT_IO;
+++        }
+++        if (status != FUXI_BT_OK && status != FUXI_BT_AGAIN) {
+++            return status;
+++        }
+++        sent += count;
+++        link->result->tx_bytes += (unsigned)count;
+++        if (sent < size && !count) {
+++            /* TX FIFO 滿：先收 RX，免得控制器因我方 RFR 停住而互等 */
+++            status = fuxi_bt_link_poll(link);
+++            if (status != FUXI_BT_OK) {
+++                return status;
+++            }
+++            link->ops->wait_us(link->ops->context, 100);
+++        }
+++        status = fuxi_bt_link_time(link);
+++        if (status != FUXI_BT_OK) {
+++            return status;
+++        }
+++        if (sent < size && link->result->elapsed_us - begin >= FUXI_BT_COMMAND_TIMEOUT_US) {
+++            return FUXI_BT_TIMEOUT;
+++        }
+++    }
+++    return FUXI_BT_OK;
+++}
+++
+++/*
+++ * 等 opcode 的 Command Complete。vendor 命令（0xfc00）回傳參數是 [cresp][rtype][data…]：rtype 不符當成
+++ * 其他事件處理，cresp≠0 失敗；一般命令是 [status][…]，status≠0 失敗。成功時 *params 指向回傳參數。
+++ */
+++static enum fuxi_bt_status fuxi_bt_link_wait(struct fuxi_bt_link *link, uint16_t opcode,
+++    uint8_t rtype, const uint8_t **params, unsigned *size)
+++{
+++    struct fuxi_bt_setup_result *result = link->result;
+++    enum fuxi_bt_status status = fuxi_bt_link_time(link);
+++    uint64_t begin;
+++    if (status != FUXI_BT_OK) {
+++        return status;
+++    }
+++    begin = result->elapsed_us;
+++    for (;;) {
+++        status = fuxi_bt_link_event(link);
+++        if (status == FUXI_BT_OK) {
+++            const uint8_t *event = link->event;
+++            if (event[1] == 0x0e && event[2] >= 3 && fuxi_bt_setup_le16(event + 4) == opcode) {
+++                const unsigned count = event[2] - 3u;
+++                if (!count || (opcode == 0xfc00 && count < 2)) {
+++                    return FUXI_BT_PROTOCOL;
+++                }
+++                if (opcode != 0xfc00 || event[7] == rtype) {
+++                    if (event[6]) {
+++                        result->controller_status = event[6];
+++                        return FUXI_BT_CONTROLLER;
+++                    }
+++                    *params = event + 6;
+++                    *size = count;
+++                    return FUXI_BT_OK;
+++                }
+++            }
+++            if (event[1] == 0x0f && event[2] == 4 && fuxi_bt_setup_le16(event + 5) == opcode &&
+++                event[3]) {
+++                result->controller_status = event[3];
+++                return FUXI_BT_CONTROLLER;
+++            }
+++            status = fuxi_bt_link_other(link);
+++            if (status != FUXI_BT_OK) {
+++                return status;
+++            }
+++            continue;
+++        }
+++        if (status != FUXI_BT_AGAIN) {
+++            return status;
+++        }
+++        status = fuxi_bt_link_time(link);
+++        if (status != FUXI_BT_OK) {
+++            return status;
+++        }
+++        if (result->elapsed_us - begin >= FUXI_BT_COMMAND_TIMEOUT_US) {
+++            return FUXI_BT_TIMEOUT;
+++        }
+++        link->ops->wait_us(link->ops->context, 200);
+++    }
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_link_command(struct fuxi_bt_link *link, uint16_t opcode,
+++    const uint8_t *payload, uint8_t payload_size, uint8_t rtype,
+++    const uint8_t **params, unsigned *size)
+++{
+++    uint8_t packet[4 + 255];
+++    enum fuxi_bt_status status;
+++    packet[0] = 1;
+++    packet[1] = (uint8_t)(opcode & 0xff);
+++    packet[2] = (uint8_t)(opcode >> 8);
+++    packet[3] = payload_size;
+++    if (payload_size) {
+++        memcpy(packet + 4, payload, payload_size);
+++    }
+++    status = fuxi_bt_link_write(link, packet, 4u + payload_size);
+++    if (status != FUXI_BT_OK) {
+++        return status;
+++    }
+++    return fuxi_bt_link_wait(link, opcode, rtype, params, size);
+++}
+++
+++/* rampatch 標頭：[type=1|len<<8] 後接 total_size、data_length、format、signature、download_mode、
+++ * reserved、product_id、rom_build、patch_version、reserved、entry（共 24 位元組）。ELF 格式不支援。 */
+++static enum fuxi_bt_status fuxi_bt_tlv_patch(const struct fuxi_bt_blob *blob,
+++    struct fuxi_bt_tlv_info *info)
+++{
+++    const uint8_t *data = blob->data;
+++    uint32_t type_len;
+++    info->file_bytes = (uint32_t)blob->size;
+++    if (blob->size < 28 || blob->size > FUXI_BT_PATCH_MAX) {
+++        return FUXI_BT_PROTOCOL;
+++    }
+++    if (!memcmp(data, "\177ELF", 4)) {
+++        return FUXI_BT_PROTOCOL;
+++    }
+++    type_len = fuxi_bt_setup_le32(data);
+++    info->type = (uint8_t)(type_len & 0xff);
+++    info->tlv_bytes = type_len >> 8;
+++    info->total_size = fuxi_bt_setup_le32(data + 4);
+++    info->download_mode = data[4 + 10];
+++    info->product = fuxi_bt_setup_le16(data + 4 + 12);
+++    info->rom = fuxi_bt_setup_le16(data + 4 + 14);
+++    info->patch = fuxi_bt_setup_le16(data + 4 + 16);
+++    if (info->type != 1 || info->tlv_bytes < 24 || info->tlv_bytes > blob->size - 4 ||
+++        info->download_mode > 3) {
+++        return FUXI_BT_PROTOCOL;
+++    }
+++    return FUXI_BT_OK;
+++}
+++
+++/* NVM：[type=2|len<<8] 後接 tag（id u16、len u16、8 位元組保留、資料）。就地改 HCI 與 deep sleep tag。 */
+++static enum fuxi_bt_status fuxi_bt_tlv_nvm(struct fuxi_bt_blob *blob, struct fuxi_bt_tlv_info *info)
+++{
+++    uint8_t *data = blob->data;
+++    uint32_t type_len;
+++    size_t length, index = 0;
+++    info->file_bytes = (uint32_t)blob->size;
+++    if (blob->size < 16 || blob->size > FUXI_BT_NVM_MAX) {
+++        return FUXI_BT_PROTOCOL;
+++    }
+++    type_len = fuxi_bt_setup_le32(data);
+++    info->type = (uint8_t)(type_len & 0xff);
+++    info->tlv_bytes = type_len >> 8;
+++    length = info->tlv_bytes;
+++    if (info->type != 2 || length < 12 || length > blob->size - 4) {
+++        return FUXI_BT_PROTOCOL;
+++    }
+++    data += 4;
+++    /* Linux：while (idx < length - sizeof(struct tlv_type_nvm))；這裡另外檢查 tag 資料不超出範圍 */
+++    while (index + 12 < length) {
+++        const uint16_t tag = fuxi_bt_setup_le16(data + index);
+++        const uint16_t tag_length = fuxi_bt_setup_le16(data + index + 2);
+++        uint8_t *value = data + index + 12;
+++        if (tag_length > length - index - 12) {
+++            return FUXI_BT_PROTOCOL;
+++        }
+++        if (tag == 17 && tag_length >= 3 && !info->hci_tag) {
+++            info->hci_tag = true;
+++            memcpy(info->hci_before, value, 3);
+++            value[0] &= 0x7f;
+++            value[1] = 0;
+++            memcpy(info->hci_after, value, 3);
+++        } else if (tag == 27 && tag_length >= 1 && !info->sleep_tag) {
+++            info->sleep_tag = true;
+++            info->sleep_before = value[0];
+++            value[0] &= 0xfe;
+++            info->sleep_after = value[0];
+++        }
+++        if (++info->tags > 4096) {
+++            return FUXI_BT_PROTOCOL;
+++        }
+++        index += 12u + tag_length;
+++    }
+++    /* 沒有 HCI tag 就無法確定控制器下載後的 baud／IBS，寧可不送。 */
+++    return info->hci_tag ? FUXI_BT_OK : FUXI_BT_PROTOCOL;
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_send_tlv(struct fuxi_bt_link *link,
+++    const struct fuxi_bt_blob *blob, uint8_t mode, struct fuxi_bt_tlv_info *info)
+++{
+++    uint8_t payload[2 + FUXI_BT_TLV_SEGMENT];
+++    for (size_t offset = 0; offset < blob->size;) {
+++        const size_t remaining = blob->size - offset;
+++        const unsigned segment = remaining < FUXI_BT_TLV_SEGMENT ?
+++            (unsigned)remaining : FUXI_BT_TLV_SEGMENT;
+++        const bool last = segment == remaining;
+++        uint8_t packet[4 + sizeof(payload)];
+++        enum fuxi_bt_status status;
+++        payload[0] = 0x1e;
+++        payload[1] = (uint8_t)segment;
+++        memcpy(payload + 2, blob->data + offset, segment);
+++        packet[0] = 1;
+++        packet[1] = 0x00;
+++        packet[2] = 0xfc;
+++        packet[3] = (uint8_t)(segment + 2);
+++        memcpy(packet + 4, payload, segment + 2);
+++        status = fuxi_bt_link_write(link, packet, 6u + segment);
+++        if (status != FUXI_BT_OK) {
+++            return status;
+++        }
+++        info->segments++;
+++        if (last || mode == 0) {
+++            const uint8_t *params = NULL;
+++            unsigned size = 0;
+++            status = fuxi_bt_link_wait(link, 0xfc00, 0x1e, &params, &size);
+++            if (status == FUXI_BT_TIMEOUT && last && mode != 0 &&
+++                fuxi_bt_link_time(link) == FUXI_BT_OK) {
+++                /* 省略回應的模式下最後一段也可能不回（Linux 自己補 Command Complete）；
+++                 * 之後的 board ID／HCI reset 會證明控制器是否正常。 */
+++                info->final_ack = false;
+++            } else if (status != FUXI_BT_OK) {
+++                return status;
+++            } else {
+++                info->acks++;
+++                info->final_ack = last;
+++            }
+++        } else {
+++            status = fuxi_bt_link_poll(link);
+++            if (status != FUXI_BT_OK) {
+++                return status;
+++            }
+++        }
+++        offset += segment;
+++    }
+++    return FUXI_BT_OK;
+++}
+++
+++static bool fuxi_bt_soft_failure(enum fuxi_bt_status status)
+++{
+++    return status == FUXI_BT_CONTROLLER || status == FUXI_BT_TIMEOUT || status == FUXI_BT_PROTOCOL;
+++}
+++
+++enum fuxi_bt_status fuxi_bt_setup_run(const struct fuxi_bt_uart_ops *ops,
+++    const struct fuxi_bt_files *files, struct fuxi_bt_setup_result *result)
+++{
+++    struct fuxi_bt_link link;
+++    struct fuxi_bt_blob patch = {NULL, 0}, nvm = {NULL, 0};
+++    const uint8_t *params = NULL;
+++    unsigned size = 0;
+++    bool acquired = false;
+++    enum fuxi_bt_status status;
+++    uint64_t mark;
+++    if (!result) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    memset(result, 0, sizeof(*result));
+++    result->board_id_status = FUXI_BT_OFF;
+++    result->build_info_status = FUXI_BT_OFF;
+++    if (!fuxi_bt_uart_ops_valid(ops)) {
+++        result->status = FUXI_BT_NO_UART;
+++        return result->status;
+++    }
+++    if (!files || !files->load || !files->release) {
+++        result->status = FUXI_BT_ARGUMENT;
+++        return result->status;
+++    }
+++    memset(&link, 0, sizeof(link));
+++    link.ops = ops;
+++    link.result = result;
+++    link.start = ops->now_us(ops->context);
+++    status = ops->acquire(ops->context, FUXI_BT_BOOT_BAUD);
+++    if (status != FUXI_BT_OK) {
+++        goto finish;
+++    }
+++    acquired = true;
+++    status = fuxi_bt_link_drain(&link);
+++    if (status != FUXI_BT_OK) {
+++        goto finish;
+++    }
+++
+++    result->stage = FUXI_BT_SETUP_VERSION;
+++    {
+++        static const uint8_t request[] = {0x19};
+++        status = fuxi_bt_link_command(&link, 0xfc00, request, 1, 0x19, &params, &size);
+++    }
+++    if (status != FUXI_BT_OK) {
+++        goto finish;
+++    }
+++    /* [cresp][0x19][長度 12][product 4][patch 2][rom 2][soc 4] */
+++    if (size < 15) {
+++        status = FUXI_BT_PROTOCOL;
+++        goto finish;
+++    }
+++    result->version.product = fuxi_bt_setup_le32(params + 3);
+++    result->version.patch = fuxi_bt_setup_le16(params + 7);
+++    result->version.rom = fuxi_bt_setup_le16(params + 9);
+++    result->version.soc = fuxi_bt_setup_le32(params + 11);
+++    if (!result->version.soc || !result->version.rom) {
+++        status = FUXI_BT_VERSION;
+++        goto finish;
+++    }
+++    result->rom_ver = (uint8_t)(((result->version.soc & 0xf00u) >> 4) | (result->version.soc & 0xfu));
+++
+++    result->stage = FUXI_BT_SETUP_PATCH_LOAD;
+++    fuxi_bt_setup_name(result->patch_name, "hmtbtfw", result->rom_ver, NULL, 0, 0, ".tlv");
+++    status = files->load(files->context, result->patch_name, FUXI_BT_PATCH_MAX, &patch);
+++    if (status != FUXI_BT_OK) {
+++        patch.data = NULL;
+++        goto finish;
+++    }
+++    if (!patch.data || !patch.size || patch.size > FUXI_BT_PATCH_MAX) {
+++        status = FUXI_BT_IO;
+++        goto finish;
+++    }
+++    result->stage = FUXI_BT_SETUP_PATCH_PARSE;
+++    status = fuxi_bt_tlv_patch(&patch, &result->patch);
+++    if (status != FUXI_BT_OK) {
+++        goto finish;
+++    }
+++    result->stage = FUXI_BT_SETUP_PATCH_SEND;
+++    mark = result->elapsed_us;
+++    status = fuxi_bt_send_tlv(&link, &patch, result->patch.download_mode, &result->patch);
+++    result->patch_us = result->elapsed_us - mark;
+++    files->release(files->context, &patch);
+++    patch.data = NULL;
+++    if (status != FUXI_BT_OK) {
+++        goto finish;
+++    }
+++    /* Linux：給控制器 10 ms 準備接 NVM */
+++    ops->wait_us(ops->context, 10000);
+++
+++    result->stage = FUXI_BT_SETUP_BOARD_ID;
+++    {
+++        static const uint8_t request[] = {0x23};
+++        status = fuxi_bt_link_command(&link, 0xfc00, request, 1, 0x23, &params, &size);
+++    }
+++    result->board_id_status = status;
+++    if (status == FUXI_BT_OK && size >= 5) {
+++        result->board_id = (uint16_t)((uint16_t)params[3] << 8 | params[4]);
+++        result->board_id_valid = true;
+++    } else if (status != FUXI_BT_OK && !fuxi_bt_soft_failure(status)) {
+++        goto finish;
+++    }
+++
+++    result->stage = FUXI_BT_SETUP_NVM_LOAD;
+++    status = FUXI_BT_OFF;
+++    for (unsigned candidate = 0; candidate < 2 && status == FUXI_BT_OFF; candidate++) {
+++        if (candidate == 0) {
+++            if (!result->board_id_valid || result->board_id == 0 || result->board_id == 0xffffu) {
+++                continue;
+++            }
+++            /*
+++             * Linux qca_get_nvm_name_by_board 的 "%s%02x.b%02x"：bid 至少兩位、超過照實際位數
+++             * （0x0a→b0a、0x10a→b10a）。2026-11-18 對照手機 /vendor/bt_firmware/image 的
+++             * hmtnv20.b0a／b10a／b14 等檔名。
+++             */
+++            fuxi_bt_setup_name(result->nvm_name, "hmtnv", result->rom_ver, ".b", result->board_id, 2, NULL);
+++        } else {
+++            /* 板級檔不存在、board ID 為 0／0xffff 或讀不到：Linux qca_get_alt_nvm_file 改讀 .bin */
+++            fuxi_bt_setup_name(result->nvm_name, "hmtnv", result->rom_ver, NULL, 0, 0, ".bin");
+++        }
+++        status = files->load(files->context, result->nvm_name, FUXI_BT_NVM_MAX, &nvm);
+++        if (status != FUXI_BT_OK) {
+++            nvm.data = NULL;
+++        }
+++    }
+++    if (status != FUXI_BT_OK) {
+++        goto finish;
+++    }
+++    if (!nvm.data || !nvm.size || nvm.size > FUXI_BT_NVM_MAX) {
+++        status = FUXI_BT_IO;
+++        goto finish;
+++    }
+++    result->stage = FUXI_BT_SETUP_NVM_PARSE;
+++    status = fuxi_bt_tlv_nvm(&nvm, &result->nvm);
+++    if (status != FUXI_BT_OK) {
+++        goto finish;
+++    }
+++    result->stage = FUXI_BT_SETUP_NVM_SEND;
+++    status = fuxi_bt_send_tlv(&link, &nvm, 0, &result->nvm);
+++    files->release(files->context, &nvm);
+++    nvm.data = NULL;
+++    if (status != FUXI_BT_OK) {
+++        goto finish;
+++    }
+++
+++    result->stage = FUXI_BT_SETUP_BUILD_INFO;
+++    {
+++        static const uint8_t request[] = {0x20};
+++        status = fuxi_bt_link_command(&link, 0xfc00, request, 1, 0x20, &params, &size);
+++    }
+++    result->build_info_status = status;
+++    if (status == FUXI_BT_OK && size >= 3) {
+++        unsigned length = params[2];
+++        unsigned out = 0;
+++        if (length > size - 3) {
+++            length = size - 3;
+++        }
+++        for (unsigned index = 0; index < length && out + 1 < sizeof(result->build_info); index++) {
+++            const uint8_t c = params[3 + index];
+++            if (!c) {
+++                break;
+++            }
+++            result->build_info[out++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+++        }
+++    } else if (status != FUXI_BT_OK && !fuxi_bt_soft_failure(status)) {
+++        goto finish;
+++    }
+++
+++    result->stage = FUXI_BT_SETUP_RESET;
+++    status = fuxi_bt_link_command(&link, 0x0c03, NULL, 0, 0, &params, &size);
+++    if (status != FUXI_BT_OK) {
+++        goto finish;
+++    }
+++
+++    result->stage = FUXI_BT_SETUP_LOCAL_VERSION;
+++    status = fuxi_bt_link_command(&link, 0x1001, NULL, 0, 0, &params, &size);
+++    if (status != FUXI_BT_OK) {
+++        goto finish;
+++    }
+++    if (size < 9) {
+++        status = FUXI_BT_PROTOCOL;
+++        goto finish;
+++    }
+++    result->hci_version = params[1];
+++    result->hci_revision = fuxi_bt_setup_le16(params + 2);
+++    result->lmp_version = params[4];
+++    result->manufacturer = fuxi_bt_setup_le16(params + 5);
+++    result->lmp_subversion = fuxi_bt_setup_le16(params + 7);
+++    result->local_version_valid = true;
+++
+++    result->stage = FUXI_BT_SETUP_BDADDR;
+++    status = fuxi_bt_link_command(&link, 0x1009, NULL, 0, 0, &params, &size);
+++    if (status != FUXI_BT_OK) {
+++        goto finish;
+++    }
+++    if (size < 7) {
+++        status = FUXI_BT_PROTOCOL;
+++        goto finish;
+++    }
+++    memcpy(result->bdaddr, params + 1, sizeof(result->bdaddr));
+++    result->bdaddr_valid = true;
+++    result->stage = FUXI_BT_SETUP_DONE;
+++    status = FUXI_BT_OK;
+++
+++finish:
+++    if (patch.data) {
+++        files->release(files->context, &patch);
+++    }
+++    if (nvm.data) {
+++        files->release(files->context, &nvm);
+++    }
+++    if (status == FUXI_BT_AGAIN) {
+++        status = FUXI_BT_IO;
+++    }
+++    result->status = status;
+++    if (acquired) {
+++        result->cleanup = ops->release(ops->context);
+++        if (result->status == FUXI_BT_OK && result->cleanup != FUXI_BT_OK) {
+++            result->status = FUXI_BT_CLEANUP;
+++        }
+++    }
+++    return result->status;
+++}
++--- /dev/null
 ++++ b/bsd/dev/fuxi_battery_freshness.c
 +@@ -0,0 +1,168 @@
 ++#include "fuxi_battery_freshness.h"
@@ -52906,7 +55684,7 @@ index 0000000..a420483
 ++static inline int fuxi_haptic_writable(unsigned address)
 ++{
 ++    return address == 0xf046 || address == 0xf048 || address == 0xf04b ||
-++        address == 0xf04c || address == 0xf04e || address == 0xf063 ||
+++        address == 0xf04c || address == 0xf04e || address == 0xf063 || address == 0xf066 ||
 ++        address == 0xf126 || address == 0xf130 || address == 0xf131 ||
 ++        (address >= 0xf134 && address <= 0xf14b);
 ++}
@@ -54548,6 +57326,124 @@ index 0000000..a420483
 ++
 ++#endif
 +--- /dev/null
+++++ b/bsd/dev/fuxi_bt_setup.h
++@@ -0,0 +1,115 @@
+++#ifndef FUXI_BT_SETUP_H
+++#define FUXI_BT_SETUP_H
+++
+++/*
+++ * WCN7850 藍牙控制器初始化（fuxi,bt=4）：版本查詢 → rampatch → board ID → NVM → build info → HCI reset
+++ * → 讀本機版本與 BD 位址。流程對照 Linux drivers/bluetooth/btqca.c qca_uart_setup（只作流程參考，
+++ * 程式自寫）。全程 115200 baud，不切 3.2 Mbaud；NVM 的 HCI tag 把 IBS 位元清掉、baud 欄位設 115200，
+++ * deep sleep 位元清掉，讓輪詢式 UART 不必處理 0xfc/0xfd/0xfe。可攜程式，主機測試用假 UART 與假檔案。
+++ */
+++
+++#include "fuxi_bt.h"
+++
+++#define FUXI_BT_TLV_SEGMENT 243u
+++/* 115200 baud 約 11.5 KB/s：1 MiB 上限的 rampatch 要約 91 秒，加上每段等 ack，總上限 240 秒 */
+++#define FUXI_BT_SETUP_TIMEOUT_US 240000000u
+++#define FUXI_BT_COMMAND_TIMEOUT_US 2000000u
+++#define FUXI_BT_PATCH_MAX (1024u * 1024u)
+++#define FUXI_BT_NVM_MAX 65536u
+++#define FUXI_BT_SETUP_MAX_FRAMES 16384u
+++#define FUXI_BT_SETUP_NAME 24u
+++
+++enum fuxi_bt_setup_stage {
+++    FUXI_BT_SETUP_START = 0,
+++    FUXI_BT_SETUP_VERSION,
+++    FUXI_BT_SETUP_PATCH_LOAD,
+++    FUXI_BT_SETUP_PATCH_PARSE,
+++    FUXI_BT_SETUP_PATCH_SEND,
+++    FUXI_BT_SETUP_BOARD_ID,
+++    FUXI_BT_SETUP_NVM_LOAD,
+++    FUXI_BT_SETUP_NVM_PARSE,
+++    FUXI_BT_SETUP_NVM_SEND,
+++    FUXI_BT_SETUP_BUILD_INFO,
+++    FUXI_BT_SETUP_RESET,
+++    FUXI_BT_SETUP_LOCAL_VERSION,
+++    FUXI_BT_SETUP_BDADDR,
+++    FUXI_BT_SETUP_DONE
+++};
+++
+++/* 讀檔回呼：name 是基本檔名；成功時 data 指向可寫緩衝區（NVM 會就地修改），直到 release。 */
+++struct fuxi_bt_blob {
+++    uint8_t *data;
+++    size_t size;
+++};
+++
+++struct fuxi_bt_files {
+++    void *context;
+++    enum fuxi_bt_status (*load)(void *, const char *, size_t, struct fuxi_bt_blob *);
+++    void (*release)(void *, struct fuxi_bt_blob *);
+++};
+++
+++struct fuxi_bt_tlv_info {
+++    uint32_t file_bytes;
+++    uint32_t tlv_bytes;
+++    uint32_t total_size;
+++    uint8_t type;
+++    uint8_t download_mode;
+++    uint16_t product;
+++    uint16_t rom;
+++    uint16_t patch;
+++    uint16_t tags;
+++    bool hci_tag;
+++    uint8_t hci_before[3];
+++    uint8_t hci_after[3];
+++    bool sleep_tag;
+++    uint8_t sleep_before;
+++    uint8_t sleep_after;
+++    uint32_t segments;
+++    uint32_t acks;
+++    bool final_ack;
+++};
+++
+++struct fuxi_bt_setup_result {
+++    enum fuxi_bt_status status;
+++    enum fuxi_bt_status cleanup;
+++    enum fuxi_bt_setup_stage stage;
+++    struct fuxi_bt_version version;
+++    uint8_t rom_ver;
+++    char patch_name[FUXI_BT_SETUP_NAME];
+++    char nvm_name[FUXI_BT_SETUP_NAME];
+++    struct fuxi_bt_tlv_info patch;
+++    struct fuxi_bt_tlv_info nvm;
+++    uint16_t board_id;
+++    bool board_id_valid;
+++    enum fuxi_bt_status board_id_status;
+++    char build_info[96];
+++    enum fuxi_bt_status build_info_status;
+++    uint8_t controller_status;
+++    uint8_t hci_version;
+++    uint16_t hci_revision;
+++    uint8_t lmp_version;
+++    uint16_t manufacturer;
+++    uint16_t lmp_subversion;
+++    bool local_version_valid;
+++    uint8_t bdaddr[6];
+++    bool bdaddr_valid;
+++    uint8_t last_event[24];
+++    unsigned last_event_size;
+++    uint8_t last_vendor[24];
+++    unsigned last_vendor_size;
+++    unsigned tx_bytes;
+++    unsigned rx_bytes;
+++    unsigned frames;
+++    unsigned ignored_frames;
+++    unsigned vendor_events;
+++    unsigned stale_acks;
+++    uint64_t elapsed_us;
+++    uint64_t patch_us;
+++};
+++
+++const char *fuxi_bt_setup_stage_name(enum fuxi_bt_setup_stage stage);
+++bool fuxi_bt_setup_name_valid(const char *name);
+++enum fuxi_bt_status fuxi_bt_setup_run(const struct fuxi_bt_uart_ops *ops,
+++    const struct fuxi_bt_files *files, struct fuxi_bt_setup_result *result);
+++
+++#endif
++--- /dev/null
 ++++ b/bsd/dev/fuxi_battery_freshness.h
 +@@ -0,0 +1,46 @@
 ++#ifndef FUXI_BATTERY_FRESHNESS_H
@@ -55020,7 +57916,7 @@ index 0000000..a420483
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_haptic_runtime.h
-+@@ -0,0 +1,176 @@
++@@ -0,0 +1,200 @@
 ++#ifndef FUXI_HAPTIC_RUNTIME_H
 ++#define FUXI_HAPTIC_RUNTIME_H
 ++/*
@@ -55046,7 +57942,16 @@ index 0000000..a420483
 ++    FUXI_VIBRATE_MODULE_ON = 0x80,
 ++    FUXI_VIBRATE_VMAX_LIMIT = 0x1c, /* 50 mV/碼，1400 mV：Android 留下的值，不接受更高 */
 ++    FUXI_VIBRATE_LEVEL_SHIFT = 16,  /* sysctl 值：bit 0..15 毫秒，bit 16..23 振幅，其餘須為 0 */
-++    FUXI_VIBRATE_AMPLITUDE = 0xf126
+++    FUXI_VIBRATE_AMPLITUDE = 0xf126,
+++    /*
+++     * FAULT_STATUS(0xf00c)：bit 2 SC、bit 1 AUTO_RES_ERROR、bit 0 HPWR_RDY_FAULT（Linux qcom-hv-haptics
+++     * HAP_CFG_FAULT_STATUS_REG）。低振幅時反電動勢太弱，自動共振鎖不住會設 bit 1；Linux 播放中從不檢查它，
+++     * 每次開播前 haptics_clear_fault 寫 FAULT_CLR(0xf066)。2026-11-18 實機：振幅 0x08..0x30 播放約 46 ms 就設 0x2，
+++     * 舊版把它當致命錯誤，整個執行期鎖到重開機。現在只有 SC／HPWR_RDY／未知位元才停機鎖死；
+++     * AUTO_RES_ERROR 只記錄，下次開播前清掉（只清這一位，SC 仍要人看）。
+++     */
+++    FUXI_VIBRATE_FAULT_CLEAR = 0xf066,
+++    FUXI_VIBRATE_FAULT_AUTORES = 0x02
 ++};
 ++
 ++typedef struct {
@@ -55154,17 +58059,32 @@ index 0000000..a420483
 ++    return fuxi_haptic_idle(io);
 ++}
 ++
+++/* 播放中檢查：AUTO_RES_ERROR 只回報在 *fault，不算失敗；其他位元回 FAULT。 */
 ++static inline int fuxi_vibrate_health(const FuxiHapticIo *io, uint8_t *fault, uint8_t *hpwr)
 ++{
 ++    if (io->read(io->context, 0xf00c, fault) || io->read(io->context, 0xf00b, hpwr)) return FUXI_HAPTIC_IO;
+++    return *fault & (uint8_t)~FUXI_VIBRATE_FAULT_AUTORES ? FUXI_HAPTIC_FAULT : FUXI_HAPTIC_OK;
+++}
+++
+++/* 只清 AUTO_RES_ERROR：FAULT_CLR 是寫一清除，不讀回比對，改讀 FAULT_STATUS 確認已歸零。 */
+++static inline int fuxi_vibrate_clear_autores(const FuxiHapticIo *io, uint8_t *fault, unsigned *cleared)
+++{
+++    unsigned owner = 7;
+++    if (*fault != FUXI_VIBRATE_FAULT_AUTORES) return *fault ? FUXI_HAPTIC_FAULT : FUXI_HAPTIC_OK;
+++    if (io->owner(io->context, FUXI_VIBRATE_FAULT_CLEAR >> 8, &owner) || owner != 0) return FUXI_HAPTIC_HARDWARE;
+++    if (io->write(io->context, FUXI_VIBRATE_FAULT_CLEAR, FUXI_VIBRATE_FAULT_AUTORES) ||
+++        io->read(io->context, 0xf00c, fault))
+++        return FUXI_HAPTIC_IO;
+++    (*cleared)++;
 ++    return *fault ? FUXI_HAPTIC_FAULT : FUXI_HAPTIC_OK;
 ++}
 ++
-++static inline int fuxi_vibrate_start(const FuxiHapticIo *io)
+++static inline int fuxi_vibrate_start(const FuxiHapticIo *io, unsigned *cleared)
 ++{
 ++    uint8_t fault = 0;
 ++    if (io->read(io->context, 0xf00c, &fault)) return FUXI_HAPTIC_IO;
-++    if (fault) return FUXI_HAPTIC_FAULT;
+++    int result = fuxi_vibrate_clear_autores(io, &fault, cleared);
+++    if (result) return result;
 ++    return fuxi_haptic_write_checked(io, 0xf04c, FUXI_VIBRATE_PLAY);
 ++}
 ++
