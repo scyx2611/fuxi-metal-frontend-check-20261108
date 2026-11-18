@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - codex/adsp-battery
+      - codex/ath12k-peer-zero
     paths:
       - tools/build-ath12k-objects.sh
       - tools/ath12k-scan-dwell.py
+      - tools/ath12k-peer-zero.py
       - tests/test-ath12k-scan-dwell.py
       - .github/workflows/ath12k-objects.yml
 permissions:
