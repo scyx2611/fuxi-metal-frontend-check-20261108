@@ -5312,7 +5312,7 @@ index efb83f1..745d165 100644
          uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
 diff --git a/tools/ci/ath12k-link.py b/tools/ci/ath12k-link.py
 new file mode 100644
-index 0000000..e500ef0
+index 0000000..d491d09
 --- /dev/null
 +++ b/tools/ci/ath12k-link.py
 @@ -0,0 +1,157 @@
@@ -5332,7 +5332,7 @@ index 0000000..e500ef0
 +    '_nw_wifi_bss_get', '_nw_wifi_stats',
 +    '_nw_wifi_set_platform', '_nw_wifi_control_transport_set',
 +    '_nw_wifi_control_attach', '_nw_wifi_control_receive',
-+    '_nw_wifi_power', '_nw_wifi_set_events', '_nw_wifi_tx',
++    '_nw_wifi_power', '_nw_wifi_set_events', '_nw_wifi_tx', '_nw_wifi_link_state',
 +)
 +IMPORTS = {
 +    '_bzero', '_memcmp', '_memcpy', '_memmove', '_memset', '_snprintf',
@@ -17985,7 +17985,7 @@ index cf82598..56f7e1a 100755
          out = Path(tmp)
          subprocess.run(['python3', str(ROOT/'tools/build-fuxi-turnip.py'), '--mesa', str(args.mesa.resolve()),
 diff --git a/tools/test-fuxi-wifi-ios.py b/tools/test-fuxi-wifi-ios.py
-index 12e012d..c9e609d 100755
+index 12e012d..68891af 100755
 --- a/tools/test-fuxi-wifi-ios.py
 +++ b/tools/test-fuxi-wifi-ios.py
 @@ -53,14 +53,20 @@ typedef void *event_t;
@@ -18021,7 +18021,7 @@ index 12e012d..c9e609d 100755
  static void *current_proc(void) { return NULL; }
  static int proc_suser(void *p) { (void)p; return !superuser; }
  struct kev_msg { unsigned vendor_code,kev_class,kev_subclass,event_code;
-@@ -86,18 +92,74 @@ static int kev_post_msg(struct kev_msg *m) {
+@@ -86,18 +92,79 @@ static int kev_post_msg(struct kev_msg *m) {
   assert(m->kev_class==6 && m->kev_subclass==1 && m->dv[0].data_length==16);
   assert(!strcmp(m->dv[0].data_ptr,"en0"));
   if (m->event_code==4) assert(m->dv[1].data_length==32);
@@ -18075,6 +18075,11 @@ index 12e012d..c9e609d 100755
  static void FuxiNetworkStackStart(void) { registry++; }
  static void fuxi_wifi_net_input(const uint8_t *p,size_t n) { assert(p[12]==0x88 && n>=14); received++; }
 -static void fuxi_wifi_net_link_state(bool up) { link_up=up; }
++static void fuxi_wifi_net_input_packet(void *source,size_t length,int (*read)(void *,size_t,void *,size_t)) {
++ (void)source;(void)length;(void)read;assert(!"synthetic backend must not use the native packet reader");
++}
++static void fuxi_wifi_net_flush_rx(void) { assert(!"synthetic backend must not batch"); }
++static bool fuxi_wifi_net_byte_counts(uint64_t *rx,uint64_t *tx) { (void)rx;(void)tx;return false; }
 +/* link_hold：把 station 執行緒停在後端的電源切換裡（假後端切電源時會先報 link down） */
 +static atomic_int link_hold, link_held;
 +static void fuxi_wifi_net_link_state(bool up) {
@@ -18098,7 +18103,7 @@ index 12e012d..c9e609d 100755
  bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *p) {
   assert(p->wireless && !p->up && p->address[0]==2); attached++; return true;
  }
-@@ -114,11 +176,68 @@ static int request(bool set,int type,void *p,unsigned n,int *val) {
+@@ -114,11 +181,68 @@ static int request(bool set,int type,void *p,unsigned n,int *val) {
   int error=fuxi_wifi_apple80211_ioctl(set?SIOCSA80211:SIOCGA80211,&req);
   if(val) *val=req.req_val; return error;
  }
@@ -18169,7 +18174,7 @@ index 12e012d..c9e609d 100755
   fuxi_wifi_ios_init(); assert(attached==1);
   assert(!fuxi_wifi_ios_attach(&fake_backend));
   assert(fuxi_wifi_sta_ask_scan(NULL)==EINVAL && fuxi_wifi_sta_ask_join(NULL)==EINVAL);
-@@ -127,6 +246,17 @@ int main(void) {
+@@ -127,6 +251,17 @@ int main(void) {
   struct apple80211req invalid={.req_if_name="ue0"};
   assert(fuxi_wifi_apple80211_ioctl(SIOCGA80211,&invalid)==ENXIO);
   assert(request(false,999,NULL,0,NULL)==EOPNOTSUPP);
@@ -18187,7 +18192,7 @@ index 12e012d..c9e609d 100755
   struct apple80211_scan_request scan={.version=1};
   assert(request(true,10,&scan,sizeof(scan)-1,NULL)==EINVAL);
   scan.ssid_length=33; assert(request(true,10,&scan,sizeof(scan),NULL)==EINVAL); scan.ssid_length=0;
-@@ -139,6 +269,7 @@ int main(void) {
+@@ -139,6 +274,7 @@ int main(void) {
   assert(request(false,11,&result,sizeof(result),NULL)==0);
   assert(result.ssid_length==13 && !memcmp(result.ssid,"Fuxi Loopback",13));
   assert(result.rssi==-42 && result.channel.channel==1 && result.elements_length==4);
@@ -18195,7 +18200,7 @@ index 12e012d..c9e609d 100755
   assert(request(false,11,&result,sizeof(result),NULL)==EIO);
   struct apple80211_channels channels;
   assert(!request(false,27,&channels,sizeof(channels),NULL) && channels.count==1);
-@@ -149,11 +280,19 @@ int main(void) {
+@@ -149,11 +285,19 @@ int main(void) {
   join.key_length=65; join.key_cipher=10; assert(request(true,20,&join,sizeof(join),NULL)==EINVAL);
   join.key_length=0; assert(!request(true,20,&join,sizeof(join),NULL)); settle();
   int val; assert(!request(false,21,NULL,0,&val) && val==1); assert(link_up);
@@ -18215,7 +18220,7 @@ index 12e012d..c9e609d 100755
   join.key_length=8;memcpy(join.key,"password",8);join.key_cipher=10;
   assert(!request(true,20,&join,sizeof(join),NULL));settle();
   assert(!request(false,21,NULL,0,&val) && val==2 && !link_up);
-@@ -163,7 +302,89 @@ int main(void) {
+@@ -163,7 +307,101 @@ int main(void) {
   assert(request(true,10,&scan,sizeof(scan),NULL)==ENETDOWN);
   power.state[0]=1;assert(!request(true,19,&power,sizeof(power),NULL));settle();
   assert(fuxi_wifi_sta_powered());
@@ -18281,6 +18286,18 @@ index 12e012d..c9e609d 100755
 + assert(!fuxi_wifi_sta_powered() && !radio_on());
 + power.state[0]=1; assert(!request(true,19,&power,sizeof(power),NULL)); settle();
 + assert(fuxi_wifi_sta_powered() && radio_on());
++ /* A later on request must wait for the queued off to reach the backend. */
++ set_ux(FUXI_WIFI_UX_POWER_ASKED|FUXI_WIFI_UX_POWER_SAME|FUXI_WIFI_UX_POWER_OFF_FIRST,4);
++ hold_station();
++ unsigned power_events=atomic_load(&events[1]);
++ power.state[0]=0; assert(!request(true,19,&power,sizeof(power),NULL));
++ power.state[0]=1; assert(!request(true,19,&power,sizeof(power),NULL));
++ assert(fuxi_wifi_sta_power_off_pending() && !said_power() && radio_on());
++ assert(request(true,10,&scan,sizeof(scan),NULL)==ENETDOWN);
++ release_station();
++ assert(!fuxi_wifi_sta_power_off_pending() && said_power() && radio_on());
++ assert(atomic_load(&events[1])==power_events+2);
++ puts("PASS: queued Wi-Fi off is applied before a later on");
 + /* bit 3：國家碼。沒開時 SET／GET 照舊拒絕 */
 + uint8_t cc8[8]={1,0,0,0,'T','W',' ',0}, got[8], bad[8]={1,0,0,0,'t','w',0,0};
 + set_ux(0,4);
@@ -18305,7 +18322,7 @@ index 12e012d..c9e609d 100755
   return 0;
  }
  '''
-@@ -181,6 +402,8 @@ def compile_run(source, directory, name):
+@@ -181,6 +419,8 @@ def compile_run(source, directory, name):
                      '-Wno-unused-function', '-Wno-unused-parameter', '-fsanitize=address,undefined',
                      '-pthread', '-I', str(SRC), str(path), '-o', str(binary)], check=True)
      subprocess.run([str(binary)], check=True, timeout=30)
@@ -18314,6 +18331,107 @@ index 12e012d..c9e609d 100755
  
  
  def wpa_test(directory):
+@@ -265,16 +505,21 @@ def net_test(directory):
+ #define MBUF_DONTWAIT 0
+ typedef int errno_t;
+ typedef void *ifnet_t;
+-typedef struct packet { uint8_t bytes[1514]; size_t offset,len,total;void *header; } *mbuf_t;
++typedef struct packet {
++ uint8_t bytes[1516]; size_t offset,len,total;void *header;struct packet *nextpkt;
++} *mbuf_t;
+ struct ifnet_stat_increment_param { unsigned packets_in,bytes_in; };
+-static unsigned freed,inputs,out_packets,out_errors;
++struct ifnet_stats_param { uint64_t bytes_in,bytes_out; };
++static unsigned freed,inputs,input_calls,out_packets,out_errors;
++static struct ifnet_stats_param interface_stats;
+ static bool fail_alloc,fail_copy,accept;
+-static size_t expected_length;
++static size_t expected_length,expected_padding;
+ static size_t mbuf_pkthdr_len(mbuf_t m) { return m->total; }
+ static void mbuf_freem(mbuf_t m) { freed++;free(m); }
+ static void ifnet_stat_increment_out(ifnet_t p,unsigned n,unsigned bytes,unsigned errors) {
+- assert(p);(void)bytes;out_packets+=n;out_errors+=errors;
++ assert(p);interface_stats.bytes_out+=bytes;out_packets+=n;out_errors+=errors;
+ }
++static int ifnet_stat(ifnet_t p,struct ifnet_stats_param *s) { assert(p);*s=interface_stats;return 0; }
+ static int mbuf_allocpacket(int flags,size_t n,unsigned *chunks,mbuf_t *out) {
+  (void)flags;(void)chunks;if(fail_alloc)return 1;
+  *out=calloc(1,sizeof(**out));(*out)->len=(*out)->total=n;return 0;
+@@ -283,23 +528,44 @@ static int mbuf_copyback(mbuf_t m,size_t off,size_t n,const void *p,int flags) {
+  (void)flags;if(fail_copy)return 1;assert(off+n<=sizeof(m->bytes));memcpy(m->bytes+off,p,n);return 0;
+ }
+ static void *mbuf_data(mbuf_t m) { return m->bytes+m->offset; }
++static int mbuf_setdata(mbuf_t m,void *data,size_t len) {
++ size_t offset=(uint8_t *)data-m->bytes;
++ if (offset>sizeof(m->bytes) || len>sizeof(m->bytes)-offset) return 1;
++ m->offset=offset;m->len=len;return 0;
++}
++static void mbuf_pkthdr_setlen(mbuf_t m,size_t len) { m->total=len; }
++static void mbuf_setnextpkt(mbuf_t m,mbuf_t next) { m->nextpkt=next; }
++static int mbuf_freem_list(mbuf_t m) {
++ int count=0;
++ while(m) { mbuf_t next=m->nextpkt;mbuf_freem(m);m=next;count++; }
++ return count;
++}
+ static void mbuf_pkthdr_setrcvif(mbuf_t m,ifnet_t p) { (void)m;assert(p); }
+ static void mbuf_pkthdr_setheader(mbuf_t m,void *p) { m->header=p; }
+ static void mbuf_adj(mbuf_t m,int n) { m->offset+=n;m->len-=n;m->total-=n; }
+ static void bpf_tap_in(ifnet_t p,int type,mbuf_t m,void *header,int n) {
+- assert(p && type==1 && n==14 && header==m->bytes && m->header==header);
+- assert(m->offset==14 && m->total==expected_length-14 && m->len==m->total);
++ assert(p && type==1 && n==14 && header==m->bytes+expected_padding && m->header==header);
++ assert(m->offset==expected_padding+14 && m->total==expected_length-14 && m->len==m->total);
+ }
+ static void bpf_tap_out(ifnet_t p,int type,mbuf_t m,void *h,int n) {
+  assert(p && type==1 && !h && !n && m->offset==0);
+ }
+ static int ifnet_input(ifnet_t p,mbuf_t m,struct ifnet_stat_increment_param *stats) {
+- assert(p && stats->packets_in==1 && stats->bytes_in==expected_length);
+- assert(m->bytes[12]==0x88 && m->bytes[13]==0xb5);inputs++;mbuf_freem(m);return 0;
++ assert(p && stats->packets_in && stats->bytes_in==stats->packets_in*expected_length);
++ for (mbuf_t packet=m;packet;packet=packet->nextpkt) {
++  assert(packet->bytes[12+expected_padding]==0x88 && packet->bytes[13+expected_padding]==0xb5);
++ }
++ input_calls++;interface_stats.bytes_in+=stats->bytes_in;
++ assert((unsigned)mbuf_freem_list(m)==stats->packets_in);inputs+=stats->packets_in;return 0;
+ }
+ '''
+     test = r'''
+ static bool send_frame(mbuf_t m,size_t n) { assert(m->total==n);return accept; }
++static int read_frame(void *source,size_t offset,void *dest,size_t n) {
++ assert(!offset && n==expected_length);
++ if (fail_copy) return 1;
++ memcpy(dest,source,n);return 0;
++}
+ int main(void) {
+  static const struct fuxi_wifi_net_link driver={.transmit=send_frame};
+  net_link=&driver;net_ifp=(void *)1;
+@@ -318,6 +584,25 @@ int main(void) {
+  packet=calloc(1,sizeof(*packet));packet->len=packet->total=60;
+  net_link_up=false;assert(net_output(net_ifp,packet)==0 && out_errors==2);
+  assert(freed==6);
++ expected_padding=2; expected_length=1514;
++ fuxi_wifi_net_input_packet(frame,1514,read_frame); assert(!rx_head);
++ net_link_up=true;
++ fuxi_wifi_net_input_packet(frame,1515,read_frame); assert(!rx_head);
++ fail_copy=true; fuxi_wifi_net_input_packet(frame,1514,read_frame);
++ assert(!rx_head && freed==7); fail_copy=false;
++ for (unsigned i=0;i<63;i++) fuxi_wifi_net_input_packet(frame,1514,read_frame);
++ assert(input_calls==2 && rx_pending.packets_in==63);
++ fuxi_wifi_net_input_packet(frame,1514,read_frame);
++ assert(input_calls==3 && inputs==66 && !rx_head && !rx_tail);
++ fuxi_wifi_net_input_packet(frame,1514,read_frame);
++ fuxi_wifi_net_flush_rx(); fuxi_wifi_net_flush_rx();
++ assert(input_calls==4 && inputs==67);
++ fuxi_wifi_net_input_packet(frame,1514,read_frame);
++ net_link_up=false; fuxi_wifi_net_flush_rx();
++ assert(input_calls==4 && !rx_head && !rx_pending.bytes_in && freed==73);
++ uint64_t rx=0,tx=0;
++ assert(fuxi_wifi_net_byte_counts(&rx,&tx) && rx==60+66*1514 && tx==60);
++ puts("PASS: aligned borrowed RX, bounded batches, error and link-down ownership");
+  puts("PASS: production ifnet TX/RX bounds, mbuf ownership, header adjustment and failures");
+ }
+ '''
 diff --git a/tools/test-fuxi-wlan-ath12k.py b/tools/test-fuxi-wlan-ath12k.py
 new file mode 100644
 index 0000000..63d210d
@@ -19360,10 +19478,10 @@ index 0000000..0e08f98
 +}
 diff --git a/tools/test-fuxi-wlan-ios.py b/tools/test-fuxi-wlan-ios.py
 new file mode 100644
-index 0000000..f308157
+index 0000000..73b74ce
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ios.py
-@@ -0,0 +1,987 @@
+@@ -0,0 +1,1051 @@
 +import hashlib
 +import hmac
 +import os
@@ -19438,7 +19556,9 @@ index 0000000..f308157
 +}
 +bool fuxi_wifi_sta_busy(void) { return false; }
 +static bool test_powered = true;
++static bool test_off_pending;
 +bool fuxi_wifi_sta_powered(void) { return test_powered; }
++bool fuxi_wifi_sta_power_off_pending(void) { return test_off_pending; }
 +static unsigned test_ux;                        /* ADT fuxi,wifi-ux；bootstrap() 時讀進 wli.ux */
 +unsigned fuxi_wifi_ux(void) { return test_ux; }
 +int fuxi_wifi_sta_ask_power(bool on) { (void)on; return 0; }
@@ -19497,6 +19617,8 @@ index 0000000..f308157
 +int nw_wifi_tx(const uint8_t *frame, size_t length) {
 +    assert(frame && length >= 14 && length <= 2000); tx_calls++; return tx_status;
 +}
++static unsigned phy_reads;
++void nw_wifi_link_state(char *text,int size) { phy_reads++; snprintf(text,(size_t)size,"fixture rate"); }
 +bool fuxi_wifi_ios_native_ready(void) { return ready; }
 +'''
 +
@@ -19508,9 +19630,20 @@ index 0000000..f308157
 +static const uint8_t far_ap[6]={2,0x46,0x55,0x58,0x49,6}, weak_ap[6]={2,0x46,0x55,0x58,0x49,7};
 +static const uint8_t own_rsn[22]={48,20,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,2,0,0};
 +static unsigned rx_frames, link_ups, link_downs;
++static unsigned rx_packets,rx_flushes;
++static uint64_t rx_octets,tx_octets;
 +static void input_rx(const uint8_t *frame,size_t length) { assert(frame && length>=14); rx_frames++; }
 +static void input_link(bool up) { if (up) link_ups++; else link_downs++; }
-+static const struct fuxi_wifi_input input={input_rx,input_link};
++static void input_rx_packet(void *source,size_t length,int (*read)(void *,size_t,void *,size_t)) {
++    uint8_t bytes[60]; assert(length==sizeof(bytes) && !read(source,0,bytes,length) && bytes[0]==0xa5);
++    rx_packets++;
++}
++static void input_rx_flush(void) { rx_flushes++; }
++static bool input_byte_counts(uint64_t *rx,uint64_t *tx) { *rx=rx_octets; *tx=tx_octets; return true; }
++static const struct fuxi_wifi_input input={
++    .rx_frame=input_rx,.link_state=input_link,.rx_packet=input_rx_packet,.rx_flush=input_rx_flush,
++    .byte_counts=input_byte_counts,
++};
 +bool fuxi_wifi_ios_attach(const struct fuxi_wifi_backend *backend) {
 +    assert(backend == &wli_backend && !memcmp(backend->station.address,station,6));
 +    assert(wli.info && wli.channels && !wli_state.last_error && backend->station.join==wli_join);
@@ -19561,7 +19694,12 @@ index 0000000..f308157
 +    assert(wli_channels[1].flags==FUXI_WIFI_STA_CHANNEL_RADAR);
 +    ready=false; assert(!wli_step(3) && !attachments);
 +    ready=true; assert(!wli_step(4) && attachments==1);
-+    assert(events && events->rx && !events->rx_packet && wli_input==&input);
++    assert(events && wli_input==&input);
++    if (test_ux & FUXI_WIFI_UX_RX_BATCH) {
++        assert(events->rx_packet && events->rx_flush && !events->rx);
++    } else {
++        assert(events->rx && !events->rx_packet);
++    }
 +}
 +static atomic_bool caller_done;
 +static int caller_result;
@@ -19890,6 +20028,29 @@ index 0000000..f308157
 +    puts("PASS scan recovery: abort, deadline, power cancellation, late completion and a subsequent scan");
 +}
 +
++static int read_test_packet(void *source,size_t offset,void *dest,size_t length) {
++    assert(offset<=60 && length<=60-offset); memcpy(dest,(uint8_t *)source+offset,length); return 0;
++}
++
++static void rx_batch_tests(void) {
++    test_ux=FUXI_WIFI_UX_RX_BATCH|FUXI_WIFI_UX_LINK_STATS;
++    bootstrap();
++    uint8_t frame[60]={0xa5};
++    events->rx_packet(frame,sizeof(frame),read_test_packet);
++    assert(!rx_packets);
++    __atomic_store_n(&wli_link,1,__ATOMIC_RELEASE);
++    events->rx_packet(frame,sizeof(frame),read_test_packet);
++    events->rx_flush(); assert(rx_packets==1 && rx_flushes==1);
++    assert(!wli_step(100) && !phy_reads);
++    rx_octets=700;tx_octets=80;
++    assert(!wli_step(5099) && !phy_reads);
++    assert(!wli_step(5100) && phy_reads==1);
++    __atomic_store_n(&wli_link,0,__ATOMIC_RELEASE);
++    assert(!wli_step(5101));
++    test_ux=0;
++    puts("PASS native RX batch callbacks and paced PHY counters");
++}
++
 +static void scan_scope_tests(void) {
 +    size_t size;
 +    memset(&caller_scan,0,sizeof(caller_scan)); caller_scan.cache_allowed=true;
@@ -20009,6 +20170,25 @@ index 0000000..f308157
 +    assert(!pthread_join(thread,NULL));
 +    assert(wli_state.phase==FUXI_WIFI_STA_IDLE && wlj.step==WLJ_NONE && !wli.fatal);
 +    assert(wli_state.last_error==caller_result); return caller_result;
++}
++static void power_off_join_test(void) {
++    test_ux=FUXI_WIFI_UX_POWER_OFF_FIRST;
++    bootstrap();
++    caller_scan.frequency_count=0;
++    pthread_t thread=begin(2,false); step(); scan_accept(false); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && !caller_result);
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK);
++    thread=begin(3,false); step(); expect_request(4);
++    respond(4,0);
++    test_off_pending=true;
++    step(); expect_request(6); respond(6,0); step();
++    assert(failed_join(thread)==ECANCELED);
++    assert(wli_scan(&caller_scan)==ECANCELED && !wli.fatal);
++    power_test(false,3);
++    test_off_pending=false;
++    power_test(true,4);
++    test_ux=0;
++    puts("PASS power off cancels an active join and leaves radio control available");
 +}
 +static void join_tests(void) {
 +    uint8_t frame[60]={0}, reply[256];
@@ -20247,6 +20427,8 @@ index 0000000..f308157
 +    cache_tests();
 +    scan_recovery_tests();
 +    scan_scope_tests();
++    rx_batch_tests();
++    power_off_join_test();
 +    bootstrap(); power_test(false,3); power_test(true,4); power_test(true,4);
 +    memset(&caller_scan,0,sizeof(caller_scan)); caller_scan.ssid_length=4;
 +    memcpy(caller_scan.ssid,"real",4); caller_scan.frequency_count=64;
@@ -36052,7 +36234,7 @@ index c497162..c9ed43d 100644
      "the association request as iOS 16.5 has it");
  _Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_ios.c b/xnu/fuxi-wifi-ios/fuxi_wifi_ios.c
-index eabab03..6121811 100644
+index eabab03..079d256 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_ios.c
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_ios.c
 @@ -11,6 +11,18 @@
@@ -36074,7 +36256,16 @@ index eabab03..6121811 100644
  
  static bool
  transmit(mbuf_t packet, size_t length)
-@@ -38,6 +50,7 @@ fuxi_wifi_ios_attach(const struct fuxi_wifi_backend *ops)
+@@ -25,6 +37,8 @@ static struct fuxi_wifi_net_link link = {
+ };
+ static const struct fuxi_wifi_input input = {
+ 	.rx_frame = fuxi_wifi_net_input, .link_state = fuxi_wifi_net_link_state,
++	.rx_packet = fuxi_wifi_net_input_packet, .rx_flush = fuxi_wifi_net_flush_rx,
++	.byte_counts = fuxi_wifi_net_byte_counts,
+ };
+ 
+ bool
+@@ -38,6 +52,7 @@ fuxi_wifi_ios_attach(const struct fuxi_wifi_backend *ops)
  		return false;
  	}
  	backend = ops;
@@ -36082,7 +36273,7 @@ index eabab03..6121811 100644
  	memcpy(link.address, ops->station.address, sizeof(link.address));
  	ops->start(&input);
  	fuxi_wifi_sta_attach(&ops->station);
-@@ -193,10 +206,17 @@ fuxi_wifi_ios_init(void)
+@@ -193,10 +208,17 @@ fuxi_wifi_ios_init(void)
  {
  	int on = 0;
  	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
@@ -36102,18 +36293,151 @@ index eabab03..6121811 100644
  	(void)fuxi_wifi_ios_attach(&fake_backend);
  }
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_ios.h b/xnu/fuxi-wifi-ios/fuxi_wifi_ios.h
-index eb5ac01..0eb0bce 100644
+index eb5ac01..ee1bc07 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_ios.h
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_ios.h
-@@ -32,5 +32,6 @@ struct fuxi_wifi_backend {
+@@ -13,6 +13,11 @@
+ struct fuxi_wifi_input {
+ 	void (*rx_frame)(const uint8_t *frame, size_t length);
+ 	void (*link_state)(bool up);
++	/* A synchronous reader for borrowed fragments. End each worker batch with rx_flush. */
++	void (*rx_packet)(void *packet, size_t length,
++	    int (*read)(void *, size_t, void *, size_t));
++	void (*rx_flush)(void);
++	bool (*byte_counts)(uint64_t *received, uint64_t *sent);
+ };
+ 
+ /* One immutable backend for the boot. No detach/hot replacement. Station
+@@ -32,5 +37,6 @@ struct fuxi_wifi_backend {
  #ifdef KERNEL
  bool fuxi_wifi_ios_attach(const struct fuxi_wifi_backend *backend);
  void fuxi_wifi_ios_init(void);
 +bool fuxi_wifi_ios_native_ready(void);
  #endif
  #endif
+diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_net.c b/xnu/fuxi-wifi-ios/fuxi_wifi_net.c
+index c6d75ee..e4d3d2d 100644
+--- a/xnu/fuxi-wifi-ios/fuxi_wifi_net.c
++++ b/xnu/fuxi-wifi-ios/fuxi_wifi_net.c
+@@ -45,6 +45,19 @@ static LCK_MTX_DECLARE(net_tx_lock, &net_lck_grp);
+ static const struct fuxi_wifi_net_link *net_link;
+ static bool net_link_up;
+ static ifnet_t net_ifp;
++/* The WLAN worker owns this list. Follow Sheng's WifiNet.cpp and hand input a bounded packet list. */
++static mbuf_t rx_head, rx_tail;
++static struct ifnet_stat_increment_param rx_pending;
++
++static void
++net_rx_header(mbuf_t packet)
++{
++	char *header = mbuf_data(packet);
++	mbuf_pkthdr_setrcvif(packet, net_ifp);
++	mbuf_pkthdr_setheader(packet, header);
++	mbuf_adj(packet, ETHER_HDR_LEN);
++	bpf_tap_in(net_ifp, DLT_EN10MB, packet, header, ETHER_HDR_LEN);
++}
+ 
+ /* ---- the interface -------------------------------------------------------------------------------- */
+ 
+@@ -77,7 +90,6 @@ fuxi_wifi_net_input(const uint8_t *frame, size_t length)
+ 	struct ifnet_stat_increment_param stats = { .packets_in = 1, .bytes_in = (uint32_t)length };
+ 	unsigned int chunks = 1;
+ 	mbuf_t packet = NULL;
+-	char *header;
+ 
+ 	if (net_ifp == NULL || !__atomic_load_n(&net_link_up, __ATOMIC_ACQUIRE) || length < ETHER_HDR_LEN || length > FUXI_WIFI_NET_FRAME_MAX ||
+ 	    mbuf_allocpacket(MBUF_DONTWAIT, length, &chunks, &packet) != 0) {
+@@ -88,14 +100,67 @@ fuxi_wifi_net_input(const uint8_t *frame, size_t length)
+ 		return;
+ 	}
+ 	/* as every Ethernet driver hands a frame up: the header noted and stepped over */
+-	header = mbuf_data(packet);
+-	mbuf_pkthdr_setrcvif(packet, net_ifp);
+-	mbuf_pkthdr_setheader(packet, header);
+-	mbuf_adj(packet, ETHER_HDR_LEN);
+-	bpf_tap_in(net_ifp, DLT_EN10MB, packet, header, ETHER_HDR_LEN);
++	net_rx_header(packet);
+ 	ifnet_input(net_ifp, packet, &stats);
+ }
+ 
++void
++fuxi_wifi_net_flush_rx(void)
++{
++	mbuf_t packets = rx_head;
++	if (packets == NULL) { return; }
++	struct ifnet_stat_increment_param stats = rx_pending;
++	rx_head = rx_tail = NULL;
++	memset(&rx_pending, 0, sizeof(rx_pending));
++	if (__atomic_load_n(&net_link_up, __ATOMIC_ACQUIRE)) {
++		ifnet_input(net_ifp, packets, &stats);
++	} else {
++		mbuf_freem_list(packets);
++	}
++}
++
++void
++fuxi_wifi_net_input_packet(void *source, size_t length,
++    int (*read)(void *, size_t, void *, size_t))
++{
++	/* Align the IP header after the 14-byte Ethernet header. One cluster holds each supported frame. */
++	const size_t padding = 2;
++	unsigned int chunks = 1;
++	mbuf_t packet = NULL;
++	if (net_ifp == NULL || !__atomic_load_n(&net_link_up, __ATOMIC_ACQUIRE) || read == NULL ||
++	    length < ETHER_HDR_LEN || length > FUXI_WIFI_NET_FRAME_MAX ||
++	    mbuf_allocpacket(MBUF_DONTWAIT, length + padding, &chunks, &packet) != 0) {
++		return;
++	}
++	if (chunks != 1 || mbuf_setdata(packet, (char *)mbuf_data(packet) + padding, length) != 0 ||
++	    read(source, 0, mbuf_data(packet), length) != 0) {
++		mbuf_freem(packet);
++		return;
++	}
++	mbuf_pkthdr_setlen(packet, length);
++	net_rx_header(packet);
++	mbuf_setnextpkt(packet, NULL);
++	if (rx_tail != NULL) {
++		mbuf_setnextpkt(rx_tail, packet);
++	} else {
++		rx_head = packet;
++	}
++	rx_tail = packet;
++	rx_pending.packets_in++;
++	rx_pending.bytes_in += (uint32_t)length;
++	if (rx_pending.packets_in == 64) { fuxi_wifi_net_flush_rx(); }
++}
++
++bool
++fuxi_wifi_net_byte_counts(uint64_t *received, uint64_t *sent)
++{
++	struct ifnet_stats_param stats;
++	if (net_ifp == NULL || ifnet_stat(net_ifp, &stats) != 0) { return false; }
++	*received = stats.bytes_in;
++	*sent = stats.bytes_out;
++	return true;
++}
++
+ static unsigned net_ioctls_said;
+ 
+ static errno_t
+diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_net.h b/xnu/fuxi-wifi-ios/fuxi_wifi_net.h
+index 338607e..bc4ef99 100644
+--- a/xnu/fuxi-wifi-ios/fuxi_wifi_net.h
++++ b/xnu/fuxi-wifi-ios/fuxi_wifi_net.h
+@@ -50,6 +50,11 @@ struct fuxi_wifi_net_link {
+ bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *link);
+ /* A frame has arrived. Copied; the buffer is the caller's again on return. */
+ void fuxi_wifi_net_input(const uint8_t *frame, size_t length);
++/* Only the ath12k worker calls these. Read the borrowed packet before returning. */
++void fuxi_wifi_net_input_packet(void *source, size_t length,
++    int (*read)(void *, size_t, void *, size_t));
++void fuxi_wifi_net_flush_rx(void);
++bool fuxi_wifi_net_byte_counts(uint64_t *received, uint64_t *sent);
+ /* Frames can pass now / can no longer pass. */
+ void fuxi_wifi_net_link_state(bool up);
+ 
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.c b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.c
-index 9479206..899bfd6 100644
+index 9479206..f4c287d 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.c
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.c
 @@ -20,6 +20,7 @@
@@ -36124,7 +36448,7 @@ index 9479206..899bfd6 100644
  #include <kern/kalloc.h>
  #include <kern/locks.h>
  #include <kern/sched_prim.h>
-@@ -42,6 +43,18 @@ static const struct fuxi_wifi_sta_ops *sta_ops;   /* the station side, while the
+@@ -42,9 +43,23 @@ static const struct fuxi_wifi_sta_ops *sta_ops;   /* the station side, while the
  static bool sta_thread_made;
  static bool sta_calls;                          /* the thread is in a call of the station side's */
  static bool sta_on;                             /* the radio's power, as last asked for */
@@ -36143,16 +36467,26 @@ index 9479206..899bfd6 100644
  
  /* what has been asked for and not begun */
  static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
-@@ -86,6 +99,8 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
++/* OFF must reach the radio even if a later ON was queued while a scan/join owned the worker. */
++static bool power_off_pending;
+ static struct fuxi_wifi_sta_scan asked_scan_what;
+ static struct fuxi_wifi_sta_join asked_join_what;
+ 
+@@ -84,8 +99,11 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
+ 		/* one thing at a time, in the order that makes sense when several wait */
+ 		if (asked_power) {
  			power = true;
- 			power_on = asked_power_on;
- 			asked_power = false;
+-			power_on = asked_power_on;
+-			asked_power = false;
++			power_on = asked_power_on && !power_off_pending;
++			asked_power = power_on != asked_power_on;
++			power_off_pending = false;
 +			power_running = true;
 +			power_running_on = power_on;
  		} else if (asked_leave) {
  			leave = true;
  			asked_leave = false;
-@@ -105,22 +120,33 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
+@@ -105,22 +123,33 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
  		if (power) {
  			struct fuxi_wifi_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
  			bool was_joined = false;
@@ -36191,7 +36525,7 @@ index 9479206..899bfd6 100644
  		} else if (leave) {
  			ops->leave();
  			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
-@@ -179,10 +205,12 @@ fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops)
+@@ -179,10 +208,12 @@ fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops)
  	}
  	lck_mtx_lock(&sta_lock);
  	sta_ops = ops;
@@ -36206,7 +36540,7 @@ index 9479206..899bfd6 100644
  }
  
  void
-@@ -203,16 +231,51 @@ fuxi_wifi_sta_present(void)
+@@ -203,16 +234,66 @@ fuxi_wifi_sta_present(void)
  	return present;
  }
  
@@ -36217,7 +36551,13 @@ index 9479206..899bfd6 100644
 +static bool
 +power_wanted(bool *on)
 +{
-+	if (!(fuxi_wifi_ux() & FUXI_WIFI_UX_POWER_ASKED)) {
++	unsigned ux = fuxi_wifi_ux();
++	if (power_off_pending || (power_running && !power_running_on &&
++	    (ux & FUXI_WIFI_UX_POWER_OFF_FIRST))) {
++		*on = false;
++		return true;
++	}
++	if (!(ux & FUXI_WIFI_UX_POWER_ASKED)) {
 +		return false;
 +	}
 +	if (asked_power) {
@@ -36245,6 +36585,15 @@ index 9479206..899bfd6 100644
  	return on;
  }
  
++bool
++fuxi_wifi_sta_power_off_pending(void)
++{
++	lck_mtx_lock(&sta_lock);
++	bool pending = power_off_pending;
++	lck_mtx_unlock(&sta_lock);
++	return pending;
++}
++
 +/* 能不能再收掃描／加入：電源是開的或正要開；bit 0 打開時，正要關就不收 */
 +static bool
 +power_accepts(void)
@@ -36259,7 +36608,7 @@ index 9479206..899bfd6 100644
  bool
  fuxi_wifi_sta_busy(void)
  {
-@@ -232,7 +295,9 @@ fuxi_wifi_sta_ask_power(bool on)
+@@ -232,10 +313,15 @@ fuxi_wifi_sta_ask_power(bool on)
  		lck_mtx_unlock(&sta_lock);
  		return ENXIO;
  	}
@@ -36270,7 +36619,13 @@ index 9479206..899bfd6 100644
  	asked_power = true;
  	asked_power_on = on;
  	if (!on) {
-@@ -252,7 +317,7 @@ fuxi_wifi_sta_ask_scan(const struct fuxi_wifi_sta_scan *what)
++		if (fuxi_wifi_ux() & FUXI_WIFI_UX_POWER_OFF_FIRST) {
++			power_off_pending = true;
++		}
+ 		asked_scan = asked_join = asked_leave = false;
+ 		bzero(&asked_join_what, sizeof(asked_join_what));
+ 	}
+@@ -252,7 +338,7 @@ fuxi_wifi_sta_ask_scan(const struct fuxi_wifi_sta_scan *what)
  		return EINVAL;
  	}
  	lck_mtx_lock(&sta_lock);
@@ -36279,7 +36634,7 @@ index 9479206..899bfd6 100644
  		lck_mtx_unlock(&sta_lock);
  		return sta_ops == NULL ? ENXIO : ENETDOWN;
  	}
-@@ -272,7 +337,7 @@ fuxi_wifi_sta_ask_join(const struct fuxi_wifi_sta_join *what)
+@@ -272,7 +358,7 @@ fuxi_wifi_sta_ask_join(const struct fuxi_wifi_sta_join *what)
  		return EINVAL;
  	}
  	lck_mtx_lock(&sta_lock);
@@ -36289,7 +36644,7 @@ index 9479206..899bfd6 100644
  		return sta_ops == NULL ? ENXIO : ENETDOWN;
  	}
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
-index dce1375..f789ca9 100644
+index dce1375..c81ac5e 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
 @@ -45,6 +45,7 @@ struct fuxi_wifi_sta_scan {
@@ -36300,7 +36655,7 @@ index dce1375..f789ca9 100644
  };
  
  enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
-@@ -99,7 +100,34 @@ enum fuxi_wifi_sta_event {
+@@ -99,7 +100,37 @@ enum fuxi_wifi_sta_event {
  	                                         * an errno: it was lost (the access point showed us the door) */
  };
  
@@ -36326,7 +36681,10 @@ index dce1375..f789ca9 100644
 +                                         * 只回報電源事件 */
 +#define FUXI_WIFI_UX_SCAN_RECOVER 32u      /* keep radio control after a failed or cancelled scan */
 +#define FUXI_WIFI_UX_SCAN_CHANNELS 64u     /* implicit scans use the advertised 2.4/5 GHz channel list */
-+#define FUXI_WIFI_UX_ALL         127u
++#define FUXI_WIFI_UX_POWER_OFF_FIRST 128u /* finish an off request before a later enable */
++#define FUXI_WIFI_UX_RX_BATCH    256u      /* receive borrowed ath12k fragments directly into batched mbufs */
++#define FUXI_WIFI_UX_LINK_STATS  512u      /* print cached PHY rate and interface byte counts */
++#define FUXI_WIFI_UX_ALL        1023u
 +
  #ifdef KERNEL
 +/* 讀一次 ADT 之後記住（ADT 開機後不變）；沒有這個屬性或長度不對都當 0 */
@@ -36335,6 +36693,14 @@ index dce1375..f789ca9 100644
  /* ---- the station side ---- */
  void     fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops);         /* init only; immutable boot-lifetime backend */
  void     fuxi_wifi_sta_lost(int error);                                   /* the network joined is gone by itself */
+@@ -112,6 +143,7 @@ int      fuxi_wifi_sta_ask_join(const struct fuxi_wifi_sta_join *what);
+ int      fuxi_wifi_sta_ask_leave(void);
+ bool     fuxi_wifi_sta_busy(void);                                        /* something asked for is not over yet */
+ bool     fuxi_wifi_sta_powered(void);
++bool     fuxi_wifi_sta_power_off_pending(void);
+ /* the `index`th access point the last scan heard: true, or false when there are not that many */
+ bool     fuxi_wifi_sta_heard(unsigned index, struct fuxi_wifi_sta_bss *bss);
+ void     fuxi_wifi_sta_state(struct fuxi_wifi_sta_state *state);
 diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
 index 1b46ea1..09ba683 100644
 --- a/xnu/fuxi-wlan/fuxi_wlan.c
@@ -36937,10 +37303,10 @@ index 0000000..b8e3263
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.h b/xnu/fuxi-wlan/fuxi_wlan_ath12k.h
 new file mode 100644
-index 0000000..ad01d60
+index 0000000..528aa15
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.h
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,110 @@
 +#ifndef FUXI_WLAN_ATH12K_H
 +#define FUXI_WLAN_ATH12K_H
 +#include <stdint.h>
@@ -37013,6 +37379,7 @@ index 0000000..ad01d60
 +extern int nw_wifi_control_receive(uint64_t, size_t, int (*)(void *, void *, size_t), void *);
 +extern int nw_wifi_start(const struct lx_platform *, const struct nw_board *);
 +extern int nw_wifi_step(void);
++extern void nw_wifi_link_state(char *, int);
 +extern void nw_wifi_stop(void);
 +extern void nw_wifi_poll(void);
 +extern void nw_wifi_irq_mode(int);
@@ -37664,10 +38031,10 @@ index 0000000..656f494
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ios.inc b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
 new file mode 100644
-index 0000000..a6d28c9
+index 0000000..6c3b8cf
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-@@ -0,0 +1,1685 @@
+@@ -0,0 +1,1753 @@
 +#include <sys/fuxi_wifi_ios.h>
 +#include <sys/fuxi_wifi_wpa.h>
 +#include <sys/errno.h>
@@ -37832,6 +38199,9 @@ index 0000000..a6d28c9
 +static int
 +wli_submit(unsigned operation, bool on, const struct fuxi_wifi_sta_scan *scan, const struct wli_target *target)
 +{
++	if ((operation == WLI_SCAN || operation == WLI_JOIN) && fuxi_wifi_sta_power_off_pending()) {
++		return ECANCELED;
++	}
 +	unsigned scan_count = 0, scan_limit = 0;
 +	if (scan) {
 +		int error = wli_scan_plan(scan, &scan_count, &scan_limit);
@@ -38322,6 +38692,11 @@ index 0000000..a6d28c9
 +			if (!error) { error = wli_pick(join, target); }
 +		}
 +	}
++	if (error == ECANCELED) {
++		memset(target, 0, sizeof(*target));
++		wli_note_error(error);
++		return error;
++	}
 +	if (!error) { error = wli_security(&target->bss, join->security, &target->group); }
 +	if (keep) {
 +		if (wli_kept(join, target, error) == 0) {
@@ -38377,6 +38752,47 @@ index 0000000..a6d28c9
 +}
 +
 +static const struct nw_wifi_events wli_events = { .rx = wli_rx };
++
++static void
++wli_rx_packet(void *source, size_t length, int (*read)(void *, size_t, void *, size_t))
++{
++	if (__atomic_load_n(&wli_link, __ATOMIC_ACQUIRE)) {
++		wli_input->rx_packet(source, length, read);
++	}
++}
++
++static void
++wli_rx_flush(void)
++{
++	wli_input->rx_flush();
++}
++
++static const struct nw_wifi_events wli_batch_events = {
++	.rx_packet = wli_rx_packet, .rx_flush = wli_rx_flush,
++};
++
++static void
++wli_link_stats(uint64_t now)
++{
++	static uint64_t last_time, last_rx, last_tx;
++	if (!__atomic_load_n(&wli_link, __ATOMIC_ACQUIRE)) {
++		last_time = 0;
++		return;
++	}
++	if (last_time && now - last_time < 5000) { return; }
++	uint64_t rx, tx;
++	if (!wli_input || !wli_input->byte_counts || !wli_input->byte_counts(&rx, &tx)) { return; }
++	if (last_time && (rx != last_rx || tx != last_tx)) {
++		char phy[128];
++		nw_wifi_link_state(phy, sizeof(phy));
++		printf("FUXI WIFI IOS: link traffic rx %llu tx %llu bytes in %llu ms; PHY %s\n",
++		    (unsigned long long)(rx - last_rx), (unsigned long long)(tx - last_tx),
++		    (unsigned long long)(now - last_time), phy[0] ? phy : "unavailable");
++	}
++	last_rx = rx;
++	last_tx = tx;
++	last_time = now;
++}
 +
 +static void
 +wli_start(const struct fuxi_wifi_input *input)
@@ -38725,7 +39141,7 @@ index 0000000..a6d28c9
 +	const uint8_t *value;
 +	if (kind == 3) {
 +		if (fwc_read32(bytes + 12)) { goto invalid; }
-+		bool recover = (wli.ux & FUXI_WIFI_UX_SCAN_RECOVER) != 0;
++		bool recover = (wli.ux & (FUXI_WIFI_UX_SCAN_RECOVER | FUXI_WIFI_UX_POWER_OFF_FIRST)) != 0;
 +		if (operation == 0x10a) {
 +			value = fwc_attribute(bytes, length, 32, &size);
 +			if (!wli.power_waiting || status || !value || size != 4 ||
@@ -39234,6 +39650,9 @@ index 0000000..a6d28c9
 +		if (wli.ux & FUXI_WIFI_UX_SCAN_RECOVER) {
 +			printf("FUXI WIFI IOS: native scan recovery enabled\n");
 +		}
++		if (wli.ux & FUXI_WIFI_UX_POWER_OFF_FIRST) {
++			printf("FUXI WIFI IOS: queued power off takes priority\n");
++		}
 +		wli_backend.station.power = wli_power;
 +		wli_backend.station.scan = wli_scan;
 +		wli_backend.station.heard = wli_heard;
@@ -39247,11 +39666,15 @@ index 0000000..a6d28c9
 +		wli.published = 1;
 +		lck_mtx_unlock(&wli_lock);
 +		if (!fuxi_wifi_ios_attach(&wli_backend)) { return ENXIO; }
-+		nw_wifi_set_events(&wli_events);
++		bool batch_rx = (wli.ux & FUXI_WIFI_UX_RX_BATCH) && wli_input &&
++		    wli_input->rx_packet && wli_input->rx_flush;
++		if (batch_rx) { printf("FUXI WIFI IOS: batched ath12k receive enabled\n"); }
++		nw_wifi_set_events(batch_rx ? &wli_batch_events : &wli_events);
 +		printf("FUXI WIFI IOS: native backend published channels %u; power/scan/join ready "
 +		    "(open, WPA2-PSK CCMP; full scan elements)\n", wli_channel_count);
 +		wli_test_start();
 +	}
++	if (wli.ux & FUXI_WIFI_UX_LINK_STATS) { wli_link_stats(now); }
 +	lck_mtx_lock(&wli_lock);
 +	bool begin = wli.busy && !wli.submitted;
 +	unsigned operation = wli.operation, power_on = wli.power_on;
@@ -39302,9 +39725,10 @@ index 0000000..a6d28c9
 +		}
 +	}
 +	if (busy && operation == WLI_SCAN && wli.scan_accepted && !wli.fetching &&
-+	    (wli.ux & FUXI_WIFI_UX_SCAN_RECOVER)) {
++	    (wli.ux & (FUXI_WIFI_UX_SCAN_RECOVER | FUXI_WIFI_UX_POWER_OFF_FIRST))) {
 +		int scan_error = wli.scan_error;
-+		if (!scan_error && (wli.ux & FUXI_WIFI_UX_POWER_ASKED) && !fuxi_wifi_sta_powered()) {
++		if (!scan_error && (fuxi_wifi_sta_power_off_pending() ||
++		    ((wli.ux & FUXI_WIFI_UX_POWER_ASKED) && !fuxi_wifi_sta_powered()))) {
 +			scan_error = ECANCELED;
 +		}
 +		if (!scan_error && now >= wli.deadline) { scan_error = ETIMEDOUT; }
@@ -39337,6 +39761,13 @@ index 0000000..a6d28c9
 +	}
 +	if (!wli.pending_operation) {
 +		if (wli.fetching) {
++			if (fuxi_wifi_sta_power_off_pending()) {
++				lck_mtx_lock(&wli_lock);
++				wli_bss_count = 0;
++				lck_mtx_unlock(&wli_lock);
++				wli_complete(ECANCELED);
++				return 0;
++			}
 +			int error = wli_request(3);
 +			if (error) {
 +				printf("FUXI WIFI IOS: GET_BSS not sent, error %d; module records instead\n", error);
@@ -39344,6 +39775,10 @@ index 0000000..a6d28c9
 +				wli_cache_scan();
 +			}
 +		} else if (wlj.step != WLJ_NONE) {
++			if (busy && operation == WLI_JOIN && wlj.step < WLJ_JOINED &&
++			    fuxi_wifi_sta_power_off_pending()) {
++				wli_join_stop(ECANCELED, "power off queued");
++			}
 +			wli_join_step(now);
 +		}
 +	}
@@ -39656,7 +40091,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..36313b4 100644
+index d21bf85..25ba9f5 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -40127,7 +40562,7 @@ index d21bf85..36313b4 100644
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,2543 @@
+@@ -5899,3 +6092,2612 @@
  + }
  + r[3] = 0;
  +}
@@ -40267,7 +40702,7 @@ index d21bf85..36313b4 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ath12k.h
-+@@ -0,0 +1,109 @@
++@@ -0,0 +1,110 @@
 ++#ifndef FUXI_WLAN_ATH12K_H
 ++#define FUXI_WLAN_ATH12K_H
 ++#include <stdint.h>
@@ -40340,6 +40775,7 @@ index d21bf85..36313b4 100644
 ++extern int nw_wifi_control_receive(uint64_t, size_t, int (*)(void *, void *, size_t), void *);
 ++extern int nw_wifi_start(const struct lx_platform *, const struct nw_board *);
 ++extern int nw_wifi_step(void);
+++extern void nw_wifi_link_state(char *, int);
 ++extern void nw_wifi_stop(void);
 ++extern void nw_wifi_poll(void);
 ++extern void nw_wifi_irq_mode(int);
@@ -40985,7 +41421,7 @@ index d21bf85..36313b4 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ios.inc
-+@@ -0,0 +1,1685 @@
++@@ -0,0 +1,1753 @@
 ++#include <sys/fuxi_wifi_ios.h>
 ++#include <sys/fuxi_wifi_wpa.h>
 ++#include <sys/errno.h>
@@ -41150,6 +41586,9 @@ index d21bf85..36313b4 100644
 ++static int
 ++wli_submit(unsigned operation, bool on, const struct fuxi_wifi_sta_scan *scan, const struct wli_target *target)
 ++{
+++	if ((operation == WLI_SCAN || operation == WLI_JOIN) && fuxi_wifi_sta_power_off_pending()) {
+++		return ECANCELED;
+++	}
 ++	unsigned scan_count = 0, scan_limit = 0;
 ++	if (scan) {
 ++		int error = wli_scan_plan(scan, &scan_count, &scan_limit);
@@ -41640,6 +42079,11 @@ index d21bf85..36313b4 100644
 ++			if (!error) { error = wli_pick(join, target); }
 ++		}
 ++	}
+++	if (error == ECANCELED) {
+++		memset(target, 0, sizeof(*target));
+++		wli_note_error(error);
+++		return error;
+++	}
 ++	if (!error) { error = wli_security(&target->bss, join->security, &target->group); }
 ++	if (keep) {
 ++		if (wli_kept(join, target, error) == 0) {
@@ -41695,6 +42139,47 @@ index d21bf85..36313b4 100644
 ++}
 ++
 ++static const struct nw_wifi_events wli_events = { .rx = wli_rx };
+++
+++static void
+++wli_rx_packet(void *source, size_t length, int (*read)(void *, size_t, void *, size_t))
+++{
+++	if (__atomic_load_n(&wli_link, __ATOMIC_ACQUIRE)) {
+++		wli_input->rx_packet(source, length, read);
+++	}
+++}
+++
+++static void
+++wli_rx_flush(void)
+++{
+++	wli_input->rx_flush();
+++}
+++
+++static const struct nw_wifi_events wli_batch_events = {
+++	.rx_packet = wli_rx_packet, .rx_flush = wli_rx_flush,
+++};
+++
+++static void
+++wli_link_stats(uint64_t now)
+++{
+++	static uint64_t last_time, last_rx, last_tx;
+++	if (!__atomic_load_n(&wli_link, __ATOMIC_ACQUIRE)) {
+++		last_time = 0;
+++		return;
+++	}
+++	if (last_time && now - last_time < 5000) { return; }
+++	uint64_t rx, tx;
+++	if (!wli_input || !wli_input->byte_counts || !wli_input->byte_counts(&rx, &tx)) { return; }
+++	if (last_time && (rx != last_rx || tx != last_tx)) {
+++		char phy[128];
+++		nw_wifi_link_state(phy, sizeof(phy));
+++		printf("FUXI WIFI IOS: link traffic rx %llu tx %llu bytes in %llu ms; PHY %s\n",
+++		    (unsigned long long)(rx - last_rx), (unsigned long long)(tx - last_tx),
+++		    (unsigned long long)(now - last_time), phy[0] ? phy : "unavailable");
+++	}
+++	last_rx = rx;
+++	last_tx = tx;
+++	last_time = now;
+++}
 ++
 ++static void
 ++wli_start(const struct fuxi_wifi_input *input)
@@ -42043,7 +42528,7 @@ index d21bf85..36313b4 100644
 ++	const uint8_t *value;
 ++	if (kind == 3) {
 ++		if (fwc_read32(bytes + 12)) { goto invalid; }
-++		bool recover = (wli.ux & FUXI_WIFI_UX_SCAN_RECOVER) != 0;
+++		bool recover = (wli.ux & (FUXI_WIFI_UX_SCAN_RECOVER | FUXI_WIFI_UX_POWER_OFF_FIRST)) != 0;
 ++		if (operation == 0x10a) {
 ++			value = fwc_attribute(bytes, length, 32, &size);
 ++			if (!wli.power_waiting || status || !value || size != 4 ||
@@ -42552,6 +43037,9 @@ index d21bf85..36313b4 100644
 ++		if (wli.ux & FUXI_WIFI_UX_SCAN_RECOVER) {
 ++			printf("FUXI WIFI IOS: native scan recovery enabled\n");
 ++		}
+++		if (wli.ux & FUXI_WIFI_UX_POWER_OFF_FIRST) {
+++			printf("FUXI WIFI IOS: queued power off takes priority\n");
+++		}
 ++		wli_backend.station.power = wli_power;
 ++		wli_backend.station.scan = wli_scan;
 ++		wli_backend.station.heard = wli_heard;
@@ -42565,11 +43053,15 @@ index d21bf85..36313b4 100644
 ++		wli.published = 1;
 ++		lck_mtx_unlock(&wli_lock);
 ++		if (!fuxi_wifi_ios_attach(&wli_backend)) { return ENXIO; }
-++		nw_wifi_set_events(&wli_events);
+++		bool batch_rx = (wli.ux & FUXI_WIFI_UX_RX_BATCH) && wli_input &&
+++		    wli_input->rx_packet && wli_input->rx_flush;
+++		if (batch_rx) { printf("FUXI WIFI IOS: batched ath12k receive enabled\n"); }
+++		nw_wifi_set_events(batch_rx ? &wli_batch_events : &wli_events);
 ++		printf("FUXI WIFI IOS: native backend published channels %u; power/scan/join ready "
 ++		    "(open, WPA2-PSK CCMP; full scan elements)\n", wli_channel_count);
 ++		wli_test_start();
 ++	}
+++	if (wli.ux & FUXI_WIFI_UX_LINK_STATS) { wli_link_stats(now); }
 ++	lck_mtx_lock(&wli_lock);
 ++	bool begin = wli.busy && !wli.submitted;
 ++	unsigned operation = wli.operation, power_on = wli.power_on;
@@ -42620,9 +43112,10 @@ index d21bf85..36313b4 100644
 ++		}
 ++	}
 ++	if (busy && operation == WLI_SCAN && wli.scan_accepted && !wli.fetching &&
-++	    (wli.ux & FUXI_WIFI_UX_SCAN_RECOVER)) {
+++	    (wli.ux & (FUXI_WIFI_UX_SCAN_RECOVER | FUXI_WIFI_UX_POWER_OFF_FIRST))) {
 ++		int scan_error = wli.scan_error;
-++		if (!scan_error && (wli.ux & FUXI_WIFI_UX_POWER_ASKED) && !fuxi_wifi_sta_powered()) {
+++		if (!scan_error && (fuxi_wifi_sta_power_off_pending() ||
+++		    ((wli.ux & FUXI_WIFI_UX_POWER_ASKED) && !fuxi_wifi_sta_powered()))) {
 ++			scan_error = ECANCELED;
 ++		}
 ++		if (!scan_error && now >= wli.deadline) { scan_error = ETIMEDOUT; }
@@ -42655,6 +43148,13 @@ index d21bf85..36313b4 100644
 ++	}
 ++	if (!wli.pending_operation) {
 ++		if (wli.fetching) {
+++			if (fuxi_wifi_sta_power_off_pending()) {
+++				lck_mtx_lock(&wli_lock);
+++				wli_bss_count = 0;
+++				lck_mtx_unlock(&wli_lock);
+++				wli_complete(ECANCELED);
+++				return 0;
+++			}
 ++			int error = wli_request(3);
 ++			if (error) {
 ++				printf("FUXI WIFI IOS: GET_BSS not sent, error %d; module records instead\n", error);
@@ -42662,6 +43162,10 @@ index d21bf85..36313b4 100644
 ++				wli_cache_scan();
 ++			}
 ++		} else if (wlj.step != WLJ_NONE) {
+++			if (busy && operation == WLI_JOIN && wlj.step < WLJ_JOINED &&
+++			    fuxi_wifi_sta_power_off_pending()) {
+++				wli_join_stop(ECANCELED, "power off queued");
+++			}
 ++			wli_join_step(now);
 ++		}
 ++	}
@@ -42921,7 +43425,7 @@ index 39be642..40ce125 100644
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
 diff --git a/xnu/patches/0104-fuxi-wifi-ios.patch b/xnu/patches/0104-fuxi-wifi-ios.patch
-index 179f5df..dc6a935 100644
+index 179f5df..a9c652e 100644
 --- a/xnu/patches/0104-fuxi-wifi-ios.patch
 +++ b/xnu/patches/0104-fuxi-wifi-ios.patch
 @@ -678,7 +678,7 @@
@@ -43418,7 +43922,7 @@ index 179f5df..dc6a935 100644
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_ios.c
 -@@ -0,0 +1,203 @@
-+@@ -0,0 +1,223 @@
++@@ -0,0 +1,225 @@
  +/* Fuxi Wi-Fi iOS shim entry and synthetic Ethernet link. No radio access. */
  +#if defined(FUXI)
  +#include <sys/param.h>
@@ -43441,7 +43945,16 @@ index 179f5df..dc6a935 100644
  +
  +static bool
  +transmit(mbuf_t packet, size_t length)
-@@ -1504,6 +1820,7 @@
+@@ -1491,6 +1807,8 @@
+ +};
+ +static const struct fuxi_wifi_input input = {
+ +	.rx_frame = fuxi_wifi_net_input, .link_state = fuxi_wifi_net_link_state,
+++	.rx_packet = fuxi_wifi_net_input_packet, .rx_flush = fuxi_wifi_net_flush_rx,
+++	.byte_counts = fuxi_wifi_net_byte_counts,
+ +};
+ +
+ +bool
+@@ -1504,6 +1822,7 @@
  +		return false;
  +	}
  +	backend = ops;
@@ -43449,7 +43962,7 @@ index 179f5df..dc6a935 100644
  +	memcpy(link.address, ops->station.address, sizeof(link.address));
  +	ops->start(&input);
  +	fuxi_wifi_sta_attach(&ops->station);
-@@ -1659,17 +1976,24 @@
+@@ -1659,17 +1978,24 @@
  +{
  +	int on = 0;
  +	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
@@ -43472,11 +43985,23 @@ index 179f5df..dc6a935 100644
  --- /dev/null
  +++ b/bsd/sys/fuxi_wifi_ios.h
 -@@ -0,0 +1,36 @@
-+@@ -0,0 +1,37 @@
++@@ -0,0 +1,42 @@
  +/* Fuxi Wi-Fi iOS shim: boot-lifetime backend boundary. */
  +#ifndef FUXI_WIFI_IOS_H
  +#define FUXI_WIFI_IOS_H
-@@ -1704,6 +2028,7 @@
+@@ -1685,6 +2011,11 @@
+ +struct fuxi_wifi_input {
+ +	void (*rx_frame)(const uint8_t *frame, size_t length);
+ +	void (*link_state)(bool up);
+++	/* A synchronous reader for borrowed fragments. End each worker batch with rx_flush. */
+++	void (*rx_packet)(void *packet, size_t length,
+++	    int (*read)(void *, size_t, void *, size_t));
+++	void (*rx_flush)(void);
+++	bool (*byte_counts)(uint64_t *received, uint64_t *sent);
+ +};
+ +
+ +/* One immutable backend for the boot. No detach/hot replacement. Station
+@@ -1704,11 +2035,12 @@
  +#ifdef KERNEL
  +bool fuxi_wifi_ios_attach(const struct fuxi_wifi_backend *backend);
  +void fuxi_wifi_ios_init(void);
@@ -43484,16 +44009,144 @@ index 179f5df..dc6a935 100644
  +#endif
  +#endif
  --- /dev/null
-@@ -2042,7 +2367,7 @@
+ +++ b/bsd/dev/fuxi_wifi_net.c
+-@@ -0,0 +1,268 @@
++@@ -0,0 +1,333 @@
+ +/*
+ + * Ported from HackiOS xnu/files/bsd/dev/redwood_net.c (APSL-2.0)
+ + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
+@@ -1756,6 +2088,19 @@
+ +static const struct fuxi_wifi_net_link *net_link;
+ +static bool net_link_up;
+ +static ifnet_t net_ifp;
+++/* The WLAN worker owns this list. Follow Sheng's WifiNet.cpp and hand input a bounded packet list. */
+++static mbuf_t rx_head, rx_tail;
+++static struct ifnet_stat_increment_param rx_pending;
+++
+++static void
+++net_rx_header(mbuf_t packet)
+++{
+++	char *header = mbuf_data(packet);
+++	mbuf_pkthdr_setrcvif(packet, net_ifp);
+++	mbuf_pkthdr_setheader(packet, header);
+++	mbuf_adj(packet, ETHER_HDR_LEN);
+++	bpf_tap_in(net_ifp, DLT_EN10MB, packet, header, ETHER_HDR_LEN);
+++}
+ +
+ +/* ---- the interface -------------------------------------------------------------------------------- */
+ +
+@@ -1788,7 +2133,6 @@
+ +	struct ifnet_stat_increment_param stats = { .packets_in = 1, .bytes_in = (uint32_t)length };
+ +	unsigned int chunks = 1;
+ +	mbuf_t packet = NULL;
+-+	char *header;
+ +
+ +	if (net_ifp == NULL || !__atomic_load_n(&net_link_up, __ATOMIC_ACQUIRE) || length < ETHER_HDR_LEN || length > FUXI_WIFI_NET_FRAME_MAX ||
+ +	    mbuf_allocpacket(MBUF_DONTWAIT, length, &chunks, &packet) != 0) {
+@@ -1799,14 +2143,67 @@
+ +		return;
+ +	}
+ +	/* as every Ethernet driver hands a frame up: the header noted and stepped over */
+-+	header = mbuf_data(packet);
+-+	mbuf_pkthdr_setrcvif(packet, net_ifp);
+-+	mbuf_pkthdr_setheader(packet, header);
+-+	mbuf_adj(packet, ETHER_HDR_LEN);
+-+	bpf_tap_in(net_ifp, DLT_EN10MB, packet, header, ETHER_HDR_LEN);
+++	net_rx_header(packet);
+ +	ifnet_input(net_ifp, packet, &stats);
+ +}
+ +
+++void
+++fuxi_wifi_net_flush_rx(void)
+++{
+++	mbuf_t packets = rx_head;
+++	if (packets == NULL) { return; }
+++	struct ifnet_stat_increment_param stats = rx_pending;
+++	rx_head = rx_tail = NULL;
+++	memset(&rx_pending, 0, sizeof(rx_pending));
+++	if (__atomic_load_n(&net_link_up, __ATOMIC_ACQUIRE)) {
+++		ifnet_input(net_ifp, packets, &stats);
+++	} else {
+++		mbuf_freem_list(packets);
+++	}
+++}
+++
+++void
+++fuxi_wifi_net_input_packet(void *source, size_t length,
+++    int (*read)(void *, size_t, void *, size_t))
+++{
+++	/* Align the IP header after the 14-byte Ethernet header. One cluster holds each supported frame. */
+++	const size_t padding = 2;
+++	unsigned int chunks = 1;
+++	mbuf_t packet = NULL;
+++	if (net_ifp == NULL || !__atomic_load_n(&net_link_up, __ATOMIC_ACQUIRE) || read == NULL ||
+++	    length < ETHER_HDR_LEN || length > FUXI_WIFI_NET_FRAME_MAX ||
+++	    mbuf_allocpacket(MBUF_DONTWAIT, length + padding, &chunks, &packet) != 0) {
+++		return;
+++	}
+++	if (chunks != 1 || mbuf_setdata(packet, (char *)mbuf_data(packet) + padding, length) != 0 ||
+++	    read(source, 0, mbuf_data(packet), length) != 0) {
+++		mbuf_freem(packet);
+++		return;
+++	}
+++	mbuf_pkthdr_setlen(packet, length);
+++	net_rx_header(packet);
+++	mbuf_setnextpkt(packet, NULL);
+++	if (rx_tail != NULL) {
+++		mbuf_setnextpkt(rx_tail, packet);
+++	} else {
+++		rx_head = packet;
+++	}
+++	rx_tail = packet;
+++	rx_pending.packets_in++;
+++	rx_pending.bytes_in += (uint32_t)length;
+++	if (rx_pending.packets_in == 64) { fuxi_wifi_net_flush_rx(); }
+++}
+++
+++bool
+++fuxi_wifi_net_byte_counts(uint64_t *received, uint64_t *sent)
+++{
+++	struct ifnet_stats_param stats;
+++	if (net_ifp == NULL || ifnet_stat(net_ifp, &stats) != 0) { return false; }
+++	*received = stats.bytes_in;
+++	*sent = stats.bytes_out;
+++	return true;
+++}
+++
+ +static unsigned net_ioctls_said;
+ +
+ +static errno_t
+@@ -1979,7 +2376,7 @@
+ +#endif /* FUXI */
+ --- /dev/null
+ +++ b/bsd/sys/fuxi_wifi_net.h
+-@@ -0,0 +1,60 @@
++@@ -0,0 +1,65 @@
+ +/*
+ + * Ported from HackiOS xnu/files/bsd/sys/redwood_net.h (APSL-2.0)
+ + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
+@@ -2032,6 +2429,11 @@
+ +bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *link);
+ +/* A frame has arrived. Copied; the buffer is the caller's again on return. */
+ +void fuxi_wifi_net_input(const uint8_t *frame, size_t length);
+++/* Only the ath12k worker calls these. Read the borrowed packet before returning. */
+++void fuxi_wifi_net_input_packet(void *source, size_t length,
+++    int (*read)(void *, size_t, void *, size_t));
+++void fuxi_wifi_net_flush_rx(void);
+++bool fuxi_wifi_net_byte_counts(uint64_t *received, uint64_t *sent);
+ +/* Frames can pass now / can no longer pass. */
+ +void fuxi_wifi_net_link_state(bool up);
+ +
+@@ -2042,7 +2444,7 @@
  +#endif /* _SYS_FUXI_WIFI_NET_H_ */
  --- /dev/null
  +++ b/bsd/dev/fuxi_wifi_sta.c
 -@@ -0,0 +1,357 @@
-+@@ -0,0 +1,422 @@
++@@ -0,0 +1,443 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/dev/redwood_sta.c (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
-@@ -2065,6 +2390,7 @@
+@@ -2065,6 +2467,7 @@
  + * Fuxi omits the root-file standing/fallback network: wifid owns rejoin policy.
  + */
  +#if defined(FUXI)
@@ -43501,7 +44154,7 @@ index 179f5df..dc6a935 100644
  +#include <kern/kalloc.h>
  +#include <kern/locks.h>
  +#include <kern/sched_prim.h>
-@@ -2087,6 +2413,18 @@
+@@ -2087,9 +2490,23 @@
  +static bool sta_thread_made;
  +static bool sta_calls;                          /* the thread is in a call of the station side's */
  +static bool sta_on;                             /* the radio's power, as last asked for */
@@ -43520,16 +44173,26 @@ index 179f5df..dc6a935 100644
  +
  +/* what has been asked for and not begun */
  +static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
-@@ -2131,6 +2469,8 @@
+++/* OFF must reach the radio even if a later ON was queued while a scan/join owned the worker. */
+++static bool power_off_pending;
+ +static struct fuxi_wifi_sta_scan asked_scan_what;
+ +static struct fuxi_wifi_sta_join asked_join_what;
+ +
+@@ -2129,8 +2546,11 @@
+ +		/* one thing at a time, in the order that makes sense when several wait */
+ +		if (asked_power) {
  +			power = true;
- +			power_on = asked_power_on;
- +			asked_power = false;
+-+			power_on = asked_power_on;
+-+			asked_power = false;
+++			power_on = asked_power_on && !power_off_pending;
+++			asked_power = power_on != asked_power_on;
+++			power_off_pending = false;
 ++			power_running = true;
 ++			power_running_on = power_on;
  +		} else if (asked_leave) {
  +			leave = true;
  +			asked_leave = false;
-@@ -2150,22 +2490,33 @@
+@@ -2150,22 +2570,33 @@
  +		if (power) {
  +			struct fuxi_wifi_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
  +			bool was_joined = false;
@@ -43568,7 +44231,7 @@ index 179f5df..dc6a935 100644
  +		} else if (leave) {
  +			ops->leave();
  +			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
-@@ -2224,10 +2575,12 @@
+@@ -2224,10 +2655,12 @@
  +	}
  +	lck_mtx_lock(&sta_lock);
  +	sta_ops = ops;
@@ -43583,7 +44246,7 @@ index 179f5df..dc6a935 100644
  +}
  +
  +void
-@@ -2248,16 +2601,51 @@
+@@ -2248,17 +2681,67 @@
  +	return present;
  +}
  +
@@ -43594,7 +44257,13 @@ index 179f5df..dc6a935 100644
 ++static bool
 ++power_wanted(bool *on)
 ++{
-++	if (!(fuxi_wifi_ux() & FUXI_WIFI_UX_POWER_ASKED)) {
+++	unsigned ux = fuxi_wifi_ux();
+++	if (power_off_pending || (power_running && !power_running_on &&
+++	    (ux & FUXI_WIFI_UX_POWER_OFF_FIRST))) {
+++		*on = false;
+++		return true;
+++	}
+++	if (!(ux & FUXI_WIFI_UX_POWER_ASKED)) {
 ++		return false;
 ++	}
 ++	if (asked_power) {
@@ -43622,6 +44291,15 @@ index 179f5df..dc6a935 100644
  +	return on;
  +}
  +
+ +bool
+++fuxi_wifi_sta_power_off_pending(void)
+++{
+++	lck_mtx_lock(&sta_lock);
+++	bool pending = power_off_pending;
+++	lck_mtx_unlock(&sta_lock);
+++	return pending;
+++}
+++
 ++/* 能不能再收掃描／加入：電源是開的或正要開；bit 0 打開時，正要關就不收 */
 ++static bool
 ++power_accepts(void)
@@ -43633,10 +44311,11 @@ index 179f5df..dc6a935 100644
 ++	return sta_on || (asked_power && asked_power_on);
 ++}
 ++
- +bool
+++bool
  +fuxi_wifi_sta_busy(void)
  +{
-@@ -2277,7 +2665,9 @@
+ +	bool busy;
+@@ -2277,10 +2760,15 @@
  +		lck_mtx_unlock(&sta_lock);
  +		return ENXIO;
  +	}
@@ -43647,7 +44326,13 @@ index 179f5df..dc6a935 100644
  +	asked_power = true;
  +	asked_power_on = on;
  +	if (!on) {
-@@ -2297,7 +2687,7 @@
+++		if (fuxi_wifi_ux() & FUXI_WIFI_UX_POWER_OFF_FIRST) {
+++			power_off_pending = true;
+++		}
+ +		asked_scan = asked_join = asked_leave = false;
+ +		bzero(&asked_join_what, sizeof(asked_join_what));
+ +	}
+@@ -2297,7 +2785,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
@@ -43656,7 +44341,7 @@ index 179f5df..dc6a935 100644
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
-@@ -2317,7 +2707,7 @@
+@@ -2317,7 +2805,7 @@
  +		return EINVAL;
  +	}
  +	lck_mtx_lock(&sta_lock);
@@ -43665,16 +44350,16 @@ index 179f5df..dc6a935 100644
  +		lck_mtx_unlock(&sta_lock);
  +		return sta_ops == NULL ? ENXIO : ENETDOWN;
  +	}
-@@ -2402,7 +2792,7 @@
+@@ -2402,7 +2890,7 @@
  +#endif /* FUXI */
  --- /dev/null
  +++ b/bsd/sys/fuxi_wifi_sta.h
 -@@ -0,0 +1,126 @@
-+@@ -0,0 +1,154 @@
++@@ -0,0 +1,158 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/sys/redwood_sta.h (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
-@@ -2450,6 +2840,7 @@
+@@ -2450,6 +2938,7 @@
  +	uint16_t frequencies[64], frequency_count;      /* only these channels */
  +	bool passive;                           /* only listen */
  +	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
@@ -43682,7 +44367,7 @@ index 179f5df..dc6a935 100644
  +};
  +
  +enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
-@@ -2504,7 +2895,34 @@
+@@ -2504,7 +2993,37 @@
  +	                                         * an errno: it was lost (the access point showed us the door) */
  +};
  +
@@ -43708,7 +44393,10 @@ index 179f5df..dc6a935 100644
 ++                                         * 只回報電源事件 */
 ++#define FUXI_WIFI_UX_SCAN_RECOVER 32u      /* keep radio control after a failed or cancelled scan */
 ++#define FUXI_WIFI_UX_SCAN_CHANNELS 64u     /* implicit scans use the advertised 2.4/5 GHz channel list */
-++#define FUXI_WIFI_UX_ALL         127u
+++#define FUXI_WIFI_UX_POWER_OFF_FIRST 128u /* finish an off request before a later enable */
+++#define FUXI_WIFI_UX_RX_BATCH    256u      /* receive borrowed ath12k fragments directly into batched mbufs */
+++#define FUXI_WIFI_UX_LINK_STATS  512u      /* print cached PHY rate and interface byte counts */
+++#define FUXI_WIFI_UX_ALL        1023u
 ++
  +#ifdef KERNEL
 ++/* 讀一次 ADT 之後記住（ADT 開機後不變）；沒有這個屬性或長度不對都當 0 */
@@ -43717,6 +44405,14 @@ index 179f5df..dc6a935 100644
  +/* ---- the station side ---- */
  +void     fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops);         /* init only; immutable boot-lifetime backend */
  +void     fuxi_wifi_sta_lost(int error);                                   /* the network joined is gone by itself */
+@@ -2517,6 +3036,7 @@
+ +int      fuxi_wifi_sta_ask_leave(void);
+ +bool     fuxi_wifi_sta_busy(void);                                        /* something asked for is not over yet */
+ +bool     fuxi_wifi_sta_powered(void);
+++bool     fuxi_wifi_sta_power_off_pending(void);
+ +/* the `index`th access point the last scan heard: true, or false when there are not that many */
+ +bool     fuxi_wifi_sta_heard(unsigned index, struct fuxi_wifi_sta_bss *bss);
+ +void     fuxi_wifi_sta_state(struct fuxi_wifi_sta_state *state);
 diff --git a/xnu/patches/0106-fuxi-unixnu.patch b/xnu/patches/0106-fuxi-unixnu.patch
 index d95faff..da02b50 100644
 --- a/xnu/patches/0106-fuxi-unixnu.patch
