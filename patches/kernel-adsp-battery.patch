@@ -19360,10 +19360,10 @@ index 0000000..0e08f98
 +}
 diff --git a/tools/test-fuxi-wlan-ios.py b/tools/test-fuxi-wlan-ios.py
 new file mode 100644
-index 0000000..af8d450
+index 0000000..f308157
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ios.py
-@@ -0,0 +1,901 @@
+@@ -0,0 +1,987 @@
 +import hashlib
 +import hmac
 +import os
@@ -19437,7 +19437,8 @@ index 0000000..af8d450
 +    for (unsigned index=0;index<length;index++) ((uint8_t *)buffer)[index]=(uint8_t)index;
 +}
 +bool fuxi_wifi_sta_busy(void) { return false; }
-+bool fuxi_wifi_sta_powered(void) { return true; }
++static bool test_powered = true;
++bool fuxi_wifi_sta_powered(void) { return test_powered; }
 +static unsigned test_ux;                        /* ADT fuxi,wifi-ux；bootstrap() 時讀進 wli.ux */
 +unsigned fuxi_wifi_ux(void) { return test_ux; }
 +int fuxi_wifi_sta_ask_power(bool on) { (void)on; return 0; }
@@ -19832,6 +19833,89 @@ index 0000000..af8d450
 +    test_cache=0; memset(&caller_scan,0,sizeof(caller_scan));
 +}
 +
++static void scan_done(unsigned status,uint64_t generation) {
++    uint8_t bytes[MESSAGE]; size_t length=header(bytes,3,0x102,generation);
++    fwc_write(bytes+20,status,4); assert(!deliver(bytes,length));
++}
++
++static void scan_recovery_tests(void) {
++    memset(&caller_scan,0,sizeof(caller_scan));
++    test_ux=FUXI_WIFI_UX_SCAN_RECOVER|FUXI_WIFI_UX_POWER_ASKED;
++    for (unsigned event_first=0;event_first<2;event_first++) {
++        bootstrap(); pthread_t thread=begin(2,false); step(); expect_request(2);
++        if (event_first) scan_done(9,wli.generation); else respond(2,0);
++        step(); assert(!atomic_load(&caller_done) && !wli.fetching);
++        if (event_first) respond(2,0); else scan_done(9,wli.generation);
++        step(); assert(!pthread_join(thread,NULL) && caller_result==EIO);
++        assert(!wli.fatal && !wli.scan_draining && !wli.cache_valid && !wli_bss_count);
++    }
++
++    bootstrap(); pthread_t thread=begin(2,false); step(); respond(2,0);
++    now=wli.deadline-2; step();
++    assert(!atomic_load(&caller_done));
++    step(); assert(!pthread_join(thread,NULL) && caller_result==ETIMEDOUT);
++    assert(!wli.fatal && wli.scan_draining && wli_scan(&caller_scan)==EBUSY);
++    power_test(true,2); assert(wli.scan_draining);
++    scan_done(9,2);
++    assert(!wli.scan_draining);
++    thread=begin(2,false); step(); scan_accept(false); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && !caller_result && wli_bss_count==5);
++
++    bootstrap(); wli_state.phase=FUXI_WIFI_STA_JOINED;
++    unsigned downs=link_downs;
++    thread=begin(2,false); step(); respond(2,0);
++    test_powered=false; step(); test_powered=true;
++    assert(!pthread_join(thread,NULL) && caller_result==ECANCELED);
++    assert(wli.scan_draining && wli_state.phase==FUXI_WIFI_STA_JOINED && link_downs==downs);
++    power_test(false,3);
++    assert(!wli.scan_draining);
++    power_test(true,4);
++    thread=begin(2,false); step(); scan_done(9,2);
++    assert(!wli.scan_done && !wli.fatal);
++    scan_accept(true); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && !caller_result);
++
++    /* An already expired aggregate scan must not enqueue another dwell batch. */
++    test_dwell=test_batch=1; offered_features=FWC_FEATURE_SCAN_DWELL_MS;
++    caller_scan.dwell_ms=110; caller_scan.frequency_count=40;
++    for (unsigned index=0;index<40;index++) caller_scan.frequencies[index]=2412+index*5;
++    bootstrap(); thread=begin(2,false); step(); scan_accept(false);
++    unsigned sequence=wli.sequence;
++    now=wli.deadline-1; step();
++    assert(!pthread_join(thread,NULL) && caller_result==ETIMEDOUT);
++    assert(wli.sequence==sequence && !wli.scan_draining && !wli.fatal);
++
++    test_ux=test_dwell=test_batch=offered_features=0;
++    memset(&caller_scan,0,sizeof(caller_scan));
++    puts("PASS scan recovery: abort, deadline, power cancellation, late completion and a subsequent scan");
++}
++
++static void scan_scope_tests(void) {
++    size_t size;
++    memset(&caller_scan,0,sizeof(caller_scan)); caller_scan.cache_allowed=true;
++    bootstrap(); pthread_t thread=begin(2,false); step();
++    assert(!request_attribute(20,&size));
++    scan_accept(false); serve_bss(6,0); assert(!pthread_join(thread,NULL) && !caller_result);
++
++    test_ux=FUXI_WIFI_UX_SCAN_CHANNELS; test_cache=1;
++    bootstrap(); thread=begin(2,false); step();
++    const uint8_t *frequencies=request_attribute(20,&size);
++    assert(frequencies && size==8 && fwc_read32(frequencies)==2412 && fwc_read32(frequencies+4)==5180);
++    assert(!request_attribute(FWC_ATTR_SCAN_DWELL_MS,&size));
++    scan_accept(false); serve_bss(6,0); assert(!pthread_join(thread,NULL) && !caller_result);
++    unsigned sequence=wli.sequence;
++    assert(!wli_scan(&caller_scan) && wli.sequence==sequence && wli.cache_hits==1);
++
++    caller_scan.frequency_count=1; caller_scan.frequencies[0]=5200;
++    thread=begin(2,false); step();
++    frequencies=request_attribute(20,&size);
++    assert(frequencies && size==4 && fwc_read32(frequencies)==5200);
++    scan_accept(true); serve_bss(6,0); assert(!pthread_join(thread,NULL) && !caller_result);
++    test_ux=test_cache=0;
++    memset(&caller_scan,0,sizeof(caller_scan));
++    puts("PASS implicit scan uses advertised channels in one request; explicit channels and cache coverage preserved");
++}
++
 +/* Events from the module about the join. */
 +static void event_auth(const uint8_t *bssid,unsigned status) {
 +    uint8_t bytes[MESSAGE], frame[30]={0xb0};
@@ -20161,6 +20245,8 @@ index 0000000..af8d450
 +    dwell_tests();
 +    batch_tests();
 +    cache_tests();
++    scan_recovery_tests();
++    scan_scope_tests();
 +    bootstrap(); power_test(false,3); power_test(true,4); power_test(true,4);
 +    memset(&caller_scan,0,sizeof(caller_scan)); caller_scan.ssid_length=4;
 +    memcpy(caller_scan.ssid,"real",4); caller_scan.frequency_count=64;
@@ -36203,7 +36289,7 @@ index 9479206..899bfd6 100644
  		return sta_ops == NULL ? ENXIO : ENETDOWN;
  	}
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
-index dce1375..bf4edca 100644
+index dce1375..f789ca9 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
 @@ -45,6 +45,7 @@ struct fuxi_wifi_sta_scan {
@@ -36214,7 +36300,7 @@ index dce1375..bf4edca 100644
  };
  
  enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
-@@ -99,7 +100,32 @@ enum fuxi_wifi_sta_event {
+@@ -99,7 +100,34 @@ enum fuxi_wifi_sta_event {
  	                                         * an errno: it was lost (the access point showed us the door) */
  };
  
@@ -36238,7 +36324,9 @@ index dce1375..bf4edca 100644
 +                                         * COUNTRY_CODE_CHANGED：wifid 收到會清掉掃描快取）；GET 51 回記住的碼 */
 +#define FUXI_WIFI_UX_POWER_SAME   16u      /* 要的電源狀態和現在一樣（例如關被開覆蓋）：不呼叫底層、不清連線，
 +                                         * 只回報電源事件 */
-+#define FUXI_WIFI_UX_ALL          31u
++#define FUXI_WIFI_UX_SCAN_RECOVER 32u      /* keep radio control after a failed or cancelled scan */
++#define FUXI_WIFI_UX_SCAN_CHANNELS 64u     /* implicit scans use the advertised 2.4/5 GHz channel list */
++#define FUXI_WIFI_UX_ALL         127u
 +
  #ifdef KERNEL
 +/* 讀一次 ADT 之後記住（ADT 開機後不變）；沒有這個屬性或長度不對都當 0 */
@@ -37576,10 +37664,10 @@ index 0000000..656f494
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ios.inc b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
 new file mode 100644
-index 0000000..25c941e
+index 0000000..a6d28c9
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-@@ -0,0 +1,1633 @@
+@@ -0,0 +1,1685 @@
 +#include <sys/fuxi_wifi_ios.h>
 +#include <sys/fuxi_wifi_wpa.h>
 +#include <sys/errno.h>
@@ -37647,6 +37735,8 @@ index 0000000..25c941e
 +	uint32_t sequence, pending_sequence, features;
 +	unsigned pending_operation, info, channels, published, busy, submitted;
 +	unsigned operation, power_on, power_waiting, scan_accepted, scan_done;
++	bool scan_draining;                      /* under wli_lock: wait for the abandoned scan's terminal event */
++	int scan_error;                          /* worker only: status of the current SCAN_DONE */
 +	unsigned fetching, fetch_index, scan_reports, diag_lines, dwell_enabled;
 +	unsigned cache_enabled, cache_valid, cache_hits, scan_rejections;
 +	unsigned batch_enabled, scan_count, scan_limit, scan_offset;
@@ -37748,8 +37838,9 @@ index 0000000..25c941e
 +		if (error) { return error; }
 +	}
 +	lck_mtx_lock(&wli_lock);
-+	if (wli.fatal || !wli.published || wli.busy) {
-+		int error = wli.fatal ? wli.fatal : wli.busy ? EBUSY : ENXIO;
++	bool draining = wli.scan_draining && (operation == WLI_SCAN || operation == WLI_JOIN);
++	if (wli.fatal || !wli.published || wli.busy || draining) {
++		int error = wli.fatal ? wli.fatal : wli.busy || draining ? EBUSY : ENXIO;
 +		lck_mtx_unlock(&wli_lock);
 +		return error;
 +	}
@@ -37823,7 +37914,19 @@ index 0000000..25c941e
 +	if (scan->dwell_ms && (!wli.dwell_enabled || !(wli.features & FWC_FEATURE_SCAN_DWELL_MS))) {
 +		return EOPNOTSUPP;
 +	}
++	struct fuxi_wifi_sta_scan scoped;
 +	lck_mtx_lock(&wli_lock);
++	/* Ath12kWifi's nw_sta.c scans the bands that the OS can use. Keep the
++	 * effective channel list in the request for cache coverage checks. */
++	if ((wli.ux & FUXI_WIFI_UX_SCAN_CHANNELS) && wli.published && !scan->frequency_count &&
++	    wli_channel_count && wli_channel_count <= sizeof(scoped.frequencies) / sizeof(scoped.frequencies[0])) {
++		scoped = *scan;
++		scoped.frequency_count = wli_channel_count;
++		for (unsigned index = 0; index < wli_channel_count; index++) {
++			scoped.frequencies[index] = wli_channels[index].frequency;
++		}
++		scan = &scoped;
++	}
 +	bool cached = scan->cache_allowed && wli.cache_enabled && wli.cache_valid && wli_bss_count &&
 +	    !wli.fatal && wli.published && !wli.busy && wli_state.phase != FUXI_WIFI_STA_OFF &&
 +	    wla_now_ms() >= wli.scanned_at && wla_now_ms() - wli.scanned_at <= WLI_CACHE_MS &&
@@ -37835,6 +37938,9 @@ index 0000000..25c941e
 +			printf("FUXI WIFI IOS: FAST scan uses fresh completed cache %u\n", hits);
 +		}
 +		return 0;
++	}
++	if (scan == &scoped) {
++		printf("FUXI WIFI IOS: native scan uses %u advertised channels\n", scan->frequency_count);
 +	}
 +	return wli_submit(WLI_SCAN, false, scan, NULL);
 +}
@@ -38207,12 +38313,12 @@ index 0000000..25c941e
 +		}
 +		printf("FUXI WIFI IOS: join needs a fresh scan (%s%s)\n", error == ENOENT ? "not heard" : "too old",
 +		    scan.frequency_count ? ", its channel first" : "");
-+		error = wli_submit(WLI_SCAN, false, &scan, NULL);
++		error = wli_scan(&scan);
 +		if (!error) { error = wli_pick(join, target); }
 +		if (scan.frequency_count && (error == ENOENT || error == ESTALE)) {
 +			scan.frequency_count = 0;
-+			printf("FUXI WIFI IOS: not on its channel; every channel\n");
-+			error = wli_submit(WLI_SCAN, false, &scan, NULL);
++			printf("FUXI WIFI IOS: not on its channel; wider scan\n");
++			error = wli_scan(&scan);
 +			if (!error) { error = wli_pick(join, target); }
 +		}
 +	}
@@ -38619,14 +38725,17 @@ index 0000000..25c941e
 +	const uint8_t *value;
 +	if (kind == 3) {
 +		if (fwc_read32(bytes + 12)) { goto invalid; }
++		bool recover = (wli.ux & FUXI_WIFI_UX_SCAN_RECOVER) != 0;
 +		if (operation == 0x10a) {
 +			value = fwc_attribute(bytes, length, 32, &size);
 +			if (!wli.power_waiting || status || !value || size != 4 ||
 +			    fwc_read32(value) != wli.power_on || generation < wli.generation ||
 +			    generation - wli.generation > 1) { goto invalid; }
++			bool power_changed = generation != wli.generation;
 +			wli.generation = generation;
 +			wli_forget();
 +			lck_mtx_lock(&wli_lock);
++			if (power_changed) { wli.scan_draining = false; }
 +			wli_state.phase = wli.power_on ? FUXI_WIFI_STA_IDLE : FUXI_WIFI_STA_OFF;
 +			wli_bss_count = 0;
 +			wli.cache_valid = 0;
@@ -38634,13 +38743,20 @@ index 0000000..25c941e
 +			if (wli_input) { wli_input->link_state(false); }
 +			wli_complete(0);
 +		} else if (operation == 0x101 || operation == 0x102) {
++			if (recover && generation < wli.generation) { return 0; }
 +			if (generation != wli.generation) { goto invalid; }
 +			lck_mtx_lock(&wli_lock);
++			bool draining = wli.scan_draining;
++			if (draining && operation == 0x102) { wli.scan_draining = false; }
 +			bool scanning = wli.busy && wli.submitted && wli.operation == WLI_SCAN && !wli.fetching;
 +			lck_mtx_unlock(&wli_lock);
++			if (draining) { return 0; }
 +			if (!scanning) { goto invalid; }
-+			if (status) { wli_fail(wli_status(status)); }
-+			if (operation == 0x102) { wli.scan_done = 1; }
++			if (status && (!recover || operation == 0x101)) { wli_fail(wli_status(status)); }
++			if (operation == 0x102) {
++				wli.scan_done = 1;
++				wli.scan_error = wli_status(status);
++			}
 +		} else if (generation == wli.generation) {
 +			wli_join_event(operation, bytes, length);
 +		}
@@ -39115,6 +39231,9 @@ index 0000000..25c941e
 +		wli.batch_enabled = batch == 1;
 +		printf("FUXI WIFI IOS: scan batch opt-in %u budget %u ms\n", wli.batch_enabled, WLI_SCAN_BUDGET_MS);
 +		wli.ux = fuxi_wifi_ux();
++		if (wli.ux & FUXI_WIFI_UX_SCAN_RECOVER) {
++			printf("FUXI WIFI IOS: native scan recovery enabled\n");
++		}
 +		wli_backend.station.power = wli_power;
 +		wli_backend.station.scan = wli_scan;
 +		wli_backend.station.heard = wli_heard;
@@ -39144,6 +39263,7 @@ index 0000000..25c941e
 +		wli.fetch_at = 0;
 +		wli.scan_parts = operation == WLI_SCAN;
 +		wli.scan_accepted = wli.scan_done = wli.fetching = 0;
++		wli.scan_error = 0;
 +		if (operation == WLI_SCAN) {
 +			if (wli_state.phase == FUXI_WIFI_STA_IDLE) { wli_state.phase = FUXI_WIFI_STA_SCANNING; }
 +			wli_bss_count = 0;
@@ -39181,10 +39301,30 @@ index 0000000..25c941e
 +			busy = false;
 +		}
 +	}
++	if (busy && operation == WLI_SCAN && wli.scan_accepted && !wli.fetching &&
++	    (wli.ux & FUXI_WIFI_UX_SCAN_RECOVER)) {
++		int scan_error = wli.scan_error;
++		if (!scan_error && (wli.ux & FUXI_WIFI_UX_POWER_ASKED) && !fuxi_wifi_sta_powered()) {
++			scan_error = ECANCELED;
++		}
++		if (!scan_error && now >= wli.deadline) { scan_error = ETIMEDOUT; }
++		if (scan_error) {
++			/* SCAN_DONE has no request ID. Until it arrives or power changes the
++			 * generation, a new scan could mistake that event for its own. */
++			lck_mtx_lock(&wli_lock);
++			wli.scan_draining = !wli.scan_done;
++			lck_mtx_unlock(&wli_lock);
++			printf("FUXI WIFI IOS: native scan ended %d after %llu ms in part %u, waiting for completion %u\n",
++			    scan_error, (unsigned long long)(now - wli.begun_at), wli.scan_parts, !wli.scan_done);
++			wli_complete(scan_error);
++			return 0;
++		}
++	}
 +	if (busy && operation == WLI_SCAN && wli.scan_accepted && wli.scan_done && !wli.fetching) {
 +		if (wli.scan_offset + wli.scan_limit < wli.scan_count) {
 +			wli.scan_offset += wli.scan_limit;
 +			wli.scan_accepted = wli.scan_done = 0;
++			wli.scan_error = 0;
 +			wli.scan_parts++;
 +			int error = wli_request(2);
 +			if (error) { return error; }
@@ -39516,7 +39656,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..acbf639 100644
+index d21bf85..36313b4 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -39987,7 +40127,7 @@ index d21bf85..acbf639 100644
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,2491 @@
+@@ -5899,3 +6092,2543 @@
  + }
  + r[3] = 0;
  +}
@@ -40845,7 +40985,7 @@ index d21bf85..acbf639 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ios.inc
-+@@ -0,0 +1,1633 @@
++@@ -0,0 +1,1685 @@
 ++#include <sys/fuxi_wifi_ios.h>
 ++#include <sys/fuxi_wifi_wpa.h>
 ++#include <sys/errno.h>
@@ -40913,6 +41053,8 @@ index d21bf85..acbf639 100644
 ++	uint32_t sequence, pending_sequence, features;
 ++	unsigned pending_operation, info, channels, published, busy, submitted;
 ++	unsigned operation, power_on, power_waiting, scan_accepted, scan_done;
+++	bool scan_draining;                      /* under wli_lock: wait for the abandoned scan's terminal event */
+++	int scan_error;                          /* worker only: status of the current SCAN_DONE */
 ++	unsigned fetching, fetch_index, scan_reports, diag_lines, dwell_enabled;
 ++	unsigned cache_enabled, cache_valid, cache_hits, scan_rejections;
 ++	unsigned batch_enabled, scan_count, scan_limit, scan_offset;
@@ -41014,8 +41156,9 @@ index d21bf85..acbf639 100644
 ++		if (error) { return error; }
 ++	}
 ++	lck_mtx_lock(&wli_lock);
-++	if (wli.fatal || !wli.published || wli.busy) {
-++		int error = wli.fatal ? wli.fatal : wli.busy ? EBUSY : ENXIO;
+++	bool draining = wli.scan_draining && (operation == WLI_SCAN || operation == WLI_JOIN);
+++	if (wli.fatal || !wli.published || wli.busy || draining) {
+++		int error = wli.fatal ? wli.fatal : wli.busy || draining ? EBUSY : ENXIO;
 ++		lck_mtx_unlock(&wli_lock);
 ++		return error;
 ++	}
@@ -41089,7 +41232,19 @@ index d21bf85..acbf639 100644
 ++	if (scan->dwell_ms && (!wli.dwell_enabled || !(wli.features & FWC_FEATURE_SCAN_DWELL_MS))) {
 ++		return EOPNOTSUPP;
 ++	}
+++	struct fuxi_wifi_sta_scan scoped;
 ++	lck_mtx_lock(&wli_lock);
+++	/* Ath12kWifi's nw_sta.c scans the bands that the OS can use. Keep the
+++	 * effective channel list in the request for cache coverage checks. */
+++	if ((wli.ux & FUXI_WIFI_UX_SCAN_CHANNELS) && wli.published && !scan->frequency_count &&
+++	    wli_channel_count && wli_channel_count <= sizeof(scoped.frequencies) / sizeof(scoped.frequencies[0])) {
+++		scoped = *scan;
+++		scoped.frequency_count = wli_channel_count;
+++		for (unsigned index = 0; index < wli_channel_count; index++) {
+++			scoped.frequencies[index] = wli_channels[index].frequency;
+++		}
+++		scan = &scoped;
+++	}
 ++	bool cached = scan->cache_allowed && wli.cache_enabled && wli.cache_valid && wli_bss_count &&
 ++	    !wli.fatal && wli.published && !wli.busy && wli_state.phase != FUXI_WIFI_STA_OFF &&
 ++	    wla_now_ms() >= wli.scanned_at && wla_now_ms() - wli.scanned_at <= WLI_CACHE_MS &&
@@ -41101,6 +41256,9 @@ index d21bf85..acbf639 100644
 ++			printf("FUXI WIFI IOS: FAST scan uses fresh completed cache %u\n", hits);
 ++		}
 ++		return 0;
+++	}
+++	if (scan == &scoped) {
+++		printf("FUXI WIFI IOS: native scan uses %u advertised channels\n", scan->frequency_count);
 ++	}
 ++	return wli_submit(WLI_SCAN, false, scan, NULL);
 ++}
@@ -41473,12 +41631,12 @@ index d21bf85..acbf639 100644
 ++		}
 ++		printf("FUXI WIFI IOS: join needs a fresh scan (%s%s)\n", error == ENOENT ? "not heard" : "too old",
 ++		    scan.frequency_count ? ", its channel first" : "");
-++		error = wli_submit(WLI_SCAN, false, &scan, NULL);
+++		error = wli_scan(&scan);
 ++		if (!error) { error = wli_pick(join, target); }
 ++		if (scan.frequency_count && (error == ENOENT || error == ESTALE)) {
 ++			scan.frequency_count = 0;
-++			printf("FUXI WIFI IOS: not on its channel; every channel\n");
-++			error = wli_submit(WLI_SCAN, false, &scan, NULL);
+++			printf("FUXI WIFI IOS: not on its channel; wider scan\n");
+++			error = wli_scan(&scan);
 ++			if (!error) { error = wli_pick(join, target); }
 ++		}
 ++	}
@@ -41885,14 +42043,17 @@ index d21bf85..acbf639 100644
 ++	const uint8_t *value;
 ++	if (kind == 3) {
 ++		if (fwc_read32(bytes + 12)) { goto invalid; }
+++		bool recover = (wli.ux & FUXI_WIFI_UX_SCAN_RECOVER) != 0;
 ++		if (operation == 0x10a) {
 ++			value = fwc_attribute(bytes, length, 32, &size);
 ++			if (!wli.power_waiting || status || !value || size != 4 ||
 ++			    fwc_read32(value) != wli.power_on || generation < wli.generation ||
 ++			    generation - wli.generation > 1) { goto invalid; }
+++			bool power_changed = generation != wli.generation;
 ++			wli.generation = generation;
 ++			wli_forget();
 ++			lck_mtx_lock(&wli_lock);
+++			if (power_changed) { wli.scan_draining = false; }
 ++			wli_state.phase = wli.power_on ? FUXI_WIFI_STA_IDLE : FUXI_WIFI_STA_OFF;
 ++			wli_bss_count = 0;
 ++			wli.cache_valid = 0;
@@ -41900,13 +42061,20 @@ index d21bf85..acbf639 100644
 ++			if (wli_input) { wli_input->link_state(false); }
 ++			wli_complete(0);
 ++		} else if (operation == 0x101 || operation == 0x102) {
+++			if (recover && generation < wli.generation) { return 0; }
 ++			if (generation != wli.generation) { goto invalid; }
 ++			lck_mtx_lock(&wli_lock);
+++			bool draining = wli.scan_draining;
+++			if (draining && operation == 0x102) { wli.scan_draining = false; }
 ++			bool scanning = wli.busy && wli.submitted && wli.operation == WLI_SCAN && !wli.fetching;
 ++			lck_mtx_unlock(&wli_lock);
+++			if (draining) { return 0; }
 ++			if (!scanning) { goto invalid; }
-++			if (status) { wli_fail(wli_status(status)); }
-++			if (operation == 0x102) { wli.scan_done = 1; }
+++			if (status && (!recover || operation == 0x101)) { wli_fail(wli_status(status)); }
+++			if (operation == 0x102) {
+++				wli.scan_done = 1;
+++				wli.scan_error = wli_status(status);
+++			}
 ++		} else if (generation == wli.generation) {
 ++			wli_join_event(operation, bytes, length);
 ++		}
@@ -42381,6 +42549,9 @@ index d21bf85..acbf639 100644
 ++		wli.batch_enabled = batch == 1;
 ++		printf("FUXI WIFI IOS: scan batch opt-in %u budget %u ms\n", wli.batch_enabled, WLI_SCAN_BUDGET_MS);
 ++		wli.ux = fuxi_wifi_ux();
+++		if (wli.ux & FUXI_WIFI_UX_SCAN_RECOVER) {
+++			printf("FUXI WIFI IOS: native scan recovery enabled\n");
+++		}
 ++		wli_backend.station.power = wli_power;
 ++		wli_backend.station.scan = wli_scan;
 ++		wli_backend.station.heard = wli_heard;
@@ -42410,6 +42581,7 @@ index d21bf85..acbf639 100644
 ++		wli.fetch_at = 0;
 ++		wli.scan_parts = operation == WLI_SCAN;
 ++		wli.scan_accepted = wli.scan_done = wli.fetching = 0;
+++		wli.scan_error = 0;
 ++		if (operation == WLI_SCAN) {
 ++			if (wli_state.phase == FUXI_WIFI_STA_IDLE) { wli_state.phase = FUXI_WIFI_STA_SCANNING; }
 ++			wli_bss_count = 0;
@@ -42447,10 +42619,30 @@ index d21bf85..acbf639 100644
 ++			busy = false;
 ++		}
 ++	}
+++	if (busy && operation == WLI_SCAN && wli.scan_accepted && !wli.fetching &&
+++	    (wli.ux & FUXI_WIFI_UX_SCAN_RECOVER)) {
+++		int scan_error = wli.scan_error;
+++		if (!scan_error && (wli.ux & FUXI_WIFI_UX_POWER_ASKED) && !fuxi_wifi_sta_powered()) {
+++			scan_error = ECANCELED;
+++		}
+++		if (!scan_error && now >= wli.deadline) { scan_error = ETIMEDOUT; }
+++		if (scan_error) {
+++			/* SCAN_DONE has no request ID. Until it arrives or power changes the
+++			 * generation, a new scan could mistake that event for its own. */
+++			lck_mtx_lock(&wli_lock);
+++			wli.scan_draining = !wli.scan_done;
+++			lck_mtx_unlock(&wli_lock);
+++			printf("FUXI WIFI IOS: native scan ended %d after %llu ms in part %u, waiting for completion %u\n",
+++			    scan_error, (unsigned long long)(now - wli.begun_at), wli.scan_parts, !wli.scan_done);
+++			wli_complete(scan_error);
+++			return 0;
+++		}
+++	}
 ++	if (busy && operation == WLI_SCAN && wli.scan_accepted && wli.scan_done && !wli.fetching) {
 ++		if (wli.scan_offset + wli.scan_limit < wli.scan_count) {
 ++			wli.scan_offset += wli.scan_limit;
 ++			wli.scan_accepted = wli.scan_done = 0;
+++			wli.scan_error = 0;
 ++			wli.scan_parts++;
 ++			int error = wli_request(2);
 ++			if (error) { return error; }
@@ -42729,7 +42921,7 @@ index 39be642..40ce125 100644
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
 diff --git a/xnu/patches/0104-fuxi-wifi-ios.patch b/xnu/patches/0104-fuxi-wifi-ios.patch
-index 179f5df..f6366cd 100644
+index 179f5df..dc6a935 100644
 --- a/xnu/patches/0104-fuxi-wifi-ios.patch
 +++ b/xnu/patches/0104-fuxi-wifi-ios.patch
 @@ -678,7 +678,7 @@
@@ -43478,7 +43670,7 @@ index 179f5df..f6366cd 100644
  --- /dev/null
  +++ b/bsd/sys/fuxi_wifi_sta.h
 -@@ -0,0 +1,126 @@
-+@@ -0,0 +1,152 @@
++@@ -0,0 +1,154 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/sys/redwood_sta.h (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
@@ -43490,7 +43682,7 @@ index 179f5df..f6366cd 100644
  +};
  +
  +enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
-@@ -2504,7 +2895,32 @@
+@@ -2504,7 +2895,34 @@
  +	                                         * an errno: it was lost (the access point showed us the door) */
  +};
  +
@@ -43514,7 +43706,9 @@ index 179f5df..f6366cd 100644
 ++                                         * COUNTRY_CODE_CHANGED：wifid 收到會清掉掃描快取）；GET 51 回記住的碼 */
 ++#define FUXI_WIFI_UX_POWER_SAME   16u      /* 要的電源狀態和現在一樣（例如關被開覆蓋）：不呼叫底層、不清連線，
 ++                                         * 只回報電源事件 */
-++#define FUXI_WIFI_UX_ALL          31u
+++#define FUXI_WIFI_UX_SCAN_RECOVER 32u      /* keep radio control after a failed or cancelled scan */
+++#define FUXI_WIFI_UX_SCAN_CHANNELS 64u     /* implicit scans use the advertised 2.4/5 GHz channel list */
+++#define FUXI_WIFI_UX_ALL         127u
 ++
  +#ifdef KERNEL
 ++/* 讀一次 ADT 之後記住（ADT 開機後不變）；沒有這個屬性或長度不對都當 0 */
