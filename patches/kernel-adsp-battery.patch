@@ -5312,10 +5312,10 @@ index efb83f1..745d165 100644
          uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
 diff --git a/tools/ci/ath12k-link.py b/tools/ci/ath12k-link.py
 new file mode 100644
-index 0000000..d491d09
+index 0000000..a83c64d
 --- /dev/null
 +++ b/tools/ci/ath12k-link.py
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,181 @@
 +import argparse
 +import hashlib
 +import json
@@ -5326,6 +5326,12 @@ index 0000000..d491d09
 +OBJECT_SHA256 = 'dc0694f49e8557b6dce943fe07711e272579b8ffc0e67196499d6f6ec3b83931'
 +LOCK_SHA256 = 'f23882695f1c136c27b3f9cb36673bebad9ae1fc2af3fa787a98bd4add76c3c9'
 +SCAN_DWELL_SHA256 = '4abc2793df722c3fc03fd098118cc1731301b5523a5c8f8b28d04228b8ec95bb'
++PEER_ZERO_PROVENANCE_SHA256 = 'd7689a235ac91b4cd108723521ca0d36b8fce3cc714431d572318820b665e385'
++OBJECT_SOURCES = {
++    OBJECT_SHA256: (44010197996, 'b2876c666c76af54be793a41830596a6b604a063', False),
++    '8f7f1c0b94dc32904a3673c17a07ae9da5d1666fecf4613c253effd824e531ec':
++        (44239539371, '6e9f2a2d7c67b69cb146aa01ca37ba9d829dfbea', True),
++}
 +ENTRY_POINTS = (
 +    '_nw_wifi_start', '_nw_wifi_step', '_nw_wifi_stop', '_nw_wifi_poll',
 +    '_nw_wifi_irq_mode', '_nw_wifi_scan', '_nw_wifi_bss_count',
@@ -5380,12 +5386,26 @@ index 0000000..d491d09
 +    return versions[0]
 +
 +
++def validate_peer_zero(directory, report):
++    provenance = directory / 'fuxi_ath12k.peer-zero.json'
++    require(provenance.is_file() and not provenance.is_symlink() and
++            digest(provenance) == PEER_ZERO_PROVENANCE_SHA256, 'ath12k peer ID fix provenance differs')
++    patch = json.loads(provenance.read_text(encoding='utf-8'))
++    source = patch['source']
++    built = [entry for entry in report.get('objects', []) if entry.get('source', '').endswith('/' + source)]
++    require(len(built) == 1 and built[0].get('source_sha256') == patch['source_after_sha256'],
++            'ath12k build does not include the patched peer lookup')
++    return patch
++
++
 +def validate_bundle(directory):
 +    directory = Path(directory).resolve()
 +    object_path = directory / 'fuxi_ath12k.o'
 +    require(object_path.is_file() and not object_path.is_symlink(),
 +            'Pinned ath12k object is missing or is a symlink')
-+    require(digest(object_path) == OBJECT_SHA256, 'Pinned ath12k object hash differs')
++    object_sha256 = digest(object_path)
++    require(object_sha256 in OBJECT_SOURCES, 'Pinned ath12k object hash differs')
++    source_run, source_commit, has_peer_zero_fix = OBJECT_SOURCES[object_sha256]
 +    with object_path.open('rb') as stream:
 +        header = stream.read(32)
 +    require(len(header) == 32 and struct.unpack_from('<4I', header) ==
@@ -5427,9 +5447,9 @@ index 0000000..d491d09
 +    exports = set((directory / 'fuxi_ath12k.exports.txt').read_text().split())
 +    require(undefined == IMPORTS, 'ath12k kernel imports differ')
 +    require(set(ENTRY_POINTS) <= exports, 'ath12k module entry points are missing')
-+    return {
++    record = {
 +        'schema': 'fuxi-ath12k-link-v1',
-+        'object_sha256': OBJECT_SHA256,
++        'object_sha256': object_sha256,
 +        'build_report_sha256': digest(report_path),
 +        'source_lock_sha256': LOCK_SHA256,
 +        'source_identity': identity,
@@ -5437,13 +5457,17 @@ index 0000000..d491d09
 +        'scan_dwell': dwell,
 +        'entry_points': list(ENTRY_POINTS),
 +        'imports': sorted(IMPORTS),
-+        'source_run': 44010197996,
-+        'source_commit': 'b2876c666c76af54be793a41830596a6b604a063',
++        'source_run': source_run,
++        'source_commit': source_commit,
 +        'kernel_build_target': KERNEL_TARGET,
 +        'macho_platform': KERNEL_PLATFORM[0],
 +        'minimum_os': '15.5',
 +        'hardware_verified': False,
 +    }
++    if has_peer_zero_fix:
++        record['peer_zero'] = validate_peer_zero(directory, report)
++        record['peer_zero_provenance_sha256'] = PEER_ZERO_PROVENANCE_SHA256
++    return record
 +
 +
 +def main():
@@ -8725,10 +8749,10 @@ index 0000000..6523d39
 +    main()
 diff --git a/tools/test-fuxi-ath12k-link.py b/tools/test-fuxi-ath12k-link.py
 new file mode 100644
-index 0000000..5ed251f
+index 0000000..9d64aae
 --- /dev/null
 +++ b/tools/test-fuxi-ath12k-link.py
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,119 @@
 +import argparse
 +import json
 +from pathlib import Path
@@ -8823,7 +8847,16 @@ index 0000000..5ed251f
 +                path.write_bytes(original)
 +                checks += 1
 +            original = report_path.read_bytes()
-+            for suffix in ('/out/ath12k-src/mac.c', '/src/nw_cfg80211_control.c'):
++            sources = ['/out/ath12k-src/mac.c', '/src/nw_cfg80211_control.c']
++            if 'peer_zero' in record:
++                path = copied / 'fuxi_ath12k.peer-zero.json'
++                provenance = path.read_bytes()
++                path.write_bytes(b'{}\n')
++                rejected(lambda: GATE['validate_bundle'](copied))
++                path.write_bytes(provenance)
++                checks += 1
++                sources.append('/out/ath12k-src/dp_peer.c')
++            for suffix in sources:
 +                report = json.loads(original)
 +                for item in report['objects']:
 +                    if item.get('source', '').endswith(suffix):
