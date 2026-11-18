@@ -35,7 +35,8 @@ python3 - "$work/Ath12kWifi/tools/fetch-sources.py" \
     "$work/UniXNU-sheng/scripts/build-ath12k-wifi.py" \
     "$(cd "$(dirname "$0")" && pwd)/ath12k-scan-dwell.py" \
     "$(cd "$(dirname "$0")/../tests" && pwd)/test-ath12k-scan-dwell.py" \
-    "$(cd "$(dirname "$0")" && pwd)/ath12k-peer-zero.py" <<'PY'
+    "$(cd "$(dirname "$0")" && pwd)/ath12k-peer-zero.py" \
+    "$(cd "$(dirname "$0")" && pwd)/ath12k-scan-priority.py" <<'PY'
 from pathlib import Path
 import sys
 path = Path(sys.argv[1])
@@ -73,6 +74,8 @@ new = ("subprocess.run([sys.executable, " + repr(str(Path(sys.argv[3]).resolve()
        "subprocess.run([sys.executable, " + repr(str(Path(sys.argv[4]).resolve())) +
        ", str(module)], check=True)\n"
        "subprocess.run([sys.executable, " + repr(str(Path(sys.argv[5]).resolve())) +
+       ", str(module)], check=True)\n"
+       "subprocess.run([sys.executable, " + repr(str(Path(sys.argv[6]).resolve())) +
        ", str(module)], check=True)\n" + old)
 if text.count(old) != 1:
     raise SystemExit("pinned ath12k compiler setup changed")

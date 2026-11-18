@@ -9,6 +9,7 @@ on:
       - tools/build-ath12k-objects.sh
       - tools/ath12k-scan-dwell.py
       - tools/ath12k-peer-zero.py
+      - tools/ath12k-scan-priority.py
       - tests/test-ath12k-scan-dwell.py
       - .github/workflows/ath12k-objects.yml
 permissions:
