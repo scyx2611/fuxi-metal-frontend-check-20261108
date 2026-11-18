@@ -5312,10 +5312,10 @@ index efb83f1..745d165 100644
          uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
 diff --git a/tools/ci/ath12k-link.py b/tools/ci/ath12k-link.py
 new file mode 100644
-index 0000000..a83c64d
+index 0000000..7a720c9
 --- /dev/null
 +++ b/tools/ci/ath12k-link.py
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,190 @@
 +import argparse
 +import hashlib
 +import json
@@ -5327,10 +5327,13 @@ index 0000000..a83c64d
 +LOCK_SHA256 = 'f23882695f1c136c27b3f9cb36673bebad9ae1fc2af3fa787a98bd4add76c3c9'
 +SCAN_DWELL_SHA256 = '4abc2793df722c3fc03fd098118cc1731301b5523a5c8f8b28d04228b8ec95bb'
 +PEER_ZERO_PROVENANCE_SHA256 = 'd7689a235ac91b4cd108723521ca0d36b8fce3cc714431d572318820b665e385'
++SCAN_PRIORITY_OBJECT = '6e31ab4a480374ff3a761b87b59f5bd17cb9bf7c953d343f2118434cbedfb715'
++SCAN_PRIORITY_WMI_SHA256 = '5898c4fb7c96c4e56ad70f543a1fe9e78a70f588e865478a8b939c6aa9abcc41'
 +OBJECT_SOURCES = {
 +    OBJECT_SHA256: (44010197996, 'b2876c666c76af54be793a41830596a6b604a063', False),
 +    '8f7f1c0b94dc32904a3673c17a07ae9da5d1666fecf4613c253effd824e531ec':
 +        (44239539371, '6e9f2a2d7c67b69cb146aa01ca37ba9d829dfbea', True),
++    SCAN_PRIORITY_OBJECT: (44243587936, '7387e889bd65b41fbe9197aaa6daba0c25ca2c6a', True),
 +}
 +ENTRY_POINTS = (
 +    '_nw_wifi_start', '_nw_wifi_step', '_nw_wifi_stop', '_nw_wifi_poll',
@@ -5467,6 +5470,12 @@ index 0000000..a83c64d
 +    if has_peer_zero_fix:
 +        record['peer_zero'] = validate_peer_zero(directory, report)
 +        record['peer_zero_provenance_sha256'] = PEER_ZERO_PROVENANCE_SHA256
++    if object_sha256 == SCAN_PRIORITY_OBJECT:
++        wmi = [entry for entry in report.get('objects', [])
++               if entry.get('source', '').endswith('/out/ath12k-src/wmi.c')]
++        require(len(wmi) == 1 and wmi[0].get('source_sha256') == SCAN_PRIORITY_WMI_SHA256,
++                'ath12k build does not encode the WMI scan priority')
++        record['scan_priority_wmi_sha256'] = SCAN_PRIORITY_WMI_SHA256
 +    return record
 +
 +
@@ -8749,10 +8758,10 @@ index 0000000..6523d39
 +    main()
 diff --git a/tools/test-fuxi-ath12k-link.py b/tools/test-fuxi-ath12k-link.py
 new file mode 100644
-index 0000000..9d64aae
+index 0000000..b2a24cb
 --- /dev/null
 +++ b/tools/test-fuxi-ath12k-link.py
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,121 @@
 +import argparse
 +import json
 +from pathlib import Path
@@ -8856,6 +8865,8 @@ index 0000000..9d64aae
 +                path.write_bytes(provenance)
 +                checks += 1
 +                sources.append('/out/ath12k-src/dp_peer.c')
++            if 'scan_priority_wmi_sha256' in record:
++                sources.append('/out/ath12k-src/wmi.c')
 +            for suffix in sources:
 +                report = json.loads(original)
 +                for item in report['objects']:
@@ -36677,7 +36688,7 @@ index 9479206..f4c287d 100644
  		return sta_ops == NULL ? ENXIO : ENETDOWN;
  	}
 diff --git a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
-index dce1375..c81ac5e 100644
+index dce1375..4e09736 100644
 --- a/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
 +++ b/xnu/fuxi-wifi-ios/fuxi_wifi_sta.h
 @@ -45,6 +45,7 @@ struct fuxi_wifi_sta_scan {
@@ -36688,7 +36699,7 @@ index dce1375..c81ac5e 100644
  };
  
  enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
-@@ -99,7 +100,37 @@ enum fuxi_wifi_sta_event {
+@@ -99,7 +100,38 @@ enum fuxi_wifi_sta_event {
  	                                         * an errno: it was lost (the access point showed us the door) */
  };
  
@@ -36717,7 +36728,8 @@ index dce1375..c81ac5e 100644
 +#define FUXI_WIFI_UX_POWER_OFF_FIRST 128u /* finish an off request before a later enable */
 +#define FUXI_WIFI_UX_RX_BATCH    256u      /* receive borrowed ath12k fragments directly into batched mbufs */
 +#define FUXI_WIFI_UX_LINK_STATS  512u      /* print cached PHY rate and interface byte counts */
-+#define FUXI_WIFI_UX_ALL        1023u
++#define FUXI_WIFI_UX_SCAN_TRACE 1024u      /* log the first ath12k scan events */
++#define FUXI_WIFI_UX_ALL        2047u
 +
  #ifdef KERNEL
 +/* 讀一次 ADT 之後記住（ADT 開機後不變）；沒有這個屬性或長度不對都當 0 */
@@ -36726,7 +36738,7 @@ index dce1375..c81ac5e 100644
  /* ---- the station side ---- */
  void     fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops);         /* init only; immutable boot-lifetime backend */
  void     fuxi_wifi_sta_lost(int error);                                   /* the network joined is gone by itself */
-@@ -112,6 +143,7 @@ int      fuxi_wifi_sta_ask_join(const struct fuxi_wifi_sta_join *what);
+@@ -112,6 +144,7 @@ int      fuxi_wifi_sta_ask_join(const struct fuxi_wifi_sta_join *what);
  int      fuxi_wifi_sta_ask_leave(void);
  bool     fuxi_wifi_sta_busy(void);                                        /* something asked for is not over yet */
  bool     fuxi_wifi_sta_powered(void);
@@ -37452,10 +37464,10 @@ index 0000000..528aa15
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
 new file mode 100644
-index 0000000..a37d565
+index 0000000..0a9fc0c
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
-@@ -0,0 +1,434 @@
+@@ -0,0 +1,461 @@
 +#include "fuxi_wlan_arena.h"
 +#include "fuxi_wlan_ath12k.h"
 +#include "fuxi_wlan_control.h"
@@ -37466,6 +37478,7 @@ index 0000000..a37d565
 +static struct fwa_arena wla_pool;
 +static struct fwa_block *wla_blocks;
 +static unsigned wla_express, wla_msi, wla_failed;
++static unsigned wla_scan_log_remaining;
 +static struct {
 +	const char *name, *file;
 +	void *memory;
@@ -37700,7 +37713,14 @@ index 0000000..a37d565
 +static void
 +wla_log(int level, const char *line)
 +{
-+	if (level <= 6 && line) { printf("FUXI ATH12K: %llu %.180s\n", wla_now_ms(), line); }
++	if (!line) { return; }
++	if (level > 6) {
++		if (!wla_scan_log_remaining ||
++		    (strncmp(line, "scan event ", sizeof("scan event ") - 1) &&
++		     strncmp(line, "send 11d scan ", sizeof("send 11d scan ") - 1))) { return; }
++		wla_scan_log_remaining--;
++	}
++	printf("FUXI ATH12K: %llu %.180s\n", wla_now_ms(), line);
 +}
 +
 +static void
@@ -37718,6 +37738,9 @@ index 0000000..a37d565
 +extern void _enable_preemption(void);
 +
 +#if defined(FUXI_ATH12K_LINKED)
++/* The pinned module namespaces Linux exports. See ath12k/debug.h for ATH12K_DBG_WMI. */
++extern unsigned int nwk_ath12k_debug_mask __attribute__((weak_import));
++#define WLA_DBG_WMI 0x00000002u
 +static struct fwc_probe wla_control;
 +static unsigned wla_control_awake;
 +
@@ -37818,6 +37841,14 @@ index 0000000..a37d565
 +	printf("FUXI ATH12K: start from PBL, full BAR, owned 128 MiB DMA, IRQ polling; legacy MHI skipped\n");
 +	nw_wifi_irq_mode(0);
 +	int error = nw_wifi_start(&platform, &board);
++	bool trace_scan = !error && ios && (fuxi_wifi_ux() & FUXI_WIFI_UX_SCAN_TRACE) && &nwk_ath12k_debug_mask;
++	unsigned int prior_debug_mask = 0;
++	if (trace_scan) {
++		prior_debug_mask = nwk_ath12k_debug_mask;
++		nwk_ath12k_debug_mask = prior_debug_mask | WLA_DBG_WMI;
++		wla_scan_log_remaining = 384;
++		printf("FUXI ATH12K: WMI scan trace enabled\n");
++	}
 +	bool attached = false, completed = false;
 +	uint64_t started = wla_now_ms(), report = started;
 +	unsigned spins = 0;
@@ -37826,6 +37857,10 @@ index 0000000..a37d565
 +		wla_control_awake = 0;
 +		/* nonzero while frames move: go round again without sleeping, but not for ever */
 +		int moving = nw_wifi_step();
++		if (trace_scan && !wla_scan_log_remaining) {
++			nwk_ath12k_debug_mask = prior_debug_mask;
++			trace_scan = false;
++		}
 +		uint64_t now = wla_now_ms();
 +		if (!attached && nw_wifi_stats.stage >= 4) {
 +			error = nw_wifi_control_attach(ios ? &wli.session : &wla_control.session);
@@ -37860,6 +37895,10 @@ index 0000000..a37d565
 +			spins = 0;
 +			wl_sleep(1);
 +		}
++	}
++	if (trace_scan) {
++		nwk_ath12k_debug_mask = prior_debug_mask;
++		wla_scan_log_remaining = 0;
 +	}
 +	if (ios) { wli_fail(error ? error : EIO); }
 +	if (!error && wla_control.error) {
@@ -38064,10 +38103,10 @@ index 0000000..656f494
 +#endif
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ios.inc b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
 new file mode 100644
-index 0000000..6c3b8cf
+index 0000000..92e0eac
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-@@ -0,0 +1,1753 @@
+@@ -0,0 +1,1762 @@
 +#include <sys/fuxi_wifi_ios.h>
 +#include <sys/fuxi_wifi_wpa.h>
 +#include <sys/errno.h>
@@ -39095,6 +39134,15 @@ index 0000000..6c3b8cf
 +			}
 +		}
 +		if (wli.scan.dwell_ms) { wli_put32(FWC_ATTR_SCAN_DWELL_MS, wli.scan.dwell_ms); }
++		if (wli.ux & FUXI_WIFI_UX_SCAN_TRACE) {
++			size_t size;
++			const uint8_t *frequencies = fwc_attribute(wli_out, wli_out_length, 20, &size);
++			unsigned count = frequencies ? (unsigned)(size / 4) : 0;
++			printf("FUXI WIFI IOS: %llu scan submit generation %llu channels %u first %u/%u/%u MHz passive %u dwell %u ms\n",
++			    (unsigned long long)wla_now_ms(), (unsigned long long)wli.generation, count,
++			    count ? fwc_read32(frequencies) : 0, count > 1 ? fwc_read32(frequencies + 4) : 0,
++			    count > 2 ? fwc_read32(frequencies + 8) : 0, wli.scan.passive, wli.scan.dwell_ms);
++		}
 +	} else if (operation == 3) {
 +		wli_put32(21, wli.fetch_index);
 +	}
@@ -40124,7 +40172,7 @@ index 0ca2838..0d215ed 100644
  + (void)__atomic_compare_exchange_n(&fg_bl_want, &want, want & ~FG_BL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
  + if (ticks > fg_bl_ticks_max) fg_bl_ticks_max = ticks;
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index d21bf85..25ba9f5 100644
+index d21bf85..f635b87 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
 @@ -29,7 +29,7 @@
@@ -40595,7 +40643,7 @@ index d21bf85..25ba9f5 100644
  +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
  +	    arg, limit);
  +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
-@@ -5899,3 +6092,2612 @@
+@@ -5899,3 +6092,2648 @@
  + }
  + r[3] = 0;
  +}
@@ -40848,7 +40896,7 @@ index d21bf85..25ba9f5 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ath12k.inc
-+@@ -0,0 +1,434 @@
++@@ -0,0 +1,461 @@
 ++#include "fuxi_wlan_arena.h"
 ++#include "fuxi_wlan_ath12k.h"
 ++#include "fuxi_wlan_control.h"
@@ -40859,6 +40907,7 @@ index d21bf85..25ba9f5 100644
 ++static struct fwa_arena wla_pool;
 ++static struct fwa_block *wla_blocks;
 ++static unsigned wla_express, wla_msi, wla_failed;
+++static unsigned wla_scan_log_remaining;
 ++static struct {
 ++	const char *name, *file;
 ++	void *memory;
@@ -41093,7 +41142,14 @@ index d21bf85..25ba9f5 100644
 ++static void
 ++wla_log(int level, const char *line)
 ++{
-++	if (level <= 6 && line) { printf("FUXI ATH12K: %llu %.180s\n", wla_now_ms(), line); }
+++	if (!line) { return; }
+++	if (level > 6) {
+++		if (!wla_scan_log_remaining ||
+++		    (strncmp(line, "scan event ", sizeof("scan event ") - 1) &&
+++		     strncmp(line, "send 11d scan ", sizeof("send 11d scan ") - 1))) { return; }
+++		wla_scan_log_remaining--;
+++	}
+++	printf("FUXI ATH12K: %llu %.180s\n", wla_now_ms(), line);
 ++}
 ++
 ++static void
@@ -41111,6 +41167,9 @@ index d21bf85..25ba9f5 100644
 ++extern void _enable_preemption(void);
 ++
 ++#if defined(FUXI_ATH12K_LINKED)
+++/* The pinned module namespaces Linux exports. See ath12k/debug.h for ATH12K_DBG_WMI. */
+++extern unsigned int nwk_ath12k_debug_mask __attribute__((weak_import));
+++#define WLA_DBG_WMI 0x00000002u
 ++static struct fwc_probe wla_control;
 ++static unsigned wla_control_awake;
 ++
@@ -41211,6 +41270,14 @@ index d21bf85..25ba9f5 100644
 ++	printf("FUXI ATH12K: start from PBL, full BAR, owned 128 MiB DMA, IRQ polling; legacy MHI skipped\n");
 ++	nw_wifi_irq_mode(0);
 ++	int error = nw_wifi_start(&platform, &board);
+++	bool trace_scan = !error && ios && (fuxi_wifi_ux() & FUXI_WIFI_UX_SCAN_TRACE) && &nwk_ath12k_debug_mask;
+++	unsigned int prior_debug_mask = 0;
+++	if (trace_scan) {
+++		prior_debug_mask = nwk_ath12k_debug_mask;
+++		nwk_ath12k_debug_mask = prior_debug_mask | WLA_DBG_WMI;
+++		wla_scan_log_remaining = 384;
+++		printf("FUXI ATH12K: WMI scan trace enabled\n");
+++	}
 ++	bool attached = false, completed = false;
 ++	uint64_t started = wla_now_ms(), report = started;
 ++	unsigned spins = 0;
@@ -41219,6 +41286,10 @@ index d21bf85..25ba9f5 100644
 ++		wla_control_awake = 0;
 ++		/* nonzero while frames move: go round again without sleeping, but not for ever */
 ++		int moving = nw_wifi_step();
+++		if (trace_scan && !wla_scan_log_remaining) {
+++			nwk_ath12k_debug_mask = prior_debug_mask;
+++			trace_scan = false;
+++		}
 ++		uint64_t now = wla_now_ms();
 ++		if (!attached && nw_wifi_stats.stage >= 4) {
 ++			error = nw_wifi_control_attach(ios ? &wli.session : &wla_control.session);
@@ -41253,6 +41324,10 @@ index d21bf85..25ba9f5 100644
 ++			spins = 0;
 ++			wl_sleep(1);
 ++		}
+++	}
+++	if (trace_scan) {
+++		nwk_ath12k_debug_mask = prior_debug_mask;
+++		wla_scan_log_remaining = 0;
 ++	}
 ++	if (ios) { wli_fail(error ? error : EIO); }
 ++	if (!error && wla_control.error) {
@@ -41454,7 +41529,7 @@ index d21bf85..25ba9f5 100644
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_wlan_ios.inc
-+@@ -0,0 +1,1753 @@
++@@ -0,0 +1,1762 @@
 ++#include <sys/fuxi_wifi_ios.h>
 ++#include <sys/fuxi_wifi_wpa.h>
 ++#include <sys/errno.h>
@@ -42482,6 +42557,15 @@ index d21bf85..25ba9f5 100644
 ++			}
 ++		}
 ++		if (wli.scan.dwell_ms) { wli_put32(FWC_ATTR_SCAN_DWELL_MS, wli.scan.dwell_ms); }
+++		if (wli.ux & FUXI_WIFI_UX_SCAN_TRACE) {
+++			size_t size;
+++			const uint8_t *frequencies = fwc_attribute(wli_out, wli_out_length, 20, &size);
+++			unsigned count = frequencies ? (unsigned)(size / 4) : 0;
+++			printf("FUXI WIFI IOS: %llu scan submit generation %llu channels %u first %u/%u/%u MHz passive %u dwell %u ms\n",
+++			    (unsigned long long)wla_now_ms(), (unsigned long long)wli.generation, count,
+++			    count ? fwc_read32(frequencies) : 0, count > 1 ? fwc_read32(frequencies + 4) : 0,
+++			    count > 2 ? fwc_read32(frequencies + 8) : 0, wli.scan.passive, wli.scan.dwell_ms);
+++		}
 ++	} else if (operation == 3) {
 ++		wli_put32(21, wli.fetch_index);
 ++	}
@@ -43458,7 +43542,7 @@ index 39be642..40ce125 100644
   		printf("FUXI KEYS: kernel_thread_start failed\n");
   	}
 diff --git a/xnu/patches/0104-fuxi-wifi-ios.patch b/xnu/patches/0104-fuxi-wifi-ios.patch
-index 179f5df..a9c652e 100644
+index 179f5df..375b1a9 100644
 --- a/xnu/patches/0104-fuxi-wifi-ios.patch
 +++ b/xnu/patches/0104-fuxi-wifi-ios.patch
 @@ -678,7 +678,7 @@
@@ -44388,7 +44472,7 @@ index 179f5df..a9c652e 100644
  --- /dev/null
  +++ b/bsd/sys/fuxi_wifi_sta.h
 -@@ -0,0 +1,126 @@
-+@@ -0,0 +1,158 @@
++@@ -0,0 +1,159 @@
  +/*
  + * Ported from HackiOS xnu/files/bsd/sys/redwood_sta.h (APSL-2.0)
  + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
@@ -44400,7 +44484,7 @@ index 179f5df..a9c652e 100644
  +};
  +
  +enum { FUXI_WIFI_STA_OPEN, FUXI_WIFI_STA_WPA2_PSK };
-@@ -2504,7 +2993,37 @@
+@@ -2504,7 +2993,38 @@
  +	                                         * an errno: it was lost (the access point showed us the door) */
  +};
  +
@@ -44429,7 +44513,8 @@ index 179f5df..a9c652e 100644
 ++#define FUXI_WIFI_UX_POWER_OFF_FIRST 128u /* finish an off request before a later enable */
 ++#define FUXI_WIFI_UX_RX_BATCH    256u      /* receive borrowed ath12k fragments directly into batched mbufs */
 ++#define FUXI_WIFI_UX_LINK_STATS  512u      /* print cached PHY rate and interface byte counts */
-++#define FUXI_WIFI_UX_ALL        1023u
+++#define FUXI_WIFI_UX_SCAN_TRACE 1024u      /* log the first ath12k scan events */
+++#define FUXI_WIFI_UX_ALL        2047u
 ++
  +#ifdef KERNEL
 ++/* 讀一次 ADT 之後記住（ADT 開機後不變）；沒有這個屬性或長度不對都當 0 */
@@ -44438,7 +44523,7 @@ index 179f5df..a9c652e 100644
  +/* ---- the station side ---- */
  +void     fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops);         /* init only; immutable boot-lifetime backend */
  +void     fuxi_wifi_sta_lost(int error);                                   /* the network joined is gone by itself */
-@@ -2517,6 +3036,7 @@
+@@ -2517,6 +3037,7 @@
  +int      fuxi_wifi_sta_ask_leave(void);
  +bool     fuxi_wifi_sta_busy(void);                                        /* something asked for is not over yet */
  +bool     fuxi_wifi_sta_powered(void);
