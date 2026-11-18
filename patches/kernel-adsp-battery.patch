@@ -14104,10 +14104,10 @@ index 0000000..172d1eb
 +    unittest.main(verbosity=2)
 diff --git a/tools/test-fuxi-exec-inject.py b/tools/test-fuxi-exec-inject.py
 new file mode 100644
-index 0000000..b0ca5bb
+index 0000000..7fe3168
 --- /dev/null
 +++ b/tools/test-fuxi-exec-inject.py
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,71 @@
 +import os
 +from pathlib import Path
 +import subprocess
@@ -14132,11 +14132,12 @@ index 0000000..b0ca5bb
 +    const char *sb = "/System/Library/CoreServices/SpringBoard.app/SpringBoard";
 +    const char *media = "/usr/sbin/mediaserverd";
 +    const char *wifi = "/usr/sbin/wifid";
++    const char *settings = "/Applications/Preferences.app/Preferences";
 +    const char *app = "/Applications/MobileSafari.app/MobileSafari";
 +    char env[FUXI_INJECT_ENV_MAX];
 +
-+    assert(FUXI_INJECT_ALL == 15u);
-+    for (unsigned mode = 0; mode < 16; mode++) {
++    assert(FUXI_INJECT_ALL == 31u);
++    for (unsigned mode = 0; mode <= FUXI_INJECT_ALL; mode++) {
 +        assert(same(fuxi_inject_library(mode, sb, "SpringBoard"), (mode & 2u) ? FUXI_INJECT_SB_LIB : NULL));
 +        assert(same(fuxi_inject_library(mode, media, "mediaserverd"), (mode & 4u) ? FUXI_INJECT_SB_LIB : NULL));
 +        assert(same(fuxi_inject_library(mode, wifi, "wifid"), (mode & 8u) ? FUXI_INJECT_SB_LIB : NULL));
@@ -14144,6 +14145,10 @@ index 0000000..b0ca5bb
 +        assert(!fuxi_inject_library(mode, "/usr/sbin/wifid2", "wifid2"));
 +        assert(!fuxi_inject_library(mode, wifi, NULL));
 +        assert(same(fuxi_inject_library(mode, app, "MobileSafari"), (mode & 1u) ? FUXI_INJECT_APP_LIB : NULL));
++        const char *settings_library = (mode & 1u) ? FUXI_INJECT_APP_LIB : NULL;
++        if (mode & 16u) settings_library = FUXI_INJECT_SB_LIB;
++        assert(same(fuxi_inject_library(mode, settings, "Preferences"), settings_library));
++        assert(!fuxi_inject_library(mode, "/var/tmp/Preferences", "Preferences"));
 +        /* 別處同名的 mediaserverd 不注入 */
 +        assert(!fuxi_inject_library(mode, "/var/tmp/mediaserverd", "mediaserverd"));
 +        assert(!fuxi_inject_library(mode, "/usr/sbin/mediaserverd2", "mediaserverd2"));
@@ -14161,7 +14166,8 @@ index 0000000..b0ca5bb
 +    assert(!fuxi_inject_env(NULL, env, sizeof(env)));
 +    assert(!fuxi_inject_env(FUXI_INJECT_SB_LIB, env, 10));
 +    assert(!fuxi_inject_env(FUXI_INJECT_SB_LIB, env, 0));
-+    puts("PASS: exec injection modes 0..15: SpringBoard, mediaserverd, opt-in wifid audit and application executables, rejects look-alikes and short buffers");
++    assert(!fuxi_inject_library(16u, "/Applications/Other.app/Preferences", "Preferences"));
++    puts("PASS: exec injection modes 0..31, exact Settings executable, other app modes and environment bounds");
 +    return 0;
 +}
 +'''
@@ -34560,10 +34566,10 @@ index 0000000..187ad59
 +#endif
 diff --git a/xnu/fuxi-inject/fuxi_exec_inject.h b/xnu/fuxi-inject/fuxi_exec_inject.h
 new file mode 100644
-index 0000000..02b8ee9
+index 0000000..d63d1d2
 --- /dev/null
 +++ b/xnu/fuxi-inject/fuxi_exec_inject.h
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,87 @@
 +/*
 + * fxinj=N, or ADT /chosen u32 "fuxi,inject"=N (FUXI): DYLD_INSERT_LIBRARIES added by the kernel at exec, for some programs (patch 0118).
 + *
@@ -34579,6 +34585,8 @@ index 0000000..02b8ee9
 + *              follows the punch hole instead of the iPhone X notch)
 + *   bit 2 (4)  mediaserverd: the same libfuxi-sb.dylib (its haptic server hands vibration patterns to
 + *              the HAP525 runtime, sysctl kern.fuxivibrate; the library checks which program it is in)
++ *   bit 3 (8)  wifid: native Wi-Fi diagnostics.
++ *   bit 4 (16) Preferences: manual Wi-Fi password prompt when password sharing is unavailable.
 + *
 + * dyld honours it because the H1 AMFI dyld policy answer (patch 0103, request 0x5a) allows everything,
 + * including a library that is missing. The variable follows the program's own environment.
@@ -34588,7 +34596,9 @@ index 0000000..02b8ee9
 +#define FUXI_INJECT_SPRINGBOARD 2u
 +#define FUXI_INJECT_MEDIASERVER 4u
 +#define FUXI_INJECT_WIFI_AUDIT  8u
-+#define FUXI_INJECT_ALL         (FUXI_INJECT_APPS | FUXI_INJECT_SPRINGBOARD | FUXI_INJECT_MEDIASERVER | FUXI_INJECT_WIFI_AUDIT)
++#define FUXI_INJECT_WIFI_PROMPT 16u
++#define FUXI_INJECT_ALL         (FUXI_INJECT_APPS | FUXI_INJECT_SPRINGBOARD | FUXI_INJECT_MEDIASERVER | \
++                                FUXI_INJECT_WIFI_AUDIT | FUXI_INJECT_WIFI_PROMPT)
 +#define FUXI_INJECT_APP_LIB     "/usr/local/lib/fuxi/libfuxi-app.dylib"
 +#define FUXI_INJECT_SB_LIB      "/usr/local/lib/fuxi/libfuxi-sb.dylib"
 +#define FUXI_INJECT_ENV_MAX     128
@@ -34627,6 +34637,10 @@ index 0000000..02b8ee9
 +	if (strcmp(name, "wifid") == 0) {
 +		return (mode & FUXI_INJECT_WIFI_AUDIT) != 0 && strcmp(path, "/usr/sbin/wifid") == 0 ?
 +		       FUXI_INJECT_SB_LIB : NULL;
++	}
++	if ((mode & FUXI_INJECT_WIFI_PROMPT) && strcmp(name, "Preferences") == 0 &&
++	    strcmp(path, "/Applications/Preferences.app/Preferences") == 0) {
++		return FUXI_INJECT_SB_LIB;
 +	}
 +	return (mode & FUXI_INJECT_APPS) != 0 && fuxi_inject_is_app(path) ? FUXI_INJECT_APP_LIB : NULL;
 +}
@@ -55583,13 +55597,13 @@ index 0000000..a420483
 + 	IOPMPowerSource::free();
 diff --git a/xnu/patches/0118-fuxi-exec-inject.patch b/xnu/patches/0118-fuxi-exec-inject.patch
 new file mode 100644
-index 0000000..321fd96
+index 0000000..f1eb7a2
 --- /dev/null
 +++ b/xnu/patches/0118-fuxi-exec-inject.patch
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,181 @@
 +--- a/bsd/kern/kern_exec.c
 ++++ b/bsd/kern/kern_exec.c
-+@@ -5649,6 +5649,56 @@
++@@ -5649,6 +5649,57 @@
 +  * Note:	The argument and environment vectors are user space pointers
 +  *		to arrays of user space pointers.
 +  */
@@ -55632,11 +55646,12 @@ index 0000000..321fd96
 ++	SInt32 n = OSIncrementAtomic(&said);
 ++
 ++	if (n == 0) {
-++		printf("FUXI INJECT: fxinj=%u:%s%s%s%s\n", mode,
+++		printf("FUXI INJECT: fxinj=%u:%s%s%s%s%s\n", mode,
 ++		    (mode & FUXI_INJECT_APPS) ? " applications get " FUXI_INJECT_APP_LIB ";" : "",
 ++		    (mode & FUXI_INJECT_SPRINGBOARD) ? " SpringBoard gets " FUXI_INJECT_SB_LIB ";" : "",
 ++		    (mode & FUXI_INJECT_MEDIASERVER) ? " mediaserverd gets " FUXI_INJECT_SB_LIB : "",
-++		    (mode & FUXI_INJECT_WIFI_AUDIT) ? " wifid gets " FUXI_INJECT_SB_LIB : "");
+++		    (mode & FUXI_INJECT_WIFI_AUDIT) ? " wifid gets " FUXI_INJECT_SB_LIB : "",
+++		    (mode & FUXI_INJECT_WIFI_PROMPT) ? " Preferences gets " FUXI_INJECT_SB_LIB : "");
 ++	}
 ++	if (n < FUXI_INJECT_SAID) {
 ++		printf("FUXI INJECT: %s <- %s\n", name, library);
@@ -55646,7 +55661,7 @@ index 0000000..321fd96
 + __attribute__((noinline))
 + static int
 + exec_extract_strings(struct image_params *imgp)
-+@@ -5822,6 +5872,30 @@
++@@ -5822,6 +5873,30 @@
 + 		imgp->ip_envc++;
 + 	}
 + 
@@ -55679,7 +55694,7 @@ index 0000000..321fd96
 + 		error = E2BIG;
 +--- /dev/null
 ++++ b/bsd/kern/fuxi_exec_inject.h
-+@@ -0,0 +1,79 @@
++@@ -0,0 +1,87 @@
 ++/*
 ++ * fxinj=N, or ADT /chosen u32 "fuxi,inject"=N (FUXI): DYLD_INSERT_LIBRARIES added by the kernel at exec, for some programs (patch 0118).
 ++ *
@@ -55695,6 +55710,8 @@ index 0000000..321fd96
 ++ *              follows the punch hole instead of the iPhone X notch)
 ++ *   bit 2 (4)  mediaserverd: the same libfuxi-sb.dylib (its haptic server hands vibration patterns to
 ++ *              the HAP525 runtime, sysctl kern.fuxivibrate; the library checks which program it is in)
+++ *   bit 3 (8)  wifid: native Wi-Fi diagnostics.
+++ *   bit 4 (16) Preferences: manual Wi-Fi password prompt when password sharing is unavailable.
 ++ *
 ++ * dyld honours it because the H1 AMFI dyld policy answer (patch 0103, request 0x5a) allows everything,
 ++ * including a library that is missing. The variable follows the program's own environment.
@@ -55704,7 +55721,9 @@ index 0000000..321fd96
 ++#define FUXI_INJECT_SPRINGBOARD 2u
 ++#define FUXI_INJECT_MEDIASERVER 4u
 ++#define FUXI_INJECT_WIFI_AUDIT  8u
-++#define FUXI_INJECT_ALL         (FUXI_INJECT_APPS | FUXI_INJECT_SPRINGBOARD | FUXI_INJECT_MEDIASERVER | FUXI_INJECT_WIFI_AUDIT)
+++#define FUXI_INJECT_WIFI_PROMPT 16u
+++#define FUXI_INJECT_ALL         (FUXI_INJECT_APPS | FUXI_INJECT_SPRINGBOARD | FUXI_INJECT_MEDIASERVER | \
+++                                FUXI_INJECT_WIFI_AUDIT | FUXI_INJECT_WIFI_PROMPT)
 ++#define FUXI_INJECT_APP_LIB     "/usr/local/lib/fuxi/libfuxi-app.dylib"
 ++#define FUXI_INJECT_SB_LIB      "/usr/local/lib/fuxi/libfuxi-sb.dylib"
 ++#define FUXI_INJECT_ENV_MAX     128
@@ -55743,6 +55762,10 @@ index 0000000..321fd96
 ++	if (strcmp(name, "wifid") == 0) {
 ++		return (mode & FUXI_INJECT_WIFI_AUDIT) != 0 && strcmp(path, "/usr/sbin/wifid") == 0 ?
 ++		       FUXI_INJECT_SB_LIB : NULL;
+++	}
+++	if ((mode & FUXI_INJECT_WIFI_PROMPT) && strcmp(name, "Preferences") == 0 &&
+++	    strcmp(path, "/Applications/Preferences.app/Preferences") == 0) {
+++		return FUXI_INJECT_SB_LIB;
 ++	}
 ++	return (mode & FUXI_INJECT_APPS) != 0 && fuxi_inject_is_app(path) ? FUXI_INJECT_APP_LIB : NULL;
 ++}

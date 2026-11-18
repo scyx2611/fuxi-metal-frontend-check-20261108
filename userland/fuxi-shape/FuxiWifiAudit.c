@@ -627,10 +627,43 @@ static unsigned wifi_audit_adt_u32(CFStringRef key)
     return value;
 }
 
+/* WiFiKit on 20H392 checks this capability before its synchronous request to
+ * Sharing. On the Fuxi build without Bluetooth, the native manual prompt is
+ * the available path. Restrict the override to Settings and its boot option. */
+static bool wifi_prompt_supports_sharing(id self, SEL selector)
+{
+    (void)self;
+    (void)selector;
+    static unsigned calls;
+    if (__atomic_fetch_add(&calls, 1u, __ATOMIC_RELAXED) < 8) {
+        wifi_audit_say("fuxi: wifi-prompt: manual password path\n");
+    }
+    return false;
+}
+
+static void wifi_prompt_image(const struct mach_header *header, intptr_t slide)
+{
+    (void)header;
+    (void)slide;
+    static IMP original;
+    static wifi_audit_hook hook = {
+        "WFNetworkListController", "_supportsWiFiPasswordSharing", "b",
+        (IMP)wifi_prompt_supports_sharing, &original, 0
+    };
+    wifi_audit_install_table("wifi-prompt:", &hook, 1);
+}
+
 __attribute__((constructor)) static void fuxi_wifi_audit_init(void)
 {
     const char *name = getprogname();
     if (name == NULL) return;
+    if (strcmp(name, "Preferences") == 0) {
+        const unsigned wifi_prompt_injection = 16u; /* fuxi_exec_inject.h */
+        if (wifi_audit_adt_u32(CFSTR("fuxi,inject")) & wifi_prompt_injection) {
+            _dyld_register_func_for_add_image(wifi_prompt_image);
+        }
+        return;
+    }
     if (strcmp(name, "SpringBoard") == 0) {
         if (wifi_audit_adt_u32(CFSTR("fuxi,wifi-sb")) == 0) return;
         wifi_audit_say("fuxi: sb-wifi: status audit enabled (fuxi,wifi-sb)\n");
