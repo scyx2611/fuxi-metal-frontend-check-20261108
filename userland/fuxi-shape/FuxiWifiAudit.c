@@ -2,6 +2,7 @@
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <objc/runtime.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -484,20 +485,22 @@ static void wifi_audit_image(const struct mach_header *header, intptr_t slide)
 }
 
 /*
- * SpringBoard 狀態欄 Wi-Fi 圖示（ADT /chosen fuxi,wifi-sb 非 0 才裝；唯讀，原實作照呼叫、回傳值不改）。
+ * SpringBoard 狀態欄 Wi-Fi 圖示（ADT /chosen fuxi,wifi-sb）。
  * 20H392 反組譯：-[SBSystemStatusWifiDataProvider _updateWifiActive] 的 block 以
  * SBWiFiManager isPowered && isPrimaryInterface && isAssociated 決定 wifiActive，_updateData 再把
  * wifiActive 與 signalStrengthBars 發佈給狀態欄；isPrimaryInterface 是 NWSystemPathMonitor isWiFiPrimary
  * （primaryEvaluator.path usesInterfaceType:wifi）。核心 en0 已是 IFNET_SUBFAMILY_WIFI
  * （ksrc/xnu/fuxi-wifi-ios：原生與合成後端共用 link.wireless=true），所以要實測是哪一項為假。
- * 每個值只在改變時記一行（各最多 16 行），RSSI 回報最多 24 行；不記 SSID、BSSID 或任何網路名稱。
+ * 診斷只在值改變時記一行（各最多 16 行），RSSI 回報最多 64 行。
  */
-enum { SB_WIFI_CHANGES = 16, SB_WIFI_RSSI_LOGS = 24 };
-enum { SB_POWERED, SB_PRIMARY, SB_ASSOCIATED, SB_ENABLED, SB_BARS, SB_RSSI, SB_ACTIVE, SB_VALUES };
+enum { SB_WIFI_AUDIT = 1u, SB_WIFI_REFRESH = 2u };
+enum { SB_WIFI_CHANGES = 16, SB_WIFI_RSSI_LOGS = 64 };
+enum { SB_POWERED, SB_PRIMARY, SB_ASSOCIATED, SB_ENABLED, SB_BARS, SB_RSSI, SB_ACTIVE, SB_HOTSPOT, SB_VALUES };
 static const char *const sb_wifi_names[SB_VALUES] = {
     "isPowered", "isPrimaryInterface", "isAssociated", "wiFiEnabled", "signalStrengthBars", "signalStrengthRSSI",
-    "provider-setWifiActive"
+    "provider-setWifiActive", "isAssociatedToIOSHotspot"
 };
+static unsigned sb_wifi_options;
 static IMP sb_wifi_original[SB_VALUES], sb_wifi_rssi_original, sb_wifi_primary_original, sb_wifi_link_original;
 static long long sb_wifi_last[SB_VALUES];
 static unsigned sb_wifi_changes[SB_VALUES], sb_wifi_rssi_calls, sb_wifi_primary_calls, sb_wifi_link_calls;
@@ -540,6 +543,7 @@ SB_WIFI_BOOL_GETTER(sb_wifi_powered, SB_POWERED)
 SB_WIFI_BOOL_GETTER(sb_wifi_primary, SB_PRIMARY)
 SB_WIFI_BOOL_GETTER(sb_wifi_associated, SB_ASSOCIATED)
 SB_WIFI_BOOL_GETTER(sb_wifi_enabled, SB_ENABLED)
+SB_WIFI_BOOL_GETTER(sb_wifi_hotspot, SB_HOTSPOT)
 SB_WIFI_INT_GETTER(sb_wifi_bars, SB_BARS)
 SB_WIFI_INT_GETTER(sb_wifi_rssi_value, SB_RSSI)
 
@@ -547,18 +551,6 @@ static void sb_wifi_set_active(id self, SEL selector, bool active)
 {
     sb_wifi_value(SB_ACTIVE, active);
     ((void (*)(id, SEL, bool))sb_wifi_original[SB_ACTIVE])(self, selector, active);
-}
-
-static void sb_wifi_rssi(id self, SEL selector, int raw, float scaled)
-{
-    unsigned call = __atomic_fetch_add(&sb_wifi_rssi_calls, 1u, __ATOMIC_RELAXED);
-    if (call < SB_WIFI_RSSI_LOGS) {
-        char line[200];
-        int length = snprintf(line, sizeof(line), "fuxi: sb-wifi: rssi update call=%u uptime-ms=%llu raw=%d scaled=%.3f\n",
-            call + 1, sb_wifi_uptime_ms(), raw, (double)scaled);
-        if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
-    }
-    ((void (*)(id, SEL, int, float))sb_wifi_rssi_original)(self, selector, raw, scaled);
 }
 
 static void sb_wifi_event(const char *name, unsigned *calls)
@@ -569,6 +561,41 @@ static void sb_wifi_event(const char *name, unsigned *calls)
     int length = snprintf(line, sizeof(line), "fuxi: sb-wifi: %s call=%u uptime-ms=%llu\n", name, call + 1,
         sb_wifi_uptime_ms());
     if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+}
+
+/* On 20H392, SBWiFiManager computes zero bars when its cached network is
+ * empty. Link notifications can arrive during the gap between associations.
+ * A subsequent device RSSI callback can retry the native current-network read
+ * on the Wi-Fi callback thread. The native read also updates hotspot status. */
+static void sb_wifi_refresh_association(id self, int raw)
+{
+    if (raw < -128 || raw >= 0 || pthread_main_np() || wifi_audit_integer(self, "_cachedIsAssociated") != 0) return;
+
+    SEL selector = sel_registerName("_updateCurrentNetwork");
+    Method update = class_getInstanceMethod(object_getClass(self), selector);
+    if (update == NULL || method_getNumberOfArguments(update) != 2 || !wifi_audit_type(update, 0, 'v')) return;
+    ((void (*)(id, SEL))method_getImplementation(update))(self, selector);
+
+    if (sb_wifi_options & SB_WIFI_AUDIT) {
+        static unsigned attempts;
+        sb_wifi_event(wifi_audit_integer(self, "_cachedIsAssociated") == 1 ?
+            "current network refreshed" : "current network still absent", &attempts);
+    }
+}
+
+static void sb_wifi_rssi(id self, SEL selector, int raw, float scaled)
+{
+    if (sb_wifi_options & SB_WIFI_REFRESH) sb_wifi_refresh_association(self, raw);
+    if (sb_wifi_options & SB_WIFI_AUDIT) {
+        unsigned call = __atomic_fetch_add(&sb_wifi_rssi_calls, 1u, __ATOMIC_RELAXED);
+        if (call < SB_WIFI_RSSI_LOGS) {
+            char line[200];
+            int length = snprintf(line, sizeof(line), "fuxi: sb-wifi: rssi update call=%u uptime-ms=%llu raw=%d scaled=%.3f\n",
+                call + 1, sb_wifi_uptime_ms(), raw, (double)scaled);
+            if (length > 0 && length < (int)sizeof(line)) (void)write(2, line, (size_t)length);
+        }
+    }
+    ((void (*)(id, SEL, int, float))sb_wifi_rssi_original)(self, selector, raw, scaled);
 }
 
 static void sb_wifi_primary_changed(id self, SEL selector, id notification)
@@ -587,15 +614,20 @@ static void sb_wifi_image(const struct mach_header *header, intptr_t slide)
 {
     (void)header;
     (void)slide;
+    static wifi_audit_hook rssi_hook = {
+        "SBWiFiManager", "_updateSignalStrengthFromRawRSSI:andScaledRSSI:", "vif", (IMP)sb_wifi_rssi,
+        &sb_wifi_rssi_original, 0
+    };
+    wifi_audit_install_table("sb-wifi:", &rssi_hook, 1);
+    if (!(sb_wifi_options & SB_WIFI_AUDIT)) return;
     static wifi_audit_hook hooks[] = {
         {"SBWiFiManager", "isPowered", "b", (IMP)sb_wifi_powered, &sb_wifi_original[SB_POWERED], 0},
         {"SBWiFiManager", "isPrimaryInterface", "b", (IMP)sb_wifi_primary, &sb_wifi_original[SB_PRIMARY], 0},
         {"SBWiFiManager", "isAssociated", "b", (IMP)sb_wifi_associated, &sb_wifi_original[SB_ASSOCIATED], 0},
         {"SBWiFiManager", "wiFiEnabled", "b", (IMP)sb_wifi_enabled, &sb_wifi_original[SB_ENABLED], 0},
+        {"SBWiFiManager", "isAssociatedToIOSHotspot", "b", (IMP)sb_wifi_hotspot, &sb_wifi_original[SB_HOTSPOT], 0},
         {"SBWiFiManager", "signalStrengthBars", "i", (IMP)sb_wifi_bars, &sb_wifi_original[SB_BARS], 0},
         {"SBWiFiManager", "signalStrengthRSSI", "i", (IMP)sb_wifi_rssi_value, &sb_wifi_original[SB_RSSI], 0},
-        {"SBWiFiManager", "_updateSignalStrengthFromRawRSSI:andScaledRSSI:", "vif", (IMP)sb_wifi_rssi,
-            &sb_wifi_rssi_original, 0},
         {"SBWiFiManager", "_primaryInterfaceChanged:", "v@", (IMP)sb_wifi_primary_changed,
             &sb_wifi_primary_original, 0},
         {"SBWiFiManager", "_linkDidChange", "v", (IMP)sb_wifi_link_changed, &sb_wifi_link_original, 0},
@@ -665,8 +697,10 @@ __attribute__((constructor)) static void fuxi_wifi_audit_init(void)
         return;
     }
     if (strcmp(name, "SpringBoard") == 0) {
-        if (wifi_audit_adt_u32(CFSTR("fuxi,wifi-sb")) == 0) return;
-        wifi_audit_say("fuxi: sb-wifi: status audit enabled (fuxi,wifi-sb)\n");
+        sb_wifi_options = wifi_audit_adt_u32(CFSTR("fuxi,wifi-sb"));
+        if (!(sb_wifi_options & (SB_WIFI_AUDIT | SB_WIFI_REFRESH))) return;
+        if (sb_wifi_options & SB_WIFI_AUDIT) wifi_audit_say("fuxi: sb-wifi: status audit enabled (fuxi,wifi-sb)\n");
+        if (sb_wifi_options & SB_WIFI_REFRESH) wifi_audit_say("fuxi: sb-wifi: current network refresh enabled\n");
         _dyld_register_func_for_add_image(sb_wifi_image);
         return;
     }
