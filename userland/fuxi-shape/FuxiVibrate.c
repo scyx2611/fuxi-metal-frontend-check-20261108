@@ -1334,6 +1334,24 @@ static void vb_generator_selftest(const char *who)
         (void *)"selection", vb_generator_fire);
 }
 
+/*
+ * 2026-11-18 hapticfb3：SpringBoard 內呼叫 LSApplicationWorkspace openApplicationWithBundleID: 回 NO
+ * （打開請求經 FrontBoard 回到 SpringBoard 自己）。改在主執行緒用 SpringBoard 的
+ * launchApplicationWithIdentifier:suspended:（UIApplication 子類別的私有方法），先檢查有沒有這個方法。
+ */
+static void vb_launch_settings(void *context)
+{
+    (void)context;
+    Class application = objc_getClass("UIApplication");
+    id shared = application ? ((vb_msg_id_t)objc_msgSend)((id)application, sel_registerName("sharedApplication")) : NULL;
+    SEL launch = sel_registerName("launchApplicationWithIdentifier:suspended:");
+    bool responds = shared && ((bool (*)(id, SEL, SEL))objc_msgSend)(shared, sel_registerName("respondsToSelector:"), launch);
+    bool launched = responds && ((bool (*)(id, SEL, id, bool))objc_msgSend)(shared, launch,
+        (id)CFSTR("com.apple.Preferences"), false);
+    vb_say("haptic selftest launch Preferences springboard=%u responds=%u launched=%u\n", shared != NULL, responds,
+        launched);
+}
+
 static void vb_open_settings(void)
 {
     Class workspace = objc_getClass("LSApplicationWorkspace");
@@ -1341,6 +1359,7 @@ static void vb_open_settings(void)
     bool opened = shared && ((bool (*)(id, SEL, id))objc_msgSend)(shared,
         sel_registerName("openApplicationWithBundleID:"), (id)CFSTR("com.apple.Preferences"));
     vb_say("haptic selftest open Preferences workspace=%u opened=%u\n", shared != NULL, opened);
+    if (!opened) dispatch_async_f(dispatch_get_main_queue(), NULL, vb_launch_settings);
 }
 
 static unsigned vb_adt_u32(CFStringRef key)
