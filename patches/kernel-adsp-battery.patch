@@ -11502,10 +11502,10 @@ index 0000000..922f6a1
 +    main()
 diff --git a/tools/test-fuxi-bluetooth-pump.py b/tools/test-fuxi-bluetooth-pump.py
 new file mode 100644
-index 0000000..b69449f
+index 0000000..4938edd
 --- /dev/null
 +++ b/tools/test-fuxi-bluetooth-pump.py
-@@ -0,0 +1,1344 @@
+@@ -0,0 +1,1393 @@
 +#!/usr/bin/env python3
 +"""Compile and run the WCN7850 resident UART pump and H4 tracer (fuxi,bt=5) against a simulated GENI FIFO."""
 +
@@ -12756,7 +12756,34 @@ index 0000000..b69449f
 +        r.event = opaque[i];
 +        assert(fuxi_bt_link_detail(&r, &value) && value == -1);
 +    }
++    r.event = 0x02;
++    assert(fuxi_bt_link_is_inquiry(&r));
++    r.event = 0x05;
++    r.keep_size = 4;
++    r.keep[0] = 0x00;
++    r.keep[1] = 0x02;
++    r.keep[2] = 0x00;
++    r.keep[3] = 0x13;
++    assert(!fuxi_bt_link_is_inquiry(&r));
++    assert(fuxi_bt_link_detail(&r, &value) && value == 0x13);
++    r.keep[0] = 0x0c;
++    assert(fuxi_bt_link_detail(&r, &value) && value == 0x0c13);
++    r.keep_size = 3;
++    assert(fuxi_bt_link_detail(&r, &value) && value == -1);
++    r.event = 0x08;
++    r.keep_size = 4;
++    r.keep[0] = 0x00;
++    r.keep[3] = 0x02;
++    assert(fuxi_bt_link_detail(&r, &value) && value == 0x02);
++    r.event = 0x10;
++    r.keep_size = 1;
++    r.keep[0] = 0x2a;
++    assert(fuxi_bt_link_detail(&r, &value) && value == 0x2a);
++    r.event = 0x30;
++    r.keep[0] = 0x00;
++    assert(fuxi_bt_link_detail(&r, &value) && value == 0x00);
 +    r.event = 0x36;
++    r.keep[0] = 0xa5;
 +    assert(fuxi_bt_link_detail(&r, &value) && value == 0xa5);
 +    r.keep_size = 0;
 +    assert(fuxi_bt_link_detail(&r, &value) && value == -1);
@@ -12766,14 +12793,36 @@ index 0000000..b69449f
 +    r.opcode = 0x405;
 +    r.has_status = true;
 +    r.status = 0x0c;
++    assert(!fuxi_bt_link_is_inquiry(&r));
 +    assert(fuxi_bt_link_detail(&r, &value) && value == 0x0c);
 +    r.direction = FUXI_BT_H4_TO_CONTROLLER;
 +    assert(fuxi_bt_link_detail(&r, &value) && value == -1);
++    r.opcode = 0x0401;
++    assert(fuxi_bt_link_is_inquiry(&r));
++    const uint16_t opaque_ops[] = {0x040b, 0x040c, 0x042e, 0x042f, 0x0430, 0x0433, 0x0434};
++    for (unsigned i = 0; i < sizeof(opaque_ops) / sizeof(opaque_ops[0]); ++i) {
++        r.opcode = opaque_ops[i];
++        r.keep_size = 6;
++        r.length = 6;
++        assert(fuxi_bt_link_detail(&r, &value) && value == -1);
++    }
++    r.opcode = 0x0413;
++    r.length = 3;
++    r.keep_size = 3;
++    r.keep[2] = 1;
++    assert(fuxi_bt_link_detail(&r, &value) && value == 1);
++    r.keep[2] = 2;
++    assert(fuxi_bt_link_detail(&r, &value) && value == -1);
 +    r.opcode = 0x0c1a;
++    r.length = 1;
 +    r.keep_size = 1;
++    r.keep[0] = 4;
 +    assert(fuxi_bt_link_detail(&r, &value) && value == -1);
 +    r.keep[0] = 3;
 +    assert(fuxi_bt_link_detail(&r, &value) && value == 3);
++    r.opcode = 0x0c56;
++    r.keep[0] = 1;
++    assert(fuxi_bt_link_detail(&r, &value) && value == 1);
 +    r.opcode = 0xfce9;
 +    assert(!fuxi_bt_link_detail(&r, &value));
 +}
@@ -38429,10 +38478,10 @@ index 0000000..78f02f7
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_pump.c b/xnu/fuxi-bluetooth/fuxi_bt_pump.c
 new file mode 100644
-index 0000000..7e8ec34
+index 0000000..3b82596
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_pump.c
-@@ -0,0 +1,849 @@
+@@ -0,0 +1,877 @@
 +#include "fuxi_bt_pump.h"
 +#include <string.h>
 +
@@ -38516,6 +38565,18 @@ index 0000000..7e8ec34
 +    parser->remaining = record->length;
 +}
 +
++bool fuxi_bt_link_is_inquiry(const struct fuxi_bt_h4_record *record)
++{
++    if (record->has_opcode) {
++        return record->opcode == 0x0401u || record->opcode == 0x0402u;
++    }
++    if (record->direction != FUXI_BT_H4_TO_HOST || record->type != FUXI_BT_H4_EVENT) {
++        return false;
++    }
++    return record->event == 0x01u || record->event == 0x02u ||
++           record->event == 0x22u || record->event == 0x2fu;
++}
++
 +bool fuxi_bt_link_detail(const struct fuxi_bt_h4_record *record, int *value)
 +{
 +    *value = -1;
@@ -38524,14 +38585,25 @@ index 0000000..7e8ec34
 +        case 0x0401: case 0x0402: /* inquiry / cancel */
 +        case 0x0405: case 0x0406: case 0x0408: /* create / disconnect / cancel */
 +        case 0x0409: case 0x040a: /* accept / reject incoming connection */
-+        case 0x0411: case 0x0419: /* authenticate / request remote name */
-+        case 0x042b: case 0x042c: case 0x042d: /* capability / confirmation replies */
++        case 0x040b: case 0x040c: /* link key reply / negative reply */
++        case 0x0411: case 0x0413: case 0x0419: /* authenticate / encrypt / remote name */
++        case 0x042b: case 0x042c: case 0x042d: /* IO cap / confirmation replies */
++        case 0x042e: case 0x042f: case 0x0430: /* passkey / OOB replies */
++        case 0x0433: case 0x0434: /* OOB / IO cap negative replies */
 +        case 0x0c1a: /* Write Scan Enable */
-+            if (record->direction == FUXI_BT_H4_TO_HOST && record->has_status)
++        case 0x0c55: case 0x0c56: /* Read / Write Simple Pairing Mode */
++            if (record->direction == FUXI_BT_H4_TO_HOST && record->has_status) {
 +                *value = record->status;
-+            else if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->opcode == 0x0c1a &&
-+                     record->length == 1 && record->keep_size == 1 && record->keep[0] <= 3)
++            } else if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->opcode == 0x0c1a &&
++                       record->length == 1 && record->keep_size == 1 && record->keep[0] <= 3) {
 +                *value = record->keep[0];
++            } else if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->opcode == 0x0c56 &&
++                       record->length == 1 && record->keep_size == 1 && record->keep[0] <= 1) {
++                *value = record->keep[0];
++            } else if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->opcode == 0x0413 &&
++                       record->length == 3 && record->keep_size >= 3 && record->keep[2] <= 1) {
++                *value = record->keep[2];
++            }
 +            return true;
 +        default:
 +            return false;
@@ -38539,8 +38611,13 @@ index 0000000..7e8ec34
 +    }
 +    if (record->direction != FUXI_BT_H4_TO_HOST || record->type != FUXI_BT_H4_EVENT) return false;
 +    switch (record->event) {
-+    case 0x01: case 0x03: case 0x05: case 0x06: case 0x07: case 0x36:
-+        if (record->keep_size) *value = record->keep[0]; /* HCI status at byte 0 */
++    case 0x01: case 0x03: case 0x06: case 0x07: case 0x10: case 0x30: case 0x36:
++        if (record->keep_size) *value = record->keep[0]; /* HCI status or hw error at byte 0 */
++        return true;
++    case 0x05: case 0x08: /* Disconnection Complete (reason) / Encryption Change (enabled) */
++        if (record->keep_size >= 4) {
++            *value = ((int)record->keep[0] << 8) | record->keep[3];
++        }
 +        return true;
 +    case 0x02: case 0x22: case 0x2f: /* inquiry results */
 +    case 0x04: case 0x16: case 0x17: case 0x18: /* incoming link, PIN or link key */
@@ -39284,10 +39361,10 @@ index 0000000..7e8ec34
 +}
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_pump.h b/xnu/fuxi-bluetooth/fuxi_bt_pump.h
 new file mode 100644
-index 0000000..4415742
+index 0000000..6d343f3
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_pump.h
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,266 @@
 +#ifndef FUXI_BT_PUMP_H
 +#define FUXI_BT_PUMP_H
 +
@@ -39378,8 +39455,9 @@ index 0000000..4415742
 +};
 +
 +typedef void (*fuxi_bt_h4_trace_fn)(void *, const struct fuxi_bt_h4_record *);
-+/* Classic link milestones. The sole payload value returned is a status or scan mode. */
++/* Classic link milestones. Only status, disconnect reason, encryption or mode flags are returned. */
 +bool fuxi_bt_link_detail(const struct fuxi_bt_h4_record *record, int *value);
++bool fuxi_bt_link_is_inquiry(const struct fuxi_bt_h4_record *record);
 +
 +struct fuxi_bt_h4_parser {
 +    uint8_t direction;
@@ -41467,10 +41545,10 @@ index 0000000..0c74011
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_xnu.c b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
 new file mode 100644
-index 0000000..4e47aca
+index 0000000..2f40bff
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
-@@ -0,0 +1,903 @@
+@@ -0,0 +1,915 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
@@ -41845,9 +41923,12 @@ index 0000000..4e47aca
 + * 記錄還沒得到 Command Complete／Status 的命令與最近送出的 opcode。 */
 +#define FUXI_BT_TRACE_PER_LINK 400u
 +#define FUXI_BT_TRACE_RECENT 8u
++#define FUXI_BT_LINK_DETAIL_LIMIT 192u
++#define FUXI_BT_LINK_INQUIRY_LIMIT 64u
 +struct fuxi_bt_trace_state {
 +    unsigned count;
 +    unsigned link_detail_count;
++    unsigned link_inquiry_count;
 +    bool link_detail_enabled;
 +    bool pending;
 +    bool pending_reported;
@@ -41863,13 +41944,21 @@ index 0000000..4e47aca
 +{
 +    struct fuxi_bt_trace_state *state = context;
 +    const uint64_t now = fuxi_bt_now_us(NULL);
-+    if (state->link_detail_enabled && state->link_detail_count < 128) {
++    if (state->link_detail_enabled) {
 +        int value;
 +        if (fuxi_bt_link_detail(record, &value)) {
-+            printf("FUXI BT LINK: ms=%llu dir=%s op=%#x evt=%#x value=%d seq=%u\n",
-+                now / 1000, record->direction == FUXI_BT_H4_TO_CONTROLLER ? "tx" : "rx",
-+                record->has_opcode ? record->opcode : 0, record->event, value, ++state->link_detail_count);
-+            if (state->link_detail_count == 128) printf("FUXI BT LINK: limit reached\n");
++            const bool inquiry = fuxi_bt_link_is_inquiry(record);
++            unsigned *counter = inquiry ? &state->link_inquiry_count : &state->link_detail_count;
++            const unsigned limit = inquiry ? FUXI_BT_LINK_INQUIRY_LIMIT : FUXI_BT_LINK_DETAIL_LIMIT;
++            if (*counter < limit) {
++                printf("FUXI BT LINK: ms=%llu dir=%s op=%#x evt=%#x value=%d seq=%u%s\n",
++                    now / 1000, record->direction == FUXI_BT_H4_TO_CONTROLLER ? "tx" : "rx",
++                    record->has_opcode ? record->opcode : 0, record->event, value,
++                    ++(*counter), inquiry ? " inq" : "");
++                if (*counter == limit) {
++                    printf("FUXI BT LINK: %s limit reached\n", inquiry ? "inquiry" : "detail");
++                }
++            }
 +        }
 +    }
 +    if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->type == FUXI_BT_H4_COMMAND &&
@@ -42056,6 +42145,7 @@ index 0000000..4e47aca
 +                link_connects = link.connects;
 +                traces.count = 0;
 +                traces.link_detail_count = 0;
++                traces.link_inquiry_count = 0;
 +                tx_dumps = rx_dumps = 0;
 +                rx_armed = 8;
 +                printf("FUXI BT: link %u trace reset\n", link.connects);
@@ -49895,6 +49985,140 @@ index 1c9367c..0c44e8e 100644
   		subcode = ut->uu_subcode;
   		etype = ut->uu_exception;
   
+diff --git a/xnu/patches/0044-sweet-crash-log-reason.patch b/xnu/patches/0044-sweet-crash-log-reason.patch
+index b0dd408..42a807e 100644
+--- a/xnu/patches/0044-sweet-crash-log-reason.patch
++++ b/xnu/patches/0044-sweet-crash-log-reason.patch
+@@ -1,6 +1,128 @@
+ --- a/bsd/kern/kern_exit.c
+ +++ b/bsd/kern/kern_exit.c
+-@@ -1889,6 +1889,13 @@
++@@ -138,6 +138,56 @@
++ 
++ #include <pexpert/pexpert.h>
++ 
+++#if defined(ARM64_BOARD_CONFIG_SWEET)
+++#include <pexpert/device_tree.h>
+++
+++static unsigned
+++fuxi_media_exit_enabled(void)
+++{
+++	static int cached = -1;
+++	int cur = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+++	unsigned mode = 0;
+++	DTEntry chosen;
+++	const void *prop = NULL;
+++	unsigned int bytes = 0;
+++
+++	if (cur >= 0) {
+++		return (unsigned)cur;
+++	}
+++	if (!PE_parse_boot_argn("fuximediaexit", &mode, sizeof(mode))) {
+++		mode = 0;
+++		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+++		    SecureDTGetProperty(chosen, "fuxi,media-exit-trace", &prop, &bytes) == kSuccess &&
+++		    prop != NULL && bytes == sizeof(uint32_t)) {
+++			memcpy(&mode, prop, sizeof(mode));
+++		}
+++	}
+++	mode = mode != 0 ? 1u : 0u;
+++	__atomic_store_n(&cached, (int)mode, __ATOMIC_RELAXED);
+++	return mode;
+++}
+++
+++/* 0: ignore, 1: media/WebKit target, 2: lskdd (tight cap) */
+++static unsigned
+++fuxi_media_exit_kind(const char *name)
+++{
+++	if (name == NULL) {
+++		return 0;
+++	}
+++	if (strcmp(name, "mediaserverd") == 0 ||
+++	    strcmp(name, "MobileSafari") == 0 ||
+++	    strcmp(name, "audiomxd") == 0 ||
+++	    strncmp(name, "VTDecoderXPC", 12) == 0 ||
+++	    strncmp(name, "com.apple.WebKit", 16) == 0) {
+++		return 1;
+++	}
+++	if (strcmp(name, "lskdd") == 0) {
+++		return 2;
+++	}
+++	return 0;
+++}
+++#endif /* ARM64_BOARD_CONFIG_SWEET */
+++
++ #include <kdp/kdp_dyld.h>
++ 
++ #if SYSV_SHM
++@@ -1444,6 +1494,18 @@
++ 			sweet_crash_log(p->p_comm, proc_getpid(p), 0, 1, 0);
++ 		}
++ 	}
+++	if (fuxi_media_exit_enabled()) {
+++		const char *name = proc_best_name(p);
+++		unsigned kind = fuxi_media_exit_kind(name);
+++		static unsigned sys_media_traced, sys_lskdd_traced;
+++		if ((kind == 1 && __atomic_fetch_add(&sys_media_traced, 1u, __ATOMIC_RELAXED) < 32u) ||
+++		    (kind == 2 && __atomic_fetch_add(&sys_lskdd_traced, 1u, __ATOMIC_RELAXED) < 2u)) {
+++			extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
+++
+++			printf("FUXI EXIT: syscall %s[%d] rval=%d\n", name, proc_getpid(p), uap->rval);
+++			sweet_crash_log(name, proc_getpid(p), 0, (uint64_t)(uint32_t)uap->rval, 0);
+++		}
+++	}
++ #endif
++ 	p->p_xhighbits = ((uint32_t)(uap->rval) & 0xFF000000) >> 24;
++ 	exit1(p, W_EXITCODE((uint32_t)uap->rval, 0), retval);
++@@ -1861,6 +1923,45 @@
++ 	if (p->p_crash_behavior != 0 || p == initproc) {
++ 		proc_handle_critical_exit(p, rv);
++ 	}
+++#if defined(ARM64_BOARD_CONFIG_SWEET)
+++	if (fuxi_media_exit_enabled()) {
+++		const char *name = proc_best_name(p);
+++		unsigned kind = fuxi_media_exit_kind(name);
+++		static unsigned prep_media_traced, prep_lskdd_traced;
+++		if ((kind == 1 && __atomic_fetch_add(&prep_media_traced, 1u, __ATOMIC_RELAXED) < 64u) ||
+++		    (kind == 2 && __atomic_fetch_add(&prep_lskdd_traced, 1u, __ATOMIC_RELAXED) < 4u)) {
+++			proc_t cur = current_proc();
+++			const char *by = cur != NULL ? proc_best_name(cur) : "(null)";
+++			int by_pid = cur != NULL ? proc_getpid(cur) : -1;
+++			uint32_t r_ns = 0;
+++			uint64_t r_code = 0, r_flags = 0;
+++			const char *r_desc = "(none)";
+++			bool will_crash_log = !(PROC_HAS_EXITREASON(p) &&
+++			    (PROC_EXITREASON_FLAGS(p) & OS_REASON_FLAG_NO_CRASH_REPORT)) &&
+++			    (hassigprop(WTERMSIG(rv), SA_CORE) || ((proc_getcsflags(p) & CS_KILLED) != 0) ||
+++			    (PROC_HAS_EXITREASON(p) && (PROC_EXITREASON_FLAGS(p) &
+++			    OS_REASON_FLAG_GENERATE_CRASH_REPORT)));
+++
+++			if (PROC_HAS_EXITREASON(p)) {
+++				char *desc = exit_reason_get_string_desc(p->p_exit_reason);
+++				r_ns = p->p_exit_reason->osr_namespace;
+++				r_code = p->p_exit_reason->osr_code;
+++				r_flags = p->p_exit_reason->osr_flags;
+++				if (desc != NULL) {
+++					r_desc = desc;
+++				}
+++			}
+++			printf("FUXI EXIT: %s[%d] rv=0x%x sig=%d status=%d self=%d by=%s[%d] cs=0x%x ns=%u code=0x%llx flags=0x%llx desc=%s\n",
+++			    name, proc_getpid(p), rv, WTERMSIG(rv), WEXITSTATUS(rv), p == cur ? 1 : 0,
+++			    by, by_pid, proc_getcsflags(p), r_ns, r_code, r_flags, r_desc);
+++			if (p == cur && !will_crash_log && (WIFSIGNALED(rv) || PROC_HAS_EXITREASON(p))) {
+++				extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
+++				sweet_crash_log(name, proc_getpid(p), WTERMSIG(rv),
+++				    ((uint64_t)ut->uu_exception << 32) | (uint32_t)ut->uu_code, ut->uu_subcode);
+++			}
+++		}
+++	}
+++#endif
++ 
++ 	/*
++ 	 * Generate a corefile/crashlog if:
++@@ -1902,6 +2003,13 @@
+  			extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
+  			sweet_crash_log(p->p_comm, proc_getpid(p), WTERMSIG(rv),
+  			    ((uint64_t)ut->uu_exception << 32) | (uint32_t)ut->uu_code, ut->uu_subcode);
 diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
 index 0ca2838..0d215ed 100644
 --- a/xnu/patches/0098-fuxi-native-adreno-abi.patch
@@ -55412,10 +55636,10 @@ index 41dbb65..b082005 100644
  +    W w;
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..5934a0e
+index 0000000..e12e15a
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,16121 @@
+@@ -0,0 +1,16162 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,36 @@
@@ -61954,7 +62178,7 @@ index 0000000..5934a0e
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_xnu.c
-+@@ -0,0 +1,903 @@
++@@ -0,0 +1,915 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
@@ -62329,9 +62553,12 @@ index 0000000..5934a0e
 ++ * 記錄還沒得到 Command Complete／Status 的命令與最近送出的 opcode。 */
 ++#define FUXI_BT_TRACE_PER_LINK 400u
 ++#define FUXI_BT_TRACE_RECENT 8u
+++#define FUXI_BT_LINK_DETAIL_LIMIT 192u
+++#define FUXI_BT_LINK_INQUIRY_LIMIT 64u
 ++struct fuxi_bt_trace_state {
 ++    unsigned count;
 ++    unsigned link_detail_count;
+++    unsigned link_inquiry_count;
 ++    bool link_detail_enabled;
 ++    bool pending;
 ++    bool pending_reported;
@@ -62347,13 +62574,21 @@ index 0000000..5934a0e
 ++{
 ++    struct fuxi_bt_trace_state *state = context;
 ++    const uint64_t now = fuxi_bt_now_us(NULL);
-++    if (state->link_detail_enabled && state->link_detail_count < 128) {
+++    if (state->link_detail_enabled) {
 ++        int value;
 ++        if (fuxi_bt_link_detail(record, &value)) {
-++            printf("FUXI BT LINK: ms=%llu dir=%s op=%#x evt=%#x value=%d seq=%u\n",
-++                now / 1000, record->direction == FUXI_BT_H4_TO_CONTROLLER ? "tx" : "rx",
-++                record->has_opcode ? record->opcode : 0, record->event, value, ++state->link_detail_count);
-++            if (state->link_detail_count == 128) printf("FUXI BT LINK: limit reached\n");
+++            const bool inquiry = fuxi_bt_link_is_inquiry(record);
+++            unsigned *counter = inquiry ? &state->link_inquiry_count : &state->link_detail_count;
+++            const unsigned limit = inquiry ? FUXI_BT_LINK_INQUIRY_LIMIT : FUXI_BT_LINK_DETAIL_LIMIT;
+++            if (*counter < limit) {
+++                printf("FUXI BT LINK: ms=%llu dir=%s op=%#x evt=%#x value=%d seq=%u%s\n",
+++                    now / 1000, record->direction == FUXI_BT_H4_TO_CONTROLLER ? "tx" : "rx",
+++                    record->has_opcode ? record->opcode : 0, record->event, value,
+++                    ++(*counter), inquiry ? " inq" : "");
+++                if (*counter == limit) {
+++                    printf("FUXI BT LINK: %s limit reached\n", inquiry ? "inquiry" : "detail");
+++                }
+++            }
 ++        }
 ++    }
 ++    if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->type == FUXI_BT_H4_COMMAND &&
@@ -62540,6 +62775,7 @@ index 0000000..5934a0e
 ++                link_connects = link.connects;
 ++                traces.count = 0;
 ++                traces.link_detail_count = 0;
+++                traces.link_inquiry_count = 0;
 ++                tx_dumps = rx_dumps = 0;
 ++                rx_armed = 8;
 ++                printf("FUXI BT: link %u trace reset\n", link.connects);
@@ -65014,7 +65250,7 @@ index 0000000..5934a0e
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_pump.c
-+@@ -0,0 +1,849 @@
++@@ -0,0 +1,877 @@
 ++#include "fuxi_bt_pump.h"
 ++#include <string.h>
 ++
@@ -65098,6 +65334,18 @@ index 0000000..5934a0e
 ++    parser->remaining = record->length;
 ++}
 ++
+++bool fuxi_bt_link_is_inquiry(const struct fuxi_bt_h4_record *record)
+++{
+++    if (record->has_opcode) {
+++        return record->opcode == 0x0401u || record->opcode == 0x0402u;
+++    }
+++    if (record->direction != FUXI_BT_H4_TO_HOST || record->type != FUXI_BT_H4_EVENT) {
+++        return false;
+++    }
+++    return record->event == 0x01u || record->event == 0x02u ||
+++           record->event == 0x22u || record->event == 0x2fu;
+++}
+++
 ++bool fuxi_bt_link_detail(const struct fuxi_bt_h4_record *record, int *value)
 ++{
 ++    *value = -1;
@@ -65106,14 +65354,25 @@ index 0000000..5934a0e
 ++        case 0x0401: case 0x0402: /* inquiry / cancel */
 ++        case 0x0405: case 0x0406: case 0x0408: /* create / disconnect / cancel */
 ++        case 0x0409: case 0x040a: /* accept / reject incoming connection */
-++        case 0x0411: case 0x0419: /* authenticate / request remote name */
-++        case 0x042b: case 0x042c: case 0x042d: /* capability / confirmation replies */
+++        case 0x040b: case 0x040c: /* link key reply / negative reply */
+++        case 0x0411: case 0x0413: case 0x0419: /* authenticate / encrypt / remote name */
+++        case 0x042b: case 0x042c: case 0x042d: /* IO cap / confirmation replies */
+++        case 0x042e: case 0x042f: case 0x0430: /* passkey / OOB replies */
+++        case 0x0433: case 0x0434: /* OOB / IO cap negative replies */
 ++        case 0x0c1a: /* Write Scan Enable */
-++            if (record->direction == FUXI_BT_H4_TO_HOST && record->has_status)
+++        case 0x0c55: case 0x0c56: /* Read / Write Simple Pairing Mode */
+++            if (record->direction == FUXI_BT_H4_TO_HOST && record->has_status) {
 ++                *value = record->status;
-++            else if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->opcode == 0x0c1a &&
-++                     record->length == 1 && record->keep_size == 1 && record->keep[0] <= 3)
+++            } else if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->opcode == 0x0c1a &&
+++                       record->length == 1 && record->keep_size == 1 && record->keep[0] <= 3) {
 ++                *value = record->keep[0];
+++            } else if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->opcode == 0x0c56 &&
+++                       record->length == 1 && record->keep_size == 1 && record->keep[0] <= 1) {
+++                *value = record->keep[0];
+++            } else if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->opcode == 0x0413 &&
+++                       record->length == 3 && record->keep_size >= 3 && record->keep[2] <= 1) {
+++                *value = record->keep[2];
+++            }
 ++            return true;
 ++        default:
 ++            return false;
@@ -65121,8 +65380,13 @@ index 0000000..5934a0e
 ++    }
 ++    if (record->direction != FUXI_BT_H4_TO_HOST || record->type != FUXI_BT_H4_EVENT) return false;
 ++    switch (record->event) {
-++    case 0x01: case 0x03: case 0x05: case 0x06: case 0x07: case 0x36:
-++        if (record->keep_size) *value = record->keep[0]; /* HCI status at byte 0 */
+++    case 0x01: case 0x03: case 0x06: case 0x07: case 0x10: case 0x30: case 0x36:
+++        if (record->keep_size) *value = record->keep[0]; /* HCI status or hw error at byte 0 */
+++        return true;
+++    case 0x05: case 0x08: /* Disconnection Complete (reason) / Encryption Change (enabled) */
+++        if (record->keep_size >= 4) {
+++            *value = ((int)record->keep[0] << 8) | record->keep[3];
+++        }
 ++        return true;
 ++    case 0x02: case 0x22: case 0x2f: /* inquiry results */
 ++    case 0x04: case 0x16: case 0x17: case 0x18: /* incoming link, PIN or link key */
@@ -69658,7 +69922,7 @@ index 0000000..5934a0e
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_pump.h
-+@@ -0,0 +1,265 @@
++@@ -0,0 +1,266 @@
 ++#ifndef FUXI_BT_PUMP_H
 ++#define FUXI_BT_PUMP_H
 ++
@@ -69749,8 +70013,9 @@ index 0000000..5934a0e
 ++};
 ++
 ++typedef void (*fuxi_bt_h4_trace_fn)(void *, const struct fuxi_bt_h4_record *);
-++/* Classic link milestones. The sole payload value returned is a status or scan mode. */
+++/* Classic link milestones. Only status, disconnect reason, encryption or mode flags are returned. */
 ++bool fuxi_bt_link_detail(const struct fuxi_bt_h4_record *record, int *value);
+++bool fuxi_bt_link_is_inquiry(const struct fuxi_bt_h4_record *record);
 ++
 ++struct fuxi_bt_h4_parser {
 ++    uint8_t direction;
