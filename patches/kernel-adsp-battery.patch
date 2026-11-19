@@ -12818,10 +12818,10 @@ index 0000000..d1cfaf8
 +    main()
 diff --git a/tools/test-fuxi-bluetooth-setup.py b/tools/test-fuxi-bluetooth-setup.py
 new file mode 100644
-index 0000000..cd0b4db
+index 0000000..637fd46
 --- /dev/null
 +++ b/tools/test-fuxi-bluetooth-setup.py
-@@ -0,0 +1,560 @@
+@@ -0,0 +1,810 @@
 +#!/usr/bin/env python3
 +"""Compile and run the WCN7850 controller setup (rampatch/NVM/HCI reset) against a simulated controller."""
 +
@@ -12867,6 +12867,16 @@ index 0000000..cd0b4db
 +    bool board_seen;
 +    unsigned segments, acquires, releases, commands;
 +    uint32_t random;
++    /* 速率模型：host_baud＝目前 acquire 的速率（0＝沒取），ctrl_baud＝控制器速率。
++     * 0xfc48 只登記 pending，host 歸還 UART 時才生效（控制器在送完後的等待期間換速）；
++     * 兩邊不同時寫出的位元組控制器收不到、控制器送的位元組 host 收不到。 */
++    unsigned host_baud, ctrl_baud, pending_baud;
++    unsigned acquire_fail_baud, rx_dead_baud, tx_dead_baud;
++    bool baud_reject, baud_ack_old, junk_once, nolog_error, build_seen;
++    unsigned baud_commands, dropped, acquire_log[8], acquire_count;
++    uint8_t baud_last;
++    unsigned nolog_seen;
++    size_t nolog_nvm;
 +};
 +
 +struct files {
@@ -12907,6 +12917,18 @@ index 0000000..cd0b4db
 +    push(s, event, 6 + size);
 +}
 +
++static unsigned qca_baud(uint8_t qca)
++{
++    switch (qca) {
++        case 0: return 115200;
++        case 10: return 921600;
++        case 13: return 2000000;
++        case 14: return 3000000;
++        case 17: return 3200000;
++        default: return 0;
++    }
++}
++
 +static void handle(struct sim *s)
 +{
 +    const uint8_t *c = s->command;
@@ -12916,7 +12938,30 @@ index 0000000..cd0b4db
 +    if (s->silent) {
 +        return;
 +    }
-+    if (opcode == 0xfc00 && p[0] == 0x19) {
++    if (s->junk_once && s->ctrl_baud != FUXI_BT_BOOT_BAUD) {
++        static const uint8_t junk[] = {0x00, 0x7f};
++        s->junk_once = false;
++        push(s, junk, sizeof(junk));
++    }
++    if (opcode == 0xfc48) {
++        assert(c[3] == 1);
++        s->baud_commands++;
++        s->baud_last = p[0];
++        if (s->baud_ack_old) {
++            const uint8_t status = 0;
++            complete(s, opcode, &status, 1);
++        }
++        if (!s->baud_reject && qca_baud(p[0])) {
++            s->pending_baud = qca_baud(p[0]);
++        }
++    } else if (opcode == 0xfc17) {
++        const uint8_t status = s->nolog_error ? 0x01 : 0;
++        assert(c[3] == 2 && p[0] == 0x14 && p[1] == 0x00);
++        assert(s->board_seen && !s->build_seen);
++        s->nolog_seen++;
++        s->nolog_nvm = s->got_nvm_size;
++        complete(s, opcode, &status, 1);
++    } else if (opcode == 0xfc00 && p[0] == 0x19) {
 +        static const uint8_t version[] = {0x0c, 0x19, 0, 0, 0, 0xfb, 0x43, 0x00, 0x02, 0x00, 0x02, 0x17, 0x40};
 +        vendor_complete(s, 0, 0x19, version, sizeof(version));
 +    } else if (opcode == 0xfc00 && p[0] == 0x1e) {
@@ -12947,6 +12992,7 @@ index 0000000..cd0b4db
 +        vendor_complete(s, s->board_error ? 0x01 : 0, 0x23, bid, sizeof(bid));
 +    } else if (opcode == 0xfc00 && p[0] == 0x20) {
 +        static const uint8_t info[] = {10, 'B', 'T', 'F', 'M', '.', 'H', 'M', 'T', 0x01, 0};
++        s->build_seen = true;
 +        if (s->ibs_after_nvm) {
 +            static const uint8_t sleep[] = {0xfe};
 +            push(s, sleep, 1);
@@ -12969,7 +13015,15 @@ index 0000000..cd0b4db
 +static enum fuxi_bt_status sim_acquire(void *context, unsigned baud)
 +{
 +    struct sim *s = context;
-+    assert(baud == FUXI_BT_BOOT_BAUD);
++    assert(fuxi_bt_rate_find(baud) && !s->host_baud);
++    if (s->acquire_count < 8) {
++        s->acquire_log[s->acquire_count] = baud;
++    }
++    s->acquire_count++;
++    if (baud == s->acquire_fail_baud) {
++        return FUXI_BT_IO;
++    }
++    s->host_baud = baud;
 +    s->acquires++;
 +    return FUXI_BT_OK;
 +}
@@ -12982,6 +13036,13 @@ index 0000000..cd0b4db
 +    *accepted = 0;
 +    if (s->stall_every && s->write_calls % s->stall_every == 0) {
 +        return FUXI_BT_AGAIN;
++    }
++    assert(s->host_baud);
++    if (s->host_baud != s->ctrl_baud || s->host_baud == s->tx_dead_baud) {
++        s->dropped += (unsigned)count;
++        s->command_size = 0;
++        *accepted = count;
++        return FUXI_BT_OK;
 +    }
 +    for (size_t index = 0; index < count; index++) {
 +        if (!s->command_size) {
@@ -13012,6 +13073,20 @@ index 0000000..cd0b4db
 +    }
 +    if (count > capacity) count = capacity;
 +    if (count > s->rx_chunk) count = s->rx_chunk;
++    assert(s->host_baud);
++    if (s->host_baud == s->rx_dead_baud) {
++        *received = 0;
++        return FUXI_BT_AGAIN;
++    }
++    if (s->host_baud != s->ctrl_baud) {
++        /* 速率不同：每個位元組都變成雜訊 */
++        for (size_t index = 0; index < count; index++) {
++            bytes[index] = (uint8_t)(0x40 + (s->out[s->out_head + index] & 0x3f));
++        }
++        s->out_head += count;
++        *received = count;
++        return count ? FUXI_BT_OK : FUXI_BT_AGAIN;
++    }
 +    memcpy(bytes, s->out + s->out_head, count);
 +    s->out_head += count;
 +    *received = count;
@@ -13021,7 +13096,17 @@ index 0000000..cd0b4db
 +static enum fuxi_bt_status sim_release(void *context)
 +{
 +    struct sim *s = context;
++    if (!s->host_baud) {
++        return FUXI_BT_OK; /* 和 board 一樣：沒取就歸還是空操作 */
++    }
 +    s->releases++;
++    s->host_baud = 0;
++    s->out_head = s->out_tail = 0; /* FIFO 關閉時沒讀的 RX 丟掉 */
++    s->command_size = 0;
++    if (s->pending_baud) {
++        s->ctrl_baud = s->pending_baud;
++        s->pending_baud = 0;
++    }
 +    return FUXI_BT_OK;
 +}
 +
@@ -13126,6 +13211,7 @@ index 0000000..cd0b4db
 +    s->fail_stale_segment = -1;
 +    s->board_id = 0x010a;
 +    s->random = 0x78501234;
++    s->ctrl_baud = FUXI_BT_BOOT_BAUD;
 +}
 +
 +static void files_init(struct files *f, size_t patch_size, uint8_t mode, const char *nvm_name)
@@ -13143,16 +13229,21 @@ index 0000000..cd0b4db
 +    return ops;
 +}
 +
-+static void expect_nvm(const struct sim *s, const struct files *f)
++static void expect_nvm_baud(const struct sim *s, const struct files *f, uint8_t qca)
 +{
 +    uint8_t expected[NVM_CAP];
 +    memcpy(expected, f->nvm, f->nvm_size);
-+    /* tag 17 在 4+18 起：資料 4+18+12 */
++    /* tag 17 在 4+18 起：資料 4+18+12；data[1]＝實際速率的 qca 列舉值 */
 +    expected[4 + 18 + 12] = 0x0e;
-+    expected[4 + 18 + 12 + 1] = 0x00;
++    expected[4 + 18 + 12 + 1] = qca;
 +    expected[4 + 18 + 16 + 12] = 0x02;
 +    assert(s->got_nvm_size == f->nvm_size);
 +    assert(!memcmp(s->got_nvm, expected, f->nvm_size));
++}
++
++static void expect_nvm(const struct sim *s, const struct files *f)
++{
++    expect_nvm_baud(s, f, 0);
 +}
 +
 +static void run_good(unsigned rx_chunk, unsigned tx_chunk, unsigned stall, uint8_t mode, size_t patch_size,
@@ -13188,6 +13279,162 @@ index 0000000..cd0b4db
 +    assert(r.bdaddr_valid && r.bdaddr[0] == 0x66 && r.bdaddr[5] == 0x11);
 +    assert(r.vendor_events == (noise ? (mode == 0 ? r.patch.segments : 1u) + r.nvm.segments + 3u : 0u));
 +    assert(r.elapsed_us < FUXI_BT_SETUP_TIMEOUT_US);
++    assert(r.baud_requested == FUXI_BT_BOOT_BAUD && r.baud_active == FUXI_BT_BOOT_BAUD);
++    assert(r.baud_status == FUXI_BT_OFF && r.baud_fallback == FUXI_BT_OFF && r.nolog_status == FUXI_BT_OFF);
++    assert(!s.baud_commands && !s.nolog_seen && !s.dropped);
++}
++
++static struct fuxi_bt_setup_result run_options(struct sim *s, struct files *f,
++    uint32_t baud, bool nolog)
++{
++    struct fuxi_bt_files ops = files_ops(f);
++    const struct fuxi_bt_setup_options options = {baud, nolog};
++    struct fuxi_bt_setup_result r;
++    s->patch_mode = f->patch[4 + 10];
++    s->patch_size = f->patch_size;
++    (void)fuxi_bt_setup_run_options(&s->ops, &ops, &options, &r);
++    assert(s->acquires == s->releases && !s->host_baud);
++    assert(f->loads == f->releases);
++    assert(r.elapsed_us <= FUXI_BT_SETUP_TIMEOUT_US + 1000000u);
++    return r;
++}
++
++/* 換速成功：01 48 fc 01 <enum>，host 歸還 UART、以新速率取回、重查版本，NVM data[1] 跟著新速率 */
++static void baud_good(unsigned rx_chunk, unsigned tx_chunk, unsigned stall, uint32_t baud, uint8_t qca,
++    bool ack_old, bool junk, bool nolog)
++{
++    struct sim s;
++    struct files f;
++    struct fuxi_bt_setup_result r;
++    sim_init(&s, rx_chunk, tx_chunk);
++    s.stall_every = stall;
++    s.baud_ack_old = ack_old;
++    s.junk_once = junk;
++    files_init(&f, 1801, 3, "hmtnv20.b10a");
++    r = run_options(&s, &f, baud, nolog);
++    assert(r.status == FUXI_BT_OK && r.stage == FUXI_BT_SETUP_DONE && r.cleanup == FUXI_BT_OK);
++    assert(r.baud_requested == baud && r.baud_active == baud && r.baud_status == FUXI_BT_OK);
++    assert(r.baud_fallback == FUXI_BT_OFF && r.baud_attempts == (junk ? 2u : 1u));
++    assert(s.baud_commands == 1 && s.baud_last == qca && s.ctrl_baud == baud && !s.dropped);
++    assert(s.acquires == 2 && s.acquire_count == 2);
++    assert(s.acquire_log[0] == FUXI_BT_BOOT_BAUD && s.acquire_log[1] == baud);
++    assert(r.baud_early_bytes == (ack_old ? 7u : 0u));
++    if (ack_old) {
++        static const uint8_t ack[] = {4, 0x0e, 4, 1, 0x48, 0xfc, 0};
++        assert(r.baud_early_size == 7 && !memcmp(r.baud_early, ack, 7));
++    }
++    assert(r.baud_us >= FUXI_BT_BAUD_SETTLE_US);
++    assert(r.version.soc == 0x40170200 && r.local_version_valid && r.bdaddr_valid);
++    expect_nvm_baud(&s, &f, qca);
++    assert(r.nvm.hci_after[1] == qca);
++    if (nolog) {
++        assert(r.nolog_status == FUXI_BT_OK && s.nolog_seen == 1 && s.nolog_nvm == f.nvm_size);
++    } else {
++        assert(r.nolog_status == FUXI_BT_OFF && !s.nolog_seen);
++    }
++}
++
++static void test_baud(void)
++{
++    struct sim s;
++    struct files f;
++    struct fuxi_bt_setup_result r;
++    static const unsigned chunks[] = {1, 3, 64};
++    static const struct { uint32_t baud; uint8_t qca; } rates[] = {
++        {921600, 10}, {2000000, 13}, {3000000, 14}, {3200000, 17}
++    };
++    unsigned runs = 0;
++    for (unsigned rate = 0; rate < 4; rate++) {
++        for (unsigned rx = 0; rx < 3; rx++) {
++            for (unsigned tx = 0; tx < 3; tx++) {
++                baud_good(chunks[rx], chunks[tx], (rx + tx) % 2 ? 3 : 0, rates[rate].baud, rates[rate].qca,
++                    (rx + tx + rate) & 1, rx == tx, (rate + rx) & 1);
++                runs++;
++            }
++        }
++    }
++
++    /* 115200 明確指定＝不換速 */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin");
++    r = run_options(&s, &f, FUXI_BT_BOOT_BAUD, false);
++    assert(r.status == FUXI_BT_OK && r.baud_status == FUXI_BT_OFF && s.acquires == 1 && !s.baud_commands);
++    expect_nvm(&s, &f);
++
++    /* 不在速率表：不取 UART 就回 ARGUMENT */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin");
++    r = run_options(&s, &f, 9600, false);
++    assert(r.status == FUXI_BT_ARGUMENT && !s.acquire_count && !s.commands);
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin");
++    r = run_options(&s, &f, 4000000, false);
++    assert(r.status == FUXI_BT_ARGUMENT && !s.acquire_count);
++    {
++        struct fuxi_bt_files ops = files_ops(&f);
++        sim_init(&s, 64, 64);
++        assert(fuxi_bt_setup_run_options(&s.ops, &ops, NULL, &r) == FUXI_BT_ARGUMENT && !s.acquire_count);
++    }
++
++    /* 控制器不換速：新速率下雙方都收不到，確認逾時 3 次，退回 115200 確認成功，以 115200 繼續 */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.baud_reject = true;
++    r = run_options(&s, &f, 3200000, true);
++    assert(r.status == FUXI_BT_OK && r.stage == FUXI_BT_SETUP_DONE);
++    assert(r.baud_status == FUXI_BT_TIMEOUT && r.baud_fallback == FUXI_BT_OK);
++    assert(r.baud_active == FUXI_BT_BOOT_BAUD && r.baud_attempts == FUXI_BT_BAUD_VERIFY_ATTEMPTS + 1);
++    assert(s.acquire_count == 3 && s.acquire_log[1] == 3200000 && s.acquire_log[2] == FUXI_BT_BOOT_BAUD);
++    assert(s.baud_commands == 1 && s.dropped > 0 && s.ctrl_baud == FUXI_BT_BOOT_BAUD);
++    assert(r.nolog_status == FUXI_BT_OK);
++    expect_nvm(&s, &f);
++
++    /* 控制器換了、host 在新速率收不到：以新速率送 0xfc48 0 要它回 115200，再確認 */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.rx_dead_baud = 3000000;
++    r = run_options(&s, &f, 3000000, false);
++    assert(r.status == FUXI_BT_OK && r.baud_status == FUXI_BT_TIMEOUT && r.baud_fallback == FUXI_BT_OK);
++    assert(r.baud_active == FUXI_BT_BOOT_BAUD && s.baud_commands == 2 && s.baud_last == 0);
++    assert(s.ctrl_baud == FUXI_BT_BOOT_BAUD);
++    expect_nvm(&s, &f);
++
++    /* 新速率取 UART 失敗、控制器沒換：退回確認成功，baud_status 記 IO */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin");
++    s.acquire_fail_baud = 3200000; s.baud_reject = true;
++    r = run_options(&s, &f, 3200000, false);
++    assert(r.status == FUXI_BT_OK && r.baud_status == FUXI_BT_IO && r.baud_fallback == FUXI_BT_OK);
++    assert(r.baud_active == FUXI_BT_BOOT_BAUD && s.acquire_count == 3 && s.baud_commands == 1);
++
++    /* 新速率取 UART 失敗、控制器已換：115200 下確認不到，setup 失敗在 baud 階段 */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.acquire_fail_baud = 3200000;
++    r = run_options(&s, &f, 3200000, false);
++    assert(r.status == FUXI_BT_TIMEOUT && r.stage == FUXI_BT_SETUP_BAUD);
++    assert(r.baud_status == FUXI_BT_IO && r.baud_fallback == FUXI_BT_TIMEOUT && f.loads == 0);
++
++    /* 控制器換了、host 在新速率送不出去：退回的 0xfc48 也送不到，setup 失敗 */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.tx_dead_baud = 2000000;
++    r = run_options(&s, &f, 2000000, false);
++    assert(r.status == FUXI_BT_TIMEOUT && r.stage == FUXI_BT_SETUP_BAUD);
++    assert(r.baud_status == FUXI_BT_TIMEOUT && r.baud_fallback == FUXI_BT_TIMEOUT);
++    assert(s.baud_commands == 1 && s.ctrl_baud == 2000000 && f.loads == 0);
++
++    /* 0xfc17 回錯：只記錄，照常完成 */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.nolog_error = true;
++    r = run_options(&s, &f, 0, true);
++    assert(r.status == FUXI_BT_OK && r.nolog_status == FUXI_BT_CONTROLLER && s.nolog_seen == 1);
++    assert(r.stage == FUXI_BT_SETUP_DONE && !s.baud_commands);
++
++    /* 換速階段控制器完全不回（silent）：第一次版本查詢就逾時，不送 0xfc48 */
++    sim_init(&s, 64, 64); files_init(&f, 972, 0, "hmtnv20.bin"); s.silent = true;
++    r = run_options(&s, &f, 3200000, true);
++    assert(r.status == FUXI_BT_TIMEOUT && r.stage == FUXI_BT_SETUP_VERSION && s.acquire_count == 1);
++
++    /* 雜訊模糊測試：任何結果都不能越界，取還次數一致 */
++    for (unsigned trial = 0; trial < 500; trial++) {
++        sim_init(&s, trial % 7 + 1, trial % 5 + 1);
++        s.random ^= trial * 2654435761u;
++        s.bad_framing = true;
++        s.silent = true;
++        files_init(&f, 972, 0, "hmtnv20.bin");
++        r = run_options(&s, &f, trial & 1 ? 3200000 : 921600, trial & 2);
++        assert(r.status != FUXI_BT_OK && r.frames <= FUXI_BT_SETUP_MAX_FRAMES);
++    }
++    printf("PASS bt setup baud: %u switch runs (4 rates, chunking, old-baud ack, junk retry, nolog), "
++           "boot/invalid rates, controller reject, RX/TX dead, acquire failure, nolog error, 500 fuzz trials\n", runs);
 +}
 +
 +static struct fuxi_bt_setup_result run_case(struct sim *s, struct files *f)
@@ -13334,10 +13581,13 @@ index 0000000..cd0b4db
 +    runs += 3;
 +    test_failures();
 +    test_fuzz();
++    test_baud();
 +    assert(fuxi_bt_setup_name_valid("hmtbtfw20.tlv") && !fuxi_bt_setup_name_valid("../x") &&
 +           !fuxi_bt_setup_name_valid(".hidden") && !fuxi_bt_setup_name_valid("a/b") &&
 +           !fuxi_bt_setup_name_valid("") && !fuxi_bt_setup_name_valid("0123456789012345678901234"));
 +    assert(!strcmp(fuxi_bt_setup_stage_name(FUXI_BT_SETUP_DONE), "done") &&
++           !strcmp(fuxi_bt_setup_stage_name(FUXI_BT_SETUP_BAUD), "baud") &&
++           !strcmp(fuxi_bt_setup_stage_name(FUXI_BT_SETUP_NOLOG), "nolog") &&
 +           !strcmp(fuxi_bt_setup_stage_name((enum fuxi_bt_setup_stage)99), "unknown"));
 +    printf("PASS bt setup: %u good runs (RX/TX chunking, FIFO stalls, download modes 0/1/3, vendor noise), "
 +           "NVM fallback names, 6 controller faults, 8 malformed inputs, 3000 fuzz trials\n", runs);
@@ -14788,10 +15038,10 @@ index 0000000..88fb729
 +    main()
 diff --git a/tools/test-fuxi-bt-board.py b/tools/test-fuxi-bt-board.py
 new file mode 100644
-index 0000000..8a0deb6
+index 0000000..5d798db
 --- /dev/null
 +++ b/tools/test-fuxi-bt-board.py
-@@ -0,0 +1,606 @@
+@@ -0,0 +1,717 @@
 +#!/usr/bin/env python3
 +"""End-to-end host check of the WCN7850 Bluetooth board glue (fuxi,bt=3).
 +
@@ -15338,6 +15588,116 @@ index 0000000..8a0deb6
 +        total, early, cleanup_faults);
 +}
 +
++/*
++ * fuxi,bt-baud：acquire(baud) 依速率表重設 UART SE 的 RCG（GPLL0_EVEN 300 MHz 經 M/N），GENI 除頻跟著變。
++ * 期望值獨立手算（clk-rcg2：N 暫存器 ~(n-m)、D 暫存器 ~clamp(n, m, 2(n-m))，取低 16 位元）：
++ * 921600＝14.7456 MHz 768/15625、2M＝32 MHz 8/75、3M＝48 MHz 4/25、3.2M＝51.2 MHz 64/375。
++ */
++static void test_baud_switch(void)
++{
++    static const struct { uint32_t baud, m, n, d; } rates[] = {
++        {921600, 768, 0xc5f6, 0xc2f6},
++        {2000000, 8, 0xffbc, 0xffb4},
++        {3000000, 4, 0xffea, 0xffe6},
++        {3200000, 64, 0xfec8, 0xfe88},
++    };
++    struct soc soc;
++    struct fuxi_bt_board board;
++    struct fuxi_bt_board_io io;
++    struct fuxi_bt_uart_ops ops;
++    struct fuxi_bt_result result;
++    unsigned writes, total, before_off, early = 0, cleanup_faults = 0, switched = 0;
++    soc_init(&soc);
++    io = soc_io(&soc);
++    assert(fuxi_bt_board_power_on(&board, &io) == FUXI_BT_OK);
++    assert(board.rcg_hz == FUXI_BT_SE_HZ && board.rcg_switches == 0);
++    fuxi_bt_board_uart_ops(&board, &ops);
++    for (unsigned index = 0; index < sizeof(rates) / sizeof(rates[0]); index++) {
++        assert(ops.acquire(ops.context, rates[index].baud) == FUXI_BT_OK);
++        assert(soc_value(&soc, RCG(8)) == (0x10000u | rates[index].m));
++        assert(soc_value(&soc, RCG(12)) == (0x20000u | rates[index].n));
++        assert(soc_value(&soc, RCG(16)) == (0x30000u | rates[index].d));
++        assert(soc_value(&soc, RCG(4)) == 0x102601u && board.rcg_cfg == 0x102601u);
++        assert(soc.uart.regs[0x48 / 4] == 0x11 && soc.uart.regs[0x4c / 4] == 0x11);
++        assert(board.baud == rates[index].baud && board.fifo.baud == rates[index].baud && board.fifo.divider == 1);
++        assert(board.rcg_switches == index + 1 && board.error == FUXI_BT_OK);
++        assert(ops.release(ops.context) == FUXI_BT_OK && !board.fifo_used && board.fifo.restored);
++    }
++    /* 同速率再取：RCG 不再寫 */
++    writes = soc_find(&soc, RCG(8))->writes;
++    assert(ops.acquire(ops.context, 3200000) == FUXI_BT_OK && board.rcg_switches == 4);
++    assert(soc_find(&soc, RCG(8))->writes == writes);
++    assert(ops.release(ops.context) == FUXI_BT_OK);
++    /* 回 115200：模型控制器只在 7.3728 MHz 回應，probe 成功代表 RCG 已回開機值 */
++    assert(fuxi_bt_probe_run(1, &ops, &result) == FUXI_BT_OK && result.version_valid);
++    assert(board.rcg_switches == 5 && board.rcg_hz == FUXI_BT_SE_HZ && board.baud == FUXI_BT_BOOT_BAUD);
++    assert(soc_value(&soc, RCG(8)) == 0x10180u && soc_value(&soc, RCG(12)) == 0x2c476u &&
++           soc_value(&soc, RCG(16)) == 0x3c2f6u);
++    /* 換速時 root off：回 OFF、rcg_hz 歸零、FIFO 沒開；狀況解除後 115200 能重新設好 */
++    soc.rcg_root_off = true;
++    assert(ops.acquire(ops.context, 3000000) == FUXI_BT_OFF);
++    assert(!board.fifo_used && board.rcg_hz == 0 && board.rcg_changed && board.rcg_switches == 5);
++    soc.rcg_root_off = false;
++    assert(ops.acquire(ops.context, FUXI_BT_BOOT_BAUD) == FUXI_BT_OK);
++    assert(board.rcg_hz == FUXI_BT_SE_HZ && board.rcg_switches == 6 && soc.uart.regs[0x48 / 4] == 0x41);
++    assert(ops.release(ops.context) == FUXI_BT_OK);
++    /* 新速率開著時 power_off：先關 FIFO，RCG 與其他板級設定回到開機前 */
++    assert(ops.acquire(ops.context, 3200000) == FUXI_BT_OK && board.fifo_used);
++    assert(fuxi_bt_board_power_off(&board) == FUXI_BT_OK);
++    assert(!board.fifo_used && board.rcg_hz == 0 && !board.rcg_changed);
++    soc_assert_restored(&soc, 0);
++    for (unsigned index = 0; index < sizeof(saved_regs) / sizeof(saved_regs[0]); index++) {
++        assert(soc.uart.regs[saved_regs[index] / 4] == soc.uart.original[saved_regs[index] / 4]);
++    }
++
++    /* 換速流程（power_on → 3.2M 取還 → probe 回 115200 → power_off）每一次 MMIO 都注入一次失敗 */
++    soc_init(&soc);
++    io = soc_io(&soc);
++    assert(fuxi_bt_board_power_on(&board, &io) == FUXI_BT_OK);
++    fuxi_bt_board_uart_ops(&board, &ops);
++    assert(ops.acquire(ops.context, 3200000) == FUXI_BT_OK && ops.release(ops.context) == FUXI_BT_OK);
++    assert(fuxi_bt_probe_run(1, &ops, &result) == FUXI_BT_OK);
++    assert(fuxi_bt_board_power_off(&board) == FUXI_BT_OK);
++    total = soc.calls;
++    for (unsigned fail = 1; fail <= total; fail++) {
++        enum fuxi_bt_status cleanup;
++        uint64_t failed_pa = 0;
++        soc_init(&soc);
++        soc.fail_at = fail;
++        io = soc_io(&soc);
++        if (fuxi_bt_board_power_on(&board, &io) == FUXI_BT_OK) {
++            fuxi_bt_board_uart_ops(&board, &ops);
++            if (ops.acquire(ops.context, 3200000) == FUXI_BT_OK) {
++                switched++;
++            }
++            (void)ops.release(ops.context);
++            (void)fuxi_bt_probe_run(1, &ops, &result);
++        }
++        before_off = soc.calls;
++        cleanup = fuxi_bt_board_power_off(&board);
++        assert(soc.failed_call == fail);
++        if (fail <= before_off) {
++            early++;
++            soc_assert_restored(&soc, 0);
++        } else {
++            cleanup_faults++;
++            assert(cleanup != FUXI_BT_OK);
++            for (unsigned index = 0; index < soc.count; index++) {
++                if (soc.regs[index].value != soc.regs[index].original) {
++                    assert(!failed_pa);
++                    failed_pa = soc.regs[index].pa;
++                }
++            }
++            soc_assert_restored(&soc, failed_pa);
++        }
++        assert(!board.votes_changed && !board.rcg_changed && !board.pins_changed && !board.bt_en_changed);
++        assert(!board.fifo_used && board.rcg_hz == 0);
++    }
++    printf("PASS board baud switch: 4 rates M/N/D/CFG + GENI 0x11, same-rate reuse, back to 115200 probe, "
++           "root-off recovery, power_off at 3.2M; %u fault sites (%u before restore, %u during restore, %u switched)\n",
++        total, early, cleanup_faults, switched);
++}
++
 +int main(void)
 +{
 +    test_success();
@@ -15346,7 +15706,8 @@ index 0000000..8a0deb6
 +    test_guards();
 +    test_no_reply();
 +    test_faults();
-+    puts("PASS production WCN7850 board glue: success path, refusals, guards, no-reply and exhaustive MMIO faults");
++    test_baud_switch();
++    puts("PASS production WCN7850 board glue: success path, refusals, guards, no-reply, exhaustive MMIO faults and baud switching");
 +    return 0;
 +}
 +'''
@@ -15757,10 +16118,10 @@ index 0000000..6976408
 +    main()
 diff --git a/tools/test-fuxi-bt-geni-fifo.py b/tools/test-fuxi-bt-geni-fifo.py
 new file mode 100644
-index 0000000..4edf8dd
+index 0000000..19076da
 --- /dev/null
 +++ b/tools/test-fuxi-bt-geni-fifo.py
-@@ -0,0 +1,931 @@
+@@ -0,0 +1,969 @@
 +#!/usr/bin/env python3
 +"""Compile production FIFO C and run a GENI register/FIFO emulator."""
 +
@@ -15813,7 +16174,7 @@ index 0000000..4edf8dd
 +    uint64_t clock;
 +};
 +
-+static struct fuxi_bt_geni_fifo_config config = {1, true, 0x30090000, 7372800};
++static struct fuxi_bt_geni_fifo_config config = {1, true, 0x30090000, 7372800, 0};
 +
 +static void model_init(struct model *model)
 +{
@@ -16008,6 +16369,7 @@ index 0000000..4edf8dd
 +    assert(fuxi_bt_geni_fifo_open(fifo, &io, &config) == FUXI_BT_OK);
 +    assert(fifo->state == FUXI_BT_FIFO_OPEN && fifo->owns_secondary);
 +    assert(model->regs[0x48 / 4] == 0x41 && model->regs[0x4c / 4] == 0x41);
++    assert(fifo->baud == FUXI_BT_BOOT_BAUD && fifo->divider == 4);
 +    assert(model->regs[0x260 / 4] == 0x4380e && model->regs[0x264 / 4] == 0xc3e0e);
 +    assert(model->regs[0x284 / 4] == 0x4380e && model->regs[0x288 / 4] == 0xc3e0e);
 +    assert(model->regs[0x25c / 4] == (model->original[0x25c / 4] & ~3u));
@@ -16100,6 +16462,43 @@ index 0000000..4edf8dd
 +    assert(fuxi_bt_geni_fifo_open(&fifo, &io, &candidate) == FUXI_BT_OK);
 +    assert(model.regs[0x48 / 4] == 0x21);
 +    closed_ok(&model, &fifo);
++
++    /* fuxi,bt-baud：速率表的時脈來源對應的 GENI 除頻（source／(baud×16)） */
++    {
++        static const struct { uint32_t source, baud, reg, divider; } rates[] = {
++            {7372800, 115200, 0x41, 4}, {14745600, 115200, 0x81, 8}, {14745600, 921600, 0x11, 1},
++            {32000000, 2000000, 0x11, 1}, {48000000, 3000000, 0x11, 1}, {51200000, 3200000, 0x11, 1},
++        };
++        static const struct { uint32_t qup, source, baud; } bad[] = {
++            {0x30090000, 7372800, 921600},    /* 7.3728 MHz 不夠 921600×16 */
++            {0x30090000, 51200000, 3000000},  /* 除不盡 */
++            {0x30090000, 102400000, 6400000}, /* 超過 FUXI_BT_MAX_BAUD */
++            {0x20040000, 51200000, 3200000},  /* 舊 QUP 取樣 32：除頻 0.5 */
++        };
++        for (unsigned index = 0; index < sizeof(rates) / sizeof(rates[0]); index++) {
++            model_init(&model);
++            memset(&fifo, 0, sizeof(fifo));
++            candidate = config;
++            candidate.source_hz = rates[index].source;
++            candidate.baud = rates[index].baud;
++            io = model_io(&model);
++            assert(fuxi_bt_geni_fifo_open(&fifo, &io, &candidate) == FUXI_BT_OK);
++            assert(model.regs[0x48 / 4] == rates[index].reg && model.regs[0x4c / 4] == rates[index].reg);
++            assert(fifo.baud == rates[index].baud && fifo.divider == rates[index].divider);
++            closed_ok(&model, &fifo);
++        }
++        for (unsigned index = 0; index < sizeof(bad) / sizeof(bad[0]); index++) {
++            model_init(&model);
++            memset(&fifo, 0, sizeof(fifo));
++            candidate = config;
++            candidate.qup_version = bad[index].qup;
++            candidate.source_hz = bad[index].source;
++            candidate.baud = bad[index].baud;
++            io = model_io(&model);
++            assert(fuxi_bt_geni_fifo_open(&fifo, &io, &candidate) == FUXI_BT_ARGUMENT);
++            assert(!model.calls && !model.writes);
++        }
++    }
 +}
 +
 +static void test_tx(void)
@@ -18843,6 +19242,136 @@ index 0000000..295f9f5
 +                            '-I', str(INCLUDE), '-c', str(SOURCE), '-o', str(directory / 'htc-arm64.o')],
 +                           cwd=directory, check=True, timeout=60)
 +            print('Freestanding arm64 iOS compile-only: PASS', flush=True)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/test-fuxi-mfb-align.py b/tools/test-fuxi-mfb-align.py
+new file mode 100644
+index 0000000..fe2de75
+--- /dev/null
++++ b/tools/test-fuxi-mfb-align.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++"""disp0 fuxi,mfb-align：DisplayPipePlaneBaseAlignment 以字典發佈的主機測試。
++
++VideoToolbox FigGetAlignmentForIOSurfaceOutputToDisplayService（iOS 16.7）以 IORegistryEntrySearchCFProperty
++取得 AppleCLCD 的 DisplayPipePlaneBaseAlignment 後直接 CFDictionaryGetValue(…, "PlaneBaseAlignmentLinear")；
++裸數字使 mediaserverd 在影片建立 render pipeline 時以 -[__NSCFNumber objectForKey:] abort。QuartzCore AppleDisplay
++只在型別為字典時讀同一 key，否則留預設 64。
++
++本測試抽出 SweetFramebuffer.cpp 的 sweet_fb_align_publish，以模擬的 OSDictionary／OSNumber 引用計數編譯執行，
++逐點注入四個步驟的失敗；並檢查 start() 的閘門（預設關、失敗時保留原本的數字）。
++"""
++import argparse
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[1]
++SOURCE = ROOT / 'xnu/fuxi-unixnu/SweetFramebuffer.cpp'
++
++PREFIX = r'''
++#include <assert.h>
++#include <stdarg.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++static int live, failAt, calls;
++static char logged[256];
++static bool step() { return ++calls != failAt; }
++struct OSObject {
++ int refs = 1;
++ virtual ~OSObject() {}
++ void release() { if (--refs == 0) { live--; delete this; } }
++};
++struct OSNumber : OSObject {
++ unsigned long long value = 0; unsigned bits = 0;
++ static OSNumber *withNumber(unsigned long long value, unsigned bits) {
++  if (!step()) return nullptr;
++  OSNumber *number = new OSNumber; number->value = value; number->bits = bits; live++; return number;
++ }
++};
++struct OSDictionary : OSObject {
++ const char *key = nullptr; OSObject *object = nullptr;
++ ~OSDictionary() override { if (object) object->release(); }
++ static OSDictionary *withCapacity(unsigned) { if (!step()) return nullptr; live++; return new OSDictionary; }
++ bool setObject(const char *name, OSObject *value) {
++  if (!step()) return false;
++  assert(!key); key = name; object = value; value->refs++; return true;
++ }
++};
++#define OSSafeReleaseNULL(p) do { if (p) { (p)->release(); (p) = nullptr; } } while (0)
++static OSDictionary *published;
++struct AppleCLCD {
++ bool setProperty(const char *name, OSDictionary *value) {
++  if (!step()) return false;
++  assert(!strcmp(name, "DisplayPipePlaneBaseAlignment")); value->refs++; published = value; return true;
++ }
++};
++static void IOLog(const char *format, ...) {
++ va_list args; va_start(args, format); vsnprintf(logged, sizeof(logged), format, args); va_end(args);
++}
++'''
++
++TEST = r'''
++int main() {
++ AppleCLCD fb;
++ assert(sweet_fb_align_publish(&fb) && calls == 4 && published);
++ assert(!strcmp(published->key, "PlaneBaseAlignmentLinear"));
++ OSNumber *linear = static_cast<OSNumber *>(published->object);
++ assert(linear->value == 64 && linear->bits == 32 && linear->refs == 1 && published->refs == 1 && live == 2);
++ assert(strstr(logged, "{PlaneBaseAlignmentLinear=64} published (fuxi,mfb-align)"));
++ published->release();
++ assert(live == 0);
++ for (int fail = 1; fail <= 4; fail++) {
++  calls = 0; failAt = fail; published = nullptr; logged[0] = 0;
++  /* 兩個物件總是先建立；之後短路：setObject 失敗就不呼叫 setProperty */
++  assert(!sweet_fb_align_publish(&fb) && !published && live == 0 && calls == (fail < 2 ? 2 : fail));
++  assert(strstr(logged, "FAILED, number kept"));
++ }
++ puts("PASS: fuxi,mfb-align DisplayPipePlaneBaseAlignment {PlaneBaseAlignmentLinear=64}, refcounts, 4 fault sites");
++ return 0;
++}
++'''
++
++GATE = ('#if defined(FUXI)\n\tif (sweet_fb_adt_u32(provider, "fuxi,mfb-align") != 1 || '
++        '!sweet_fb_align_publish(this))\n#endif\n\tsetProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);\n')
++
++
++def function(source, name):
++    match = re.search(r'^static bool\s*\n?' + re.escape(name) + r'\([^;]*?\)\s*\{', source, re.M)
++    assert match, name
++    depth, end = 1, match.end()
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[match.start():end] + '\n'
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    ap.add_argument('--sanitize', action='store_true', help='build with ASan/UBSan')
++    ap.add_argument('--cxx', default='clang++')
++    args = ap.parse_args()
++    display = SOURCE.read_text()
++    # 閘門：只有 disp0 fuxi,mfb-align=1 且字典發佈成功才跳過原本的數字，並且在 registerService 之前。
++    assert display.count(GATE) == 1, 'start() gate changed'
++    assert display.count('"DisplayPipePlaneBaseAlignment"') == 2
++    assert display.index('static bool sweet_fb_align_publish(') < display.index(GATE) < \
++        display.index('\tregisterService();\n\tIOLog("SWEET FB: AppleCLCD')
++    # 幅距需求刻意不發佈（兩個讀者缺值都用 64）。
++    assert 'DisplayPipeStrideRequirements' not in display.replace('DisplayPipeStrideRequirements 不發佈', '')
++    print('PASS: fuxi,mfb-align gate defaults off, keeps the number on failure, precedes registerService')
++    with tempfile.TemporaryDirectory(prefix='fuxi-mfb-align-') as tmp:
++        cpp = Path(tmp) / 'align.cpp'
++        cpp.write_text(PREFIX + function(display, 'sweet_fb_align_publish') + TEST)
++        cmd = [args.cxx, '-std=c++17', '-Wall', '-Wextra', '-Werror', str(cpp), '-o', str(Path(tmp) / 'align')]
++        if args.sanitize:
++            cmd[1:1] = ['-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-fno-sanitize-recover=all']
++        subprocess.run(cmd, check=True)
++        subprocess.run([str(Path(tmp) / 'align')], check=True)
 +
 +
 +if __name__ == '__main__':
@@ -35890,10 +36419,10 @@ index 0000000..e298226
 +}
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt.c b/xnu/fuxi-bluetooth/fuxi_bt.c
 new file mode 100644
-index 0000000..77639ac
+index 0000000..b24dc71
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt.c
-@@ -0,0 +1,394 @@
+@@ -0,0 +1,418 @@
 +#include "fuxi_bt.h"
 +#include <string.h>
 +
@@ -35934,6 +36463,30 @@ index 0000000..77639ac
 +{
 +    return ops && ops->acquire && ops->write && ops->read &&
 +        ops->release && ops->now_us && ops->wait_us;
++}
++
++/*
++ * 來源頻率與 m/n 取自 Linux drivers/clk/qcom/gcc-sm8550.c ftbl_gcc_qupv3_wrap2_s6_clk_src
++ * （P_GCC_GPLL0_OUT_EVEN、pre_div 1）；QUP ≥ 2.5 取樣 16，除頻 = 來源 / (baud × 16)：
++ * 115200 用 7.3728 MHz 除 4，其餘除 1。qca 值對照 Linux btqca.h enum qca_baudrate；
++ * Linux 的 WCN7850 DT 用 max-speed 3200000。
++ */
++static const struct fuxi_bt_rate fuxi_bt_rates[] = {
++    {115200u, 7372800u, 384u, 15625u, 0u},
++    {921600u, 14745600u, 768u, 15625u, 10u},
++    {2000000u, 32000000u, 8u, 75u, 13u},
++    {3000000u, 48000000u, 4u, 25u, 14u},
++    {3200000u, 51200000u, 64u, 375u, 17u}
++};
++
++const struct fuxi_bt_rate *fuxi_bt_rate_find(uint32_t baud)
++{
++    for (unsigned index = 0; index < sizeof(fuxi_bt_rates) / sizeof(fuxi_bt_rates[0]); index++) {
++        if (fuxi_bt_rates[index].baud == baud) {
++            return &fuxi_bt_rates[index];
++        }
++    }
++    return NULL;
 +}
 +
 +static enum fuxi_bt_status fuxi_bt_event(const uint8_t *event,
@@ -36290,10 +36843,10 @@ index 0000000..77639ac
 +}
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt.h b/xnu/fuxi-bluetooth/fuxi_bt.h
 new file mode 100644
-index 0000000..0e23c8a
+index 0000000..7565358
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,114 @@
 +#ifndef FUXI_BT_H
 +#define FUXI_BT_H
 +
@@ -36307,6 +36860,7 @@ index 0000000..0e23c8a
 +#define FUXI_BT_TLMM_BASE UINT64_C(0xf100000)
 +#define FUXI_BT_UART_INTID 493u
 +#define FUXI_BT_BOOT_BAUD 115200u
++#define FUXI_BT_MAX_BAUD 3200000u /* Linux qca_set_baudrate 拒絕 3.2 Mbaud 以上 */
 +#define FUXI_BT_TIMEOUT_US 2000000u
 +#define FUXI_BT_MAX_POLLS 2000u
 +#define FUXI_BT_MAX_RX 4096u
@@ -36382,10 +36936,23 @@ index 0000000..0e23c8a
 +    uint32_t secondary_irq;
 +};
 +
++/*
++ * UART 速率：SE6 RCG 來源（GPLL0_OUT_EVEN 300 MHz × m/n）、GENI 除頻後的 baud，
++ * 以及 QCA 0xfc48 的速率列舉值（Linux btqca.h enum qca_baudrate）。
++ */
++struct fuxi_bt_rate {
++    uint32_t baud;
++    uint32_t source_hz;
++    uint16_t m;
++    uint16_t n;
++    uint8_t qca;
++};
++
 +typedef enum fuxi_bt_status (*fuxi_bt_read32_fn)(void *, uint64_t, uint32_t *);
 +
 +const char *fuxi_bt_status_name(enum fuxi_bt_status status);
 +bool fuxi_bt_uart_ops_valid(const struct fuxi_bt_uart_ops *ops);
++const struct fuxi_bt_rate *fuxi_bt_rate_find(uint32_t baud);
 +enum fuxi_bt_status fuxi_bt_probe_run(unsigned opt_in,
 +    const struct fuxi_bt_uart_ops *ops, struct fuxi_bt_result *result);
 +enum fuxi_bt_status fuxi_bt_snapshot_read(fuxi_bt_read32_fn read32,
@@ -36396,10 +36963,10 @@ index 0000000..0e23c8a
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_board.c b/xnu/fuxi-bluetooth/fuxi_bt_board.c
 new file mode 100644
-index 0000000..aeb1a18
+index 0000000..ea96666
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_board.c
-@@ -0,0 +1,501 @@
+@@ -0,0 +1,543 @@
 +#include "fuxi_bt_board.h"
 +#include <string.h>
 +
@@ -36419,11 +36986,9 @@ index 0000000..aeb1a18
 +#define FUXI_BT_RCG_ROOT_OFF (1u << 31)
 +/* hid 除頻 [4:0]、來源 [10:8]、MND 模式 [13:12]；bit 20（HW_CLK_CTRL）保留 XBL 的設定。 */
 +#define FUXI_BT_RCG_CFG_FIELDS 0x371fu
-+/* F(7372800, P_GCC_GPLL0_OUT_EVEN, 1, 384, 15625)：pre_div 2*1-1、parent_map_8 來源 6、雙沿 MND。 */
++/* F(hz, P_GCC_GPLL0_OUT_EVEN, 1, m, n)：pre_div 2*1-1、parent_map_8 來源 6、雙沿 MND（速率表每項都是這組）。 */
 +#define FUXI_BT_RCG_CFG_VALUE (1u | (6u << 8) | (2u << 12))
 +#define FUXI_BT_MND_MASK 0xffffu
-+#define FUXI_BT_MND_M 384u
-+#define FUXI_BT_MND_N 15625u
 +
 +static const uint32_t fuxi_bt_board_branches[] = {0x233d4, 0x233d0, 0x233cc, 0x23004, 0x1e754};
 +
@@ -36538,29 +37103,37 @@ index 0000000..aeb1a18
 +    return fuxi_bt_board_fail(board, FUXI_BT_TIMEOUT, command);
 +}
 +
-+static enum fuxi_bt_status fuxi_bt_board_rcg(struct fuxi_bt_board *board)
++/* 依速率表設 RCG；rcg_saved 必須已存好 XBL 的值（上半部保留位元照抄）。 */
++static enum fuxi_bt_status fuxi_bt_board_rcg_program(struct fuxi_bt_board *board,
++    const struct fuxi_bt_rate *rate)
 +{
 +    static const uint32_t offsets[] = {4, 8, 12, 16};
-+    uint32_t command = 0, values[4];
++    uint32_t command = 0, values[4], d;
 +    enum fuxi_bt_status status;
++    if (!rate || !rate->m || rate->m >= rate->n) {
++        return FUXI_BT_ARGUMENT;
++    }
 +    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command)) {
 +        return board->error;
 +    }
 +    if (command & FUXI_BT_RCG_UPDATE) {
 +        return fuxi_bt_board_fail(board, FUXI_BT_BUSY, command);
 +    }
-+    for (unsigned index = 0; index < 4; index++) {
-+        if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + offsets[index],
-+            &board->rcg_saved[index])) {
-+            return board->error;
-+        }
++    /* clk-rcg2 __clk_rcg2_configure_mnd：2d 值＝n，夾在 [m, 2(n-m)]；D 暫存器寫 ~2d */
++    d = rate->n;
++    if (d < rate->m) {
++        d = rate->m;
++    }
++    if (d > 2u * (uint32_t)(rate->n - rate->m)) {
++        d = 2u * (uint32_t)(rate->n - rate->m);
 +    }
 +    values[0] = (board->rcg_saved[0] & ~FUXI_BT_RCG_CFG_FIELDS) | FUXI_BT_RCG_CFG_VALUE;
-+    values[1] = (board->rcg_saved[1] & ~FUXI_BT_MND_MASK) | FUXI_BT_MND_M;
++    values[1] = (board->rcg_saved[1] & ~FUXI_BT_MND_MASK) | rate->m;
 +    values[2] = (board->rcg_saved[2] & ~FUXI_BT_MND_MASK) |
-+        (~(FUXI_BT_MND_N - FUXI_BT_MND_M) & FUXI_BT_MND_MASK);
-+    values[3] = (board->rcg_saved[3] & ~FUXI_BT_MND_MASK) | (~FUXI_BT_MND_N & FUXI_BT_MND_MASK);
++        (~(uint32_t)(rate->n - rate->m) & FUXI_BT_MND_MASK);
++    values[3] = (board->rcg_saved[3] & ~FUXI_BT_MND_MASK) | (~d & FUXI_BT_MND_MASK);
 +    board->rcg_changed = true;
++    board->rcg_hz = 0;
 +    /* 和 Linux 一樣先寫 M/N/D 再寫 CFG，最後 CMD_UPDATE。 */
 +    for (unsigned index = 1; index < 4; index++) {
 +        if (!fuxi_bt_board_write(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + offsets[index], values[index])) {
@@ -36584,7 +37157,27 @@ index 0000000..aeb1a18
 +    if (command & FUXI_BT_RCG_ROOT_OFF) {
 +        return fuxi_bt_board_fail(board, FUXI_BT_OFF, command);
 +    }
++    board->rcg_hz = rate->source_hz;
 +    return FUXI_BT_OK;
++}
++
++static enum fuxi_bt_status fuxi_bt_board_rcg(struct fuxi_bt_board *board)
++{
++    static const uint32_t offsets[] = {4, 8, 12, 16};
++    uint32_t command = 0;
++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command)) {
++        return board->error;
++    }
++    if (command & FUXI_BT_RCG_UPDATE) {
++        return fuxi_bt_board_fail(board, FUXI_BT_BUSY, command);
++    }
++    for (unsigned index = 0; index < 4; index++) {
++        if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + offsets[index],
++            &board->rcg_saved[index])) {
++            return board->error;
++        }
++    }
++    return fuxi_bt_board_rcg_program(board, fuxi_bt_rate_find(FUXI_BT_BOOT_BAUD));
 +}
 +
 +enum fuxi_bt_status fuxi_bt_board_power_on(struct fuxi_bt_board *board,
@@ -36782,6 +37375,7 @@ index 0000000..aeb1a18
 +            cleanup = FUXI_BT_TIMEOUT;
 +        }
 +        board->rcg_changed = false;
++        board->rcg_hz = 0;
 +    }
 +    if (board->votes_changed) {
 +        uint32_t vote = 0;
@@ -36828,15 +37422,21 @@ index 0000000..aeb1a18
 +    board->io.wait_us(board->io.context, microseconds);
 +}
 +
++/*
++ * baud 必須在速率表內。RCG 來源頻率不同時，趁 FIFO 關著（GENI 引擎閒置、RFR 已還原）先改 RCG，
++ * 再用新的來源頻率與 baud 開 FIFO；對照 Linux qcom_geni_serial_set_termios 的 dev_pm_opp_set_rate＋
++ * M/S_CLK_CFG。
++ */
 +static enum fuxi_bt_status fuxi_bt_board_acquire(void *context, unsigned baud)
 +{
 +    struct fuxi_bt_board *board = context;
 +    const struct fuxi_bt_geni_fifo_io io = {
 +        board, fuxi_bt_board_se_read, fuxi_bt_board_se_write, fuxi_bt_board_now
 +    };
-+    const struct fuxi_bt_geni_fifo_config config = {1, true, board->qup_version, FUXI_BT_SE_HZ};
++    const struct fuxi_bt_rate *rate = fuxi_bt_rate_find(baud);
++    struct fuxi_bt_geni_fifo_config config;
 +    enum fuxi_bt_status status;
-+    if (baud != FUXI_BT_BOOT_BAUD) {
++    if (!rate) {
 +        return FUXI_BT_ARGUMENT;
 +    }
 +    if (board->fifo_used) {
@@ -36845,6 +37445,15 @@ index 0000000..aeb1a18
 +    if (board->stage != FUXI_BT_STAGE_READY) {
 +        return FUXI_BT_NO_UART;
 +    }
++    if (board->rcg_hz != rate->source_hz) {
++        status = fuxi_bt_board_rcg_program(board, rate);
++        if (status != FUXI_BT_OK) {
++            return status;
++        }
++        board->rcg_switches++;
++    }
++    config = (struct fuxi_bt_geni_fifo_config){1, true, board->qup_version, rate->source_hz, rate->baud};
++    board->baud = rate->baud;
 +    board->fifo_used = true;
 +    status = fuxi_bt_geni_fifo_open(&board->fifo, &io, &config);
 +    for (unsigned poll = 0; status == FUXI_BT_AGAIN && poll < FUXI_BT_ACQUIRE_POLLS; poll++) {
@@ -36903,16 +37512,17 @@ index 0000000..aeb1a18
 +}
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_board.h b/xnu/fuxi-bluetooth/fuxi_bt_board.h
 new file mode 100644
-index 0000000..a17708f
+index 0000000..197bfe9
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_board.h
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,99 @@
 +#ifndef FUXI_BT_BOARD_H
 +#define FUXI_BT_BOARD_H
 +
 +/*
 + * WCN7850 藍牙 UART 的板級準備（fuxi,bt=3）：
 + * QUP2 SE6 時脈投票、SE6 RCG 設成 7.3728 MHz（GPLL0_OUT_EVEN 300 MHz × 384/15625，與 Linux gcc-sm8550 相同）、
++ * 之後 acquire 要求其他 baud 時，在 FIFO 關閉期間把 RCG 改成速率表的來源頻率（power_off 還原 XBL 的值）、
 + * gpio76–79 切成 qup2_se6、BT_EN（gpio81）拉高。前提是 WLAN 已把 WCN 的電源軌和 WLAN_EN（gpio80）打開。
 + * 純 C；MMIO 經由呼叫端提供的 read/write（XNU 走 fault-safe 存取，主機測試走模擬模型）。
 + * power_off 依旗標逆序還原 power_on 改過的東西，不論 power_on 成功或失敗都要呼叫。
@@ -36971,6 +37581,9 @@ index 0000000..a17708f
 +    uint32_t added_votes;
 +    uint32_t rcg_saved[4]; /* cfg、m、n、d */
 +    uint32_t rcg_cfg;
++    uint32_t rcg_hz; /* 目前 RCG 設定的來源頻率；0＝未設或設定中途失敗 */
++    uint32_t baud; /* 最近一次 acquire 的 baud */
++    unsigned rcg_switches;
 +    uint32_t qup_version;
 +    uint32_t firmware;
 +    uint32_t pin_ctl[4];
@@ -37004,10 +37617,10 @@ index 0000000..a17708f
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.c b/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.c
 new file mode 100644
-index 0000000..de0b50e
+index 0000000..1cdc79c
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.c
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,617 @@
 +#include "fuxi_bt_geni_fifo.h"
 +#include <string.h>
 +
@@ -37110,7 +37723,7 @@ index 0000000..de0b50e
 +{
 +    uint32_t status, tx_status, rx_status, events, hw_tx, hw_rx;
 +    uint32_t master_control, secondary_control;
-+    uint32_t divider, sampling, depth_mask;
++    uint32_t divider, sampling, depth_mask, baud;
 +    unsigned major, minor;
 +    if (!fifo || !config) {
 +        return FUXI_BT_ARGUMENT;
@@ -37126,15 +37739,19 @@ index 0000000..de0b50e
 +        return FUXI_BT_BUSY;
 +    }
 +    sampling = config->qup_version >= 0x20050000u ? 16u : 32u;
-+    if (!config->source_hz || config->source_hz % (FUXI_BT_BOOT_BAUD * sampling)) {
++    baud = config->baud ? config->baud : FUXI_BT_BOOT_BAUD;
++    /* 只接受整數除頻（Linux get_clk_div_rate 找的也是剛好整除的來源頻率） */
++    if (baud > FUXI_BT_MAX_BAUD || !config->source_hz || config->source_hz % (baud * sampling)) {
 +        return FUXI_BT_ARGUMENT;
 +    }
-+    divider = config->source_hz / (FUXI_BT_BOOT_BAUD * sampling);
++    divider = config->source_hz / (baud * sampling);
 +    if (!divider || divider > 4095) {
 +        return FUXI_BT_ARGUMENT;
 +    }
 +    memset(fifo, 0, sizeof(*fifo));
 +    fifo->io = *io;
++    fifo->baud = baud;
++    fifo->divider = divider;
 +    fifo->last_us = io->now_us(io->context);
 +    if (!fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_IF_DISABLE, &fifo->interface_disable)) {
 +        return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
@@ -37623,10 +38240,10 @@ index 0000000..de0b50e
 +}
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.h b/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.h
 new file mode 100644
-index 0000000..35331b3
+index 0000000..78f02f7
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_geni_fifo.h
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,149 @@
 +#ifndef FUXI_BT_GENI_FIFO_H
 +#define FUXI_BT_GENI_FIFO_H
 +
@@ -37712,6 +38329,7 @@ index 0000000..35331b3
 +    bool resources_owned;
 +    uint32_t qup_version;
 +    uint32_t source_hz;
++    uint32_t baud; /* 0＝FUXI_BT_BOOT_BAUD */
 +};
 +
 +struct fuxi_bt_geni_fifo {
@@ -37736,6 +38354,8 @@ index 0000000..35331b3
 +    uint32_t startup_secondary_irq;
 +    unsigned tx_depth;
 +    unsigned rx_depth;
++    uint32_t baud;
++    uint32_t divider;
 +    uint32_t saved[FUXI_BT_FIFO_SAVED_REGISTERS];
 +    uint64_t start_us;
 +    unsigned start_polls;
@@ -38864,10 +39484,10 @@ index 0000000..50e6fc2
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_setup.c b/xnu/fuxi-bluetooth/fuxi_bt_setup.c
 new file mode 100644
-index 0000000..eccccaf
+index 0000000..65623f7
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_setup.c
-@@ -0,0 +1,758 @@
+@@ -0,0 +1,985 @@
 +#include "fuxi_bt_setup.h"
 +#include <string.h>
 +
@@ -38878,8 +39498,12 @@ index 0000000..eccccaf
 + *  - WCN3991 以後回 Command Complete，回傳參數 [cresp][rtype][data…]，cresp=0 成功、rtype=子命令；
 + *  - rampatch/NVM 整個檔案依序切 243 位元組段送出；patch 標頭的 download_mode 非 0 時控制器只回最後一段；
 + *  - NVM tag 17（HCI）：data[0] bit 7＝軟體 IBS、data[1]＝baud（WCN3991 以後）；tag 27 bit 0＝deep sleep。
-+ *    Linux 會打開 IBS 並設成工作 baud；這裡關掉 IBS／deep sleep、baud 設 115200（列舉值 0），
-+ *    因為本驅動是輪詢式 UART、沒有 IBS 狀態機，也不切換 baud。
++ *    Linux 會打開 IBS 並設成工作 baud；這裡關掉 IBS／deep sleep，baud 設成實際使用的速率
++ *    （預設 115200，列舉值 0）。
++ *  - 換速（qca_set_speed／qca_set_baudrate）：0xfc48 參數是 enum qca_baudrate，送出後不等回應，
++ *    送完等 1–10 ms 再改 host 速率；這裡改 host 速率＝關 FIFO（RFR 先設未就緒）、改 RCG、以新速率重開。
++ *    Linux 不另外確認，這裡以新速率重查版本，確認不到就退回 115200。
++ *  - WCN7850 在 NVM 之後送 0xfc17 {0x14, 0x00} 關控制器日誌（qca_disable_soc_logging），選用。
 + */
 +
 +struct fuxi_bt_link {
@@ -38912,8 +39536,8 @@ index 0000000..eccccaf
 +const char *fuxi_bt_setup_stage_name(enum fuxi_bt_setup_stage stage)
 +{
 +    static const char *const names[] = {
-+        "start", "version", "patch-load", "patch-parse", "patch-send", "board-id",
-+        "nvm-load", "nvm-parse", "nvm-send", "build-info", "reset", "local-version",
++        "start", "version", "baud", "patch-load", "patch-parse", "patch-send", "board-id",
++        "nvm-load", "nvm-parse", "nvm-send", "nolog", "build-info", "reset", "local-version",
 +        "bdaddr", "done"
 +    };
 +    if ((unsigned)stage >= sizeof(names) / sizeof(names[0])) {
@@ -38994,6 +39618,15 @@ index 0000000..eccccaf
 +    const unsigned count = size < 24u ? size : 24u;
 +    memcpy(destination, event, count);
 +    *destination_size = count;
++}
++
++/* 換速後從頭分框：丟掉舊速率留下的半個封包。 */
++static void fuxi_bt_link_reset(struct fuxi_bt_link *link)
++{
++    link->rx_offset = link->rx_size = 0;
++    link->header_size = link->header_need = 0;
++    link->body_size = link->body_need = 0;
++    link->event_size = 0;
 +}
 +
 +/* 開始前把 UART 裡的殘留位元組讀掉（不解析，避免從半個封包開始）。 */
@@ -39303,7 +39936,8 @@ index 0000000..eccccaf
 +}
 +
 +/* NVM：[type=2|len<<8] 後接 tag（id u16、len u16、8 位元組保留、資料）。就地改 HCI 與 deep sleep tag。 */
-+static enum fuxi_bt_status fuxi_bt_tlv_nvm(struct fuxi_bt_blob *blob, struct fuxi_bt_tlv_info *info)
++static enum fuxi_bt_status fuxi_bt_tlv_nvm(struct fuxi_bt_blob *blob, struct fuxi_bt_tlv_info *info,
++    uint8_t baud)
 +{
 +    uint8_t *data = blob->data;
 +    uint32_t type_len;
@@ -39332,7 +39966,7 @@ index 0000000..eccccaf
 +            info->hci_tag = true;
 +            memcpy(info->hci_before, value, 3);
 +            value[0] &= 0x7f;
-+            value[1] = 0;
++            value[1] = baud;
 +            memcpy(info->hci_after, value, 3);
 +        } else if (tag == 27 && tag_length >= 1 && !info->sleep_tag) {
 +            info->sleep_tag = true;
@@ -39404,11 +40038,199 @@ index 0000000..eccccaf
 +    return status == FUXI_BT_CONTROLLER || status == FUXI_BT_TIMEOUT || status == FUXI_BT_PROTOCOL;
 +}
 +
++/* 版本查詢：回傳參數 [cresp][0x19][長度 12][product 4][patch 2][rom 2][soc 4] */
++static enum fuxi_bt_status fuxi_bt_setup_version(struct fuxi_bt_link *link,
++    struct fuxi_bt_version *version)
++{
++    static const uint8_t request[] = {0x19};
++    const uint8_t *params = NULL;
++    unsigned size = 0;
++    enum fuxi_bt_status status = fuxi_bt_link_command(link, 0xfc00, request, 1, 0x19, &params, &size);
++    if (status != FUXI_BT_OK) {
++        return status;
++    }
++    if (size < 15) {
++        return FUXI_BT_PROTOCOL;
++    }
++    version->product = fuxi_bt_setup_le32(params + 3);
++    version->patch = fuxi_bt_setup_le16(params + 7);
++    version->rom = fuxi_bt_setup_le16(params + 9);
++    version->soc = fuxi_bt_setup_le32(params + 11);
++    return FUXI_BT_OK;
++}
++
++/* 換速前後以舊速率收到的原始位元組：不解析，只記數量與前 8 個（看控制器有沒有先回 Command Complete）。 */
++static enum fuxi_bt_status fuxi_bt_link_collect(struct fuxi_bt_link *link)
++{
++    struct fuxi_bt_setup_result *result = link->result;
++    uint8_t bytes[64];
++    for (unsigned round = 0; round < 16; round++) {
++        size_t count = 0;
++        enum fuxi_bt_status status = link->ops->read(link->ops->context, bytes, sizeof(bytes), &count);
++        if (count > sizeof(bytes) || (status != FUXI_BT_OK && count)) {
++            return FUXI_BT_IO;
++        }
++        if (status == FUXI_BT_AGAIN || (status == FUXI_BT_OK && !count)) {
++            return FUXI_BT_OK;
++        }
++        if (status != FUXI_BT_OK) {
++            return status;
++        }
++        for (size_t index = 0; index < count; index++) {
++            if (result->baud_early_size < sizeof(result->baud_early)) {
++                result->baud_early[result->baud_early_size++] = bytes[index];
++            }
++        }
++        result->baud_early_bytes += (unsigned)count;
++        result->rx_bytes += (unsigned)count;
++    }
++    return FUXI_BT_OK;
++}
++
++/* Linux qca_set_baudrate：01 48 fc 01 <enum>，不等回應；送完後等 BAUD_SETTLE_US 才換 host 速率。 */
++static enum fuxi_bt_status fuxi_bt_setup_rate_command(struct fuxi_bt_link *link, uint8_t qca)
++{
++    const uint8_t packet[] = {1, 0x48, 0xfc, 1, qca};
++    enum fuxi_bt_status status = fuxi_bt_link_write(link, packet, sizeof(packet));
++    if (status != FUXI_BT_OK) {
++        return status;
++    }
++    for (unsigned step = 0; step < FUXI_BT_BAUD_SETTLE_US / 1000u; step++) {
++        link->ops->wait_us(link->ops->context, 1000);
++        status = fuxi_bt_link_collect(link);
++        if (status != FUXI_BT_OK) {
++            return status;
++        }
++    }
++    return FUXI_BT_OK;
++}
++
++/* host 換速：歸還 UART（FIFO 關閉、暫存器還原）再以新速率取回。歸還失敗表示 FIFO 沒還原，不能繼續。 */
++static enum fuxi_bt_status fuxi_bt_setup_reopen(struct fuxi_bt_link *link, uint32_t baud,
++    bool *acquired)
++{
++    const struct fuxi_bt_uart_ops *ops = link->ops;
++    enum fuxi_bt_status status;
++    *acquired = false;
++    status = ops->release(ops->context);
++    if (status != FUXI_BT_OK) {
++        link->result->cleanup = status == FUXI_BT_AGAIN ? FUXI_BT_TIMEOUT : status;
++        return FUXI_BT_CLEANUP;
++    }
++    fuxi_bt_link_reset(link);
++    status = ops->acquire(ops->context, baud);
++    if (status != FUXI_BT_OK) {
++        return status == FUXI_BT_AGAIN ? FUXI_BT_TIMEOUT : status;
++    }
++    *acquired = true;
++    return FUXI_BT_OK;
++}
++
++static bool fuxi_bt_setup_noise(enum fuxi_bt_status status)
++{
++    return fuxi_bt_soft_failure(status) || status == FUXI_BT_IBS || status == FUXI_BT_BUDGET ||
++        status == FUXI_BT_VERSION;
++}
++
++/* 以目前速率重查版本，必須和第一次相同；分框錯、IBS 位元組、超量與逾時都當成雜訊重試。 */
++static enum fuxi_bt_status fuxi_bt_setup_verify(struct fuxi_bt_link *link,
++    const struct fuxi_bt_version *expected)
++{
++    enum fuxi_bt_status status = FUXI_BT_TIMEOUT;
++    for (unsigned attempt = 0; attempt < FUXI_BT_BAUD_VERIFY_ATTEMPTS; attempt++) {
++        struct fuxi_bt_version version;
++        link->result->baud_attempts++;
++        if (attempt) {
++            link->ops->wait_us(link->ops->context, FUXI_BT_BAUD_SETTLE_US);
++        }
++        fuxi_bt_link_reset(link);
++        status = fuxi_bt_link_drain(link);
++        if (status == FUXI_BT_OK) {
++            memset(&version, 0, sizeof(version));
++            status = fuxi_bt_setup_version(link, &version);
++        }
++        if (status == FUXI_BT_OK) {
++            if (version.product == expected->product && version.soc == expected->soc &&
++                version.rom == expected->rom && version.patch == expected->patch) {
++                return FUXI_BT_OK;
++            }
++            status = FUXI_BT_VERSION;
++        }
++        if (!fuxi_bt_setup_noise(status) || fuxi_bt_link_time(link) != FUXI_BT_OK) {
++            return status;
++        }
++    }
++    return status;
++}
++
++/*
++ * 換到 rate；確認不到就（盡力）以新速率送 0xfc48 回 115200、host 也回 115200 再確認一次，
++ * 成功就以 115200 繼續（baud_status 記失敗原因）。退回也確認不到才算 setup 失敗。
++ */
++static enum fuxi_bt_status fuxi_bt_setup_baud(struct fuxi_bt_link *link,
++    const struct fuxi_bt_rate *rate, bool *acquired)
++{
++    struct fuxi_bt_setup_result *result = link->result;
++    const struct fuxi_bt_version expected = result->version;
++    const struct fuxi_bt_rate *boot = fuxi_bt_rate_find(FUXI_BT_BOOT_BAUD);
++    enum fuxi_bt_status status, failure;
++    if (!boot) {
++        return FUXI_BT_ARGUMENT;
++    }
++    status = fuxi_bt_setup_rate_command(link, rate->qca);
++    if (status != FUXI_BT_OK) {
++        return status;
++    }
++    status = fuxi_bt_setup_reopen(link, rate->baud, acquired);
++    if (status == FUXI_BT_CLEANUP) {
++        return status;
++    }
++    if (status == FUXI_BT_OK) {
++        status = fuxi_bt_setup_verify(link, &expected);
++        if (status == FUXI_BT_OK) {
++            result->baud_status = FUXI_BT_OK;
++            result->baud_active = rate->baud;
++            return FUXI_BT_OK;
++        }
++        if (!fuxi_bt_setup_noise(status)) {
++            return status;
++        }
++    }
++    failure = status;
++    if (*acquired) {
++        /* 只有我方收不到時有用；控制器根本沒換速時，這幾個位元組對它只是雜訊 */
++        status = fuxi_bt_setup_rate_command(link, boot->qca);
++        if (status != FUXI_BT_OK && !fuxi_bt_setup_noise(status)) {
++            return status;
++        }
++    }
++    status = fuxi_bt_setup_reopen(link, boot->baud, acquired);
++    if (status == FUXI_BT_OK) {
++        status = fuxi_bt_setup_verify(link, &expected);
++    }
++    result->baud_fallback = status;
++    result->baud_status = failure;
++    if (status != FUXI_BT_OK) {
++        return status;
++    }
++    result->baud_active = boot->baud;
++    return FUXI_BT_OK;
++}
++
 +enum fuxi_bt_status fuxi_bt_setup_run(const struct fuxi_bt_uart_ops *ops,
 +    const struct fuxi_bt_files *files, struct fuxi_bt_setup_result *result)
 +{
++    const struct fuxi_bt_setup_options options = {0, false};
++    return fuxi_bt_setup_run_options(ops, files, &options, result);
++}
++
++enum fuxi_bt_status fuxi_bt_setup_run_options(const struct fuxi_bt_uart_ops *ops,
++    const struct fuxi_bt_files *files, const struct fuxi_bt_setup_options *options,
++    struct fuxi_bt_setup_result *result)
++{
 +    struct fuxi_bt_link link;
 +    struct fuxi_bt_blob patch = {NULL, 0}, nvm = {NULL, 0};
++    const struct fuxi_bt_rate *rate, *active;
 +    const uint8_t *params = NULL;
 +    unsigned size = 0;
 +    bool acquired = false;
@@ -39420,11 +40242,21 @@ index 0000000..eccccaf
 +    memset(result, 0, sizeof(*result));
 +    result->board_id_status = FUXI_BT_OFF;
 +    result->build_info_status = FUXI_BT_OFF;
++    result->baud_status = FUXI_BT_OFF;
++    result->baud_fallback = FUXI_BT_OFF;
++    result->nolog_status = FUXI_BT_OFF;
++    result->baud_active = FUXI_BT_BOOT_BAUD;
 +    if (!fuxi_bt_uart_ops_valid(ops)) {
 +        result->status = FUXI_BT_NO_UART;
 +        return result->status;
 +    }
-+    if (!files || !files->load || !files->release) {
++    if (!files || !files->load || !files->release || !options) {
++        result->status = FUXI_BT_ARGUMENT;
++        return result->status;
++    }
++    result->baud_requested = options->baud ? options->baud : FUXI_BT_BOOT_BAUD;
++    rate = fuxi_bt_rate_find(result->baud_requested);
++    if (!rate) {
 +        result->status = FUXI_BT_ARGUMENT;
 +        return result->status;
 +    }
@@ -39443,27 +40275,31 @@ index 0000000..eccccaf
 +    }
 +
 +    result->stage = FUXI_BT_SETUP_VERSION;
-+    {
-+        static const uint8_t request[] = {0x19};
-+        status = fuxi_bt_link_command(&link, 0xfc00, request, 1, 0x19, &params, &size);
-+    }
++    status = fuxi_bt_setup_version(&link, &result->version);
 +    if (status != FUXI_BT_OK) {
 +        goto finish;
 +    }
-+    /* [cresp][0x19][長度 12][product 4][patch 2][rom 2][soc 4] */
-+    if (size < 15) {
-+        status = FUXI_BT_PROTOCOL;
-+        goto finish;
-+    }
-+    result->version.product = fuxi_bt_setup_le32(params + 3);
-+    result->version.patch = fuxi_bt_setup_le16(params + 7);
-+    result->version.rom = fuxi_bt_setup_le16(params + 9);
-+    result->version.soc = fuxi_bt_setup_le32(params + 11);
 +    if (!result->version.soc || !result->version.rom) {
 +        status = FUXI_BT_VERSION;
 +        goto finish;
 +    }
 +    result->rom_ver = (uint8_t)(((result->version.soc & 0xf00u) >> 4) | (result->version.soc & 0xfu));
++
++    if (rate->baud != FUXI_BT_BOOT_BAUD) {
++        result->stage = FUXI_BT_SETUP_BAUD;
++        mark = result->elapsed_us;
++        status = fuxi_bt_setup_baud(&link, rate, &acquired);
++        (void)fuxi_bt_link_time(&link);
++        result->baud_us = result->elapsed_us - mark;
++        if (status != FUXI_BT_OK) {
++            goto finish;
++        }
++    }
++    active = fuxi_bt_rate_find(result->baud_active);
++    if (!active) {
++        status = FUXI_BT_ARGUMENT;
++        goto finish;
++    }
 +
 +    result->stage = FUXI_BT_SETUP_PATCH_LOAD;
 +    fuxi_bt_setup_name(result->patch_name, "hmtbtfw", result->rom_ver, NULL, 0, 0, ".tlv");
@@ -39536,7 +40372,7 @@ index 0000000..eccccaf
 +        goto finish;
 +    }
 +    result->stage = FUXI_BT_SETUP_NVM_PARSE;
-+    status = fuxi_bt_tlv_nvm(&nvm, &result->nvm);
++    status = fuxi_bt_tlv_nvm(&nvm, &result->nvm, active->qca);
 +    if (status != FUXI_BT_OK) {
 +        goto finish;
 +    }
@@ -39546,6 +40382,17 @@ index 0000000..eccccaf
 +    nvm.data = NULL;
 +    if (status != FUXI_BT_OK) {
 +        goto finish;
++    }
++
++    if (options->disable_logging) {
++        /* Linux qca_uart_setup：WCN7850 在 NVM 之後、HCI reset 之前關控制器日誌；失敗只記錄 */
++        static const uint8_t request[] = {0x14, 0x00};
++        result->stage = FUXI_BT_SETUP_NOLOG;
++        status = fuxi_bt_link_command(&link, 0xfc17, request, sizeof(request), 0, &params, &size);
++        result->nolog_status = status;
++        if (status != FUXI_BT_OK && !fuxi_bt_soft_failure(status)) {
++            goto finish;
++        }
 +    }
 +
 +    result->stage = FUXI_BT_SETUP_BUILD_INFO;
@@ -39628,18 +40475,20 @@ index 0000000..eccccaf
 +}
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_setup.h b/xnu/fuxi-bluetooth/fuxi_bt_setup.h
 new file mode 100644
-index 0000000..bacd410
+index 0000000..d883870
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_setup.h
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,140 @@
 +#ifndef FUXI_BT_SETUP_H
 +#define FUXI_BT_SETUP_H
 +
 +/*
 + * WCN7850 藍牙控制器初始化（fuxi,bt=4）：版本查詢 → rampatch → board ID → NVM → build info → HCI reset
 + * → 讀本機版本與 BD 位址。流程對照 Linux drivers/bluetooth/btqca.c qca_uart_setup（只作流程參考，
-+ * 程式自寫）。全程 115200 baud，不切 3.2 Mbaud；NVM 的 HCI tag 把 IBS 位元清掉、baud 欄位設 115200，
-+ * deep sleep 位元清掉，讓輪詢式 UART 不必處理 0xfc/0xfd/0xfe。可攜程式，主機測試用假 UART 與假檔案。
++ * 程式自寫）。預設全程 115200 baud；options.baud（fuxi,bt-baud）要求其他速率時，照 Linux qca_setup：
++ * 以 115200 查版本後送 0xfc48、host 換速、再查一次版本確認，確認不到就退回 115200 繼續。
++ * NVM 的 HCI tag 把 IBS 位元清掉、baud 欄位設成實際速率，deep sleep 位元清掉。
++ * 可攜程式，主機測試用假 UART 與假檔案。
 + */
 +
 +#include "fuxi_bt.h"
@@ -39652,10 +40501,13 @@ index 0000000..bacd410
 +#define FUXI_BT_NVM_MAX 65536u
 +#define FUXI_BT_SETUP_MAX_FRAMES 16384u
 +#define FUXI_BT_SETUP_NAME 24u
++#define FUXI_BT_BAUD_VERIFY_ATTEMPTS 3u
++#define FUXI_BT_BAUD_SETTLE_US 10000u /* Linux WCN7850：送完 0xfc48 後 usleep_range(1000, 10000) */
 +
 +enum fuxi_bt_setup_stage {
 +    FUXI_BT_SETUP_START = 0,
 +    FUXI_BT_SETUP_VERSION,
++    FUXI_BT_SETUP_BAUD,
 +    FUXI_BT_SETUP_PATCH_LOAD,
 +    FUXI_BT_SETUP_PATCH_PARSE,
 +    FUXI_BT_SETUP_PATCH_SEND,
@@ -39663,6 +40515,7 @@ index 0000000..bacd410
 +    FUXI_BT_SETUP_NVM_LOAD,
 +    FUXI_BT_SETUP_NVM_PARSE,
 +    FUXI_BT_SETUP_NVM_SEND,
++    FUXI_BT_SETUP_NOLOG,
 +    FUXI_BT_SETUP_BUILD_INFO,
 +    FUXI_BT_SETUP_RESET,
 +    FUXI_BT_SETUP_LOCAL_VERSION,
@@ -39680,6 +40533,12 @@ index 0000000..bacd410
 +    void *context;
 +    enum fuxi_bt_status (*load)(void *, const char *, size_t, struct fuxi_bt_blob *);
 +    void (*release)(void *, struct fuxi_bt_blob *);
++};
++
++/* 預設全關（fuxi_bt_setup_run 用的就是全 0）。 */
++struct fuxi_bt_setup_options {
++    uint32_t baud; /* 0 或 115200＝不換速；其他值須在速率表內（fuxi,bt-baud） */
++    bool disable_logging; /* Linux qca_disable_soc_logging：0xfc17 {0x14, 0x00}（fuxi,bt-nolog） */
 +};
 +
 +struct fuxi_bt_tlv_info {
@@ -39739,12 +40598,25 @@ index 0000000..bacd410
 +    unsigned stale_acks;
 +    uint64_t elapsed_us;
 +    uint64_t patch_us;
++    uint32_t baud_requested;
++    uint32_t baud_active;
++    enum fuxi_bt_status baud_status; /* off＝沒換速；ok＝已換；其他＝新速率確認失敗的原因 */
++    enum fuxi_bt_status baud_fallback; /* off＝沒退回；ok＝已退回 115200 並確認 */
++    unsigned baud_attempts;
++    unsigned baud_early_bytes; /* 送 0xfc48 後、host 換速前以舊速率收到的位元組數 */
++    uint8_t baud_early[8];
++    unsigned baud_early_size;
++    uint64_t baud_us;
++    enum fuxi_bt_status nolog_status; /* off＝沒要求 */
 +};
 +
 +const char *fuxi_bt_setup_stage_name(enum fuxi_bt_setup_stage stage);
 +bool fuxi_bt_setup_name_valid(const char *name);
 +enum fuxi_bt_status fuxi_bt_setup_run(const struct fuxi_bt_uart_ops *ops,
 +    const struct fuxi_bt_files *files, struct fuxi_bt_setup_result *result);
++enum fuxi_bt_status fuxi_bt_setup_run_options(const struct fuxi_bt_uart_ops *ops,
++    const struct fuxi_bt_files *files, const struct fuxi_bt_setup_options *options,
++    struct fuxi_bt_setup_result *result);
 +
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_sk.c b/xnu/fuxi-bluetooth/fuxi_bt_sk.c
@@ -40524,10 +41396,10 @@ index 0000000..0c74011
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_xnu.c b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
 new file mode 100644
-index 0000000..d9a95a3
+index 0000000..f94afd2
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
-@@ -0,0 +1,866 @@
+@@ -0,0 +1,890 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
@@ -40853,6 +41725,16 @@ index 0000000..d9a95a3
 +    if (result->bdaddr_valid) {
 +        printf("FUXI BT: setup bdaddr valid (not logged)\n");
 +    }
++    if (result->baud_requested != FUXI_BT_BOOT_BAUD || result->baud_status != FUXI_BT_OFF) {
++        fuxi_bt_hex(result->baud_early, result->baud_early_size, hex, sizeof(hex));
++        printf("FUXI BT: setup baud requested=%u active=%u status=%s fallback=%s attempts=%u early=%u %s ms=%llu\n",
++            result->baud_requested, result->baud_active, fuxi_bt_status_name(result->baud_status),
++            fuxi_bt_status_name(result->baud_fallback), result->baud_attempts, result->baud_early_bytes,
++            hex, result->baud_us / 1000u);
++    }
++    if (result->nolog_status != FUXI_BT_OFF) {
++        printf("FUXI BT: setup nolog status=%s\n", fuxi_bt_status_name(result->nolog_status));
++    }
 +    fuxi_bt_hex(result->last_event, result->last_event_size, hex, sizeof(hex));
 +    printf("FUXI BT: setup last_event %s\n", hex);
 +    if (result->last_vendor_size) {
@@ -41003,7 +41885,8 @@ index 0000000..d9a95a3
 +    static struct fuxi_bt_pump pump;
 +    static struct fuxi_bt_trace_state traces;
 +    const struct fuxi_bt_pump_sink sink = {NULL, fuxi_bt_deliver, fuxi_bt_take};
-+    enum fuxi_bt_status status = ops->acquire(ops->context, FUXI_BT_BOOT_BAUD);
++    /* setup 換速成功時控制器已在新速率（NVM HCI tag 也是），這裡用同一個速率 */
++    enum fuxi_bt_status status = ops->acquire(ops->context, setup->baud_active);
 +    if (status == FUXI_BT_OK) {
 +        memset(&traces, 0, sizeof(traces));
 +        status = fuxi_bt_pump_init(&pump, ops, &sink, fuxi_bt_trace, &traces);
@@ -41030,7 +41913,7 @@ index 0000000..d9a95a3
 +        optional_vendor |= pump.optional[index] == FUXI_BT_OPTIONAL_VENDOR;
 +    }
 +    printf("FUXI BT: resident ready baud=%u ibs=%u optional=%u optional_vendor=%u pad=%u mask=%u txmask=%u\n",
-+        FUXI_BT_BOOT_BAUD, (unsigned)pump.ibs, pump.optional_count, (unsigned)optional_vendor,
++        setup->baud_active, (unsigned)pump.ibs, pump.optional_count, (unsigned)optional_vendor,
 +        pump.pad_count, pump.mask_count, pump.txmask_count);
 +    for (unsigned index = 0; index < pump.optional_count; index++) {
 +        printf("FUXI BT: optional opcode=%#x\n", pump.optional[index]);
@@ -41233,8 +42116,21 @@ index 0000000..d9a95a3
 +        if (fuxi_bt_mode >= 4) {
 +            static struct fuxi_bt_setup_result setup; /* 約 0.5 KB，不放核心堆疊 */
 +            const struct fuxi_bt_files files = {NULL, fuxi_bt_file_load, fuxi_bt_file_release};
-+            status = fuxi_bt_setup_run(&ops, &files, &setup);
++            struct fuxi_bt_setup_options options = {0, false};
++            /* fuxi,bt-baud：u32 工作速率（預設無＝115200）；必須在速率表內，否則忽略 */
++            const int baud = fuxi_bt_adt_u32("fuxi,bt-baud");
++            if (baud > 0 && fuxi_bt_rate_find((uint32_t)baud)) {
++                options.baud = (uint32_t)baud;
++            } else if (baud != 0) {
++                printf("FUXI BT: fuxi,bt-baud %d ignored (not in rate table)\n", baud);
++            }
++            /* fuxi,bt-nolog=1：NVM 後送 0xfc17 關控制器日誌（預設關） */
++            options.disable_logging = fuxi_bt_adt_u32("fuxi,bt-nolog") == 1;
++            status = fuxi_bt_setup_run_options(&ops, &files, &options, &setup);
 +            fuxi_bt_print_setup(status, &setup);
++            printf("FUXI BT: uart baud=%u div=%u rcg_hz=%u rcg_switches=%u nolog=%u\n",
++                board->baud, board->fifo.divider, board->rcg_hz, board->rcg_switches,
++                (unsigned)options.disable_logging);
 +            if (status == FUXI_BT_OK && fuxi_bt_mode == 5) {
 +                status = fuxi_bt_resident(board, &ops, &setup);
 +                printf("FUXI BT: resident stopped status=%s\n", fuxi_bt_status_name(status));
@@ -44259,7 +45155,7 @@ index 0000000..8a1b9db
 +    return 0;
 +}
 diff --git a/xnu/fuxi-unixnu/SweetFramebuffer.cpp b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
-index 8b38ece..a13e5a7 100644
+index 8b38ece..9e937c3 100644
 --- a/xnu/fuxi-unixnu/SweetFramebuffer.cpp
 +++ b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
 @@ -32,7 +32,8 @@
@@ -44272,7 +45168,46 @@ index 8b38ece..a13e5a7 100644
   *
   * FUXI (0093): frames are shown at up to 60 Hz by default (7 fast cores;
   * sweetfb_hz still overrides), the tick runs on absolute deadlines so the
-@@ -653,10 +654,10 @@ AppleCLCD::start(IOService *provider)
+@@ -455,6 +456,28 @@ static void sweet_fb_refresh_publish(AppleCLCD *fb)
+  OSSafeReleaseNULL(refresh);
+ }
+ 
++/*
++ * disp0 fuxi,mfb-align=1：DisplayPipePlaneBaseAlignment 改用 iOS 讀取的字典格式。
++ * VideoToolbox FigGetAlignmentForIOSurfaceOutputToDisplayService（iOS 16.7）以
++ * IORegistryEntrySearchCFProperty 取得此屬性後，直接 CFDictionaryGetValue(…, "PlaneBaseAlignmentLinear")；
++ * 原本的裸數字會讓影片項目建立 render pipeline 時 mediaserverd 以 -[__NSCFNumber objectForKey:] abort。
++ * QuartzCore AppleDisplay 只在型別為字典時才讀同一個 key，否則維持預設 64，所以填 64 不改變 backboardd。
++ * DisplayPipeStrideRequirements 不發佈：VideoToolbox 與 QuartzCore 缺值時都用 64。
++ * 依據：主機 shared cache 反組譯（K-077 趟 21 紀錄）。
++ */
++static bool sweet_fb_align_publish(AppleCLCD *fb)
++{
++ OSDictionary *align = OSDictionary::withCapacity(1);
++ OSNumber *linear = OSNumber::withNumber(64ULL, 32);
++ bool ok = align && linear && align->setObject("PlaneBaseAlignmentLinear", linear) &&
++     fb->setProperty("DisplayPipePlaneBaseAlignment", align);
++ OSSafeReleaseNULL(linear);
++ OSSafeReleaseNULL(align);
++ IOLog("SWEET FB: DisplayPipePlaneBaseAlignment {PlaneBaseAlignmentLinear=64} %s (fuxi,mfb-align)\n",
++     ok ? "published" : "FAILED, number kept");
++ return ok;
++}
++
+ static void sweet_fb_te_configure(AppleCLCD *fb)
+ {
+  unsigned enabled = 0, offset = 7800; /* 7.3 ms transfer + 0.5 ms margin */
+@@ -631,6 +654,9 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
++#if defined(FUXI)
++	if (sweet_fb_adt_u32(provider, "fuxi,mfb-align") != 1 || !sweet_fb_align_publish(this))
++#endif
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ #if defined(FUXI)
+ 	int backlight = 0;
+@@ -653,10 +679,10 @@ AppleCLCD::start(IOService *provider)
   PE_parse_boot_argn("fuxigpuscanoutlog", &log, sizeof(log));
   int quiet = 0;
   PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet));
@@ -53399,7 +54334,7 @@ index 179f5df..375b1a9 100644
  +bool     fuxi_wifi_sta_heard(unsigned index, struct fuxi_wifi_sta_bss *bss);
  +void     fuxi_wifi_sta_state(struct fuxi_wifi_sta_state *state);
 diff --git a/xnu/patches/0106-fuxi-unixnu.patch b/xnu/patches/0106-fuxi-unixnu.patch
-index d95faff..da02b50 100644
+index d95faff..50f32c7 100644
 --- a/xnu/patches/0106-fuxi-unixnu.patch
 +++ b/xnu/patches/0106-fuxi-unixnu.patch
 @@ -42,7 +42,19 @@
@@ -53916,38 +54851,72 @@ index d95faff..da02b50 100644
   
   OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
 -@@ -174,6 +375,163 @@
-+@@ -174,6 +376,163 @@
++@@ -174,6 +376,185 @@
   OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
   #if defined(FUXI)
   extern "C" void fuxi_display_kick(void);
-@@ -820,7 +1174,7 @@
+@@ -740,6 +1094,28 @@
+ + OSSafeReleaseNULL(refresh);
+ +}
+ +
+++/*
+++ * disp0 fuxi,mfb-align=1：DisplayPipePlaneBaseAlignment 改用 iOS 讀取的字典格式。
+++ * VideoToolbox FigGetAlignmentForIOSurfaceOutputToDisplayService（iOS 16.7）以
+++ * IORegistryEntrySearchCFProperty 取得此屬性後，直接 CFDictionaryGetValue(…, "PlaneBaseAlignmentLinear")；
+++ * 原本的裸數字會讓影片項目建立 render pipeline 時 mediaserverd 以 -[__NSCFNumber objectForKey:] abort。
+++ * QuartzCore AppleDisplay 只在型別為字典時才讀同一個 key，否則維持預設 64，所以填 64 不改變 backboardd。
+++ * DisplayPipeStrideRequirements 不發佈：VideoToolbox 與 QuartzCore 缺值時都用 64。
+++ * 依據：主機 shared cache 反組譯（K-077 趟 21 紀錄）。
+++ */
+++static bool sweet_fb_align_publish(AppleCLCD *fb)
+++{
+++ OSDictionary *align = OSDictionary::withCapacity(1);
+++ OSNumber *linear = OSNumber::withNumber(64ULL, 32);
+++ bool ok = align && linear && align->setObject("PlaneBaseAlignmentLinear", linear) &&
+++     fb->setProperty("DisplayPipePlaneBaseAlignment", align);
+++ OSSafeReleaseNULL(linear);
+++ OSSafeReleaseNULL(align);
+++ IOLog("SWEET FB: DisplayPipePlaneBaseAlignment {PlaneBaseAlignmentLinear=64} %s (fuxi,mfb-align)\n",
+++     ok ? "published" : "FAILED, number kept");
+++ return ok;
+++}
+++
+ +static void sweet_fb_te_configure(AppleCLCD *fb)
+ +{
+ + unsigned enabled = 0, offset = 7800; /* 7.3 ms transfer + 0.5 ms margin */
+@@ -820,7 +1196,7 @@
   #endif
   
   bool
 -@@ -214,7 +572,33 @@
-+@@ -214,7 +573,33 @@
++@@ -214,7 +595,33 @@
   		OSSafeReleaseNULL(fWorkLoop);
   		return false;
   	}
-@@ -855,7 +1209,7 @@
+@@ -855,7 +1231,7 @@
   	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
   		IOLog("SWEET FB: no vsync timer\n");
   		return false;
 -@@ -227,11 +611,20 @@
-+@@ -227,11 +612,20 @@
++@@ -227,40 +634,174 @@
   	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
   	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
   #if defined(FUXI)
-@@ -878,7 +1232,7 @@
+@@ -878,9 +1254,12 @@
   #else
   	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
   #endif
 -@@ -239,28 +632,150 @@
-+@@ -239,28 +633,150 @@
++ 
   	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
   	setProperty("external", false);
+++#if defined(FUXI)
+++	if (sweet_fb_adt_u32(provider, "fuxi,mfb-align") != 1 || !sweet_fb_align_publish(this))
+++#endif
   	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
-@@ -904,10 +1258,10 @@
+ +#if defined(FUXI)
+ +	int backlight = 0;
+@@ -904,10 +1283,10 @@
  + PE_parse_boot_argn("fuxigpuscanoutlog", &log, sizeof(log));
  + int quiet = 0;
  + PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet));
@@ -53960,147 +54929,147 @@ index d95faff..da02b50 100644
  + if (fScanout) { sweet_console_muted = 1; fConsolePaused = true; }
  + fuxi_gpu_scanout_configure(fPixels, fScanout, check);
  + uint32_t nc = 0;
-@@ -1035,7 +1389,7 @@
+@@ -1035,7 +1414,7 @@
   #else
   	(void)fb;
   	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
 -@@ -272,44 +787,34 @@
-+@@ -272,44 +788,34 @@
++@@ -272,44 +813,34 @@
   {
   	AppleCLCD *fb = (AppleCLCD *)owner;
   	uint64_t now = mach_absolute_time();
-@@ -1098,7 +1452,7 @@
+@@ -1098,7 +1477,7 @@
   	if (fb->fPowerOff) {
   		/* Fade out: halve every channel each vsync, then black, then idle. */
   		uint32_t step = fb->fFadeStep;
 -@@ -319,14 +824,22 @@
-+@@ -319,14 +825,22 @@
++@@ -319,14 +850,22 @@
   		IOLockUnlock(fb->fLock);
   #if defined(FUXI)
   		if (step == 0) {
-@@ -1126,7 +1480,7 @@
+@@ -1126,7 +1505,7 @@
   		}
   #else
   		if (step <= 6) {
 -@@ -341,20 +854,13 @@
-+@@ -341,20 +855,13 @@
++@@ -341,20 +880,13 @@
   		sweet_fb_rearm(fb, sender);
   		return;
   	}
-@@ -1154,7 +1508,7 @@
+@@ -1154,7 +1533,7 @@
   	sweet_fb_rearm(fb, sender);
   }
   
 -@@ -388,38 +894,356 @@
-+@@ -388,38 +895,356 @@
++@@ -388,38 +920,356 @@
   static uint32_t sweet_fb_swaps_logged;
   static uint64_t sweet_fb_swap_count;
   
-@@ -1537,7 +1891,7 @@
+@@ -1537,7 +1916,7 @@
   
   	if (!fConsolePaused) {
   		int quiet = 0;
 -@@ -442,7 +1266,7 @@
-+@@ -442,7 +1267,7 @@
++@@ -442,7 +1292,7 @@
   		if (!(mask & (1u << layer)) || id == 0) {
   			continue;
   		}
-@@ -1546,7 +1900,7 @@
+@@ -1546,7 +1925,7 @@
   		if (sweet_fb_swaps_logged < 16) {
   			sweet_fb_swaps_logged++;
   			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
 -@@ -451,6 +1275,7 @@
-+@@ -451,6 +1276,7 @@
++@@ -451,6 +1301,7 @@
   			    get32(a, 12), dx, dy, w, h);
   		}
   		if (s == NULL || s == fSurface) {
-@@ -1554,7 +1908,7 @@
+@@ -1554,7 +1933,7 @@
   			OSSafeReleaseNULL(s);
   			continue;
   		}
 -@@ -500,35 +1325,262 @@
-+@@ -500,35 +1326,262 @@
++@@ -500,35 +1351,262 @@
   		if (src != 0 && bpe == 4) {
   			int copied = 0;
   #if defined(FUXI)
-@@ -1825,7 +2179,7 @@
+@@ -1825,7 +2204,7 @@
   	fStatCopy += took;
   	fStatCopyMax = took > fStatCopyMax ? took : fStatCopyMax;
   	if (++fStatFrames >= 600) {
 -@@ -538,15 +1590,47 @@
-+@@ -538,15 +1591,47 @@
++@@ -538,15 +1616,47 @@
   		absolutetime_to_nanoseconds(t1 - fStatStart, &span_ns);
   		IOLockLock(fLock);
   		uint32_t swaps = fStatSwaps, dropped = fStatDropped;
-@@ -1876,7 +2230,7 @@
+@@ -1876,7 +2255,7 @@
   		sweet_surface_gpu_stats(&split);
   		uint64_t ticks[] = {split.pin, split.lookup, split.map, split.clean,
   		    split.submit, split.wait, split.unmap, split.cpu};
 -@@ -557,13 +1641,21 @@
-+@@ -557,13 +1642,21 @@
++@@ -557,13 +1667,21 @@
   			absolutetime_to_nanoseconds(ticks[i], &ns);
   			us[i] = attempts ? ns / 1000 / attempts : 0;
   		}
-@@ -1901,7 +2255,7 @@
+@@ -1901,7 +2280,7 @@
   		fGpuBusyTicks = fGpuFailed = 0;
   		fGpuFrames = fCpuFrames = 0;
   		fGpuTime = fCpuTime = 0;
 -@@ -571,6 +1663,33 @@
-+@@ -571,6 +1664,33 @@
++@@ -571,6 +1689,33 @@
   		fStatCopy = fStatCopyMax = 0;
   		fStatStart = t1;
   	}
-@@ -1935,7 +2289,7 @@
+@@ -1935,7 +2314,7 @@
   #endif
   }
   
 -@@ -620,6 +1739,7 @@
-+@@ -620,6 +1740,7 @@
++@@ -620,6 +1765,7 @@
   	IOLockLock(fFB->fLock);
   	old = fPort;
   	fPort = port;
-@@ -1943,7 +2297,7 @@
+@@ -1943,7 +2322,7 @@
   	IOLockUnlock(fFB->fLock);
   	if (old != MACH_PORT_NULL) {
   		releaseNotificationPort(old);
 -@@ -643,6 +1763,40 @@
-+@@ -643,6 +1764,40 @@
++@@ -643,6 +1789,40 @@
   }
   
   static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
-@@ -1984,7 +2338,7 @@
+@@ -1984,7 +2363,7 @@
   
   IOReturn
   IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
 -@@ -660,7 +1814,7 @@
-+@@ -660,7 +1815,7 @@
++@@ -660,7 +1840,7 @@
   		break;
   	case kSweetFBSwapBegin:
   		IOLockLock(fFB->fLock);
-@@ -1993,7 +2347,7 @@
+@@ -1993,7 +2372,7 @@
   		IOLockUnlock(fFB->fLock);
   		outCount = 1;
   		break;
 -@@ -672,7 +1826,7 @@
-+@@ -672,7 +1827,7 @@
++@@ -672,7 +1852,7 @@
   			break;
   		}
   		memcpy(rec, args->structureInput, sizeof(rec));
-@@ -2002,7 +2356,7 @@
+@@ -2002,7 +2381,7 @@
   		break;
   	}
   	case kSweetFBGetID:
 -@@ -698,6 +1852,7 @@
-+@@ -698,6 +1853,7 @@
++@@ -698,6 +1878,7 @@
   			IOLockLock(fFB->fLock);
   			fFunc[type] = args->scalarInput[0];
   			fRefcon[type] = args->scalarInput[1];
-@@ -2010,7 +2364,7 @@
+@@ -2010,7 +2389,7 @@
   			IOLockUnlock(fFB->fLock);
   			char name[32];
   			proc_selfname(name, sizeof(name));
 -@@ -707,19 +1862,13 @@
-+@@ -707,19 +1863,13 @@
++@@ -707,19 +1888,13 @@
   		break;
   	case kSweetFBRequestPowerChange:
   		if (args->scalarInputCount >= 1) {
@@ -54359,10 +55328,10 @@ index 41dbb65..b082005 100644
  +    W w;
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..6bc2bb0
+index 0000000..7046262
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,15704 @@
+@@ -0,0 +1,16071 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,36 @@
@@ -60480,7 +61449,7 @@ index 0000000..6bc2bb0
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt.c
-+@@ -0,0 +1,394 @@
++@@ -0,0 +1,418 @@
 ++#include "fuxi_bt.h"
 ++#include <string.h>
 ++
@@ -60521,6 +61490,30 @@ index 0000000..6bc2bb0
 ++{
 ++    return ops && ops->acquire && ops->write && ops->read &&
 ++        ops->release && ops->now_us && ops->wait_us;
+++}
+++
+++/*
+++ * 來源頻率與 m/n 取自 Linux drivers/clk/qcom/gcc-sm8550.c ftbl_gcc_qupv3_wrap2_s6_clk_src
+++ * （P_GCC_GPLL0_OUT_EVEN、pre_div 1）；QUP ≥ 2.5 取樣 16，除頻 = 來源 / (baud × 16)：
+++ * 115200 用 7.3728 MHz 除 4，其餘除 1。qca 值對照 Linux btqca.h enum qca_baudrate；
+++ * Linux 的 WCN7850 DT 用 max-speed 3200000。
+++ */
+++static const struct fuxi_bt_rate fuxi_bt_rates[] = {
+++    {115200u, 7372800u, 384u, 15625u, 0u},
+++    {921600u, 14745600u, 768u, 15625u, 10u},
+++    {2000000u, 32000000u, 8u, 75u, 13u},
+++    {3000000u, 48000000u, 4u, 25u, 14u},
+++    {3200000u, 51200000u, 64u, 375u, 17u}
+++};
+++
+++const struct fuxi_bt_rate *fuxi_bt_rate_find(uint32_t baud)
+++{
+++    for (unsigned index = 0; index < sizeof(fuxi_bt_rates) / sizeof(fuxi_bt_rates[0]); index++) {
+++        if (fuxi_bt_rates[index].baud == baud) {
+++            return &fuxi_bt_rates[index];
+++        }
+++    }
+++    return NULL;
 ++}
 ++
 ++static enum fuxi_bt_status fuxi_bt_event(const uint8_t *event,
@@ -60877,7 +61870,7 @@ index 0000000..6bc2bb0
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_xnu.c
-+@@ -0,0 +1,866 @@
++@@ -0,0 +1,890 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
@@ -61203,6 +62196,16 @@ index 0000000..6bc2bb0
 ++    if (result->bdaddr_valid) {
 ++        printf("FUXI BT: setup bdaddr valid (not logged)\n");
 ++    }
+++    if (result->baud_requested != FUXI_BT_BOOT_BAUD || result->baud_status != FUXI_BT_OFF) {
+++        fuxi_bt_hex(result->baud_early, result->baud_early_size, hex, sizeof(hex));
+++        printf("FUXI BT: setup baud requested=%u active=%u status=%s fallback=%s attempts=%u early=%u %s ms=%llu\n",
+++            result->baud_requested, result->baud_active, fuxi_bt_status_name(result->baud_status),
+++            fuxi_bt_status_name(result->baud_fallback), result->baud_attempts, result->baud_early_bytes,
+++            hex, result->baud_us / 1000u);
+++    }
+++    if (result->nolog_status != FUXI_BT_OFF) {
+++        printf("FUXI BT: setup nolog status=%s\n", fuxi_bt_status_name(result->nolog_status));
+++    }
 ++    fuxi_bt_hex(result->last_event, result->last_event_size, hex, sizeof(hex));
 ++    printf("FUXI BT: setup last_event %s\n", hex);
 ++    if (result->last_vendor_size) {
@@ -61353,7 +62356,8 @@ index 0000000..6bc2bb0
 ++    static struct fuxi_bt_pump pump;
 ++    static struct fuxi_bt_trace_state traces;
 ++    const struct fuxi_bt_pump_sink sink = {NULL, fuxi_bt_deliver, fuxi_bt_take};
-++    enum fuxi_bt_status status = ops->acquire(ops->context, FUXI_BT_BOOT_BAUD);
+++    /* setup 換速成功時控制器已在新速率（NVM HCI tag 也是），這裡用同一個速率 */
+++    enum fuxi_bt_status status = ops->acquire(ops->context, setup->baud_active);
 ++    if (status == FUXI_BT_OK) {
 ++        memset(&traces, 0, sizeof(traces));
 ++        status = fuxi_bt_pump_init(&pump, ops, &sink, fuxi_bt_trace, &traces);
@@ -61380,7 +62384,7 @@ index 0000000..6bc2bb0
 ++        optional_vendor |= pump.optional[index] == FUXI_BT_OPTIONAL_VENDOR;
 ++    }
 ++    printf("FUXI BT: resident ready baud=%u ibs=%u optional=%u optional_vendor=%u pad=%u mask=%u txmask=%u\n",
-++        FUXI_BT_BOOT_BAUD, (unsigned)pump.ibs, pump.optional_count, (unsigned)optional_vendor,
+++        setup->baud_active, (unsigned)pump.ibs, pump.optional_count, (unsigned)optional_vendor,
 ++        pump.pad_count, pump.mask_count, pump.txmask_count);
 ++    for (unsigned index = 0; index < pump.optional_count; index++) {
 ++        printf("FUXI BT: optional opcode=%#x\n", pump.optional[index]);
@@ -61583,8 +62587,21 @@ index 0000000..6bc2bb0
 ++        if (fuxi_bt_mode >= 4) {
 ++            static struct fuxi_bt_setup_result setup; /* 約 0.5 KB，不放核心堆疊 */
 ++            const struct fuxi_bt_files files = {NULL, fuxi_bt_file_load, fuxi_bt_file_release};
-++            status = fuxi_bt_setup_run(&ops, &files, &setup);
+++            struct fuxi_bt_setup_options options = {0, false};
+++            /* fuxi,bt-baud：u32 工作速率（預設無＝115200）；必須在速率表內，否則忽略 */
+++            const int baud = fuxi_bt_adt_u32("fuxi,bt-baud");
+++            if (baud > 0 && fuxi_bt_rate_find((uint32_t)baud)) {
+++                options.baud = (uint32_t)baud;
+++            } else if (baud != 0) {
+++                printf("FUXI BT: fuxi,bt-baud %d ignored (not in rate table)\n", baud);
+++            }
+++            /* fuxi,bt-nolog=1：NVM 後送 0xfc17 關控制器日誌（預設關） */
+++            options.disable_logging = fuxi_bt_adt_u32("fuxi,bt-nolog") == 1;
+++            status = fuxi_bt_setup_run_options(&ops, &files, &options, &setup);
 ++            fuxi_bt_print_setup(status, &setup);
+++            printf("FUXI BT: uart baud=%u div=%u rcg_hz=%u rcg_switches=%u nolog=%u\n",
+++                board->baud, board->fifo.divider, board->rcg_hz, board->rcg_switches,
+++                (unsigned)options.disable_logging);
 ++            if (status == FUXI_BT_OK && fuxi_bt_mode == 5) {
 ++                status = fuxi_bt_resident(board, &ops, &setup);
 ++                printf("FUXI BT: resident stopped status=%s\n", fuxi_bt_status_name(status));
@@ -61746,7 +62763,7 @@ index 0000000..6bc2bb0
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_geni_fifo.c
-+@@ -0,0 +1,613 @@
++@@ -0,0 +1,617 @@
 ++#include "fuxi_bt_geni_fifo.h"
 ++#include <string.h>
 ++
@@ -61849,7 +62866,7 @@ index 0000000..6bc2bb0
 ++{
 ++    uint32_t status, tx_status, rx_status, events, hw_tx, hw_rx;
 ++    uint32_t master_control, secondary_control;
-++    uint32_t divider, sampling, depth_mask;
+++    uint32_t divider, sampling, depth_mask, baud;
 ++    unsigned major, minor;
 ++    if (!fifo || !config) {
 ++        return FUXI_BT_ARGUMENT;
@@ -61865,15 +62882,19 @@ index 0000000..6bc2bb0
 ++        return FUXI_BT_BUSY;
 ++    }
 ++    sampling = config->qup_version >= 0x20050000u ? 16u : 32u;
-++    if (!config->source_hz || config->source_hz % (FUXI_BT_BOOT_BAUD * sampling)) {
+++    baud = config->baud ? config->baud : FUXI_BT_BOOT_BAUD;
+++    /* 只接受整數除頻（Linux get_clk_div_rate 找的也是剛好整除的來源頻率） */
+++    if (baud > FUXI_BT_MAX_BAUD || !config->source_hz || config->source_hz % (baud * sampling)) {
 ++        return FUXI_BT_ARGUMENT;
 ++    }
-++    divider = config->source_hz / (FUXI_BT_BOOT_BAUD * sampling);
+++    divider = config->source_hz / (baud * sampling);
 ++    if (!divider || divider > 4095) {
 ++        return FUXI_BT_ARGUMENT;
 ++    }
 ++    memset(fifo, 0, sizeof(*fifo));
 ++    fifo->io = *io;
+++    fifo->baud = baud;
+++    fifo->divider = divider;
 ++    fifo->last_us = io->now_us(io->context);
 ++    if (!fuxi_bt_fifo_read32(fifo, FUXI_BT_FIFO_IF_DISABLE, &fifo->interface_disable)) {
 ++        return fuxi_bt_fifo_fail(fifo, FUXI_BT_IO);
@@ -62362,7 +63383,7 @@ index 0000000..6bc2bb0
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_board.c
-+@@ -0,0 +1,501 @@
++@@ -0,0 +1,543 @@
 ++#include "fuxi_bt_board.h"
 ++#include <string.h>
 ++
@@ -62382,11 +63403,9 @@ index 0000000..6bc2bb0
 ++#define FUXI_BT_RCG_ROOT_OFF (1u << 31)
 ++/* hid 除頻 [4:0]、來源 [10:8]、MND 模式 [13:12]；bit 20（HW_CLK_CTRL）保留 XBL 的設定。 */
 ++#define FUXI_BT_RCG_CFG_FIELDS 0x371fu
-++/* F(7372800, P_GCC_GPLL0_OUT_EVEN, 1, 384, 15625)：pre_div 2*1-1、parent_map_8 來源 6、雙沿 MND。 */
+++/* F(hz, P_GCC_GPLL0_OUT_EVEN, 1, m, n)：pre_div 2*1-1、parent_map_8 來源 6、雙沿 MND（速率表每項都是這組）。 */
 ++#define FUXI_BT_RCG_CFG_VALUE (1u | (6u << 8) | (2u << 12))
 ++#define FUXI_BT_MND_MASK 0xffffu
-++#define FUXI_BT_MND_M 384u
-++#define FUXI_BT_MND_N 15625u
 ++
 ++static const uint32_t fuxi_bt_board_branches[] = {0x233d4, 0x233d0, 0x233cc, 0x23004, 0x1e754};
 ++
@@ -62501,29 +63520,37 @@ index 0000000..6bc2bb0
 ++    return fuxi_bt_board_fail(board, FUXI_BT_TIMEOUT, command);
 ++}
 ++
-++static enum fuxi_bt_status fuxi_bt_board_rcg(struct fuxi_bt_board *board)
+++/* 依速率表設 RCG；rcg_saved 必須已存好 XBL 的值（上半部保留位元照抄）。 */
+++static enum fuxi_bt_status fuxi_bt_board_rcg_program(struct fuxi_bt_board *board,
+++    const struct fuxi_bt_rate *rate)
 ++{
 ++    static const uint32_t offsets[] = {4, 8, 12, 16};
-++    uint32_t command = 0, values[4];
+++    uint32_t command = 0, values[4], d;
 ++    enum fuxi_bt_status status;
+++    if (!rate || !rate->m || rate->m >= rate->n) {
+++        return FUXI_BT_ARGUMENT;
+++    }
 ++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command)) {
 ++        return board->error;
 ++    }
 ++    if (command & FUXI_BT_RCG_UPDATE) {
 ++        return fuxi_bt_board_fail(board, FUXI_BT_BUSY, command);
 ++    }
-++    for (unsigned index = 0; index < 4; index++) {
-++        if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + offsets[index],
-++            &board->rcg_saved[index])) {
-++            return board->error;
-++        }
+++    /* clk-rcg2 __clk_rcg2_configure_mnd：2d 值＝n，夾在 [m, 2(n-m)]；D 暫存器寫 ~2d */
+++    d = rate->n;
+++    if (d < rate->m) {
+++        d = rate->m;
+++    }
+++    if (d > 2u * (uint32_t)(rate->n - rate->m)) {
+++        d = 2u * (uint32_t)(rate->n - rate->m);
 ++    }
 ++    values[0] = (board->rcg_saved[0] & ~FUXI_BT_RCG_CFG_FIELDS) | FUXI_BT_RCG_CFG_VALUE;
-++    values[1] = (board->rcg_saved[1] & ~FUXI_BT_MND_MASK) | FUXI_BT_MND_M;
+++    values[1] = (board->rcg_saved[1] & ~FUXI_BT_MND_MASK) | rate->m;
 ++    values[2] = (board->rcg_saved[2] & ~FUXI_BT_MND_MASK) |
-++        (~(FUXI_BT_MND_N - FUXI_BT_MND_M) & FUXI_BT_MND_MASK);
-++    values[3] = (board->rcg_saved[3] & ~FUXI_BT_MND_MASK) | (~FUXI_BT_MND_N & FUXI_BT_MND_MASK);
+++        (~(uint32_t)(rate->n - rate->m) & FUXI_BT_MND_MASK);
+++    values[3] = (board->rcg_saved[3] & ~FUXI_BT_MND_MASK) | (~d & FUXI_BT_MND_MASK);
 ++    board->rcg_changed = true;
+++    board->rcg_hz = 0;
 ++    /* 和 Linux 一樣先寫 M/N/D 再寫 CFG，最後 CMD_UPDATE。 */
 ++    for (unsigned index = 1; index < 4; index++) {
 ++        if (!fuxi_bt_board_write(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + offsets[index], values[index])) {
@@ -62547,7 +63574,27 @@ index 0000000..6bc2bb0
 ++    if (command & FUXI_BT_RCG_ROOT_OFF) {
 ++        return fuxi_bt_board_fail(board, FUXI_BT_OFF, command);
 ++    }
+++    board->rcg_hz = rate->source_hz;
 ++    return FUXI_BT_OK;
+++}
+++
+++static enum fuxi_bt_status fuxi_bt_board_rcg(struct fuxi_bt_board *board)
+++{
+++    static const uint32_t offsets[] = {4, 8, 12, 16};
+++    uint32_t command = 0;
+++    if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD, &command)) {
+++        return board->error;
+++    }
+++    if (command & FUXI_BT_RCG_UPDATE) {
+++        return fuxi_bt_board_fail(board, FUXI_BT_BUSY, command);
+++    }
+++    for (unsigned index = 0; index < 4; index++) {
+++        if (!fuxi_bt_board_read(board, FUXI_BT_GCC_BASE + FUXI_BT_RCG_CMD + offsets[index],
+++            &board->rcg_saved[index])) {
+++            return board->error;
+++        }
+++    }
+++    return fuxi_bt_board_rcg_program(board, fuxi_bt_rate_find(FUXI_BT_BOOT_BAUD));
 ++}
 ++
 ++enum fuxi_bt_status fuxi_bt_board_power_on(struct fuxi_bt_board *board,
@@ -62745,6 +63792,7 @@ index 0000000..6bc2bb0
 ++            cleanup = FUXI_BT_TIMEOUT;
 ++        }
 ++        board->rcg_changed = false;
+++        board->rcg_hz = 0;
 ++    }
 ++    if (board->votes_changed) {
 ++        uint32_t vote = 0;
@@ -62791,15 +63839,21 @@ index 0000000..6bc2bb0
 ++    board->io.wait_us(board->io.context, microseconds);
 ++}
 ++
+++/*
+++ * baud 必須在速率表內。RCG 來源頻率不同時，趁 FIFO 關著（GENI 引擎閒置、RFR 已還原）先改 RCG，
+++ * 再用新的來源頻率與 baud 開 FIFO；對照 Linux qcom_geni_serial_set_termios 的 dev_pm_opp_set_rate＋
+++ * M/S_CLK_CFG。
+++ */
 ++static enum fuxi_bt_status fuxi_bt_board_acquire(void *context, unsigned baud)
 ++{
 ++    struct fuxi_bt_board *board = context;
 ++    const struct fuxi_bt_geni_fifo_io io = {
 ++        board, fuxi_bt_board_se_read, fuxi_bt_board_se_write, fuxi_bt_board_now
 ++    };
-++    const struct fuxi_bt_geni_fifo_config config = {1, true, board->qup_version, FUXI_BT_SE_HZ};
+++    const struct fuxi_bt_rate *rate = fuxi_bt_rate_find(baud);
+++    struct fuxi_bt_geni_fifo_config config;
 ++    enum fuxi_bt_status status;
-++    if (baud != FUXI_BT_BOOT_BAUD) {
+++    if (!rate) {
 ++        return FUXI_BT_ARGUMENT;
 ++    }
 ++    if (board->fifo_used) {
@@ -62808,6 +63862,15 @@ index 0000000..6bc2bb0
 ++    if (board->stage != FUXI_BT_STAGE_READY) {
 ++        return FUXI_BT_NO_UART;
 ++    }
+++    if (board->rcg_hz != rate->source_hz) {
+++        status = fuxi_bt_board_rcg_program(board, rate);
+++        if (status != FUXI_BT_OK) {
+++            return status;
+++        }
+++        board->rcg_switches++;
+++    }
+++    config = (struct fuxi_bt_geni_fifo_config){1, true, board->qup_version, rate->source_hz, rate->baud};
+++    board->baud = rate->baud;
 ++    board->fifo_used = true;
 ++    status = fuxi_bt_geni_fifo_open(&board->fifo, &io, &config);
 ++    for (unsigned poll = 0; status == FUXI_BT_AGAIN && poll < FUXI_BT_ACQUIRE_POLLS; poll++) {
@@ -62866,7 +63929,7 @@ index 0000000..6bc2bb0
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_setup.c
-+@@ -0,0 +1,758 @@
++@@ -0,0 +1,985 @@
 ++#include "fuxi_bt_setup.h"
 ++#include <string.h>
 ++
@@ -62877,8 +63940,12 @@ index 0000000..6bc2bb0
 ++ *  - WCN3991 以後回 Command Complete，回傳參數 [cresp][rtype][data…]，cresp=0 成功、rtype=子命令；
 ++ *  - rampatch/NVM 整個檔案依序切 243 位元組段送出；patch 標頭的 download_mode 非 0 時控制器只回最後一段；
 ++ *  - NVM tag 17（HCI）：data[0] bit 7＝軟體 IBS、data[1]＝baud（WCN3991 以後）；tag 27 bit 0＝deep sleep。
-++ *    Linux 會打開 IBS 並設成工作 baud；這裡關掉 IBS／deep sleep、baud 設 115200（列舉值 0），
-++ *    因為本驅動是輪詢式 UART、沒有 IBS 狀態機，也不切換 baud。
+++ *    Linux 會打開 IBS 並設成工作 baud；這裡關掉 IBS／deep sleep，baud 設成實際使用的速率
+++ *    （預設 115200，列舉值 0）。
+++ *  - 換速（qca_set_speed／qca_set_baudrate）：0xfc48 參數是 enum qca_baudrate，送出後不等回應，
+++ *    送完等 1–10 ms 再改 host 速率；這裡改 host 速率＝關 FIFO（RFR 先設未就緒）、改 RCG、以新速率重開。
+++ *    Linux 不另外確認，這裡以新速率重查版本，確認不到就退回 115200。
+++ *  - WCN7850 在 NVM 之後送 0xfc17 {0x14, 0x00} 關控制器日誌（qca_disable_soc_logging），選用。
 ++ */
 ++
 ++struct fuxi_bt_link {
@@ -62911,8 +63978,8 @@ index 0000000..6bc2bb0
 ++const char *fuxi_bt_setup_stage_name(enum fuxi_bt_setup_stage stage)
 ++{
 ++    static const char *const names[] = {
-++        "start", "version", "patch-load", "patch-parse", "patch-send", "board-id",
-++        "nvm-load", "nvm-parse", "nvm-send", "build-info", "reset", "local-version",
+++        "start", "version", "baud", "patch-load", "patch-parse", "patch-send", "board-id",
+++        "nvm-load", "nvm-parse", "nvm-send", "nolog", "build-info", "reset", "local-version",
 ++        "bdaddr", "done"
 ++    };
 ++    if ((unsigned)stage >= sizeof(names) / sizeof(names[0])) {
@@ -62993,6 +64060,15 @@ index 0000000..6bc2bb0
 ++    const unsigned count = size < 24u ? size : 24u;
 ++    memcpy(destination, event, count);
 ++    *destination_size = count;
+++}
+++
+++/* 換速後從頭分框：丟掉舊速率留下的半個封包。 */
+++static void fuxi_bt_link_reset(struct fuxi_bt_link *link)
+++{
+++    link->rx_offset = link->rx_size = 0;
+++    link->header_size = link->header_need = 0;
+++    link->body_size = link->body_need = 0;
+++    link->event_size = 0;
 ++}
 ++
 ++/* 開始前把 UART 裡的殘留位元組讀掉（不解析，避免從半個封包開始）。 */
@@ -63302,7 +64378,8 @@ index 0000000..6bc2bb0
 ++}
 ++
 ++/* NVM：[type=2|len<<8] 後接 tag（id u16、len u16、8 位元組保留、資料）。就地改 HCI 與 deep sleep tag。 */
-++static enum fuxi_bt_status fuxi_bt_tlv_nvm(struct fuxi_bt_blob *blob, struct fuxi_bt_tlv_info *info)
+++static enum fuxi_bt_status fuxi_bt_tlv_nvm(struct fuxi_bt_blob *blob, struct fuxi_bt_tlv_info *info,
+++    uint8_t baud)
 ++{
 ++    uint8_t *data = blob->data;
 ++    uint32_t type_len;
@@ -63331,7 +64408,7 @@ index 0000000..6bc2bb0
 ++            info->hci_tag = true;
 ++            memcpy(info->hci_before, value, 3);
 ++            value[0] &= 0x7f;
-++            value[1] = 0;
+++            value[1] = baud;
 ++            memcpy(info->hci_after, value, 3);
 ++        } else if (tag == 27 && tag_length >= 1 && !info->sleep_tag) {
 ++            info->sleep_tag = true;
@@ -63403,11 +64480,199 @@ index 0000000..6bc2bb0
 ++    return status == FUXI_BT_CONTROLLER || status == FUXI_BT_TIMEOUT || status == FUXI_BT_PROTOCOL;
 ++}
 ++
+++/* 版本查詢：回傳參數 [cresp][0x19][長度 12][product 4][patch 2][rom 2][soc 4] */
+++static enum fuxi_bt_status fuxi_bt_setup_version(struct fuxi_bt_link *link,
+++    struct fuxi_bt_version *version)
+++{
+++    static const uint8_t request[] = {0x19};
+++    const uint8_t *params = NULL;
+++    unsigned size = 0;
+++    enum fuxi_bt_status status = fuxi_bt_link_command(link, 0xfc00, request, 1, 0x19, &params, &size);
+++    if (status != FUXI_BT_OK) {
+++        return status;
+++    }
+++    if (size < 15) {
+++        return FUXI_BT_PROTOCOL;
+++    }
+++    version->product = fuxi_bt_setup_le32(params + 3);
+++    version->patch = fuxi_bt_setup_le16(params + 7);
+++    version->rom = fuxi_bt_setup_le16(params + 9);
+++    version->soc = fuxi_bt_setup_le32(params + 11);
+++    return FUXI_BT_OK;
+++}
+++
+++/* 換速前後以舊速率收到的原始位元組：不解析，只記數量與前 8 個（看控制器有沒有先回 Command Complete）。 */
+++static enum fuxi_bt_status fuxi_bt_link_collect(struct fuxi_bt_link *link)
+++{
+++    struct fuxi_bt_setup_result *result = link->result;
+++    uint8_t bytes[64];
+++    for (unsigned round = 0; round < 16; round++) {
+++        size_t count = 0;
+++        enum fuxi_bt_status status = link->ops->read(link->ops->context, bytes, sizeof(bytes), &count);
+++        if (count > sizeof(bytes) || (status != FUXI_BT_OK && count)) {
+++            return FUXI_BT_IO;
+++        }
+++        if (status == FUXI_BT_AGAIN || (status == FUXI_BT_OK && !count)) {
+++            return FUXI_BT_OK;
+++        }
+++        if (status != FUXI_BT_OK) {
+++            return status;
+++        }
+++        for (size_t index = 0; index < count; index++) {
+++            if (result->baud_early_size < sizeof(result->baud_early)) {
+++                result->baud_early[result->baud_early_size++] = bytes[index];
+++            }
+++        }
+++        result->baud_early_bytes += (unsigned)count;
+++        result->rx_bytes += (unsigned)count;
+++    }
+++    return FUXI_BT_OK;
+++}
+++
+++/* Linux qca_set_baudrate：01 48 fc 01 <enum>，不等回應；送完後等 BAUD_SETTLE_US 才換 host 速率。 */
+++static enum fuxi_bt_status fuxi_bt_setup_rate_command(struct fuxi_bt_link *link, uint8_t qca)
+++{
+++    const uint8_t packet[] = {1, 0x48, 0xfc, 1, qca};
+++    enum fuxi_bt_status status = fuxi_bt_link_write(link, packet, sizeof(packet));
+++    if (status != FUXI_BT_OK) {
+++        return status;
+++    }
+++    for (unsigned step = 0; step < FUXI_BT_BAUD_SETTLE_US / 1000u; step++) {
+++        link->ops->wait_us(link->ops->context, 1000);
+++        status = fuxi_bt_link_collect(link);
+++        if (status != FUXI_BT_OK) {
+++            return status;
+++        }
+++    }
+++    return FUXI_BT_OK;
+++}
+++
+++/* host 換速：歸還 UART（FIFO 關閉、暫存器還原）再以新速率取回。歸還失敗表示 FIFO 沒還原，不能繼續。 */
+++static enum fuxi_bt_status fuxi_bt_setup_reopen(struct fuxi_bt_link *link, uint32_t baud,
+++    bool *acquired)
+++{
+++    const struct fuxi_bt_uart_ops *ops = link->ops;
+++    enum fuxi_bt_status status;
+++    *acquired = false;
+++    status = ops->release(ops->context);
+++    if (status != FUXI_BT_OK) {
+++        link->result->cleanup = status == FUXI_BT_AGAIN ? FUXI_BT_TIMEOUT : status;
+++        return FUXI_BT_CLEANUP;
+++    }
+++    fuxi_bt_link_reset(link);
+++    status = ops->acquire(ops->context, baud);
+++    if (status != FUXI_BT_OK) {
+++        return status == FUXI_BT_AGAIN ? FUXI_BT_TIMEOUT : status;
+++    }
+++    *acquired = true;
+++    return FUXI_BT_OK;
+++}
+++
+++static bool fuxi_bt_setup_noise(enum fuxi_bt_status status)
+++{
+++    return fuxi_bt_soft_failure(status) || status == FUXI_BT_IBS || status == FUXI_BT_BUDGET ||
+++        status == FUXI_BT_VERSION;
+++}
+++
+++/* 以目前速率重查版本，必須和第一次相同；分框錯、IBS 位元組、超量與逾時都當成雜訊重試。 */
+++static enum fuxi_bt_status fuxi_bt_setup_verify(struct fuxi_bt_link *link,
+++    const struct fuxi_bt_version *expected)
+++{
+++    enum fuxi_bt_status status = FUXI_BT_TIMEOUT;
+++    for (unsigned attempt = 0; attempt < FUXI_BT_BAUD_VERIFY_ATTEMPTS; attempt++) {
+++        struct fuxi_bt_version version;
+++        link->result->baud_attempts++;
+++        if (attempt) {
+++            link->ops->wait_us(link->ops->context, FUXI_BT_BAUD_SETTLE_US);
+++        }
+++        fuxi_bt_link_reset(link);
+++        status = fuxi_bt_link_drain(link);
+++        if (status == FUXI_BT_OK) {
+++            memset(&version, 0, sizeof(version));
+++            status = fuxi_bt_setup_version(link, &version);
+++        }
+++        if (status == FUXI_BT_OK) {
+++            if (version.product == expected->product && version.soc == expected->soc &&
+++                version.rom == expected->rom && version.patch == expected->patch) {
+++                return FUXI_BT_OK;
+++            }
+++            status = FUXI_BT_VERSION;
+++        }
+++        if (!fuxi_bt_setup_noise(status) || fuxi_bt_link_time(link) != FUXI_BT_OK) {
+++            return status;
+++        }
+++    }
+++    return status;
+++}
+++
+++/*
+++ * 換到 rate；確認不到就（盡力）以新速率送 0xfc48 回 115200、host 也回 115200 再確認一次，
+++ * 成功就以 115200 繼續（baud_status 記失敗原因）。退回也確認不到才算 setup 失敗。
+++ */
+++static enum fuxi_bt_status fuxi_bt_setup_baud(struct fuxi_bt_link *link,
+++    const struct fuxi_bt_rate *rate, bool *acquired)
+++{
+++    struct fuxi_bt_setup_result *result = link->result;
+++    const struct fuxi_bt_version expected = result->version;
+++    const struct fuxi_bt_rate *boot = fuxi_bt_rate_find(FUXI_BT_BOOT_BAUD);
+++    enum fuxi_bt_status status, failure;
+++    if (!boot) {
+++        return FUXI_BT_ARGUMENT;
+++    }
+++    status = fuxi_bt_setup_rate_command(link, rate->qca);
+++    if (status != FUXI_BT_OK) {
+++        return status;
+++    }
+++    status = fuxi_bt_setup_reopen(link, rate->baud, acquired);
+++    if (status == FUXI_BT_CLEANUP) {
+++        return status;
+++    }
+++    if (status == FUXI_BT_OK) {
+++        status = fuxi_bt_setup_verify(link, &expected);
+++        if (status == FUXI_BT_OK) {
+++            result->baud_status = FUXI_BT_OK;
+++            result->baud_active = rate->baud;
+++            return FUXI_BT_OK;
+++        }
+++        if (!fuxi_bt_setup_noise(status)) {
+++            return status;
+++        }
+++    }
+++    failure = status;
+++    if (*acquired) {
+++        /* 只有我方收不到時有用；控制器根本沒換速時，這幾個位元組對它只是雜訊 */
+++        status = fuxi_bt_setup_rate_command(link, boot->qca);
+++        if (status != FUXI_BT_OK && !fuxi_bt_setup_noise(status)) {
+++            return status;
+++        }
+++    }
+++    status = fuxi_bt_setup_reopen(link, boot->baud, acquired);
+++    if (status == FUXI_BT_OK) {
+++        status = fuxi_bt_setup_verify(link, &expected);
+++    }
+++    result->baud_fallback = status;
+++    result->baud_status = failure;
+++    if (status != FUXI_BT_OK) {
+++        return status;
+++    }
+++    result->baud_active = boot->baud;
+++    return FUXI_BT_OK;
+++}
+++
 ++enum fuxi_bt_status fuxi_bt_setup_run(const struct fuxi_bt_uart_ops *ops,
 ++    const struct fuxi_bt_files *files, struct fuxi_bt_setup_result *result)
 ++{
+++    const struct fuxi_bt_setup_options options = {0, false};
+++    return fuxi_bt_setup_run_options(ops, files, &options, result);
+++}
+++
+++enum fuxi_bt_status fuxi_bt_setup_run_options(const struct fuxi_bt_uart_ops *ops,
+++    const struct fuxi_bt_files *files, const struct fuxi_bt_setup_options *options,
+++    struct fuxi_bt_setup_result *result)
+++{
 ++    struct fuxi_bt_link link;
 ++    struct fuxi_bt_blob patch = {NULL, 0}, nvm = {NULL, 0};
+++    const struct fuxi_bt_rate *rate, *active;
 ++    const uint8_t *params = NULL;
 ++    unsigned size = 0;
 ++    bool acquired = false;
@@ -63419,11 +64684,21 @@ index 0000000..6bc2bb0
 ++    memset(result, 0, sizeof(*result));
 ++    result->board_id_status = FUXI_BT_OFF;
 ++    result->build_info_status = FUXI_BT_OFF;
+++    result->baud_status = FUXI_BT_OFF;
+++    result->baud_fallback = FUXI_BT_OFF;
+++    result->nolog_status = FUXI_BT_OFF;
+++    result->baud_active = FUXI_BT_BOOT_BAUD;
 ++    if (!fuxi_bt_uart_ops_valid(ops)) {
 ++        result->status = FUXI_BT_NO_UART;
 ++        return result->status;
 ++    }
-++    if (!files || !files->load || !files->release) {
+++    if (!files || !files->load || !files->release || !options) {
+++        result->status = FUXI_BT_ARGUMENT;
+++        return result->status;
+++    }
+++    result->baud_requested = options->baud ? options->baud : FUXI_BT_BOOT_BAUD;
+++    rate = fuxi_bt_rate_find(result->baud_requested);
+++    if (!rate) {
 ++        result->status = FUXI_BT_ARGUMENT;
 ++        return result->status;
 ++    }
@@ -63442,27 +64717,31 @@ index 0000000..6bc2bb0
 ++    }
 ++
 ++    result->stage = FUXI_BT_SETUP_VERSION;
-++    {
-++        static const uint8_t request[] = {0x19};
-++        status = fuxi_bt_link_command(&link, 0xfc00, request, 1, 0x19, &params, &size);
-++    }
+++    status = fuxi_bt_setup_version(&link, &result->version);
 ++    if (status != FUXI_BT_OK) {
 ++        goto finish;
 ++    }
-++    /* [cresp][0x19][長度 12][product 4][patch 2][rom 2][soc 4] */
-++    if (size < 15) {
-++        status = FUXI_BT_PROTOCOL;
-++        goto finish;
-++    }
-++    result->version.product = fuxi_bt_setup_le32(params + 3);
-++    result->version.patch = fuxi_bt_setup_le16(params + 7);
-++    result->version.rom = fuxi_bt_setup_le16(params + 9);
-++    result->version.soc = fuxi_bt_setup_le32(params + 11);
 ++    if (!result->version.soc || !result->version.rom) {
 ++        status = FUXI_BT_VERSION;
 ++        goto finish;
 ++    }
 ++    result->rom_ver = (uint8_t)(((result->version.soc & 0xf00u) >> 4) | (result->version.soc & 0xfu));
+++
+++    if (rate->baud != FUXI_BT_BOOT_BAUD) {
+++        result->stage = FUXI_BT_SETUP_BAUD;
+++        mark = result->elapsed_us;
+++        status = fuxi_bt_setup_baud(&link, rate, &acquired);
+++        (void)fuxi_bt_link_time(&link);
+++        result->baud_us = result->elapsed_us - mark;
+++        if (status != FUXI_BT_OK) {
+++            goto finish;
+++        }
+++    }
+++    active = fuxi_bt_rate_find(result->baud_active);
+++    if (!active) {
+++        status = FUXI_BT_ARGUMENT;
+++        goto finish;
+++    }
 ++
 ++    result->stage = FUXI_BT_SETUP_PATCH_LOAD;
 ++    fuxi_bt_setup_name(result->patch_name, "hmtbtfw", result->rom_ver, NULL, 0, 0, ".tlv");
@@ -63535,7 +64814,7 @@ index 0000000..6bc2bb0
 ++        goto finish;
 ++    }
 ++    result->stage = FUXI_BT_SETUP_NVM_PARSE;
-++    status = fuxi_bt_tlv_nvm(&nvm, &result->nvm);
+++    status = fuxi_bt_tlv_nvm(&nvm, &result->nvm, active->qca);
 ++    if (status != FUXI_BT_OK) {
 ++        goto finish;
 ++    }
@@ -63545,6 +64824,17 @@ index 0000000..6bc2bb0
 ++    nvm.data = NULL;
 ++    if (status != FUXI_BT_OK) {
 ++        goto finish;
+++    }
+++
+++    if (options->disable_logging) {
+++        /* Linux qca_uart_setup：WCN7850 在 NVM 之後、HCI reset 之前關控制器日誌；失敗只記錄 */
+++        static const uint8_t request[] = {0x14, 0x00};
+++        result->stage = FUXI_BT_SETUP_NOLOG;
+++        status = fuxi_bt_link_command(&link, 0xfc17, request, sizeof(request), 0, &params, &size);
+++        result->nolog_status = status;
+++        if (status != FUXI_BT_OK && !fuxi_bt_soft_failure(status)) {
+++            goto finish;
+++        }
 ++    }
 ++
 ++    result->stage = FUXI_BT_SETUP_BUILD_INFO;
@@ -67722,7 +69012,7 @@ index 0000000..6bc2bb0
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt.h
-+@@ -0,0 +1,100 @@
++@@ -0,0 +1,114 @@
 ++#ifndef FUXI_BT_H
 ++#define FUXI_BT_H
 ++
@@ -67736,6 +69026,7 @@ index 0000000..6bc2bb0
 ++#define FUXI_BT_TLMM_BASE UINT64_C(0xf100000)
 ++#define FUXI_BT_UART_INTID 493u
 ++#define FUXI_BT_BOOT_BAUD 115200u
+++#define FUXI_BT_MAX_BAUD 3200000u /* Linux qca_set_baudrate 拒絕 3.2 Mbaud 以上 */
 ++#define FUXI_BT_TIMEOUT_US 2000000u
 ++#define FUXI_BT_MAX_POLLS 2000u
 ++#define FUXI_BT_MAX_RX 4096u
@@ -67811,10 +69102,23 @@ index 0000000..6bc2bb0
 ++    uint32_t secondary_irq;
 ++};
 ++
+++/*
+++ * UART 速率：SE6 RCG 來源（GPLL0_OUT_EVEN 300 MHz × m/n）、GENI 除頻後的 baud，
+++ * 以及 QCA 0xfc48 的速率列舉值（Linux btqca.h enum qca_baudrate）。
+++ */
+++struct fuxi_bt_rate {
+++    uint32_t baud;
+++    uint32_t source_hz;
+++    uint16_t m;
+++    uint16_t n;
+++    uint8_t qca;
+++};
+++
 ++typedef enum fuxi_bt_status (*fuxi_bt_read32_fn)(void *, uint64_t, uint32_t *);
 ++
 ++const char *fuxi_bt_status_name(enum fuxi_bt_status status);
 ++bool fuxi_bt_uart_ops_valid(const struct fuxi_bt_uart_ops *ops);
+++const struct fuxi_bt_rate *fuxi_bt_rate_find(uint32_t baud);
 ++enum fuxi_bt_status fuxi_bt_probe_run(unsigned opt_in,
 ++    const struct fuxi_bt_uart_ops *ops, struct fuxi_bt_result *result);
 ++enum fuxi_bt_status fuxi_bt_snapshot_read(fuxi_bt_read32_fn read32,
@@ -67825,7 +69129,7 @@ index 0000000..6bc2bb0
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_geni_fifo.h
-+@@ -0,0 +1,146 @@
++@@ -0,0 +1,149 @@
 ++#ifndef FUXI_BT_GENI_FIFO_H
 ++#define FUXI_BT_GENI_FIFO_H
 ++
@@ -67911,6 +69215,7 @@ index 0000000..6bc2bb0
 ++    bool resources_owned;
 ++    uint32_t qup_version;
 ++    uint32_t source_hz;
+++    uint32_t baud; /* 0＝FUXI_BT_BOOT_BAUD */
 ++};
 ++
 ++struct fuxi_bt_geni_fifo {
@@ -67935,6 +69240,8 @@ index 0000000..6bc2bb0
 ++    uint32_t startup_secondary_irq;
 ++    unsigned tx_depth;
 ++    unsigned rx_depth;
+++    uint32_t baud;
+++    uint32_t divider;
 ++    uint32_t saved[FUXI_BT_FIFO_SAVED_REGISTERS];
 ++    uint64_t start_us;
 ++    unsigned start_polls;
@@ -67974,13 +69281,14 @@ index 0000000..6bc2bb0
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_board.h
-+@@ -0,0 +1,95 @@
++@@ -0,0 +1,99 @@
 ++#ifndef FUXI_BT_BOARD_H
 ++#define FUXI_BT_BOARD_H
 ++
 ++/*
 ++ * WCN7850 藍牙 UART 的板級準備（fuxi,bt=3）：
 ++ * QUP2 SE6 時脈投票、SE6 RCG 設成 7.3728 MHz（GPLL0_OUT_EVEN 300 MHz × 384/15625，與 Linux gcc-sm8550 相同）、
+++ * 之後 acquire 要求其他 baud 時，在 FIFO 關閉期間把 RCG 改成速率表的來源頻率（power_off 還原 XBL 的值）、
 ++ * gpio76–79 切成 qup2_se6、BT_EN（gpio81）拉高。前提是 WLAN 已把 WCN 的電源軌和 WLAN_EN（gpio80）打開。
 ++ * 純 C；MMIO 經由呼叫端提供的 read/write（XNU 走 fault-safe 存取，主機測試走模擬模型）。
 ++ * power_off 依旗標逆序還原 power_on 改過的東西，不論 power_on 成功或失敗都要呼叫。
@@ -68039,6 +69347,9 @@ index 0000000..6bc2bb0
 ++    uint32_t added_votes;
 ++    uint32_t rcg_saved[4]; /* cfg、m、n、d */
 ++    uint32_t rcg_cfg;
+++    uint32_t rcg_hz; /* 目前 RCG 設定的來源頻率；0＝未設或設定中途失敗 */
+++    uint32_t baud; /* 最近一次 acquire 的 baud */
+++    unsigned rcg_switches;
 ++    uint32_t qup_version;
 ++    uint32_t firmware;
 ++    uint32_t pin_ctl[4];
@@ -68072,15 +69383,17 @@ index 0000000..6bc2bb0
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_setup.h
-+@@ -0,0 +1,115 @@
++@@ -0,0 +1,140 @@
 ++#ifndef FUXI_BT_SETUP_H
 ++#define FUXI_BT_SETUP_H
 ++
 ++/*
 ++ * WCN7850 藍牙控制器初始化（fuxi,bt=4）：版本查詢 → rampatch → board ID → NVM → build info → HCI reset
 ++ * → 讀本機版本與 BD 位址。流程對照 Linux drivers/bluetooth/btqca.c qca_uart_setup（只作流程參考，
-++ * 程式自寫）。全程 115200 baud，不切 3.2 Mbaud；NVM 的 HCI tag 把 IBS 位元清掉、baud 欄位設 115200，
-++ * deep sleep 位元清掉，讓輪詢式 UART 不必處理 0xfc/0xfd/0xfe。可攜程式，主機測試用假 UART 與假檔案。
+++ * 程式自寫）。預設全程 115200 baud；options.baud（fuxi,bt-baud）要求其他速率時，照 Linux qca_setup：
+++ * 以 115200 查版本後送 0xfc48、host 換速、再查一次版本確認，確認不到就退回 115200 繼續。
+++ * NVM 的 HCI tag 把 IBS 位元清掉、baud 欄位設成實際速率，deep sleep 位元清掉。
+++ * 可攜程式，主機測試用假 UART 與假檔案。
 ++ */
 ++
 ++#include "fuxi_bt.h"
@@ -68093,10 +69406,13 @@ index 0000000..6bc2bb0
 ++#define FUXI_BT_NVM_MAX 65536u
 ++#define FUXI_BT_SETUP_MAX_FRAMES 16384u
 ++#define FUXI_BT_SETUP_NAME 24u
+++#define FUXI_BT_BAUD_VERIFY_ATTEMPTS 3u
+++#define FUXI_BT_BAUD_SETTLE_US 10000u /* Linux WCN7850：送完 0xfc48 後 usleep_range(1000, 10000) */
 ++
 ++enum fuxi_bt_setup_stage {
 ++    FUXI_BT_SETUP_START = 0,
 ++    FUXI_BT_SETUP_VERSION,
+++    FUXI_BT_SETUP_BAUD,
 ++    FUXI_BT_SETUP_PATCH_LOAD,
 ++    FUXI_BT_SETUP_PATCH_PARSE,
 ++    FUXI_BT_SETUP_PATCH_SEND,
@@ -68104,6 +69420,7 @@ index 0000000..6bc2bb0
 ++    FUXI_BT_SETUP_NVM_LOAD,
 ++    FUXI_BT_SETUP_NVM_PARSE,
 ++    FUXI_BT_SETUP_NVM_SEND,
+++    FUXI_BT_SETUP_NOLOG,
 ++    FUXI_BT_SETUP_BUILD_INFO,
 ++    FUXI_BT_SETUP_RESET,
 ++    FUXI_BT_SETUP_LOCAL_VERSION,
@@ -68121,6 +69438,12 @@ index 0000000..6bc2bb0
 ++    void *context;
 ++    enum fuxi_bt_status (*load)(void *, const char *, size_t, struct fuxi_bt_blob *);
 ++    void (*release)(void *, struct fuxi_bt_blob *);
+++};
+++
+++/* 預設全關（fuxi_bt_setup_run 用的就是全 0）。 */
+++struct fuxi_bt_setup_options {
+++    uint32_t baud; /* 0 或 115200＝不換速；其他值須在速率表內（fuxi,bt-baud） */
+++    bool disable_logging; /* Linux qca_disable_soc_logging：0xfc17 {0x14, 0x00}（fuxi,bt-nolog） */
 ++};
 ++
 ++struct fuxi_bt_tlv_info {
@@ -68180,12 +69503,25 @@ index 0000000..6bc2bb0
 ++    unsigned stale_acks;
 ++    uint64_t elapsed_us;
 ++    uint64_t patch_us;
+++    uint32_t baud_requested;
+++    uint32_t baud_active;
+++    enum fuxi_bt_status baud_status; /* off＝沒換速；ok＝已換；其他＝新速率確認失敗的原因 */
+++    enum fuxi_bt_status baud_fallback; /* off＝沒退回；ok＝已退回 115200 並確認 */
+++    unsigned baud_attempts;
+++    unsigned baud_early_bytes; /* 送 0xfc48 後、host 換速前以舊速率收到的位元組數 */
+++    uint8_t baud_early[8];
+++    unsigned baud_early_size;
+++    uint64_t baud_us;
+++    enum fuxi_bt_status nolog_status; /* off＝沒要求 */
 ++};
 ++
 ++const char *fuxi_bt_setup_stage_name(enum fuxi_bt_setup_stage stage);
 ++bool fuxi_bt_setup_name_valid(const char *name);
 ++enum fuxi_bt_status fuxi_bt_setup_run(const struct fuxi_bt_uart_ops *ops,
 ++    const struct fuxi_bt_files *files, struct fuxi_bt_setup_result *result);
+++enum fuxi_bt_status fuxi_bt_setup_run_options(const struct fuxi_bt_uart_ops *ops,
+++    const struct fuxi_bt_files *files, const struct fuxi_bt_setup_options *options,
+++    struct fuxi_bt_setup_result *result);
 ++
 ++#endif
 +--- /dev/null
