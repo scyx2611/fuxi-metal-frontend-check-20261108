@@ -11502,10 +11502,10 @@ index 0000000..922f6a1
 +    main()
 diff --git a/tools/test-fuxi-bluetooth-pump.py b/tools/test-fuxi-bluetooth-pump.py
 new file mode 100644
-index 0000000..d1cfaf8
+index 0000000..b69449f
 --- /dev/null
 +++ b/tools/test-fuxi-bluetooth-pump.py
-@@ -0,0 +1,1310 @@
+@@ -0,0 +1,1344 @@
 +#!/usr/bin/env python3
 +"""Compile and run the WCN7850 resident UART pump and H4 tracer (fuxi,bt=5) against a simulated GENI FIFO."""
 +
@@ -12745,8 +12745,42 @@ index 0000000..d1cfaf8
 +    free(split);
 +}
 +
++static void test_link_detail(void)
++{
++    struct fuxi_bt_h4_record r = { .direction = FUXI_BT_H4_TO_HOST, .type = FUXI_BT_H4_EVENT,
++                                  .keep_size = 1, .length = 1 };
++    int value = 0;
++    memset(r.keep, 0xa5, sizeof(r.keep));
++    const uint8_t opaque[] = {2, 4, 0x16, 0x17, 0x18, 0x22, 0x2f, 0x31, 0x32, 0x33, 0x34, 0x35};
++    for (unsigned i = 0; i < sizeof(opaque); ++i) {
++        r.event = opaque[i];
++        assert(fuxi_bt_link_detail(&r, &value) && value == -1);
++    }
++    r.event = 0x36;
++    assert(fuxi_bt_link_detail(&r, &value) && value == 0xa5);
++    r.keep_size = 0;
++    assert(fuxi_bt_link_detail(&r, &value) && value == -1);
++    r.event = 0x3e;
++    assert(!fuxi_bt_link_detail(&r, &value));
++    r.has_opcode = true;
++    r.opcode = 0x405;
++    r.has_status = true;
++    r.status = 0x0c;
++    assert(fuxi_bt_link_detail(&r, &value) && value == 0x0c);
++    r.direction = FUXI_BT_H4_TO_CONTROLLER;
++    assert(fuxi_bt_link_detail(&r, &value) && value == -1);
++    r.opcode = 0x0c1a;
++    r.keep_size = 1;
++    assert(fuxi_bt_link_detail(&r, &value) && value == -1);
++    r.keep[0] = 3;
++    assert(fuxi_bt_link_detail(&r, &value) && value == 3);
++    r.opcode = 0xfce9;
++    assert(!fuxi_bt_link_detail(&r, &value));
++}
++
 +int main(void)
 +{
++    test_link_detail();
 +    test_reset_roundtrip();
 +    test_bulk_ordering(0, 0, 64, 3);
 +    test_bulk_ordering(1, 0, 4, 0);
@@ -38395,10 +38429,10 @@ index 0000000..78f02f7
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_pump.c b/xnu/fuxi-bluetooth/fuxi_bt_pump.c
 new file mode 100644
-index 0000000..1f4d222
+index 0000000..7e8ec34
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_pump.c
-@@ -0,0 +1,814 @@
+@@ -0,0 +1,849 @@
 +#include "fuxi_bt_pump.h"
 +#include <string.h>
 +
@@ -38480,6 +38514,41 @@ index 0000000..1f4d222
 +        break;
 +    }
 +    parser->remaining = record->length;
++}
++
++bool fuxi_bt_link_detail(const struct fuxi_bt_h4_record *record, int *value)
++{
++    *value = -1;
++    if (record->has_opcode) {
++        switch (record->opcode) {
++        case 0x0401: case 0x0402: /* inquiry / cancel */
++        case 0x0405: case 0x0406: case 0x0408: /* create / disconnect / cancel */
++        case 0x0409: case 0x040a: /* accept / reject incoming connection */
++        case 0x0411: case 0x0419: /* authenticate / request remote name */
++        case 0x042b: case 0x042c: case 0x042d: /* capability / confirmation replies */
++        case 0x0c1a: /* Write Scan Enable */
++            if (record->direction == FUXI_BT_H4_TO_HOST && record->has_status)
++                *value = record->status;
++            else if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->opcode == 0x0c1a &&
++                     record->length == 1 && record->keep_size == 1 && record->keep[0] <= 3)
++                *value = record->keep[0];
++            return true;
++        default:
++            return false;
++        }
++    }
++    if (record->direction != FUXI_BT_H4_TO_HOST || record->type != FUXI_BT_H4_EVENT) return false;
++    switch (record->event) {
++    case 0x01: case 0x03: case 0x05: case 0x06: case 0x07: case 0x36:
++        if (record->keep_size) *value = record->keep[0]; /* HCI status at byte 0 */
++        return true;
++    case 0x02: case 0x22: case 0x2f: /* inquiry results */
++    case 0x04: case 0x16: case 0x17: case 0x18: /* incoming link, PIN or link key */
++    case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: /* pairing stages */
++        return true; /* never expose a remote address, key or displayed code */
++    default:
++        return false;
++    }
 +}
 +
 +static void fuxi_bt_h4_finish(struct fuxi_bt_h4_parser *parser,
@@ -39215,10 +39284,10 @@ index 0000000..1f4d222
 +}
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_pump.h b/xnu/fuxi-bluetooth/fuxi_bt_pump.h
 new file mode 100644
-index 0000000..50e6fc2
+index 0000000..4415742
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_pump.h
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,265 @@
 +#ifndef FUXI_BT_PUMP_H
 +#define FUXI_BT_PUMP_H
 +
@@ -39309,6 +39378,8 @@ index 0000000..50e6fc2
 +};
 +
 +typedef void (*fuxi_bt_h4_trace_fn)(void *, const struct fuxi_bt_h4_record *);
++/* Classic link milestones. The sole payload value returned is a status or scan mode. */
++bool fuxi_bt_link_detail(const struct fuxi_bt_h4_record *record, int *value);
 +
 +struct fuxi_bt_h4_parser {
 +    uint8_t direction;
@@ -41396,10 +41467,10 @@ index 0000000..0c74011
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_xnu.c b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
 new file mode 100644
-index 0000000..f94afd2
+index 0000000..4e47aca
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
-@@ -0,0 +1,890 @@
+@@ -0,0 +1,903 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
@@ -41776,6 +41847,8 @@ index 0000000..f94afd2
 +#define FUXI_BT_TRACE_RECENT 8u
 +struct fuxi_bt_trace_state {
 +    unsigned count;
++    unsigned link_detail_count;
++    bool link_detail_enabled;
 +    bool pending;
 +    bool pending_reported;
 +    uint16_t pending_opcode;
@@ -41790,6 +41863,15 @@ index 0000000..f94afd2
 +{
 +    struct fuxi_bt_trace_state *state = context;
 +    const uint64_t now = fuxi_bt_now_us(NULL);
++    if (state->link_detail_enabled && state->link_detail_count < 128) {
++        int value;
++        if (fuxi_bt_link_detail(record, &value)) {
++            printf("FUXI BT LINK: ms=%llu dir=%s op=%#x evt=%#x value=%d seq=%u\n",
++                now / 1000, record->direction == FUXI_BT_H4_TO_CONTROLLER ? "tx" : "rx",
++                record->has_opcode ? record->opcode : 0, record->event, value, ++state->link_detail_count);
++            if (state->link_detail_count == 128) printf("FUXI BT LINK: limit reached\n");
++        }
++    }
 +    if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->type == FUXI_BT_H4_COMMAND &&
 +        record->has_opcode) {
 +        state->recent[state->recent_pos++ % FUXI_BT_TRACE_RECENT] = record->opcode;
@@ -41889,6 +41971,7 @@ index 0000000..f94afd2
 +    enum fuxi_bt_status status = ops->acquire(ops->context, setup->baud_active);
 +    if (status == FUXI_BT_OK) {
 +        memset(&traces, 0, sizeof(traces));
++        traces.link_detail_enabled = fuxi_bt_adt_u32("fuxi,bt-link-log") == 1;
 +        status = fuxi_bt_pump_init(&pump, ops, &sink, fuxi_bt_trace, &traces);
 +        /* fuxi,bt-ibs=1：回應 QCA IBS（預設關，NVM 已關 IBS；只在診斷看到 0xfd 時打開） */
 +        pump.ibs = fuxi_bt_adt_u32("fuxi,bt-ibs") == 1;
@@ -41972,6 +42055,7 @@ index 0000000..f94afd2
 +            if (link.connects != link_connects) {
 +                link_connects = link.connects;
 +                traces.count = 0;
++                traces.link_detail_count = 0;
 +                tx_dumps = rx_dumps = 0;
 +                rx_armed = 8;
 +                printf("FUXI BT: link %u trace reset\n", link.connects);
@@ -55328,10 +55412,10 @@ index 41dbb65..b082005 100644
  +    W w;
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..7046262
+index 0000000..5934a0e
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,16071 @@
+@@ -0,0 +1,16121 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,36 @@
@@ -61870,7 +61954,7 @@ index 0000000..7046262
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_xnu.c
-+@@ -0,0 +1,890 @@
++@@ -0,0 +1,903 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
@@ -62247,6 +62331,8 @@ index 0000000..7046262
 ++#define FUXI_BT_TRACE_RECENT 8u
 ++struct fuxi_bt_trace_state {
 ++    unsigned count;
+++    unsigned link_detail_count;
+++    bool link_detail_enabled;
 ++    bool pending;
 ++    bool pending_reported;
 ++    uint16_t pending_opcode;
@@ -62261,6 +62347,15 @@ index 0000000..7046262
 ++{
 ++    struct fuxi_bt_trace_state *state = context;
 ++    const uint64_t now = fuxi_bt_now_us(NULL);
+++    if (state->link_detail_enabled && state->link_detail_count < 128) {
+++        int value;
+++        if (fuxi_bt_link_detail(record, &value)) {
+++            printf("FUXI BT LINK: ms=%llu dir=%s op=%#x evt=%#x value=%d seq=%u\n",
+++                now / 1000, record->direction == FUXI_BT_H4_TO_CONTROLLER ? "tx" : "rx",
+++                record->has_opcode ? record->opcode : 0, record->event, value, ++state->link_detail_count);
+++            if (state->link_detail_count == 128) printf("FUXI BT LINK: limit reached\n");
+++        }
+++    }
 ++    if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->type == FUXI_BT_H4_COMMAND &&
 ++        record->has_opcode) {
 ++        state->recent[state->recent_pos++ % FUXI_BT_TRACE_RECENT] = record->opcode;
@@ -62360,6 +62455,7 @@ index 0000000..7046262
 ++    enum fuxi_bt_status status = ops->acquire(ops->context, setup->baud_active);
 ++    if (status == FUXI_BT_OK) {
 ++        memset(&traces, 0, sizeof(traces));
+++        traces.link_detail_enabled = fuxi_bt_adt_u32("fuxi,bt-link-log") == 1;
 ++        status = fuxi_bt_pump_init(&pump, ops, &sink, fuxi_bt_trace, &traces);
 ++        /* fuxi,bt-ibs=1：回應 QCA IBS（預設關，NVM 已關 IBS；只在診斷看到 0xfd 時打開） */
 ++        pump.ibs = fuxi_bt_adt_u32("fuxi,bt-ibs") == 1;
@@ -62443,6 +62539,7 @@ index 0000000..7046262
 ++            if (link.connects != link_connects) {
 ++                link_connects = link.connects;
 ++                traces.count = 0;
+++                traces.link_detail_count = 0;
 ++                tx_dumps = rx_dumps = 0;
 ++                rx_armed = 8;
 ++                printf("FUXI BT: link %u trace reset\n", link.connects);
@@ -64917,7 +65014,7 @@ index 0000000..7046262
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_pump.c
-+@@ -0,0 +1,814 @@
++@@ -0,0 +1,849 @@
 ++#include "fuxi_bt_pump.h"
 ++#include <string.h>
 ++
@@ -64999,6 +65096,41 @@ index 0000000..7046262
 ++        break;
 ++    }
 ++    parser->remaining = record->length;
+++}
+++
+++bool fuxi_bt_link_detail(const struct fuxi_bt_h4_record *record, int *value)
+++{
+++    *value = -1;
+++    if (record->has_opcode) {
+++        switch (record->opcode) {
+++        case 0x0401: case 0x0402: /* inquiry / cancel */
+++        case 0x0405: case 0x0406: case 0x0408: /* create / disconnect / cancel */
+++        case 0x0409: case 0x040a: /* accept / reject incoming connection */
+++        case 0x0411: case 0x0419: /* authenticate / request remote name */
+++        case 0x042b: case 0x042c: case 0x042d: /* capability / confirmation replies */
+++        case 0x0c1a: /* Write Scan Enable */
+++            if (record->direction == FUXI_BT_H4_TO_HOST && record->has_status)
+++                *value = record->status;
+++            else if (record->direction == FUXI_BT_H4_TO_CONTROLLER && record->opcode == 0x0c1a &&
+++                     record->length == 1 && record->keep_size == 1 && record->keep[0] <= 3)
+++                *value = record->keep[0];
+++            return true;
+++        default:
+++            return false;
+++        }
+++    }
+++    if (record->direction != FUXI_BT_H4_TO_HOST || record->type != FUXI_BT_H4_EVENT) return false;
+++    switch (record->event) {
+++    case 0x01: case 0x03: case 0x05: case 0x06: case 0x07: case 0x36:
+++        if (record->keep_size) *value = record->keep[0]; /* HCI status at byte 0 */
+++        return true;
+++    case 0x02: case 0x22: case 0x2f: /* inquiry results */
+++    case 0x04: case 0x16: case 0x17: case 0x18: /* incoming link, PIN or link key */
+++    case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: /* pairing stages */
+++        return true; /* never expose a remote address, key or displayed code */
+++    default:
+++        return false;
+++    }
 ++}
 ++
 ++static void fuxi_bt_h4_finish(struct fuxi_bt_h4_parser *parser,
@@ -69526,7 +69658,7 @@ index 0000000..7046262
 ++#endif
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_pump.h
-+@@ -0,0 +1,263 @@
++@@ -0,0 +1,265 @@
 ++#ifndef FUXI_BT_PUMP_H
 ++#define FUXI_BT_PUMP_H
 ++
@@ -69617,6 +69749,8 @@ index 0000000..7046262
 ++};
 ++
 ++typedef void (*fuxi_bt_h4_trace_fn)(void *, const struct fuxi_bt_h4_record *);
+++/* Classic link milestones. The sole payload value returned is a status or scan mode. */
+++bool fuxi_bt_link_detail(const struct fuxi_bt_h4_record *record, int *value);
 ++
 ++struct fuxi_bt_h4_parser {
 ++    uint8_t direction;
