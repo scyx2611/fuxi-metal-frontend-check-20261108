@@ -1111,9 +1111,10 @@ __attribute__((noinline)) static void vb_throw_log(void *thrown, void *type, uin
         offset = from - (uintptr_t)info.dli_fbase;
     }
     char detail[220] = "";
-    if (strstr(name, "CAXException") && thrown) {
-        struct { char operation[256]; int32_t status; } copy; /* PublicUtility CAXException：無 vtable */
-        if (vb_copy(thrown, &copy, sizeof(copy))) {
+    if (strcmp(name, "12CAXException") == 0 && thrown) {
+        /* 20H392 AudioToolbox 的建構子先寫 vptr，文字位於 +0x08、OSStatus 位於 +0x108。 */
+        struct { char operation[256]; int32_t status; } copy;
+        if (vb_copy((const char *)thrown + 8, &copy, sizeof(copy))) {
             uint32_t code = (uint32_t)copy.status;
             char fourcc[5] = {(char)(code >> 24), (char)(code >> 16), (char)(code >> 8), (char)code, 0};
             for (unsigned k = 0; k < 4; k++) if (fourcc[k] < 32 || fourcc[k] > 126) fourcc[k] = '.';
@@ -1639,9 +1640,14 @@ __attribute__((constructor)) static void fuxi_vibrate_init(void)
     const char *path = _dyld_get_image_name(0);
     if (strcmp(name, "mediaserverd") == 0) vb_role = VB_MEDIA;
     else if (strcmp(name, "SpringBoard") == 0) vb_role = VB_SPRINGBOARD;
-    else if (path && strstr(path, ".app/")) vb_role = VB_APP;
+    /* 設定的執行檔可能從 Cryptex 載入，constructor 裡的 image[0] 路徑不一定能辨認它。 */
+    else if (strcmp(name, "Preferences") == 0 || (path && strstr(path, ".app/"))) vb_role = VB_APP;
     else return;
     vb_name = name;
+    if (vb_role == VB_SPRINGBOARD && vb_adt_u32(CFSTR("fuxi,bt-probe")) == 1) {
+        extern void *fuxi_bluetooth_probe(void *);
+        vb_spawn(fuxi_bluetooth_probe, "Bluetooth HCI self-test scheduled");
+    }
     if (vb_role == VB_APP) {
         /* 沙盒可能擋 IORegistry：讀得到 fuxi,inject（注入我們的就是它）才算 ADT 可讀，讀不到就照預設開 */
         bool readable = vb_adt_u32(CFSTR("fuxi,inject")) != 0;

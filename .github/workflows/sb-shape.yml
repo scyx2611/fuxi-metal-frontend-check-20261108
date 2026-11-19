@@ -10,6 +10,7 @@ on:
       - tools/test-flashlight-levels.c
       - tools/test-vibe-pattern.c
       - tools/test-vibe-worker.py
+      - tools/test-oslog-format.c
       - .github/workflows/sb-shape.yml
 permissions:
   contents: read
@@ -34,6 +35,9 @@ jobs:
               -Iuserland/fuxi-shape tools/test-vibe-pattern.c -o /tmp/fuxi-vibe-pattern
           /tmp/fuxi-vibe-pattern
           python3 tools/test-vibe-worker.py
+          clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+              -Iuserland/fuxi-shape tools/test-oslog-format.c -o /tmp/fuxi-oslog-format
+          /tmp/fuxi-oslog-format
       - name: Build, sign ad hoc, check
         shell: bash
         run: |
@@ -45,7 +49,8 @@ jobs:
           "$cc" -target arm64-apple-ios16.0 -isysroot "$sdk" -O2 -Wall -Wextra -Werror -fstack-protector-strong \
               -dynamiclib userland/fuxi-shape/FuxiShape.c userland/fuxi-shape/FuxiFlashlight.c \
               userland/fuxi-shape/FuxiBatteryAudit.c userland/fuxi-shape/FuxiVibrate.c \
-              userland/fuxi-shape/FuxiWifiAudit.c \
+              userland/fuxi-shape/FuxiWifiAudit.c userland/fuxi-shape/FuxiBluetoothProbe.c userland/fuxi-shape/FuxiBlueTool.c \
+              userland/fuxi-shape/FuxiBluetoothLog.c \
               -lobjc -framework CoreFoundation -framework IOKit \
               -install_name /usr/local/lib/fuxi/libfuxi-sb.dylib -o out/libfuxi-sb.dylib
           codesign -f -s - out/libfuxi-sb.dylib
