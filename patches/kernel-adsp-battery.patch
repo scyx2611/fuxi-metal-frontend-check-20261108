@@ -5643,287 +5643,6 @@ index 069fc18..545d250 100755
  p = builder / "build.sh"
  text = p.read_text()
  
-diff --git a/tools/fuxi-audio/FuxiAudio.c b/tools/fuxi-audio/FuxiAudio.c
-index 1a04356..00cbee6 100644
---- a/tools/fuxi-audio/FuxiAudio.c
-+++ b/tools/fuxi-audio/FuxiAudio.c
-@@ -45,10 +45,9 @@
-  *               waveforms (only with /product/haptics closed-loop)
-  *   "Codec"     one input of one channel with the data source 'imic': the built-in microphone
-  *
-- * Fuxi has no audio output path yet (docs-lanes/audio.md): what is mixed for an output is counted
-- * and dropped, inputs are silence. The point is a routing graph that settles, so that
-- * mediaserverd/audiomxd stop retrying, not sound. HackiOS's kernel sinks (/dev/redwood-audio,
-- * -mic, -haptic) and the volume ioctl are left out. The device's clock is the system's: it claims
-+ * The Actuator can drive HAP525 with fuxihalhaptic=1 and the existing fuxi,haptic runtime.
-+ * Speaker output is counted and inputs supply silence while the AudioReach path is being built
-+ * (docs-lanes/audio.md). The device's clock is the system's: it claims
-  * to play exactly FUXI_AUDIO_RATE frames a second of mach_absolute_time(), and the HAL's I/O thread
-  * paces itself by that. Installed only by tools/fuxi-sys-root.py --audio-plugin (off by default).
-  */
-@@ -58,8 +57,11 @@
- #include <mach/mach_time.h>
- #include <pthread.h>
- #include <stdarg.h>
-+#include <stdbool.h>
- #include <stdio.h>
- #include <string.h>
-+#include <sys/sysctl.h>
-+#include <time.h>
- #include <unistd.h>
- 
- /* The one format: 16-bit signed samples at 48 kHz; the speaker is stereo. */
-@@ -241,6 +243,111 @@ static UInt64 written;                  /* frames since the speaker's I/O starte
- static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
- static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
- 
-+static void say(const char *format, ...);
-+
-+/* HAP525 的 DIRECT_PLAY 以晶片共振頻率工作，依 10 ms PCM 視窗的振幅調整馬達輸出。 */
-+enum {
-+	ACTUATOR_WINDOW = FUXI_AUDIO_RATE / 100,
-+	ACTUATOR_QUEUE_SIZE = 64,
-+	ACTUATOR_MAX_LEVEL = 128,
-+	ACTUATOR_SLACK_MS = 5,
-+};
-+
-+struct actuator_pulse {
-+	UInt64 start, end;
-+	unsigned level;
-+};
-+
-+static struct {
-+	pthread_mutex_t lock;
-+	pthread_cond_t ready;
-+	struct actuator_pulse queue[ACTUATOR_QUEUE_SIZE];
-+	UInt64 accepted_until, playing_until;
-+	unsigned head, count, submitted, errors;
-+	bool enabled, active;
-+} actuator = {.lock = PTHREAD_MUTEX_INITIALIZER, .ready = PTHREAD_COND_INITIALIZER};
-+
-+static UInt64
-+actuator_ticks_ms(void)
-+{
-+	return (UInt64)(ticks_per_frame * (FUXI_AUDIO_RATE / 1000));
-+}
-+
-+static void
-+actuator_wait(UInt64 ticks)
-+{
-+	UInt64 ns = (UInt64)((Float64)ticks / ticks_per_frame * (1e9 / FUXI_AUDIO_RATE));
-+	const struct timespec delay = {(time_t)(ns / 1000000000u), (long)(ns % 1000000000u)};
-+	(void)pthread_cond_timedwait_relative_np(&actuator.ready, &actuator.lock, &delay);
-+}
-+
-+/* actuator.lock 已持有，且目前視窗已到播放時間。 */
-+static void
-+actuator_submit(UInt64 now, UInt64 ticks_ms)
-+{
-+	const struct actuator_pulse pulse = actuator.queue[actuator.head];
-+	actuator.head = (actuator.head + 1) % ACTUATOR_QUEUE_SIZE;
-+	actuator.count--;
-+	if (now >= pulse.end) {
-+		return;
-+	}
-+	unsigned ms = (unsigned)((pulse.end - now + ticks_ms - 1) / ticks_ms);
-+	if (actuator.count && actuator.queue[actuator.head].start == pulse.end) {
-+		ms += ACTUATOR_SLACK_MS;
-+	}
-+	int request = (int)((pulse.level << 16) | ms);
-+	if (sysctlbyname("kern.fuxivibrate", NULL, NULL, &request, sizeof(request)) == 0) {
-+		actuator.playing_until = now + ms * ticks_ms;
-+		if (actuator.submitted++ == 0) {
-+			say("fuxi: audio: Actuator HAP525 first pulse ms=%u level=%u\n", ms, pulse.level);
-+		}
-+	} else {
-+		actuator.errors++;
-+	}
-+}
-+
-+/* 以核心既有的有限播放要求傳輸。HAL 的 I/O callback 只填排程。 */
-+static void *
-+actuator_worker(__unused void *context)
-+{
-+	const UInt64 ticks_ms = actuator_ticks_ms();
-+	pthread_mutex_lock(&actuator.lock);
-+	for (;;) {
-+		if (!actuator.active || !actuator.count) {
-+			pthread_cond_wait(&actuator.ready, &actuator.lock);
-+			continue;
-+		}
-+		UInt64 start = actuator.queue[actuator.head].start;
-+		UInt64 now = mach_absolute_time();
-+		if (now < start) {
-+			actuator_wait(start - now);
-+			continue;
-+		}
-+		actuator_submit(now, ticks_ms);
-+	}
-+}
-+
-+static void
-+actuator_initialize(void)
-+{
-+	char args[1024] = {0};
-+	size_t size = sizeof(args) - 1;
-+	if (actuator.enabled || !actuator_ticks_ms() || sysctlbyname("kern.bootargs", args, &size, NULL, 0)) {
-+		return;
-+	}
-+	char *save;
-+	for (char *arg = strtok_r(args, " ", &save); arg; arg = strtok_r(NULL, " ", &save)) {
-+		if (strcmp(arg, "fuxihalhaptic=1") == 0) {
-+			pthread_t worker;
-+			actuator.enabled = pthread_create(&worker, NULL, actuator_worker, NULL) == 0;
-+			if (actuator.enabled) {
-+				(void)pthread_detach(worker);
-+			}
-+			return;
-+		}
-+	}
-+}
-+
- static void
- say(const char *format, ...)
- {
-@@ -343,7 +450,9 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef
- 	host = the_host;
- 	mach_timebase_info(&timebase);
- 	ticks_per_frame = 1e9 * timebase.denom / timebase.numer / FUXI_AUDIO_RATE;
--	say("fuxi: audio: Speaker, Hawking, Actuator and Codec are with the HAL (outputs discarded, inputs silent)\n");
-+	actuator_initialize();
-+	say("fuxi: audio: Speaker, Hawking, Actuator and Codec are with the HAL (HAP525=%u)\n",
-+	    (unsigned)actuator.enabled);
- 	return 0;
- }
- 
-@@ -863,6 +972,10 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
- 		}
- 		if (d->object == OBJECT_CODEC) {
- 			codec_open();
-+		} else if (d->object == OBJECT_ACTUATOR && actuator.enabled) {
-+			pthread_mutex_lock(&actuator.lock);
-+			actuator.active = true;
-+			pthread_mutex_unlock(&actuator.lock);
- 		}
- 	}
- 	pthread_mutex_unlock(&lock);
-@@ -881,6 +994,21 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
- 	if (d->running != 0 && --d->running == 0) {
- 		if (d->object == OBJECT_CODEC) {
- 			codec_close();
-+		} else if (d->object == OBJECT_ACTUATOR && actuator.enabled) {
-+			pthread_mutex_lock(&actuator.lock);
-+			actuator.active = false;
-+			actuator.head = actuator.count = 0;
-+			actuator.accepted_until = 0;
-+			if (mach_absolute_time() < actuator.playing_until) {
-+				int stop = 0;
-+				(void)sysctlbyname("kern.fuxivibrate", NULL, NULL, &stop, sizeof(stop));
-+			}
-+			actuator.playing_until = 0;
-+			pthread_cond_signal(&actuator.ready);
-+			unsigned submitted = actuator.submitted, errors = actuator.errors;
-+			actuator.submitted = actuator.errors = 0;
-+			pthread_mutex_unlock(&actuator.lock);
-+			say("fuxi: audio: Actuator stopped (HAP525 requests=%u errors=%u)\n", submitted, errors);
- 		} else if (d->output != 0) {
- 			say("fuxi: audio: %s stopped after %llu.%02llu s (discarded)\n", CFStringGetCStringPtr(d->uid,
- 			    kCFStringEncodingUTF8), written / FUXI_AUDIO_RATE, written % FUXI_AUDIO_RATE * 100 / FUXI_AUDIO_RATE);
-@@ -931,32 +1059,74 @@ begin_end_io_operation(__unused AudioServerPlugInDriverRef driver, __unused Audi
- 
- /*
-  * What iOS plays on the actuator -- the haptics: the system's feedbacks and the ringer's vibration,
-- * as waveforms of one channel (iOS plays on this device at all only when the device tree says the
-- * phone's haptics are "closed-loop": tools/mkadt-fuxi.py --product-haptics). There is no motor
-- * driver here yet, so the samples are discarded. Said the first times, with how loud.
-+ * as waveforms of one channel (ADT /product/haptics closed-loop). 在混音執行緒計算振幅並排進時間軸，
-+ * 由另一條執行緒驅動 HAP525。過期的視窗與純靜音不送出播放要求。
-  */
- static unsigned haptic_said;
- 
--static void
--actuator_write(const int16_t *samples, UInt32 frames)
-+static unsigned
-+actuator_peak(const int16_t *samples, UInt32 frames)
- {
--	int peak = 0;
-+	unsigned peak = 0;
- 
- 	for (UInt32 i = 0; i < frames; i++) {
--		int v = samples[i] < 0 ? -samples[i] : samples[i];
-+		int sample = samples[i];
-+		unsigned magnitude = (unsigned)(sample < 0 ? -sample : sample);
-+		peak = magnitude > peak ? magnitude : peak;
-+	}
-+	return peak;
-+}
- 
--		peak = v > peak ? v : peak;
-+static void
-+actuator_write(const int16_t *samples, UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle)
-+{
-+	if (!samples || !frames || frames > TIMESTAMP_PERIOD) {
-+		return;
- 	}
--	if (peak > 0 && haptic_said < 12) {
-+	if (!actuator.enabled) {
-+		unsigned peak = actuator_peak(samples, frames);
-+		if (!peak || haptic_said >= 12) {
-+			return;
-+		}
- 		haptic_said++;
--		say("fuxi: audio: the actuator plays: %u frames, peak %d of 32768 (no motor driver: not felt)\n",
-+		say("fuxi: audio: the actuator plays: %u frames, peak %u of 32768 (HAP525 inactive)\n",
- 		    (unsigned)frames, peak);
-+		return;
-+	}
-+	if (pthread_mutex_trylock(&actuator.lock)) {
-+		return;
-+	}
-+	UInt64 now = mach_absolute_time();
-+	UInt64 start = cycle && (cycle->mOutputTime.mFlags & kAudioTimeStampHostTimeValid)
-+	    ? cycle->mOutputTime.mHostTime : now;
-+	UInt64 span = (UInt64)(ticks_per_frame * frames);
-+	if (actuator.active && start <= UINT64_MAX - span &&
-+	    (start <= now || start - now <= actuator_ticks_ms() * 500u)) {
-+		for (UInt32 offset = 0; offset < frames && actuator.count < ACTUATOR_QUEUE_SIZE;) {
-+			UInt32 count = frames - offset;
-+			if (count > ACTUATOR_WINDOW) {
-+				count = ACTUATOR_WINDOW;
-+			}
-+			UInt64 begin = start + (UInt64)(ticks_per_frame * offset);
-+			UInt64 end = start + (UInt64)(ticks_per_frame * (offset + count));
-+			unsigned peak = actuator_peak(samples + offset, count);
-+			unsigned level = (peak * ACTUATOR_MAX_LEVEL + 16384u) / 32768u;
-+			if (level && end > now && begin >= actuator.accepted_until) {
-+				unsigned index = (actuator.head + actuator.count) % ACTUATOR_QUEUE_SIZE;
-+				actuator.queue[index] = (struct actuator_pulse){begin, end, level};
-+				actuator.count++;
-+				actuator.accepted_until = end;
-+			}
-+			offset += count;
-+		}
-+		pthread_cond_signal(&actuator.ready);
- 	}
-+	pthread_mutex_unlock(&actuator.lock);
- }
- 
- static OSStatus
- do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object, AudioObjectID stream,
--    __unused UInt32 client, UInt32 operation, UInt32 frames, __unused const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
-+    __unused UInt32 client, UInt32 operation, UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
-     __unused void *secondary)
- {
- 	const struct device *d = device_of(stream);
-@@ -970,7 +1140,7 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
- 		/* the speaker's and Hawking's inputs: silence */
- 		memset(buffer, 0, (size_t)frames * 2 * d->input_channels);
- 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
--		actuator_write(buffer, frames);
-+		actuator_write(buffer, frames, cycle);
- 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
- 		/* nothing plays it yet: the mix is counted and dropped, never waited on */
- 		written += frames;
 diff --git a/tools/fuxi-charge-evidence.py b/tools/fuxi-charge-evidence.py
 new file mode 100644
 index 0000000..919ce07
@@ -8676,7 +8395,7 @@ index 90d7242..54eacf5 100644
  @@ -745,6 +745,10 @@
 diff --git a/tools/sync-fuxi-adsp.py b/tools/sync-fuxi-adsp.py
 new file mode 100644
-index 0000000..3ac8fba
+index 0000000..8338e11
 --- /dev/null
 +++ b/tools/sync-fuxi-adsp.py
 @@ -0,0 +1,184 @@
@@ -8738,7 +8457,7 @@ index 0000000..3ac8fba
 +})
 +HEADERS += ('fuxi_torch_steady.h',)
 +SOURCES += ('fuxi_audio_spf.c', 'fuxi_audio_prep_gpr.c')
-+HEADERS += ('fuxi_audio_prep_gpr.h', 'fuxi_audio_smmu.h')
++HEADERS += ('fuxi_audio_prep_gpr.h', 'fuxi_audio_smmu.h', 'fuxi_amp_tone.h')
 +# HAP525 DIRECT_PLAY runtime (fuxi,haptic=2|3, sysctl kern.fuxivibrate)
 +HEADERS += ('fuxi_haptic_runtime.h', 'fuxi_haptic_rtp.h')
 +SOURCE_PATHS.update({
@@ -9303,10 +9022,10 @@ index 0000000..d74473c
 +    main()
 diff --git a/tools/test-fuxi-audio-spf.py b/tools/test-fuxi-audio-spf.py
 new file mode 100644
-index 0000000..b7b127e
+index 0000000..7a1a934
 --- /dev/null
 +++ b/tools/test-fuxi-audio-spf.py
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,1027 @@
 +import os
 +from pathlib import Path
 +import subprocess
@@ -9336,8 +9055,11 @@ index 0000000..b7b127e
 +static unsigned dma_surveys, dma_opens, dma_closes;
 +static bool have_dma;
 +static const uint64_t test_dma_address = 0x1a9250000ull;
++uint32_t fuxi_amp_tone;
++static uint32_t dma_buffer[0x10000 / sizeof(uint32_t)];
 +static ShengAdspClient callbacks;
 +static uint8_t sent[SHENG_ADSP_MAX_MESSAGE];
++static void (*on_send)(const uint8_t *data, uint32_t length);
 +struct ShengAdspChannel { unsigned marker; };
 +static struct ShengAdspChannel channel;
 +static uint64_t mach_absolute_time(void) { return now; }
@@ -9363,7 +9085,9 @@ index 0000000..b7b127e
 +}
 +int sheng_adsp_send(ShengAdspChannel *target,const void *data,uint32_t length) {
 +    assert(target==&channel && length>=24 && length<=512 && !callback_depth);
-+    memcpy(sent,data,length); sent_length=length; sends++; return send_error;
++    memcpy(sent,data,length); sent_length=length; sends++;
++    if (!send_error && on_send) on_send(data, length);
++    return send_error;
 +}
 +void fuxi_audio_dma_survey(void) {
 +    assert(!callback_depth);
@@ -9379,6 +9103,10 @@ index 0000000..b7b127e
 +    *address = test_dma_address;
 +    return true;
 +}
++void *fuxi_audio_dma_buffer(void)
++{
++    return have_dma && dma_opens && !dma_closes ? dma_buffer : NULL;
++}
 +void fuxi_audio_dma_close(void)
 +{
 +    assert(!callback_depth && have_dma && dma_opens == 1 && !dma_closes);
@@ -9389,6 +9117,10 @@ index 0000000..b7b127e
 +    memset(&gSpf,0,sizeof(gSpf)); memset(&callbacks,0,sizeof(callbacks));
 +    memset(&gPrm,0,sizeof(gPrm));
 +    memset(&gGraph,0,sizeof(gGraph));
++    memset(&gTone,0,sizeof(gTone));
++    memset(dma_buffer,0,sizeof(dma_buffer));
++    on_send=NULL;
++    fuxi_amp_tone=FUXI_TONE_IDLE;
 +    now=0; argument=0; adt_value=0; adt_bytes=4;
 +    registrations=0; sends=0; callback_depth=0; sent_length=0;
 +    dma_surveys=0; dma_opens=0; dma_closes=0; have_dma=false;
@@ -9670,6 +9402,398 @@ index 0000000..b7b127e
 +    assert(gGraph.step == FUXI_GRAPH_IDLE && gGraph.failed == write_timeout && dma_closes == 1);
 +}
 +
++static uint32_t tone_expect_sent, tone_expect_frame, tone_peak_seen;
++static bool tone_expect_sine;
++
++/* 每送出一筆 WRITE 就核對位址輪替與 DMA 緩衝區內容（靜音或精確正弦與淡入淡出）。 */
++static void tone_verify_send(const uint8_t *data, uint32_t length)
++{
++    if (gGraph.step != FUXI_GRAPH_WRITE) {
++        return;
++    }
++    FuxiAudioPrepGprView packet;
++    assert(!fuxi_audio_prep_gpr_decode(data, length, &packet));
++    assert(packet.fields.src_port == FUXI_SPF_PORT && packet.fields.dst_port == FUXI_AR_IID_PLAY_SHMEM &&
++        packet.fields.opcode == FUXI_AR_OP_WRITE && packet.fields.token == FUXI_GRAPH_TOKEN + FUXI_GRAPH_WRITE);
++    uint32_t words[11];
++    assert(packet.payload_bytes == sizeof(words));
++    memcpy(words, packet.payload, sizeof(words));
++    const uint32_t index = tone_expect_sent % FUXI_TONE_PERIODS;
++    const uint64_t expected_addr = test_dma_address + (uint64_t)index * FUXI_TONE_PERIOD_BYTES;
++    assert(words[0] == (uint32_t)expected_addr && words[1] == (uint32_t)(expected_addr >> 32) &&
++        words[2] == 0x1024u && words[3] == FUXI_TONE_PERIOD_BYTES);
++    for (unsigned i = 4; i < 11; i++) {
++        assert(words[i] == 0);
++    }
++    const uint32_t *period = dma_buffer + index * (FUXI_TONE_PERIOD_BYTES / sizeof(uint32_t));
++    for (uint32_t frame = 0; frame < FUXI_TONE_PERIOD_FRAMES; frame++) {
++        int32_t want = 0;
++        if (tone_expect_sine && tone_expect_frame < FUXI_TONE_FRAMES) {
++            want = fuxi_amp_tone_sample(tone_expect_frame++);
++            if (want == 214748365) {
++                tone_peak_seen++;
++            }
++        }
++        for (uint32_t slot = 0; slot < 4; slot++) {
++            assert(period[4 * frame + slot] == (uint32_t)want);
++        }
++    }
++    tone_expect_sent++;
++}
++
++static void begin_tone_mode(uint32_t amp_state, bool dma)
++{
++    reset();
++    have_adt = true;
++    adt_value = 5;
++    have_dma = dma;
++    __atomic_store_n(&fuxi_amp_tone, amp_state, __ATOMIC_RELEASE);
++    fuxi_audio_spf_start();
++    state(1);
++    fuxi_audio_spf_poll();
++    assert(sends == 1 && gGraph.step == FUXI_GRAPH_IDLE);
++    deliver(FUXI_AUDIO_PREP_SPF_STATE_REPLY, FUXI_SPF_TOKEN, 1);
++    fuxi_audio_spf_poll();
++    assert(gSpf.done && sends == 1);
++}
++
++static void graph_step_reply_ok(void)
++{
++    FuxiAudioPrepGprView packet;
++    assert(gGraph.waiting && !fuxi_audio_prep_gpr_decode(sent, sent_length, &packet));
++    const uint32_t port = graph_steps[gGraph.step].port;
++    if (gGraph.step == FUXI_GRAPH_MAP) {
++        graph_reply(0);
++        const uint32_t handle = 0x1024;
++        deliver_graph_completion(&handle, sizeof(handle));
++    } else if (port == FUXI_AR_PRM_IID) {
++        const uint32_t reply[] = {packet.fields.opcode, 0};
++        deliver_graph_completion(reply, sizeof(reply));
++    } else {
++        graph_reply(0);
++    }
++}
++
++static void tone_deliver_done(uint64_t addr, uint32_t handle, uint32_t status)
++{
++    const uint32_t done[] = {(uint32_t)addr, (uint32_t)(addr >> 32), handle, status};
++    deliver_graph_completion(done, sizeof(done));
++}
++
++static void tone_deliver_next(uint32_t status)
++{
++    const uint64_t addr = test_dma_address + (uint64_t)(gTone.done % FUXI_TONE_PERIODS) * FUXI_TONE_PERIOD_BYTES;
++    tone_deliver_done(addr, 0x1024u, status);
++}
++
++static void tone_reach_write(void)
++{
++    begin_tone_mode(FUXI_TONE_PENDING, true);
++    assert(gGraph.step == FUXI_GRAPH_VOTE_MACRO && gTone.phase == FUXI_TONE_PCM_GATE && sends == 1);
++    now += 1000ull * NSEC_PER_MSEC;
++    fuxi_audio_spf_poll();
++    assert(gTone.phase == FUXI_TONE_PCM_GATE && sends == 1);
++    assert(fuxi_amp_tone_move(FUXI_TONE_PENDING, FUXI_TONE_READY));
++    fuxi_audio_spf_poll();
++    assert(gTone.phase == FUXI_TONE_PCM_GRAPH && gGraph.step == FUXI_GRAPH_VOTE_MACRO && gGraph.waiting);
++    while (gGraph.step < FUXI_GRAPH_WRITE) {
++        graph_step_reply_ok();
++    }
++    assert(gGraph.step == FUXI_GRAPH_WRITE && gTone.phase == FUXI_TONE_PCM_PREROLL &&
++        gTone.sent == FUXI_TONE_AHEAD && gTone.done == 0);
++}
++
++static void tone_finish_teardown(bool expect_failed)
++{
++    while (gGraph.step != FUXI_GRAPH_IDLE) {
++        assert(gGraph.step >= FUXI_GRAPH_STOP_PLAYBACK && gGraph.step < FUXI_GRAPH_COMPLETE);
++        graph_step_reply_ok();
++    }
++    assert(gGraph.failed == expect_failed && dma_closes == 1 && gTone.phase == FUXI_TONE_PCM_OFF);
++}
++
++static void test_tone(void)
++{
++    /* 1. 完整成功路徑：GATE → 建圖 → PREROLL（5 筆靜音）→ CLOCKED → ON → PLAY（50 筆正弦 + 5 筆尾端靜音）→ DRAIN → OFF → FINISH → 關圖。 */
++    tone_expect_sent = 0;
++    tone_expect_frame = 0;
++    tone_peak_seen = 0;
++    tone_expect_sine = false;
++    begin_tone_mode(FUXI_TONE_PENDING, true);
++    on_send = tone_verify_send;
++    assert(fuxi_amp_tone_move(FUXI_TONE_PENDING, FUXI_TONE_READY));
++    fuxi_audio_spf_poll();
++    while (gGraph.step < FUXI_GRAPH_WRITE) {
++        graph_step_reply_ok();
++    }
++    assert(gTone.phase == FUXI_TONE_PCM_PREROLL && gTone.sent == 3 && tone_expect_sent == 3 && !gTone.clocked);
++    for (unsigned i = 0; i < 4; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++        assert(fuxi_amp_tone_get() == FUXI_TONE_READY && !gTone.clocked);
++    }
++    now += 20ull * NSEC_PER_MSEC;
++    tone_deliver_next(0);
++    assert(fuxi_amp_tone_get() == FUXI_TONE_CLOCKED && gTone.clocked && gTone.done == 5 && gTone.sent == 8);
++    /* 等功放上電期間持續送靜音。 */
++    for (unsigned i = 0; i < 2; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++        assert(gTone.phase == FUXI_TONE_PCM_PREROLL && gTone.frame == 0);
++    }
++    /* 功放進入 ON：下一次 poll 切換 PLAY，下一個送出的週期開始填正弦。 */
++    assert(fuxi_amp_tone_move(FUXI_TONE_CLOCKED, FUXI_TONE_ON));
++    tone_expect_sine = true;
++    fuxi_audio_spf_poll();
++    assert(gTone.phase == FUXI_TONE_PCM_PLAY && gTone.tone_start == gTone.sent && gTone.frame == 0);
++    /* 模擬暫時送出失敗一次：gTone.frame 必須回捲，下一輪重試同一筆正弦。 */
++    now += 20ull * NSEC_PER_MSEC;
++    send_error = -1;
++    tone_deliver_next(0);
++    assert(gTone.frame == 0 && gTone.sent == gTone.tone_start);
++    send_error = 0;
++    fuxi_audio_spf_poll();
++    assert(gTone.frame == FUXI_TONE_PERIOD_FRAMES && gTone.sent == gTone.tone_start + 1);
++    /* 繼續播完剩下的 49 個正弦週期，再播 5 個尾端靜音週期。 */
++    while (gTone.phase == FUXI_TONE_PCM_PLAY) {
++        now += 20ull * NSEC_PER_MSEC;
++        if (gTone.frame >= FUXI_TONE_FRAMES && gTone.done + 1 < gTone.tone_end + FUXI_TONE_ZEROS) {
++            assert(fuxi_amp_tone_get() == FUXI_TONE_ON);
++        }
++        tone_deliver_next(0);
++    }
++    assert(gTone.phase == FUXI_TONE_PCM_POSTROLL && fuxi_amp_tone_get() == FUXI_TONE_DRAIN);
++    assert(gTone.frame == FUXI_TONE_FRAMES && tone_expect_frame == FUXI_TONE_FRAMES && tone_peak_seen > 1000);
++    assert(gTone.tone_end == gTone.tone_start + 50u && gTone.done == gTone.tone_end + FUXI_TONE_ZEROS);
++    tone_expect_sine = false;
++    /* POSTROLL 期間持續送靜音直到功放 OFF。 */
++    for (unsigned i = 0; i < 2; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++        assert(gTone.phase == FUXI_TONE_PCM_POSTROLL);
++    }
++    assert(fuxi_amp_tone_move(FUXI_TONE_DRAIN, FUXI_TONE_OFF));
++    fuxi_audio_spf_poll();
++    assert(gTone.phase == FUXI_TONE_PCM_FINISH);
++    const uint32_t final_sent = gTone.sent;
++    assert(final_sent == gTone.done + FUXI_TONE_AHEAD);
++    while (gTone.done + 1 < final_sent) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++        assert(gTone.sent == final_sent && gGraph.step == FUXI_GRAPH_WRITE && gTone.phase == FUXI_TONE_PCM_FINISH);
++    }
++    now += 20ull * NSEC_PER_MSEC;
++    tone_deliver_next(0);
++    assert(gTone.sent == final_sent && gTone.done == final_sent && gTone.stray == 0 && gTone.status == 0);
++    assert(gTone.phase == FUXI_TONE_PCM_OFF && gGraph.step == FUXI_GRAPH_STOP_PLAYBACK);
++    on_send = NULL;
++    tone_finish_teardown(false);
++
++    /* 2. DMA 開啟失敗時釋放功放（PENDING → FAILED）。 */
++    begin_tone_mode(FUXI_TONE_PENDING, false);
++    assert(gGraph.step == FUXI_GRAPH_IDLE && fuxi_amp_tone_get() == FUXI_TONE_FAILED);
++
++    /* 3. GATE 期間功放已失敗：降回 mode 5 靜音探測。 */
++    begin_tone_mode(FUXI_TONE_PENDING, true);
++    assert(fuxi_amp_tone_move(FUXI_TONE_PENDING, FUXI_TONE_FAILED));
++    fuxi_audio_spf_poll();
++    assert(gTone.phase == FUXI_TONE_PCM_OFF && gGraph.step == FUXI_GRAPH_VOTE_MACRO && gGraph.waiting);
++    while (gGraph.step < FUXI_GRAPH_WRITE) {
++        graph_step_reply_ok();
++    }
++    {
++        const uint32_t done[] = {0xa9250000, 1, 0x1024, 0};
++        deliver_graph_completion(done, sizeof(done));
++    }
++    tone_finish_teardown(false);
++
++    /* 4. GATE 逾時 120 秒：放棄功放並降回靜音探測。 */
++    begin_tone_mode(FUXI_TONE_PENDING, true);
++    now += FUXI_TONE_GATE_MS * (uint64_t)NSEC_PER_MSEC;
++    fuxi_audio_spf_poll();
++    assert(fuxi_amp_tone_get() == FUXI_TONE_FAILED && gTone.phase == FUXI_TONE_PCM_OFF && gGraph.waiting);
++
++    /* 5. 建圖期間失敗（OPEN_SPEAKER 錯誤）：釋放功放（READY → FAILED）。 */
++    begin_tone_mode(FUXI_TONE_READY, true);
++    fuxi_audio_spf_poll();
++    while (gGraph.step < FUXI_GRAPH_OPEN_SPEAKER) {
++        graph_step_reply_ok();
++    }
++    graph_reply(8);
++    assert(fuxi_amp_tone_get() == FUXI_TONE_FAILED && gTone.phase == FUXI_TONE_PCM_OFF);
++    tone_finish_teardown(true);
++
++    /* 6. PREROLL 還沒播完 5 筆靜音功放就放棄：第 5 筆完成時 CAS READY→CLOCKED 失敗並收尾。 */
++    tone_reach_write();
++    assert(fuxi_amp_tone_move(FUXI_TONE_READY, FUXI_TONE_FAILED));
++    for (unsigned i = 0; i < 5; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(gTone.phase == FUXI_TONE_PCM_FINISH && gTone.error && !gTone.clocked);
++    while (gTone.done < gTone.sent) {
++        tone_deliver_next(0);
++    }
++    tone_finish_teardown(true);
++
++    /* 7. PREROLL 送出 CLOCKED 後功放上電失敗或逾時。 */
++    tone_reach_write();
++    for (unsigned i = 0; i < 5; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(fuxi_amp_tone_get() == FUXI_TONE_CLOCKED);
++    assert(fuxi_amp_tone_move(FUXI_TONE_CLOCKED, FUXI_TONE_FAILED));
++    fuxi_audio_spf_poll();
++    assert(gTone.phase == FUXI_TONE_PCM_FINISH && gTone.error);
++    while (gTone.done < gTone.sent) {
++        tone_deliver_next(0);
++    }
++    tone_finish_teardown(true);
++
++    tone_reach_write();
++    for (unsigned i = 0; i < 5; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    for (unsigned i = 0; i < 160 && gTone.phase == FUXI_TONE_PCM_PREROLL; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(gTone.phase == FUXI_TONE_PCM_FINISH && gTone.error && fuxi_amp_tone_get() == FUXI_TONE_FAILED);
++    while (gTone.done < gTone.sent) {
++        tone_deliver_next(0);
++    }
++    tone_finish_teardown(true);
++
++    /* 8. PLAY 期間收到亂序／錯 handle 的 WRITE_DONE（計入 stray）與非零狀態錯誤。 */
++    tone_reach_write();
++    for (unsigned i = 0; i < 5; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(fuxi_amp_tone_move(FUXI_TONE_CLOCKED, FUXI_TONE_ON));
++    fuxi_audio_spf_poll();
++    assert(gTone.phase == FUXI_TONE_PCM_PLAY);
++    tone_deliver_done(test_dma_address + ((gTone.done + 1) % FUXI_TONE_PERIODS) * FUXI_TONE_PERIOD_BYTES, 0x1024u, 0);
++    tone_deliver_done(test_dma_address + (gTone.done % FUXI_TONE_PERIODS) * FUXI_TONE_PERIOD_BYTES, 0x9999u, 0);
++    assert(gTone.stray == 2 && gTone.done == 5 && gTone.phase == FUXI_TONE_PCM_PLAY);
++    tone_deliver_next(5);
++    assert(gTone.error && gTone.status == 5 && gTone.phase == FUXI_TONE_PCM_FINISH &&
++        fuxi_amp_tone_get() == FUXI_TONE_FAILED);
++    while (gTone.done < gTone.sent) {
++        tone_deliver_next(0);
++    }
++    tone_finish_teardown(true);
++
++    /* 9. PLAY 期間 BASIC_RESULT 回非零錯誤，以及功放中途離開 ON。 */
++    tone_reach_write();
++    for (unsigned i = 0; i < 5; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(fuxi_amp_tone_move(FUXI_TONE_CLOCKED, FUXI_TONE_ON));
++    fuxi_audio_spf_poll();
++    deliver_result(FUXI_AR_IID_PLAY_SHMEM, FUXI_SPF_PORT, FUXI_AUDIO_PREP_BASIC_RESULT, FUXI_AR_OP_WRITE,
++        FUXI_GRAPH_TOKEN + FUXI_GRAPH_WRITE, 9);
++    fuxi_audio_spf_poll();
++    assert(gTone.error && gTone.status == 9 && gTone.phase == FUXI_TONE_PCM_FINISH &&
++        fuxi_amp_tone_get() == FUXI_TONE_FAILED);
++    while (gTone.done < gTone.sent) {
++        tone_deliver_next(0);
++    }
++    tone_finish_teardown(true);
++
++    tone_reach_write();
++    for (unsigned i = 0; i < 5; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(fuxi_amp_tone_move(FUXI_TONE_CLOCKED, FUXI_TONE_ON));
++    fuxi_audio_spf_poll();
++    assert(fuxi_amp_tone_move(FUXI_TONE_ON, FUXI_TONE_FAILED));
++    fuxi_audio_spf_poll();
++    assert(gTone.error && gTone.phase == FUXI_TONE_PCM_FINISH);
++    while (gTone.done < gTone.sent) {
++        tone_deliver_next(0);
++    }
++    tone_finish_teardown(true);
++
++    /* 10. PLAY 期間寫入逾時與 GLINK 斷線。 */
++    tone_reach_write();
++    for (unsigned i = 0; i < 5; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(fuxi_amp_tone_move(FUXI_TONE_CLOCKED, FUXI_TONE_ON));
++    fuxi_audio_spf_poll();
++    now += FUXI_SPF_REPLY_MS * (uint64_t)NSEC_PER_MSEC;
++    fuxi_audio_spf_poll();
++    assert(gTone.error && gTone.phase == FUXI_TONE_PCM_FINISH && fuxi_amp_tone_get() == FUXI_TONE_FAILED);
++    now += FUXI_SPF_REPLY_MS * (uint64_t)NSEC_PER_MSEC;
++    fuxi_audio_spf_poll();
++    tone_finish_teardown(true);
++
++    tone_reach_write();
++    for (unsigned i = 0; i < 5; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(fuxi_amp_tone_move(FUXI_TONE_CLOCKED, FUXI_TONE_ON));
++    fuxi_audio_spf_poll();
++    state(0);
++    fuxi_audio_spf_poll();
++    assert(gTone.phase == FUXI_TONE_PCM_OFF && fuxi_amp_tone_get() == FUXI_TONE_FAILED &&
++        gGraph.step == FUXI_GRAPH_STOP_PLAYBACK);
++    state(1);
++    fuxi_audio_spf_poll();
++    tone_finish_teardown(true);
++
++    /* 11. POSTROLL 期間功放下電失敗。 */
++    tone_reach_write();
++    for (unsigned i = 0; i < 5; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(fuxi_amp_tone_move(FUXI_TONE_CLOCKED, FUXI_TONE_ON));
++    fuxi_audio_spf_poll();
++    while (gTone.phase == FUXI_TONE_PCM_PLAY) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(gTone.phase == FUXI_TONE_PCM_POSTROLL && fuxi_amp_tone_get() == FUXI_TONE_DRAIN);
++    assert(fuxi_amp_tone_move(FUXI_TONE_DRAIN, FUXI_TONE_FAILED));
++    fuxi_audio_spf_poll();
++    assert(gTone.error && gTone.phase == FUXI_TONE_PCM_FINISH);
++    while (gTone.done < gTone.sent) {
++        tone_deliver_next(0);
++    }
++    tone_finish_teardown(true);
++
++    /* 12. POSTROLL 期間功放下電逾時：PCM 逾時收尾，DRAIN 仍留給功放端自行下電。 */
++    tone_reach_write();
++    for (unsigned i = 0; i < 5; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(fuxi_amp_tone_move(FUXI_TONE_CLOCKED, FUXI_TONE_ON));
++    fuxi_audio_spf_poll();
++    while (gTone.phase == FUXI_TONE_PCM_PLAY) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(gTone.phase == FUXI_TONE_PCM_POSTROLL && fuxi_amp_tone_get() == FUXI_TONE_DRAIN);
++    for (unsigned i = 0; i < 160 && gTone.phase == FUXI_TONE_PCM_POSTROLL; i++) {
++        now += 20ull * NSEC_PER_MSEC;
++        tone_deliver_next(0);
++    }
++    assert(gTone.error && gTone.phase == FUXI_TONE_PCM_FINISH && fuxi_amp_tone_get() == FUXI_TONE_DRAIN);
++    while (gTone.done < gTone.sent) {
++        tone_deliver_next(0);
++    }
++    tone_finish_teardown(true);
++}
++
 +static uint32_t smmu_regs[FUXI_APPS_SMMU_BYTES / 4];
 +static uint32_t smmu_read_fault;
 +static unsigned smmu_writes, smmu_fail_write;
@@ -9892,9 +10016,11 @@ index 0000000..b7b127e
 +    assert(gGraph.step == FUXI_GRAPH_IDLE && dma_opens == 1 && !dma_closes);
 +    test_pcm(false);
 +    test_pcm(true);
++    test_tone();
 +    puts("PASS production audio SPF/PRM/TDM client: readiness, LPASS vote/release, graph configuration and cleanup (simulated DSP)");
 +    puts("PASS production audio SMMU survey: masked overlaps, occupied banks and ASIDs, access failure and layout bounds");
 +    puts("PASS production silent PCM: pass-through rollback, PRM, map/write confirmation and teardown");
++    puts("PASS production tone PCM: mode 7 handshake, 2 kHz sine/fade/zeros, stray/error/timeout/disconnect teardown");
 +}
 +'''
 +
@@ -20082,141 +20208,6 @@ index 0000000..31ffe57
 +
 +if __name__ == '__main__':
 +    main()
-diff --git a/tools/test-fuxi-sys.py b/tools/test-fuxi-sys.py
-index 931fb84..3e7a431 100644
---- a/tools/test-fuxi-sys.py
-+++ b/tools/test-fuxi-sys.py
-@@ -6,6 +6,7 @@ FuxiAudio HAL plug-in and the SpringBoard snapshot library natively against
- small stand-in headers, and exercises mkadt-fuxi.py's /product options and
- fuxi-sys-root.py on synthetic inputs.
- """
-+import argparse
- import importlib.util
- import os
- from pathlib import Path
-@@ -274,6 +275,7 @@ typedef struct {
- } AudioStreamBasicDescription;
- typedef struct { Float64 mSampleTime; UInt64 mHostTime; Float64 mRateScalar; UInt64 mWordClockTime; UInt32 mFlags, mReserved; } AudioTimeStamp;
- enum { kAudioFormatLinearPCM = 'lpcm', kAudioFormatFlagIsSignedInteger = 1u << 2, kAudioFormatFlagIsPacked = 1u << 3 };
-+enum { kAudioTimeStampHostTimeValid = 1u << 1 };
- '''
- 
- MACH_TIME_STUB = r'''
-@@ -285,6 +287,31 @@ static inline uint64_t mach_absolute_time(void) { return model_now; }
- static inline int mach_timebase_info(mach_timebase_info_data_t *t) { t->numer = 125; t->denom = 3; return 0; }
- '''
- 
-+AUDIO_SYSCTL_STUB = r'''
-+#pragma once
-+#include <assert.h>
-+#include <pthread.h>
-+static unsigned actuator_calls;
-+static int actuator_value;
-+static inline int sysctlbyname(const char *name, void *out, size_t *outlen, const void *in, size_t inlen) {
-+ if (!strcmp(name, "kern.bootargs")) {
-+  assert(out && outlen && !in);
-+  ((char *)out)[0] = 0;
-+  *outlen = 1;
-+  return 0;
-+ }
-+ assert(!strcmp(name, "kern.fuxivibrate") && !out && in && inlen == sizeof(int));
-+ memcpy(&actuator_value, in, inlen);
-+ actuator_calls++;
-+ return 0;
-+}
-+static inline int pthread_cond_timedwait_relative_np(pthread_cond_t *cond, pthread_mutex_t *mutex, const struct timespec *delay) {
-+ (void)cond; (void)mutex; (void)delay;
-+ assert(0 && "host advances the actuator clock synchronously");
-+ return -1;
-+}
-+'''
-+
- AUDIO_TEST = r'''
- uint64_t model_now = 1000;
- static AudioServerPlugInDriverRef drv;
-@@ -388,6 +415,43 @@ int main(void) {
-  assert(interface.StopIO(drv, OBJECT_CODEC, 1) == 0 && interface.StopIO(drv, OBJECT_SPEAKER, 1) == 0);
-  assert(interface.StopIO(drv, OBJECT_HAWKING, 1) == 0 && interface.StopIO(drv, OBJECT_HAWKING, 1) == 0);
-  assert(interface.StartIO(drv, OBJECT_HAWKING_INPUT, 1) == kAudioHardwareBadObjectError);
-+
-+ /* 實際的 DoIOOperation 將非零樣本依 host time 排程，I/O callback 內沒有呼叫硬體。 */
-+ assert(!actuator.enabled && actuator_calls == 0);
-+ actuator.enabled = true;   /* 以手動推進的時鐘代替正式 worker */
-+ assert(interface.StartIO(drv, OBJECT_ACTUATOR, 1) == 0);
-+ int16_t wave[ACTUATOR_WINDOW * 3] = {INT16_MIN};
-+ wave[ACTUATOR_WINDOW] = 16384;
-+ UInt64 ticks_ms = actuator_ticks_ms();
-+ AudioServerPlugInIOCycleInfo cycle = {.mOutputTime = {
-+  .mFlags = kAudioTimeStampHostTimeValid, .mHostTime = model_now + ticks_ms * 20
-+ }};
-+ assert(interface.DoIOOperation(drv, OBJECT_ACTUATOR, OBJECT_ACTUATOR_OUTPUT, 1,
-+  kAudioServerPlugInIOOperationWriteMix, ACTUATOR_WINDOW * 3, &cycle, wave, NULL) == 0);
-+ assert(actuator.count == 2 && actuator_calls == 0);
-+ assert(actuator.queue[0].start == cycle.mOutputTime.mHostTime && actuator.queue[0].level == 128);
-+ assert(actuator.queue[1].start == actuator.queue[0].end && actuator.queue[1].level == 64);
-+ /* 同一時間戳的混音重送不重複排進馬達佇列。 */
-+ actuator_write(wave, ACTUATOR_WINDOW * 3, &cycle);
-+ assert(actuator.count == 2);
-+ pthread_mutex_lock(&actuator.lock);
-+ model_now = actuator.queue[0].start;
-+ actuator_submit(model_now, ticks_ms);
-+ assert(actuator_calls == 1 && actuator_value == ((128 << 16) | (10 + ACTUATOR_SLACK_MS)));
-+ model_now = actuator.queue[1].start;
-+ actuator_submit(model_now, ticks_ms);
-+ assert(actuator_calls == 2 && actuator_value == ((64 << 16) | 10) && !actuator.count);
-+ pthread_mutex_unlock(&actuator.lock);
-+ assert(interface.StopIO(drv, OBJECT_ACTUATOR, 1) == 0);
-+ assert(actuator_calls == 3 && actuator_value == 0 && !actuator.active && !actuator.count);
-+ assert(interface.StartIO(drv, OBJECT_ACTUATOR, 1) == 0);
-+ cycle.mOutputTime.mHostTime = model_now - ticks_ms * 40;
-+ actuator_write(wave, ACTUATOR_WINDOW * 3, &cycle);
-+ assert(actuator.count == 0 && actuator_calls == 3);
-+ cycle.mOutputTime.mHostTime = model_now + ticks_ms * 501;
-+ actuator_write(wave, ACTUATOR_WINDOW, &cycle);
-+ assert(actuator.count == 0 && actuator_calls == 3);
-+ assert(interface.StopIO(drv, OBJECT_ACTUATOR, 1) == 0);
-  puts("audio model ok");
-  return 0;
- }
-@@ -397,7 +461,8 @@ int main(void) {
- def test_audio(tmp):
-     inc = Path(tmp) / 'audio-include'
-     for rel, text in (('CoreFoundation/CoreFoundation.h', CF_STUB), ('CoreFoundation/CFPlugInCOM.h', '#pragma once\n'),
--                      ('CoreAudioTypes/CoreAudioTypes.h', AUDIO_TYPES_STUB), ('mach/mach_time.h', MACH_TIME_STUB)):
-+                      ('CoreAudioTypes/CoreAudioTypes.h', AUDIO_TYPES_STUB), ('mach/mach_time.h', MACH_TIME_STUB),
-+                      ('sys/sysctl.h', AUDIO_SYSCTL_STUB)):
-         (inc / rel).parent.mkdir(parents=True, exist_ok=True)
-         (inc / rel).write_text(text)
-     source = (TOOLS / 'fuxi-audio/FuxiAudio.c').read_text()
-@@ -412,7 +477,7 @@ def test_audio(tmp):
-         info = plistlib.load(f)
-     factory = info['CFPlugInTypes']['443ABAB8-E7B3-491A-B985-BEB9187030DB'][0]
-     assert info['CFPlugInFactories'][factory] == 'FuxiAudio_Create' and info['CFBundleExecutable'] == 'FuxiAudio'
--    print('PASS: FuxiAudio devices, Hawking input, formats, volume, clock and discard I/O (host model)')
-+    print('PASS: FuxiAudio devices, formats, clock, HAP525 timing, scaling, silence and cancellation (host model)')
- 
- 
- # ---- libfuxi-sb.dylib -------------------------------------------------------------------
-@@ -703,11 +768,16 @@ def test_root(tmp):
- 
- 
- def main():
-+    parser = argparse.ArgumentParser(description=__doc__)
-+    parser.add_argument('--audio-only', action='store_true', help='run the HAL implementation and root bundle tests')
-+    args = parser.parse_args()
-     with tempfile.TemporaryDirectory(prefix='fuxi-sys-test-') as tmp:
--        test_kernel(tmp)
-+        if not args.audio_only:
-+            test_kernel(tmp)
-         test_audio(tmp)
--        test_sb(tmp)
--        test_adt(tmp)
-+        if not args.audio_only:
-+            test_sb(tmp)
-+            test_adt(tmp)
-         test_root(tmp)
- 
- 
 diff --git a/tools/test-fuxi-tap-command.py b/tools/test-fuxi-tap-command.py
 new file mode 100644
 index 0000000..1d7b73c
@@ -28221,10 +28212,10 @@ index 0000000..72eedb5
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/xnu/fuxi-adsp/fuxi_adsp.c b/xnu/fuxi-adsp/fuxi_adsp.c
 new file mode 100644
-index 0000000..e63c8a5
+index 0000000..b80d598
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_adsp.c
-@@ -0,0 +1,1027 @@
+@@ -0,0 +1,1034 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 + *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -28481,6 +28472,13 @@ index 0000000..e63c8a5
 +    printf("FUXI AUDIO PCM: loader DMA region pa=%#x bytes=%#x stream=%u\n",
 +        handoff.pa, handoff.bytes, FUXI_AUDIO_DMA_STREAM);
 +    return true;
++}
++
++/* 出聲模式寫 PCM 用；fuxi_audio_dma_open 成功前與 close 之後都是 NULL。 */
++void *fuxi_audio_dma_buffer(void);
++void *fuxi_audio_dma_buffer(void)
++{
++    return gAudioDma.va ? (void *)gAudioDma.va : NULL;
 +}
 +
 +void fuxi_audio_dma_close(void)
@@ -29935,10 +29933,10 @@ index 0000000..7755f92
 +#endif /* FUXI */
 diff --git a/xnu/fuxi-adsp/fuxi_amp.c b/xnu/fuxi-adsp/fuxi_amp.c
 new file mode 100644
-index 0000000..f0540b4
+index 0000000..0b1049c
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_amp.c
-@@ -0,0 +1,768 @@
+@@ -0,0 +1,1010 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* FUXI speaker amplifiers: two Cirrus CS35L41 on QUP2 SE0 I2C (live DT i2c@880000: cs35l41@40 "B", reset GPIO 183; cs35l41@42
 + * "T", reset GPIO 182, both active low; pins gpio0 SDA / gpio1 SCL, function 2 = qup2_se0_l0/l1_mirb, 2 mA, pull-up; engine SPI
@@ -29960,6 +29958,10 @@ index 0000000..f0540b4
 + *   6  applies the B2 errata and OTP trims first, loads as mode 5, then runs the protection firmware with GLOBAL_EN and AMP_EN
 + *      clear and no I2S clocks (Linux cs35l41_hda.c cs35l41_smart_amp): HALO_STATE RUN, mailbox status and PAUSE are checked,
 + *      then the core is stopped and the amplifier goes back into reset. No output stage, no boost, no volume write.
++ *   7  先做 mode 6；只有 CSPL_STATE 0（CSPL_ST_RUNNING）、ERRORNO 0、CAL_STATUS 1 才繼續：下方喇叭播一秒 2 kHz、-20 dBFS，
++ *      數位音量 -30 dB（0x6000 = 0xb885），不經 DSP（早期 Fuxi shim/fuxi-probe au_amp_on.h steps 12-31 與 au_tone_stage，
++ *      當年 a-spk1 出過聲）。PCM 由 fuxi_audio_spf.c format 5 送，交握在 fuxi_amp_tone.h。使用者 2026-11-18 只同意這一檔、
++ *      這一顆喇叭。
 + * Facts: QUP2 SE0 window 0x880000 + 0x4000, GCC 0x100000, TLMM 0xf100000 (0x1000 per pin: ctl, io at +4), GICD 0x17100000.
 + * Windows are mapped with kernel_map VA and pmap entries (never ml_io_map), as fuxi_adsp.c does. */
 +#include <pexpert/arm64/board_config.h>
@@ -29975,6 +29977,9 @@ index 0000000..f0540b4
 +#include <vm/vm_kern.h>
 +#include <vm/pmap.h>
 +#include "GeniI2c.h"
++#include "fuxi_amp_tone.h"
++
++uint32_t fuxi_amp_tone; /* fuxi_amp_tone.h：mode 7 的交握狀態，其餘模式保持 IDLE */
 +
 +extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
 +    unsigned, void *);
@@ -30048,6 +30053,21 @@ index 0000000..f0540b4
 +#define FM_EGPIO_PRESENT (1u << 11)
 +#define FM_EGPIO_ENABLE (1u << 12)
 +#define FM_RESET_CTL (1u << 9 | 7u << 6)  /* GPIO, output enabled, 16 mA, no pull */
++/* Mode 7（早期 au_amp_on.h／audio.c 的值，逐項對照）。 */
++#define FM_IRQ1_STATUS3 0x10018u
++#define FM_TONE_ERRORS 0x800281c0u     /* IRQ1_STATUS1：amp short、temp error/warn、boost short、DCM UVP、boost OVP */
++#define FM_TONE_PUP_DONE (1u << 24)     /* IRQ1_STATUS1 */
++#define FM_TONE_PDN_DONE (1u << 23)
++#define FM_TONE_PLL_LOCK 0x2u           /* IRQ1_STATUS3 */
++#define FM_TONE_PLL_UNLOCK (1u << 4)
++#define FM_TONE_TEST 0x2084u            /* 測試鑰匙下的上電／下電值 0x002f1aa0／0x002f1aa3 */
++#define FM_DIG_VOL 0x6000u
++#define FM_DIG_VOL_MUTE 0xa678u         /* HPF 開，音量靜音 */
++#define FM_DIG_VOL_LEVEL 0xb885u        /* HPF 開，-30 dB：使用者 2026-11-18 只同意這一檔 */
++#define FM_AMP_GAIN 0x6c04u
++#define FM_TONE_READY_MS 15000u         /* READY 後等 PCM 圖開出 TDM 時脈的上限 */
++#define FM_TONE_ON_MS 5000u             /* 正弦一秒，加 PCM 端排隊與回報的餘裕 */
++#define FM_TDM_CTL (1u << 2 | 3u << 6)  /* gpio121／123／124：function 1，8 mA，不拉（早期 au_pin） */
 +
 +static const uint32_t kHalts[5] = {0x233d4u, 0x233d0u, 0x233ccu, 0x23004u, 0x1e004u};
 +static const unsigned kPins[4] = {0, 1, 183, 182};    /* SDA, SCL, reset B, reset T */
@@ -30060,6 +30080,9 @@ index 0000000..f0540b4
 +static struct fm_window gGcc0 = {FM_GCC, 0x4000, 0}, gGcc1c = {FM_GCC + 0x1c000, 0x4000, 0}, gGcc20 = {FM_GCC + 0x20000, 0x4000, 0},
 +    gGcc50 = {FM_GCC + 0x50000, 0x4000, 0}, gSe = {FM_SE, 0x4000, 0}, gGicd = {FM_GICD, 0x4000, 0};
 +static struct fm_window gPin[4];
++/* 只有 mode 7 對應：TDM 時脈、幀同步、資料輸出；gpio121–123 在 0xf178000 頁，gpio124 在 0xf17c000 頁。 */
++static const unsigned kTdmPins[3] = {121, 123, 124};
++static struct fm_window gTdmPin[3];
 +
 +static kern_return_t fm_map(struct fm_window *w)
 +{
@@ -30386,8 +30409,9 @@ index 0000000..f0540b4
 +/* Linux v6.12 cs35l41_hda.c cs35l41_smart_amp after the load: fs errata (cs35l41_configure_cs_dsp), cs_dsp_run (MPU with
 + * lock_regions 0xffffffff, cs_dsp_halo_start_core), HALO_STATE RUN (2), DSP_MBOX_2 RUNNING or PAUSED, then PAUSE. Xiaomi
 + * wm_halo_apply_calibration also sets MAX_LRCLK_DELAY 0x20 before the run. The HDA driver runs this with GLOBAL_EN clear and
-+ * no stream; so does this. Then cs_dsp_stop: watchdog off, CORE_EN clear, soft reset; the caller holds the amp in reset. */
-+static int ampRunMutedProtection(uint8_t address)
++ * no stream; so does this. Then cs_dsp_stop: watchdog off, CORE_EN clear, soft reset; the caller holds the amp in reset.
++ * 成功時把八個控制值（順序同 controls[]）複製到 out，mode 7 依此決定能否出聲。 */
++static int ampRunMutedProtection(uint8_t address, uint32_t out[8])
 +{
 +    static const uint8_t lrclk[4] = {0, 0, 0, 0x20};
 +    static const uint16_t mpu[20] = {0x00, 0x04, 0x08, 0x0c, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x2c,
@@ -30461,6 +30485,7 @@ index 0000000..f0540b4
 +    if (ok) {
 +        printf("FUXI AMP: protection running confirmed halo_state=2 after %u ms heartbeat %#x->%#x mbox %u paused %u ack %u, "
 +            "output off\n", ms, beat0, beat1, mbox, paused, ack);
++        memcpy(out, value, sizeof(value));
 +    } else {
 +        printf("FUXI AMP: protection run refused stage=%u halo_state=%#x ms=%u mbox=%#x paused=%#x ack=%u core=%#x "
 +            "irq1=%#x/%#x/%#x/%#x\n", stage, state, ms, mbox, paused, ack, core, irq[0], irq[1], irq[2], irq[3]);
@@ -30468,8 +30493,8 @@ index 0000000..f0540b4
 +    return ok;
 +}
 +
-+/* Stock section boundaries are checked in full before the first bus write. */
-+static void ampLoadMutedProtection(uint8_t address, unsigned mode)
++/* Stock section boundaries are checked in full before the first bus write. 回傳 1 表示這個模式的每一步都通過。 */
++static int ampLoadMutedProtection(uint8_t address, unsigned mode)
 +{
 +    static const struct { uint32_t reg, length, group; } regions[] = {
 +        {0x02000000, 72, 12}, {0x0200009c, 528, 12}, {0x020003cc, 1596, 12},
@@ -30482,7 +30507,8 @@ index 0000000..f0540b4
 +    uint32_t header[2];
 +    unsigned verified = 0;
 +    const uint8_t *cal = NULL;
-+    if (mode < 3 || mode > 6 || address != kAddr[0] ||
++    uint32_t controls[8] = {0};
++    if (mode < 3 || mode > 7 || address != kAddr[0] ||
 +        SecureDTLookupEntry(NULL, mode >= 4 ? "/chosen/fuxi-speaker" : "/chosen", &chosen) != kSuccess ||
 +        SecureDTGetProperty(chosen, "fuxi,cs35l41-prot", &property, &length) != kSuccess ||
 +        length < sizeof(header)) goto refused;
@@ -30509,7 +30535,7 @@ index 0000000..f0540b4
 +            header[1] > length - offset) goto refused;
 +        offset += header[1];
 +    }
-+    if (offset != length || (mode == 6 && !ampB2Prepare(address)) || !ampOutputDisabled(address, 1)) goto refused;
++    if (offset != length || (mode >= 6 && !ampB2Prepare(address)) || !ampOutputDisabled(address, 1)) goto refused;
 +
 +    offset = sizeof(header);
 +    for (unsigned i = 0; i < count; i++) {
@@ -30530,10 +30556,16 @@ index 0000000..f0540b4
 +    if (mode >= 4) printf("FUXI AMP: full muted HALO verified bytes=%u sections=%u\n", verified, count);
 +    else printf("FUXI AMP: muted HALO XM probe verified bytes=%u sections=%u\n", verified, count);
 +    if (mode >= 5 && !ampBottomTuning(address, cal)) goto refused;
-+    if (mode == 6 && !ampRunMutedProtection(address)) goto refused;
-+    return;
++    if (mode >= 6 && !ampRunMutedProtection(address, controls)) goto refused;
++    /* 出聲前的閘門：保護韌體在跑（CSPL_ST_RUNNING = 0，Xiaomi cs35l41.h）、沒有錯誤碼、校正已套用。 */
++    if (mode == 7 && (controls[1] != 0 || controls[2] != 0 || controls[5] != 1)) {
++        printf("FUXI AMP: tone refused cspl_state=%#x errorno=%#x cal_status=%#x\n", controls[1], controls[2], controls[5]);
++        goto refused;
++    }
++    return 1;
 +refused:
 +    printf("FUXI AMP: muted HALO firmware refused verified=%u, resetting lower amp\n", verified);
++    return 0;
 +}
 +
 +/* The survey reads the engine only with every branch plainly on (CLK_OFF clear, hardware control or not): a read of an unclocked
@@ -30567,13 +30599,189 @@ index 0000000..f0540b4
 +    *running = run;
 +}
 +
++/* ---- mode 7：下方喇叭出聲短測 ---- */
++/* 早期 au_on_set：整個暫存器寫入後讀回，不同就停。 */
++static int ampSet(uint8_t address, uint32_t reg, uint32_t value)
++{
++    uint32_t got = 0;
++    if (ampWrite32(address, reg, value) && ampRead(address, reg, &got) && got == value) return 1;
++    printf("FUXI AMP: tone write refused reg=%#x want=%#x got=%#x\n", reg, value, got);
++    return 0;
++}
++
++/* 早期 au_on_rmw：讀、改、寫回，再讀回比對。 */
++static int ampSetBits(uint8_t address, uint32_t reg, uint32_t mask, uint32_t value)
++{
++    uint32_t was = 0;
++    if (!ampRead(address, reg, &was)) {
++        printf("FUXI AMP: tone read failed reg=%#x\n", reg);
++        return 0;
++    }
++    return ampSet(address, reg, (was & ~mask) | (value & mask));
++}
++
++/* au_on_prepare steps 12–26（steps 6–11 的 B2 errata 與 OTP 已由 ampB2Prepare 做過），right_slot、不開 VI 監看。
++ * 全程 GLOBAL_EN 關、音量靜音、類比增益最低；PLL 參考時脈設成 BCLK。 */
++static int ampTonePrepare(uint8_t address)
++{
++    static const uint32_t sets[][2] = {
++        {FM_PWR_CTRL2, 0x20}, {FM_AMP_GAIN, 0}, {FM_DIG_VOL, FM_DIG_VOL_MUTE},                    /* 15–16 */
++        {0x2c0c, 3}, {0x4804, 0x28}, {0x4808, 0x20200000u}, {0x4840, 0x18}, {0x4830, 0x18},       /* 17–19 */
++        {0x4820, 0x401}, {0x480c, 3}, {0x4c00, 8}, {0x4c20, 0}, {0x4c24, 0}, {0x4c28, 0}, {0x4c2c, 0}, /* 20–22 */
++        {0x2d10, 0x18010}, {0x4800, 0x10000},                                                    /* 23–24 */
++    };
++    static const uint32_t pll[6][2] = {{0x800, 0x800}, {0x7e0, 0x28u << 5}, {0x10, 0}, {0x7, 0}, {0x800, 0}, {0x10, 0x10}};
++    uint32_t status = 0;
++    if (!ampNoOutput(address)) return 0;
++    /* 12：舊的中斷旗標寫回清掉 */
++    for (unsigned i = 0; i < 4; i++)
++        if (!ampRead(address, FM_IRQ1_STATUS1 + 4u * i, &status) || !ampWrite32(address, FM_IRQ1_STATUS1 + 4u * i, status))
++            return 0;
++    /* 13–14：升壓 1000 nH、15 uF、峰值 4000 mA，先於任何能開升壓的寫入 */
++    if (!ampSetBits(address, 0x3810, 0xffff, 0x2424) || !ampSetBits(address, 0x3814, 0xff03, 0x7500) ||
++        !ampSetBits(address, 0x3808, 0x7f, 0x40)) return 0;
++    if (!ampRead(address, 0x3800, &status) || status != 0) {
++        printf("FUXI AMP: tone refused 0x3800=%#x\n", status);
++        return 0;
++    }
++    for (unsigned i = 0; i < sizeof(sets) / sizeof(sets[0]); i++)
++        if (!ampSet(address, sets[i][0], sets[i][1])) return 0;
++    for (unsigned i = 0; i < 6; i++)
++        if (!ampSetBits(address, FM_PLL_CLK_CTRL, pll[i][0], pll[i][1])) return 0;
++    return ampSet(address, FM_PWR_CTRL2, 0x21); /* 26：AMP_EN，GLOBAL_EN 仍關 */
++}
++
++/* au_on_power_up steps 28–31：TDM 時脈已在跑。PUP_DONE 最多等 100 ms，PLL 要鎖住。 */
++static int ampTonePowerUp(uint8_t address, unsigned *ms, uint32_t *status3)
++{
++    uint32_t status = 0;
++    *status3 = 0;
++    const int unlocked = ampWrite32(address, FM_TEST_KEY, 0x55) && ampWrite32(address, FM_TEST_KEY, 0xaa);
++    const int testOk = unlocked && ampWrite32(address, FM_TONE_TEST, 0x002f1aa0u);
++    const int locked = unlocked && ampWrite32(address, FM_TEST_KEY, 0xcc) && ampWrite32(address, FM_TEST_KEY, 0x33);
++    if (!testOk || !locked || !ampSetBits(address, FM_PWR_CTRL1, 1, 1)) return 0;
++    for (*ms = 0;; ++*ms) {
++        if (!ampRead(address, FM_IRQ1_STATUS1, &status) || (status & FM_TONE_ERRORS)) {
++            printf("FUXI AMP: tone power-up fault irq1_status1=%#x after %u ms\n", status, *ms);
++            return 0;
++        }
++        if (status & FM_TONE_PUP_DONE) break;
++        if (*ms >= 100) {
++            printf("FUXI AMP: tone power-up timeout irq1_status1=%#x\n", status);
++            return 0;
++        }
++        IOSleep(1);
++    }
++    if (!ampWrite32(address, FM_IRQ1_STATUS1, FM_TONE_PUP_DONE) || !ampRead(address, FM_IRQ1_STATUS3, status3)) return 0;
++    if ((*status3 & FM_TONE_PLL_LOCK) && !(*status3 & (FM_TONE_PLL_UNLOCK | FM_OTP_BOOT_ERR))) return 1;
++    printf("FUXI AMP: tone PLL not locked irq1_status3=%#x\n", *status3);
++    return 0;
++}
++
++/* au_on_check：四個狀態字都留著，STATUS1 有故障位元就停。 */
++static int ampToneCheck(uint8_t address, uint32_t status[4])
++{
++    for (unsigned i = 0; i < 4; i++)
++        if (!ampRead(address, FM_IRQ1_STATUS1 + 4u * i, &status[i])) return 0;
++    return !(status[0] & FM_TONE_ERRORS);
++}
++
++/* au_on_down：每一步都試，回傳是否全部成功且看到 PDN_DONE。之後呼叫端照樣把功放壓回 reset。 */
++static int ampToneDown(uint8_t address)
++{
++    uint32_t status = 0;
++    int ok = ampWrite32(address, FM_AMP_GAIN, 0);
++    ok = ampWrite32(address, FM_DIG_VOL, FM_DIG_VOL_MUTE) && ok;
++    ok = ampRmw(address, FM_PWR_CTRL1, 1, 0) && ok;
++    int down = 0;
++    for (unsigned i = 0; i < 100; i++) {
++        if (!ampRead(address, FM_IRQ1_STATUS1, &status)) break;
++        if ((down = (status & FM_TONE_PDN_DONE) != 0)) break;
++        IOSleep(1);
++    }
++    ok = ampWrite32(address, FM_IRQ1_STATUS1, FM_TONE_PDN_DONE) && ok && down;
++    const int unlocked = ampWrite32(address, FM_TEST_KEY, 0x55) && ampWrite32(address, FM_TEST_KEY, 0xaa);
++    const int testOk = unlocked && ampWrite32(address, FM_TONE_TEST, 0x002f1aa3u);
++    const int locked = unlocked && ampWrite32(address, FM_TEST_KEY, 0xcc) && ampWrite32(address, FM_TEST_KEY, 0x33);
++    ok = testOk && locked && ok;
++    ok = ampRmw(address, FM_PWR_CTRL2, 1, 0) && ok;
++    ok = ampWrite32(address, 0x4800, 0) && ok;
++    return ok;
++}
++
++/* 早期 au_tone_stage 的功放端順序：PCM 圖先送 100 ms 靜音（CLOCKED），steps 12–26，100 ms，上電，200 ms，檢查，-30 dB，
++ * 正弦期間每 100 ms 檢查一次，正弦送完（DRAIN）後再檢查一次，下電。任何一步失敗：先標 FAILED 讓 PCM 停送正弦，再下電。
++ * 呼叫端之後一律把功放壓回 reset。 */
++static int ampTone(uint8_t address)
++{
++    uint32_t status[4] = {0}, status3 = 0, state = FUXI_TONE_PENDING;
++    unsigned waited = 0, pup = 0, on = 0, checks = 0, stage = 1;
++    int ok = 0, touched = 0, quiet = 1;
++
++    if (!fuxi_amp_tone_move(FUXI_TONE_PENDING, FUXI_TONE_READY)) {
++        printf("FUXI AMP: tone refused, PCM side already gave up (state %u)\n", fuxi_amp_tone_get());
++        return 0;
++    }
++    printf("FUXI AMP: tone ready, bottom amplifier muted, waiting for the TDM clock\n");
++    while ((state = fuxi_amp_tone_get()) == FUXI_TONE_READY && waited < FM_TONE_READY_MS) {
++        IOSleep(5);
++        waited += 5;
++    }
++    if (state == FUXI_TONE_READY && !fuxi_amp_tone_move(FUXI_TONE_READY, FUXI_TONE_FAILED)) state = fuxi_amp_tone_get();
++    if (state != FUXI_TONE_CLOCKED) goto out;
++    stage = 2;
++    touched = 1;
++    if (!ampTonePrepare(address)) goto out;
++    IOSleep(100);
++    stage = 3;
++    if (!ampTonePowerUp(address, &pup, &status3)) goto out;
++    IOSleep(200);
++    stage = 4;
++    if (!ampToneCheck(address, status)) goto out;
++    stage = 5;
++    if (!ampSet(address, FM_DIG_VOL, FM_DIG_VOL_LEVEL)) goto out;
++    stage = 6;
++    if (!fuxi_amp_tone_move(FUXI_TONE_CLOCKED, FUXI_TONE_ON)) goto out;
++    printf("FUXI AMP: tone on -30 dB after %u ms, pup %u ms, pll %#x, irq1=%#x/%#x/%#x/%#x\n", waited, pup, status3,
++        status[0], status[1], status[2], status[3]);
++    stage = 7;
++    while ((state = fuxi_amp_tone_get()) == FUXI_TONE_ON && on < FM_TONE_ON_MS) {
++        IOSleep(10);
++        on += 10;
++        if (on % 100u == 0) {
++            checks++;
++            if (!ampToneCheck(address, status)) break;
++        }
++    }
++    if (state != FUXI_TONE_DRAIN) goto out;
++    stage = 8;
++    if (!ampToneCheck(address, status)) goto out;
++    ok = 1;
++out:
++    if (!ok && !fuxi_amp_tone_move(FUXI_TONE_DRAIN, FUXI_TONE_FAILED)) fuxi_amp_tone_abandon();
++    if (touched) quiet = ampToneDown(address);
++    if (ok && !(quiet && fuxi_amp_tone_move(FUXI_TONE_DRAIN, FUXI_TONE_OFF))) {
++        ok = 0;
++        stage = 9;
++        fuxi_amp_tone_move(FUXI_TONE_DRAIN, FUXI_TONE_FAILED);
++    }
++    printf("FUXI AMP: tone %s stage=%u waited=%u ms on=%u ms checks=%u irq1=%#x/%#x/%#x/%#x down %s state=%u\n",
++        ok ? "done" : "refused", stage, waited, on, checks, status[0], status[1], status[2], status[3],
++        touched ? (quiet ? "ok" : "incomplete") : "not needed", fuxi_amp_tone_get());
++    return ok;
++}
++
 +/* Mode 2. Saved state is put back on every exit path. */
 +static void bringUp(int wasRunning, unsigned mode)
 +{
-+    uint32_t savedCtl[4], savedIo[4];
++    uint32_t savedCtl[4], savedIo[4], tdmCtl[3] = {0}, tdmIo[3] = {0};
 +    for (unsigned i = 0; i < 4; ++i) { savedCtl[i] = pinCtl(i); savedIo[i] = pinIo(i); }
++    for (unsigned i = 0; mode == 7 && i < 3; ++i) {
++        tdmCtl[i] = rd(&gTdmPin[i], pinPa(kTdmPins[i]));
++        tdmIo[i] = rd(&gTdmPin[i], pinPa(kTdmPins[i]) + 4);
++    }
 +    const uint32_t savedVote2 = gcc(FM_VOTE2), savedGpll0 = gcc(FM_GPLL0_VOTE);
-+    int bus = 0, step = 0;
++    int bus = 0, step = 0, tdmMuxed = 0;
 +    uint32_t config = 0;
 +
 +    /* clocks */
@@ -30632,12 +30840,29 @@ index 0000000..f0540b4
 +            "no answer", devid, devid == FM_DEVID ? " (CS35L41)" : "", revid, st3, st4, gBus.error, gBus.error_status, gBus.done,
 +            gBus.failed, gBus.timeouts, kReset[a], ctlNow, lowIn, highIn);
 +        if (mode >= 3) {
-+            if (ok2 && devid == FM_DEVID && revid == 0xb2 && !(st3 & FM_OTP_BOOT_ERR) && (st4 & FM_OTP_BOOT_DONE))
-+                ampLoadMutedProtection(kAddr[a], mode);
-+            else
++            if (ok2 && devid == FM_DEVID && revid == 0xb2 && !(st3 & FM_OTP_BOOT_ERR) && (st4 & FM_OTP_BOOT_DONE)) {
++                if (ampLoadMutedProtection(kAddr[a], mode) && mode == 7) {
++                    /* 早期 au_pin：TDM 三支腳切到 function 1、8 mA；eGPIO 就從 LPASS 取回。時脈要等 PCM 圖開了才有。 */
++                    for (unsigned i = 0; i < 3; ++i) {
++                        const uint32_t egpio = tdmCtl[i] & FM_EGPIO_PRESENT ? FM_EGPIO_PRESENT | FM_EGPIO_ENABLE : 0;
++                        wr(&gTdmPin[i], pinPa(kTdmPins[i]), egpio | FM_TDM_CTL);
++                    }
++                    tdmMuxed = 1;
++                    ampTone(kAddr[a]);
++                }
++            } else {
 +                printf("FUXI AMP: muted XM skipped; lower amp identity or OTP boot check failed\n");
++            }
 +        }
 +        wr(&gPin[p], pinPa(kReset[a]) + 4, 0);           /* back into reset */
++        if (tdmMuxed) {
++            for (unsigned i = 0; i < 3; ++i) {
++                wr(&gTdmPin[i], pinPa(kTdmPins[i]) + 4, tdmIo[i] & ~1u);
++                wr(&gTdmPin[i], pinPa(kTdmPins[i]), tdmCtl[i]);
++            }
++            tdmMuxed = 0;
++            printf("FUXI AMP: TDM pins restored gpio121 %#x gpio123 %#x gpio124 %#x\n", tdmCtl[0], tdmCtl[1], tdmCtl[2]);
++        }
 +    }
 +    step = 6;
 +out:
@@ -30681,12 +30906,24 @@ index 0000000..f0540b4
 +        for (unsigned j = 0; j < i; ++j) if (gPin[j].pa == gPin[i].pa) gPin[i].va = gPin[j].va; /* gpio0 and gpio1 share a page */
 +        ok = fm_map(&gPin[i]) == KERN_SUCCESS;
 +    }
++    for (unsigned i = 0; ok && mode == 7 && i < 3; ++i) {
++        gTdmPin[i].pa = pinPa(kTdmPins[i]) & ~(uint64_t)0x3fffu;
++        gTdmPin[i].size = 0x4000;
++        for (unsigned j = 0; j < i; ++j) if (gTdmPin[j].pa == gTdmPin[i].pa) gTdmPin[i].va = gTdmPin[j].va; /* 121、123 同頁 */
++        ok = fm_map(&gTdmPin[i]) == KERN_SUCCESS;
++    }
 +    if (!ok) {
 +        printf("FUXI AMP: mapping failed\n");
 +    } else {
 +        int running = 0;
 +        survey(&running);
 +        if (mode >= 2) bringUp(running, mode);
++    }
++    /* mode 7 任何沒走到 OFF 的路徑（對應失敗、身分或韌體不符、閘門拒絕）都讓 PCM 端別再等。 */
++    if (mode == 7) {
++        const uint32_t was = fuxi_amp_tone_abandon();
++        if (was >= FUXI_TONE_PENDING && was <= FUXI_TONE_ON)
++            printf("FUXI AMP: tone abandoned in state %u, PCM side plays zeros only\n", was);
 +    }
 +    thread_terminate(current_thread());
 +}
@@ -30697,9 +30934,12 @@ index 0000000..f0540b4
 +    static int started;
 +    thread_t thread = NULL;
 +    const unsigned mode = fm_mode();
-+    if (!mode || mode > 6 || started) return;
++    if (!mode || mode > 7 || started) return;
 +    started = 1;
++    /* 先於 ADSP 執行緒設好，PCM 圖一開始就知道要等功放。 */
++    if (mode == 7) __atomic_store_n(&fuxi_amp_tone, FUXI_TONE_PENDING, __ATOMIC_RELEASE);
 +    if (kernel_thread_start(ampThread, (void *)(uintptr_t)mode, &thread) != KERN_SUCCESS) {
++        if (mode == 7) fuxi_amp_tone_abandon();
 +        printf("FUXI AMP: no thread\n");
 +        return;
 +    }
@@ -30707,6 +30947,86 @@ index 0000000..f0540b4
 +    printf("FUXI AMP: started mode %u\n", mode);
 +}
 +#endif /* FUXI */
+diff --git a/xnu/fuxi-adsp/fuxi_amp_tone.h b/xnu/fuxi-adsp/fuxi_amp_tone.h
+new file mode 100644
+index 0000000..0588f8c
+--- /dev/null
++++ b/xnu/fuxi-adsp/fuxi_amp_tone.h
+@@ -0,0 +1,74 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* FUXI 下方喇叭出聲短測（fuxiamp／ADT fuxi,amp = 7，搭配 fuxi,audio-spf = 5）的雙方交握。
++ * fuxi_amp.c 的功放執行緒和 fuxi_audio_spf.c 的 ADSP 擁有者執行緒只透過 fuxi_amp_tone 這個狀態字溝通；
++ * 每次轉換都用 CAS，任何一方出錯就改成 FAILED，另一方看到後自行收尾（功放：靜音、下電、回 reset；PCM：停送正弦、關圖）。
++ *
++ *   IDLE     不是 mode 7，PCM 圖照 mode 5 只送靜音
++ *   PENDING  mode 7 已啟動，功放還在載入與核對保護韌體（PCM 圖停在 GATE，不開 TDM）
++ *   READY    保護韌體試跑通過且 CSPL_STATE／ERRORNO／CAL_STATUS 正常，TDM 腳位已切換，輸出仍關，等 TDM 時脈
++ *   CLOCKED  PCM 圖已 START 並播完 100 ms 靜音，功放可設旁路與上電
++ *   ON       功放上電、-30 dB；PCM 開始送 1 秒正弦
++ *   DRAIN    正弦的每個週期都已回 WRITE_DONE，PCM 改送靜音，功放做最後檢查與下電
++ *   OFF      功放已下電，PCM 收尾關圖
++ *   FAILED   任一方放棄
++ *
++ * 正弦表、長度與淡入淡出逐項沿用早期 Fuxi shim/fuxi-probe/audio.c au_sine／au_tone_fill（2 kHz、-20 dBFS、1 秒、
++ * 各 40 ms 淡入淡出，四個槽同值），2026-11-19 對照。 */
++#ifndef FUXI_AMP_TONE_H
++#define FUXI_AMP_TONE_H
++
++#include <stdint.h>
++
++enum {
++    FUXI_TONE_IDLE = 0,
++    FUXI_TONE_PENDING = 1,
++    FUXI_TONE_READY = 2,
++    FUXI_TONE_CLOCKED = 3,
++    FUXI_TONE_ON = 4,
++    FUXI_TONE_DRAIN = 5,
++    FUXI_TONE_OFF = 6,
++    FUXI_TONE_FAILED = 7,
++};
++
++#define FUXI_TONE_FRAMES 48000u /* 一秒 */
++#define FUXI_TONE_FADE 1920u    /* 40 ms */
++
++/* fuxi_amp.c 定義。 */
++extern uint32_t fuxi_amp_tone;
++
++static inline uint32_t fuxi_amp_tone_get(void)
++{
++    return __atomic_load_n(&fuxi_amp_tone, __ATOMIC_ACQUIRE);
++}
++
++/* from → to；狀態已被另一方改掉就回 0。 */
++static inline int fuxi_amp_tone_move(uint32_t from, uint32_t to)
++{
++    return __atomic_compare_exchange_n(&fuxi_amp_tone, &from, to, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++}
++
++/* PENDING 到 ON 之間的任何狀態改成 FAILED，回傳原本的狀態。DRAIN 由功放自己收尾，OFF／FAILED／IDLE 不動。 */
++static inline uint32_t fuxi_amp_tone_abandon(void)
++{
++    uint32_t state = fuxi_amp_tone_get();
++    while (state >= FUXI_TONE_PENDING && state <= FUXI_TONE_ON &&
++        !__atomic_compare_exchange_n(&fuxi_amp_tone, &state, FUXI_TONE_FAILED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++    }
++    return state;
++}
++
++/* 第 frame 個取樣（32 位元，四個槽同值）；超過一秒回 0。 */
++static inline int32_t fuxi_amp_tone_sample(uint32_t frame)
++{
++    static const int32_t sine[24] = {0, 55580967, 107374182, 151850025, 185977539, 207430992, 214748365, 207430992,
++        185977539, 151850025, 107374182, 55580967, 0, -55580967, -107374182, -151850025, -185977539, -207430992,
++        -214748365, -207430992, -185977539, -151850025, -107374182, -55580967};
++    if (frame >= FUXI_TONE_FRAMES) {
++        return 0;
++    }
++    const uint32_t left = FUXI_TONE_FRAMES - frame;
++    const uint32_t gain = frame < FUXI_TONE_FADE ? frame : left < FUXI_TONE_FADE ? left : FUXI_TONE_FADE;
++    return (int32_t)((int64_t)sine[frame % 24u] * gain / FUXI_TONE_FADE);
++}
++
++#endif /* FUXI_AMP_TONE_H */
 diff --git a/xnu/fuxi-adsp/fuxi_audio_smmu.h b/xnu/fuxi-adsp/fuxi_audio_smmu.h
 new file mode 100644
 index 0000000..071cf95
@@ -30964,10 +31284,10 @@ index 0000000..071cf95
 +#endif
 diff --git a/xnu/fuxi-adsp/fuxi_audio_spf.c b/xnu/fuxi-adsp/fuxi_audio_spf.c
 new file mode 100644
-index 0000000..cc57282
+index 0000000..88e8d82
 --- /dev/null
 +++ b/xnu/fuxi-adsp/fuxi_audio_spf.c
-@@ -0,0 +1,579 @@
+@@ -0,0 +1,841 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/systm.h>
@@ -30978,6 +31298,7 @@ index 0000000..cc57282
 +#include "fuxi_audio_prep_gpr.h"
 +#include "fuxi_audio_smmu.h"
 +#include "fuxi_audioreach.h"
++#include "fuxi_amp_tone.h"
 +
 +#define FUXI_SPF_PORT 0x1000u
 +#define FUXI_SPF_TOKEN 0x53504601u
@@ -30996,6 +31317,22 @@ index 0000000..cc57282
 +#define FUXI_TDM_CLOCK_INVERT 4u
 +#define FUXI_PCM_BYTES (3840u * 4u * sizeof(uint32_t)) /* 80 ms, four 32-bit slots */
 +_Static_assert(FUXI_PCM_BYTES <= FUXI_AUDIO_DMA_BYTES, "PCM must fit in the loader buffer");
++/* 出聲模式（功放 mode 7）：早期 au_tone_pump 的 20 ms 週期、四個緩衝輪替；這裡最多三個在 DSP 手上，第四個供下一次填寫。 */
++#define FUXI_TONE_PERIOD_FRAMES 960u
++#define FUXI_TONE_PERIOD_BYTES (FUXI_TONE_PERIOD_FRAMES * 4u * sizeof(uint32_t))
++#define FUXI_TONE_PERIODS 4u
++#define FUXI_TONE_AHEAD 3u
++#define FUXI_TONE_ZEROS 5u        /* 開功放前、以及正弦之後各播 100 ms 靜音（早期先確認 write_done ≥ 5） */
++#define FUXI_TONE_GATE_MS 120000u /* 功放載入與試跑保護韌體的上限 */
++#define FUXI_TONE_WAIT_MS 3000u   /* 靜音播放、功放上電、功放下電各自的上限 */
++_Static_assert(FUXI_TONE_PERIODS * FUXI_TONE_PERIOD_BYTES <= FUXI_AUDIO_DMA_BYTES, "tone periods must fit in the loader buffer");
++_Static_assert(FUXI_TONE_AHEAD < FUXI_TONE_PERIODS, "the period being filled must not be in the DSP's hands");
++_Static_assert(FUXI_TONE_FRAMES % FUXI_TONE_PERIOD_FRAMES == 0, "the tone ends on a period boundary");
++#if defined(__aarch64__)
++#define FUXI_PCM_BARRIER() __asm__ volatile("dsb sy" ::: "memory")
++#else
++#define FUXI_PCM_BARRIER() __atomic_thread_fence(__ATOMIC_SEQ_CST)
++#endif
 +
 +enum fuxi_prm_phase {
 +    FUXI_PRM_IDLE, FUXI_PRM_VOTE_REPLY, FUXI_PRM_QUEUE_RELEASE, FUXI_PRM_RELEASE_REPLY
@@ -31080,11 +31417,27 @@ index 0000000..cc57282
 +    int up, attempted, waiting, done, accepted, reported_accepted, reported_first, reply_ready, disconnected;
 +} gSpf;
 +
++/* 出聲模式的 PCM 端階段。GATE：圖還沒開，等功放 READY；GRAPH：照 mode 5 建圖；PREROLL：WRITE 步驟送靜音，播滿後交出
++ * CLOCKED，等功放 ON；PLAY：送一秒正弦；POSTROLL：正弦全部回報後再送靜音，交出 DRAIN，等功放 OFF；FINISH：停送，等手上的緩衝回來。 */
++enum fuxi_tone_phase {
++    FUXI_TONE_PCM_OFF, FUXI_TONE_PCM_GATE, FUXI_TONE_PCM_GRAPH, FUXI_TONE_PCM_PREROLL,
++    FUXI_TONE_PCM_PLAY, FUXI_TONE_PCM_POSTROLL, FUXI_TONE_PCM_FINISH
++};
++
++static struct {
++    enum fuxi_tone_phase phase;
++    uint64_t deadline;
++    uint32_t sent, done, frame, tone_start, tone_end, stray, status;
++    bool clocked, error;
++    const char *why;
++} gTone;
++
 +void fuxi_audio_spf_start(void);
 +void fuxi_audio_spf_poll(void);
 +extern void fuxi_audio_dma_survey(void);
 +extern bool fuxi_audio_dma_open(uint64_t *address);
 +extern void fuxi_audio_dma_close(void);
++extern void *fuxi_audio_dma_buffer(void);
 +
 +static unsigned format(void)
 +{
@@ -31159,8 +31512,206 @@ index 0000000..cc57282
 +    }
 +}
 +
++/* ---- 出聲模式 ---- */
++static bool tone_owns_write(void)
++{
++    return gGraph.step == FUXI_GRAPH_WRITE && gTone.phase >= FUXI_TONE_PCM_GRAPH;
++}
++
++/* 出錯：把功放狀態改成 FAILED（DRAIN 交給功放自己收尾），不再送新的緩衝。 */
++static void tone_stop(const char *why)
++{
++    if (!gTone.why) {
++        gTone.why = why;
++    }
++    gTone.error = true;
++    fuxi_amp_tone_abandon();
++    gTone.phase = FUXI_TONE_PCM_FINISH;
++    clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gTone.deadline);
++}
++
++/* GATE：PCM 圖還沒送任何命令。功放還在 PENDING 就繼續等；READY 才建圖，否則照 mode 5 只送靜音。回傳 true 表示可以往下走。 */
++static bool tone_gate(void)
++{
++    const uint32_t state = fuxi_amp_tone_get();
++    clock_interval_to_deadline(FUXI_GRAPH_QUEUE_MS, NSEC_PER_MSEC, &gGraph.deadline);
++    if (state == FUXI_TONE_PENDING && !gGraph.link_lost && mach_absolute_time() < gTone.deadline) {
++        return false;
++    }
++    if (state == FUXI_TONE_READY && !gGraph.link_lost) {
++        gTone.phase = FUXI_TONE_PCM_GRAPH;
++        printf("FUXI AUDIO TONE: bottom amplifier ready, opening the speaker graph\n");
++    } else {
++        const uint32_t was = fuxi_amp_tone_abandon();
++        gTone.phase = FUXI_TONE_PCM_OFF;
++        printf("FUXI AUDIO TONE: amplifier state %u%s, silent PCM only\n", was,
++            gGraph.link_lost ? " and GLINK lost" : state == FUXI_TONE_PENDING ? " after the wait" : "");
++    }
++    return true;
++}
++
++/* 第 index 個週期：靜音，或剩下的正弦（不足一個週期的部分補零）。裝置記憶體只用 32 位元 volatile 寫入，不讓編譯器換成 DC ZVA。 */
++static bool tone_fill(uint32_t index, bool tone)
++{
++    uint8_t *base = fuxi_audio_dma_buffer();
++    if (!base) {
++        return false;
++    }
++    volatile uint32_t *out = (volatile uint32_t *)(base + index * FUXI_TONE_PERIOD_BYTES);
++    for (uint32_t i = 0; i < FUXI_TONE_PERIOD_FRAMES; i++) {
++        uint32_t value = 0;
++        if (tone && gTone.frame < FUXI_TONE_FRAMES) {
++            value = (uint32_t)fuxi_amp_tone_sample(gTone.frame++);
++        }
++        for (uint32_t slot = 0; slot < 4; slot++) {
++            out[4 * i + slot] = value;
++        }
++    }
++    FUXI_PCM_BARRIER();
++    return true;
++}
++
++/* WRITE_DONE 必須照送出的順序回來（位址與 map handle 都對）；不認得的只計數。在擁有者執行緒的接收回呼裡，不送任何東西。 */
++static void tone_receive(const uint8_t *data, uint32_t length)
++{
++    FuxiAudioPrepGprView view;
++    if (!gSpf.up || length > FUXI_SPF_INTENT_BYTES || fuxi_audio_prep_gpr_decode(data, length, &view) ||
++        view.fields.src_domain != FUXI_AUDIO_PREP_DOMAIN_ADSP ||
++        view.fields.dst_domain != FUXI_AUDIO_PREP_DOMAIN_APPS ||
++        view.fields.src_port != FUXI_AR_IID_PLAY_SHMEM || view.fields.dst_port != FUXI_SPF_PORT ||
++        view.fields.token != FUXI_GRAPH_TOKEN + FUXI_GRAPH_WRITE) {
++        return;
++    }
++    if (view.fields.opcode == FUXI_AUDIO_PREP_BASIC_RESULT) {
++        uint32_t result[2];
++        if (view.payload_bytes == sizeof(result)) {
++            memcpy(result, view.payload, sizeof(result));
++            if (result[0] == FUXI_AR_OP_WRITE && result[1] != 0) {
++                gTone.error = true;
++                gTone.status = result[1];
++            }
++        }
++        return;
++    }
++    if (view.fields.opcode != FUXI_AR_OP_WRITE_DONE || view.payload_bytes < 16) {
++        return;
++    }
++    uint32_t result[4];
++    memcpy(result, view.payload, sizeof(result));
++    const uint64_t returned = (uint64_t)result[1] << 32 | result[0];
++    const uint64_t expected = gGraph.dma_address + (uint64_t)(gTone.done % FUXI_TONE_PERIODS) * FUXI_TONE_PERIOD_BYTES;
++    if (gTone.done >= gTone.sent || returned != expected || result[2] != gGraph.map_handle) {
++        gTone.stray++;
++        return;
++    }
++    if (result[3] != 0) {
++        gTone.error = true;
++        gTone.status = result[3];
++    }
++    gTone.done++;
++    clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gGraph.deadline);
++}
++
++/* 出聲模式下 WRITE 步驟由這裡接手。回傳 true 表示結束，呼叫端再 graph_advance(gTone.error) 進入停圖。 */
++static bool tone_pump(void)
++{
++    const uint64_t now = mach_absolute_time();
++    if (gTone.phase == FUXI_TONE_PCM_GRAPH) {
++        gTone.phase = FUXI_TONE_PCM_PREROLL;
++        clock_interval_to_deadline(FUXI_TONE_WAIT_MS, NSEC_PER_MSEC, &gTone.deadline);
++        clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gGraph.deadline);
++        printf("FUXI AUDIO TONE: speaker graph started, %u ms of zeros before the amplifier\n", FUXI_TONE_ZEROS * 20u);
++    }
++    if (gTone.phase < FUXI_TONE_PCM_FINISH) {
++        const uint32_t state = fuxi_amp_tone_get();
++        if (gGraph.link_lost) {
++            tone_stop("GLINK disconnect");
++        } else if (gTone.error) {
++            tone_stop("write error");
++        } else if (now >= gGraph.deadline) {
++            tone_stop("write reply timeout");
++        } else if (gTone.phase == FUXI_TONE_PCM_PREROLL && !gTone.clocked) {
++            if (gTone.done >= FUXI_TONE_ZEROS) {
++                if (fuxi_amp_tone_move(FUXI_TONE_READY, FUXI_TONE_CLOCKED)) {
++                    gTone.clocked = true;
++                    clock_interval_to_deadline(FUXI_TONE_WAIT_MS, NSEC_PER_MSEC, &gTone.deadline);
++                    printf("FUXI AUDIO TONE: TDM clock running, %u periods of zeros played\n", gTone.done);
++                } else {
++                    tone_stop("amplifier gave up before the clock");
++                }
++            } else if (now >= gTone.deadline) {
++                tone_stop("zeros did not play");
++            }
++        } else if (gTone.phase == FUXI_TONE_PCM_PREROLL) {
++            if (state == FUXI_TONE_ON) {
++                gTone.phase = FUXI_TONE_PCM_PLAY;
++                gTone.tone_start = gTone.sent;
++                printf("FUXI AUDIO TONE: amplifier on, tone starts at period %u\n", gTone.sent);
++            } else if (state != FUXI_TONE_CLOCKED) {
++                tone_stop("amplifier did not power up");
++            } else if (now >= gTone.deadline) {
++                tone_stop("amplifier power-up timeout");
++            }
++        } else if (gTone.phase == FUXI_TONE_PCM_PLAY) {
++            if (state != FUXI_TONE_ON) {
++                tone_stop("amplifier left ON during the tone");
++            } else if (gTone.frame >= FUXI_TONE_FRAMES && gTone.done >= gTone.tone_end + FUXI_TONE_ZEROS) {
++                if (fuxi_amp_tone_move(FUXI_TONE_ON, FUXI_TONE_DRAIN)) {
++                    gTone.phase = FUXI_TONE_PCM_POSTROLL;
++                    clock_interval_to_deadline(FUXI_TONE_WAIT_MS, NSEC_PER_MSEC, &gTone.deadline);
++                    printf("FUXI AUDIO TONE: tone played, %u frames in periods %u-%u, amplifier powering down\n",
++                        gTone.frame, gTone.tone_start, gTone.tone_end - 1);
++                } else {
++                    tone_stop("amplifier left ON during the tone");
++                }
++            }
++        } else if (gTone.phase == FUXI_TONE_PCM_POSTROLL) {
++            if (state == FUXI_TONE_OFF) {
++                gTone.phase = FUXI_TONE_PCM_FINISH;
++                clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gTone.deadline);
++            } else if (state != FUXI_TONE_DRAIN) {
++                tone_stop("amplifier failed while powering down");
++            } else if (now >= gTone.deadline) {
++                tone_stop("amplifier power-down timeout");
++            }
++        }
++    }
++    if (gTone.phase == FUXI_TONE_PCM_FINISH) {
++        if (gTone.done < gTone.sent && gSpf.up && !gGraph.link_lost && now < gTone.deadline) {
++            return false;
++        }
++        printf("FUXI AUDIO TONE: %s%s%s periods sent=%u done=%u tone_frames=%u stray=%u status=%u amp_state=%u\n",
++            gTone.error ? "failed" : "complete", gTone.why ? ": " : "", gTone.why ? gTone.why : "", gTone.sent, gTone.done,
++            gTone.frame, gTone.stray, gTone.status, fuxi_amp_tone_get());
++        gTone.phase = FUXI_TONE_PCM_OFF;
++        return true;
++    }
++    while (gSpf.up && gTone.sent < gTone.done + FUXI_TONE_AHEAD) {
++        const uint32_t index = gTone.sent % FUXI_TONE_PERIODS, frame = gTone.frame;
++        const bool tone = gTone.phase == FUXI_TONE_PCM_PLAY && gTone.frame < FUXI_TONE_FRAMES;
++        uint8_t packet[FUXI_SPF_INTENT_BYTES];
++        const uint32_t length = fuxi_ar_write(packet, sizeof(packet), FUXI_SPF_PORT, FUXI_GRAPH_TOKEN + FUXI_GRAPH_WRITE,
++            gGraph.dma_address + (uint64_t)index * FUXI_TONE_PERIOD_BYTES, gGraph.map_handle, FUXI_TONE_PERIOD_BYTES);
++        if (!length || !tone_fill(index, tone) || sheng_adsp_send(gSpf.channel, packet, length) != 0) {
++            gTone.frame = frame;
++            break;
++        }
++        gGraph.queued |= GRAPH_SENT(FUXI_GRAPH_WRITE);
++        gTone.sent++;
++        if (tone && gTone.frame >= FUXI_TONE_FRAMES) {
++            gTone.tone_end = gTone.sent;
++        }
++        clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gGraph.deadline);
++    }
++    return false;
++}
++
 +static void graph_receive(const uint8_t *data, uint32_t length)
 +{
++    if (gGraph.step == FUXI_GRAPH_WRITE && gTone.phase >= FUXI_TONE_PCM_PREROLL) {
++        tone_receive(data, length);
++        return;
++    }
 +    if (!gGraph.waiting || gGraph.reply_ready || gGraph.link_lost || !gSpf.up ||
 +        mach_absolute_time() >= gGraph.deadline) {
 +        return;
@@ -31211,6 +31762,11 @@ index 0000000..cc57282
 +static void graph_advance(bool failed)
 +{
 +    gGraph.failed |= failed;
++    if (failed && gTone.phase == FUXI_TONE_PCM_GRAPH) {
++        fuxi_amp_tone_abandon();
++        gTone.phase = FUXI_TONE_PCM_OFF;
++        printf("FUXI AUDIO TONE: speaker graph failed before the tone, amplifier released\n");
++    }
 +    if (failed && gGraph.step < FUXI_GRAPH_STOP_PLAYBACK) {
 +        graph_set_step(FUXI_GRAPH_STOP_PLAYBACK);
 +    } else if (gGraph.step == FUXI_GRAPH_CONFIG_PLAYBACK && !gGraph.dma_address) {
@@ -31229,8 +31785,16 @@ index 0000000..cc57282
 +    if (gGraph.step == FUXI_GRAPH_IDLE) {
 +        return;
 +    }
++    if (gTone.phase == FUXI_TONE_PCM_GATE && !tone_gate()) {
++        return;
++    }
 +    const char *name = graph_steps[gGraph.step].name;
-+    if (gGraph.link_lost) {
++    if (tone_owns_write()) {
++        if (!tone_pump()) {
++            return;
++        }
++        graph_advance(gTone.error);
++    } else if (gGraph.link_lost) {
 +        printf("FUXI AUDIO TDM: %s interrupted by GLINK disconnect\n", name);
 +        graph_advance(true);
 +    } else if (gGraph.reply_ready) {
@@ -31249,6 +31813,10 @@ index 0000000..cc57282
 +        graph_set_step(gGraph.step + 1);
 +    }
 +    if (gGraph.step == FUXI_GRAPH_COMPLETE) {
++        if (gTone.phase != FUXI_TONE_PCM_OFF) {
++            fuxi_amp_tone_abandon();
++            gTone.phase = FUXI_TONE_PCM_OFF;
++        }
 +        if (gGraph.dma_address) {
 +            fuxi_audio_dma_close();
 +            printf("FUXI AUDIO PCM: probe complete result=%s\n", gGraph.failed ? "failed" : "ok");
@@ -31258,6 +31826,13 @@ index 0000000..cc57282
 +        return;
 +    }
 +    if (!gSpf.up || gGraph.waiting) {
++        return;
++    }
++    if (tone_owns_write()) {
++        /* 剛從 START_PLAYBACK 進到 WRITE：同一輪就開始送靜音。 */
++        if (tone_pump()) {
++            graph_advance(gTone.error);
++        }
 +        return;
 +    }
 +
@@ -31478,7 +32053,14 @@ index 0000000..cc57282
 +                } else if (gSpf.format == 5) {
 +                    if (fuxi_audio_dma_open(&gGraph.dma_address)) {
 +                        graph_set_step(FUXI_GRAPH_VOTE_MACRO);
++                        if (fuxi_amp_tone_get() != FUXI_TONE_IDLE) {
++                            /* 功放 mode 7：圖先不開，等功放載入並核對保護韌體。 */
++                            gTone.phase = FUXI_TONE_PCM_GATE;
++                            clock_interval_to_deadline(FUXI_TONE_GATE_MS, NSEC_PER_MSEC, &gTone.deadline);
++                            printf("FUXI AUDIO TONE: waiting for the bottom amplifier\n");
++                        }
 +                    } else {
++                        fuxi_amp_tone_abandon();
 +                        printf("FUXI AUDIO PCM: loader DMA handoff or live SMMU routes unavailable\n");
 +                    }
 +                }
@@ -48263,6 +48845,37 @@ index ebe463a..791422b 100644
  +	default:
  +		ret = kIOReturnUnsupported;
  +		break;
+diff --git a/xnu/patches/0043-sweet-console-crash-log.patch b/xnu/patches/0043-sweet-console-crash-log.patch
+index 1c9367c..0c44e8e 100644
+--- a/xnu/patches/0043-sweet-console-crash-log.patch
++++ b/xnu/patches/0043-sweet-console-crash-log.patch
+@@ -63,7 +63,25 @@
+  	exception_type_t        exception,
+ --- a/bsd/kern/kern_exit.c
+ +++ b/bsd/kern/kern_exit.c
+-@@ -1884,6 +1884,13 @@
++@@ -1433,4 +1433,17 @@
++ exit(proc_t p, struct exit_args *uap, int *retval)
++ {
+++#if defined(ARM64_BOARD_CONFIG_SWEET)
+++	if (uap->rval == 1 && strcmp(p->p_comm, "bluetoothd") == 0) {
+++		unsigned enabled = 0;
+++		static unsigned traced;
+++		if (PE_parse_boot_argn("fuxibtexittrace", &enabled, sizeof(enabled)) && enabled &&
+++		    __atomic_fetch_add(&traced, 1u, __ATOMIC_RELAXED) < 3) {
+++			extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
+++
+++			/* The user address space is still intact at syscall entry. */
+++			sweet_crash_log(p->p_comm, proc_getpid(p), 0, 1, 0);
+++		}
+++	}
+++#endif
++ 	p->p_xhighbits = ((uint32_t)(uap->rval) & 0xFF000000) >> 24;
++ 	exit1(p, W_EXITCODE((uint32_t)uap->rval, 0), retval);
++@@ -1884,6 +1897,13 @@
+  		subcode = ut->uu_subcode;
+  		etype = ut->uu_exception;
+  
 diff --git a/xnu/patches/0098-fuxi-native-adreno-abi.patch b/xnu/patches/0098-fuxi-native-adreno-abi.patch
 index 0ca2838..0d215ed 100644
 --- a/xnu/patches/0098-fuxi-native-adreno-abi.patch
@@ -53746,10 +54359,10 @@ index 41dbb65..b082005 100644
  +    W w;
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..b2d96b0
+index 0000000..6bc2bb0
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,15116 @@
+@@ -0,0 +1,15704 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,36 @@
@@ -53791,7 +54404,7 @@ index 0000000..b2d96b0
 + bsd/dev/unix_startup.c			standard
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_adsp.c
-+@@ -0,0 +1,1027 @@
++@@ -0,0 +1,1034 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* FUXI audio DSP (ADSP, LPASS) owner. Boot argument fuxiadsp (or ADT /chosen u32 "fuxi,adsp" when the command line is full):
 ++ *   1  survey what the boot stages left (SMEM partition and items, the DSP's SMP2P state, the AOSS mailbox, the RSC, the GIC
@@ -54048,6 +54661,13 @@ index 0000000..b2d96b0
 ++    printf("FUXI AUDIO PCM: loader DMA region pa=%#x bytes=%#x stream=%u\n",
 ++        handoff.pa, handoff.bytes, FUXI_AUDIO_DMA_STREAM);
 ++    return true;
+++}
+++
+++/* 出聲模式寫 PCM 用；fuxi_audio_dma_open 成功前與 close 之後都是 NULL。 */
+++void *fuxi_audio_dma_buffer(void);
+++void *fuxi_audio_dma_buffer(void)
+++{
+++    return gAudioDma.va ? (void *)gAudioDma.va : NULL;
 ++}
 ++
 ++void fuxi_audio_dma_close(void)
@@ -55452,7 +56072,7 @@ index 0000000..b2d96b0
 ++#endif /* FUXI */
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_amp.c
-+@@ -0,0 +1,768 @@
++@@ -0,0 +1,1010 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* FUXI speaker amplifiers: two Cirrus CS35L41 on QUP2 SE0 I2C (live DT i2c@880000: cs35l41@40 "B", reset GPIO 183; cs35l41@42
 ++ * "T", reset GPIO 182, both active low; pins gpio0 SDA / gpio1 SCL, function 2 = qup2_se0_l0/l1_mirb, 2 mA, pull-up; engine SPI
@@ -55474,6 +56094,10 @@ index 0000000..b2d96b0
 ++ *   6  applies the B2 errata and OTP trims first, loads as mode 5, then runs the protection firmware with GLOBAL_EN and AMP_EN
 ++ *      clear and no I2S clocks (Linux cs35l41_hda.c cs35l41_smart_amp): HALO_STATE RUN, mailbox status and PAUSE are checked,
 ++ *      then the core is stopped and the amplifier goes back into reset. No output stage, no boost, no volume write.
+++ *   7  先做 mode 6；只有 CSPL_STATE 0（CSPL_ST_RUNNING）、ERRORNO 0、CAL_STATUS 1 才繼續：下方喇叭播一秒 2 kHz、-20 dBFS，
+++ *      數位音量 -30 dB（0x6000 = 0xb885），不經 DSP（早期 Fuxi shim/fuxi-probe au_amp_on.h steps 12-31 與 au_tone_stage，
+++ *      當年 a-spk1 出過聲）。PCM 由 fuxi_audio_spf.c format 5 送，交握在 fuxi_amp_tone.h。使用者 2026-11-18 只同意這一檔、
+++ *      這一顆喇叭。
 ++ * Facts: QUP2 SE0 window 0x880000 + 0x4000, GCC 0x100000, TLMM 0xf100000 (0x1000 per pin: ctl, io at +4), GICD 0x17100000.
 ++ * Windows are mapped with kernel_map VA and pmap entries (never ml_io_map), as fuxi_adsp.c does. */
 ++#include <pexpert/arm64/board_config.h>
@@ -55489,6 +56113,9 @@ index 0000000..b2d96b0
 ++#include <vm/vm_kern.h>
 ++#include <vm/pmap.h>
 ++#include "GeniI2c.h"
+++#include "fuxi_amp_tone.h"
+++
+++uint32_t fuxi_amp_tone; /* fuxi_amp_tone.h：mode 7 的交握狀態，其餘模式保持 IDLE */
 ++
 ++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
 ++    unsigned, void *);
@@ -55562,6 +56189,21 @@ index 0000000..b2d96b0
 ++#define FM_EGPIO_PRESENT (1u << 11)
 ++#define FM_EGPIO_ENABLE (1u << 12)
 ++#define FM_RESET_CTL (1u << 9 | 7u << 6)  /* GPIO, output enabled, 16 mA, no pull */
+++/* Mode 7（早期 au_amp_on.h／audio.c 的值，逐項對照）。 */
+++#define FM_IRQ1_STATUS3 0x10018u
+++#define FM_TONE_ERRORS 0x800281c0u     /* IRQ1_STATUS1：amp short、temp error/warn、boost short、DCM UVP、boost OVP */
+++#define FM_TONE_PUP_DONE (1u << 24)     /* IRQ1_STATUS1 */
+++#define FM_TONE_PDN_DONE (1u << 23)
+++#define FM_TONE_PLL_LOCK 0x2u           /* IRQ1_STATUS3 */
+++#define FM_TONE_PLL_UNLOCK (1u << 4)
+++#define FM_TONE_TEST 0x2084u            /* 測試鑰匙下的上電／下電值 0x002f1aa0／0x002f1aa3 */
+++#define FM_DIG_VOL 0x6000u
+++#define FM_DIG_VOL_MUTE 0xa678u         /* HPF 開，音量靜音 */
+++#define FM_DIG_VOL_LEVEL 0xb885u        /* HPF 開，-30 dB：使用者 2026-11-18 只同意這一檔 */
+++#define FM_AMP_GAIN 0x6c04u
+++#define FM_TONE_READY_MS 15000u         /* READY 後等 PCM 圖開出 TDM 時脈的上限 */
+++#define FM_TONE_ON_MS 5000u             /* 正弦一秒，加 PCM 端排隊與回報的餘裕 */
+++#define FM_TDM_CTL (1u << 2 | 3u << 6)  /* gpio121／123／124：function 1，8 mA，不拉（早期 au_pin） */
 ++
 ++static const uint32_t kHalts[5] = {0x233d4u, 0x233d0u, 0x233ccu, 0x23004u, 0x1e004u};
 ++static const unsigned kPins[4] = {0, 1, 183, 182};    /* SDA, SCL, reset B, reset T */
@@ -55574,6 +56216,9 @@ index 0000000..b2d96b0
 ++static struct fm_window gGcc0 = {FM_GCC, 0x4000, 0}, gGcc1c = {FM_GCC + 0x1c000, 0x4000, 0}, gGcc20 = {FM_GCC + 0x20000, 0x4000, 0},
 ++    gGcc50 = {FM_GCC + 0x50000, 0x4000, 0}, gSe = {FM_SE, 0x4000, 0}, gGicd = {FM_GICD, 0x4000, 0};
 ++static struct fm_window gPin[4];
+++/* 只有 mode 7 對應：TDM 時脈、幀同步、資料輸出；gpio121–123 在 0xf178000 頁，gpio124 在 0xf17c000 頁。 */
+++static const unsigned kTdmPins[3] = {121, 123, 124};
+++static struct fm_window gTdmPin[3];
 ++
 ++static kern_return_t fm_map(struct fm_window *w)
 ++{
@@ -55900,8 +56545,9 @@ index 0000000..b2d96b0
 ++/* Linux v6.12 cs35l41_hda.c cs35l41_smart_amp after the load: fs errata (cs35l41_configure_cs_dsp), cs_dsp_run (MPU with
 ++ * lock_regions 0xffffffff, cs_dsp_halo_start_core), HALO_STATE RUN (2), DSP_MBOX_2 RUNNING or PAUSED, then PAUSE. Xiaomi
 ++ * wm_halo_apply_calibration also sets MAX_LRCLK_DELAY 0x20 before the run. The HDA driver runs this with GLOBAL_EN clear and
-++ * no stream; so does this. Then cs_dsp_stop: watchdog off, CORE_EN clear, soft reset; the caller holds the amp in reset. */
-++static int ampRunMutedProtection(uint8_t address)
+++ * no stream; so does this. Then cs_dsp_stop: watchdog off, CORE_EN clear, soft reset; the caller holds the amp in reset.
+++ * 成功時把八個控制值（順序同 controls[]）複製到 out，mode 7 依此決定能否出聲。 */
+++static int ampRunMutedProtection(uint8_t address, uint32_t out[8])
 ++{
 ++    static const uint8_t lrclk[4] = {0, 0, 0, 0x20};
 ++    static const uint16_t mpu[20] = {0x00, 0x04, 0x08, 0x0c, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x2c,
@@ -55975,6 +56621,7 @@ index 0000000..b2d96b0
 ++    if (ok) {
 ++        printf("FUXI AMP: protection running confirmed halo_state=2 after %u ms heartbeat %#x->%#x mbox %u paused %u ack %u, "
 ++            "output off\n", ms, beat0, beat1, mbox, paused, ack);
+++        memcpy(out, value, sizeof(value));
 ++    } else {
 ++        printf("FUXI AMP: protection run refused stage=%u halo_state=%#x ms=%u mbox=%#x paused=%#x ack=%u core=%#x "
 ++            "irq1=%#x/%#x/%#x/%#x\n", stage, state, ms, mbox, paused, ack, core, irq[0], irq[1], irq[2], irq[3]);
@@ -55982,8 +56629,8 @@ index 0000000..b2d96b0
 ++    return ok;
 ++}
 ++
-++/* Stock section boundaries are checked in full before the first bus write. */
-++static void ampLoadMutedProtection(uint8_t address, unsigned mode)
+++/* Stock section boundaries are checked in full before the first bus write. 回傳 1 表示這個模式的每一步都通過。 */
+++static int ampLoadMutedProtection(uint8_t address, unsigned mode)
 ++{
 ++    static const struct { uint32_t reg, length, group; } regions[] = {
 ++        {0x02000000, 72, 12}, {0x0200009c, 528, 12}, {0x020003cc, 1596, 12},
@@ -55996,7 +56643,8 @@ index 0000000..b2d96b0
 ++    uint32_t header[2];
 ++    unsigned verified = 0;
 ++    const uint8_t *cal = NULL;
-++    if (mode < 3 || mode > 6 || address != kAddr[0] ||
+++    uint32_t controls[8] = {0};
+++    if (mode < 3 || mode > 7 || address != kAddr[0] ||
 ++        SecureDTLookupEntry(NULL, mode >= 4 ? "/chosen/fuxi-speaker" : "/chosen", &chosen) != kSuccess ||
 ++        SecureDTGetProperty(chosen, "fuxi,cs35l41-prot", &property, &length) != kSuccess ||
 ++        length < sizeof(header)) goto refused;
@@ -56023,7 +56671,7 @@ index 0000000..b2d96b0
 ++            header[1] > length - offset) goto refused;
 ++        offset += header[1];
 ++    }
-++    if (offset != length || (mode == 6 && !ampB2Prepare(address)) || !ampOutputDisabled(address, 1)) goto refused;
+++    if (offset != length || (mode >= 6 && !ampB2Prepare(address)) || !ampOutputDisabled(address, 1)) goto refused;
 ++
 ++    offset = sizeof(header);
 ++    for (unsigned i = 0; i < count; i++) {
@@ -56044,10 +56692,16 @@ index 0000000..b2d96b0
 ++    if (mode >= 4) printf("FUXI AMP: full muted HALO verified bytes=%u sections=%u\n", verified, count);
 ++    else printf("FUXI AMP: muted HALO XM probe verified bytes=%u sections=%u\n", verified, count);
 ++    if (mode >= 5 && !ampBottomTuning(address, cal)) goto refused;
-++    if (mode == 6 && !ampRunMutedProtection(address)) goto refused;
-++    return;
+++    if (mode >= 6 && !ampRunMutedProtection(address, controls)) goto refused;
+++    /* 出聲前的閘門：保護韌體在跑（CSPL_ST_RUNNING = 0，Xiaomi cs35l41.h）、沒有錯誤碼、校正已套用。 */
+++    if (mode == 7 && (controls[1] != 0 || controls[2] != 0 || controls[5] != 1)) {
+++        printf("FUXI AMP: tone refused cspl_state=%#x errorno=%#x cal_status=%#x\n", controls[1], controls[2], controls[5]);
+++        goto refused;
+++    }
+++    return 1;
 ++refused:
 ++    printf("FUXI AMP: muted HALO firmware refused verified=%u, resetting lower amp\n", verified);
+++    return 0;
 ++}
 ++
 ++/* The survey reads the engine only with every branch plainly on (CLK_OFF clear, hardware control or not): a read of an unclocked
@@ -56081,13 +56735,189 @@ index 0000000..b2d96b0
 ++    *running = run;
 ++}
 ++
+++/* ---- mode 7：下方喇叭出聲短測 ---- */
+++/* 早期 au_on_set：整個暫存器寫入後讀回，不同就停。 */
+++static int ampSet(uint8_t address, uint32_t reg, uint32_t value)
+++{
+++    uint32_t got = 0;
+++    if (ampWrite32(address, reg, value) && ampRead(address, reg, &got) && got == value) return 1;
+++    printf("FUXI AMP: tone write refused reg=%#x want=%#x got=%#x\n", reg, value, got);
+++    return 0;
+++}
+++
+++/* 早期 au_on_rmw：讀、改、寫回，再讀回比對。 */
+++static int ampSetBits(uint8_t address, uint32_t reg, uint32_t mask, uint32_t value)
+++{
+++    uint32_t was = 0;
+++    if (!ampRead(address, reg, &was)) {
+++        printf("FUXI AMP: tone read failed reg=%#x\n", reg);
+++        return 0;
+++    }
+++    return ampSet(address, reg, (was & ~mask) | (value & mask));
+++}
+++
+++/* au_on_prepare steps 12–26（steps 6–11 的 B2 errata 與 OTP 已由 ampB2Prepare 做過），right_slot、不開 VI 監看。
+++ * 全程 GLOBAL_EN 關、音量靜音、類比增益最低；PLL 參考時脈設成 BCLK。 */
+++static int ampTonePrepare(uint8_t address)
+++{
+++    static const uint32_t sets[][2] = {
+++        {FM_PWR_CTRL2, 0x20}, {FM_AMP_GAIN, 0}, {FM_DIG_VOL, FM_DIG_VOL_MUTE},                    /* 15–16 */
+++        {0x2c0c, 3}, {0x4804, 0x28}, {0x4808, 0x20200000u}, {0x4840, 0x18}, {0x4830, 0x18},       /* 17–19 */
+++        {0x4820, 0x401}, {0x480c, 3}, {0x4c00, 8}, {0x4c20, 0}, {0x4c24, 0}, {0x4c28, 0}, {0x4c2c, 0}, /* 20–22 */
+++        {0x2d10, 0x18010}, {0x4800, 0x10000},                                                    /* 23–24 */
+++    };
+++    static const uint32_t pll[6][2] = {{0x800, 0x800}, {0x7e0, 0x28u << 5}, {0x10, 0}, {0x7, 0}, {0x800, 0}, {0x10, 0x10}};
+++    uint32_t status = 0;
+++    if (!ampNoOutput(address)) return 0;
+++    /* 12：舊的中斷旗標寫回清掉 */
+++    for (unsigned i = 0; i < 4; i++)
+++        if (!ampRead(address, FM_IRQ1_STATUS1 + 4u * i, &status) || !ampWrite32(address, FM_IRQ1_STATUS1 + 4u * i, status))
+++            return 0;
+++    /* 13–14：升壓 1000 nH、15 uF、峰值 4000 mA，先於任何能開升壓的寫入 */
+++    if (!ampSetBits(address, 0x3810, 0xffff, 0x2424) || !ampSetBits(address, 0x3814, 0xff03, 0x7500) ||
+++        !ampSetBits(address, 0x3808, 0x7f, 0x40)) return 0;
+++    if (!ampRead(address, 0x3800, &status) || status != 0) {
+++        printf("FUXI AMP: tone refused 0x3800=%#x\n", status);
+++        return 0;
+++    }
+++    for (unsigned i = 0; i < sizeof(sets) / sizeof(sets[0]); i++)
+++        if (!ampSet(address, sets[i][0], sets[i][1])) return 0;
+++    for (unsigned i = 0; i < 6; i++)
+++        if (!ampSetBits(address, FM_PLL_CLK_CTRL, pll[i][0], pll[i][1])) return 0;
+++    return ampSet(address, FM_PWR_CTRL2, 0x21); /* 26：AMP_EN，GLOBAL_EN 仍關 */
+++}
+++
+++/* au_on_power_up steps 28–31：TDM 時脈已在跑。PUP_DONE 最多等 100 ms，PLL 要鎖住。 */
+++static int ampTonePowerUp(uint8_t address, unsigned *ms, uint32_t *status3)
+++{
+++    uint32_t status = 0;
+++    *status3 = 0;
+++    const int unlocked = ampWrite32(address, FM_TEST_KEY, 0x55) && ampWrite32(address, FM_TEST_KEY, 0xaa);
+++    const int testOk = unlocked && ampWrite32(address, FM_TONE_TEST, 0x002f1aa0u);
+++    const int locked = unlocked && ampWrite32(address, FM_TEST_KEY, 0xcc) && ampWrite32(address, FM_TEST_KEY, 0x33);
+++    if (!testOk || !locked || !ampSetBits(address, FM_PWR_CTRL1, 1, 1)) return 0;
+++    for (*ms = 0;; ++*ms) {
+++        if (!ampRead(address, FM_IRQ1_STATUS1, &status) || (status & FM_TONE_ERRORS)) {
+++            printf("FUXI AMP: tone power-up fault irq1_status1=%#x after %u ms\n", status, *ms);
+++            return 0;
+++        }
+++        if (status & FM_TONE_PUP_DONE) break;
+++        if (*ms >= 100) {
+++            printf("FUXI AMP: tone power-up timeout irq1_status1=%#x\n", status);
+++            return 0;
+++        }
+++        IOSleep(1);
+++    }
+++    if (!ampWrite32(address, FM_IRQ1_STATUS1, FM_TONE_PUP_DONE) || !ampRead(address, FM_IRQ1_STATUS3, status3)) return 0;
+++    if ((*status3 & FM_TONE_PLL_LOCK) && !(*status3 & (FM_TONE_PLL_UNLOCK | FM_OTP_BOOT_ERR))) return 1;
+++    printf("FUXI AMP: tone PLL not locked irq1_status3=%#x\n", *status3);
+++    return 0;
+++}
+++
+++/* au_on_check：四個狀態字都留著，STATUS1 有故障位元就停。 */
+++static int ampToneCheck(uint8_t address, uint32_t status[4])
+++{
+++    for (unsigned i = 0; i < 4; i++)
+++        if (!ampRead(address, FM_IRQ1_STATUS1 + 4u * i, &status[i])) return 0;
+++    return !(status[0] & FM_TONE_ERRORS);
+++}
+++
+++/* au_on_down：每一步都試，回傳是否全部成功且看到 PDN_DONE。之後呼叫端照樣把功放壓回 reset。 */
+++static int ampToneDown(uint8_t address)
+++{
+++    uint32_t status = 0;
+++    int ok = ampWrite32(address, FM_AMP_GAIN, 0);
+++    ok = ampWrite32(address, FM_DIG_VOL, FM_DIG_VOL_MUTE) && ok;
+++    ok = ampRmw(address, FM_PWR_CTRL1, 1, 0) && ok;
+++    int down = 0;
+++    for (unsigned i = 0; i < 100; i++) {
+++        if (!ampRead(address, FM_IRQ1_STATUS1, &status)) break;
+++        if ((down = (status & FM_TONE_PDN_DONE) != 0)) break;
+++        IOSleep(1);
+++    }
+++    ok = ampWrite32(address, FM_IRQ1_STATUS1, FM_TONE_PDN_DONE) && ok && down;
+++    const int unlocked = ampWrite32(address, FM_TEST_KEY, 0x55) && ampWrite32(address, FM_TEST_KEY, 0xaa);
+++    const int testOk = unlocked && ampWrite32(address, FM_TONE_TEST, 0x002f1aa3u);
+++    const int locked = unlocked && ampWrite32(address, FM_TEST_KEY, 0xcc) && ampWrite32(address, FM_TEST_KEY, 0x33);
+++    ok = testOk && locked && ok;
+++    ok = ampRmw(address, FM_PWR_CTRL2, 1, 0) && ok;
+++    ok = ampWrite32(address, 0x4800, 0) && ok;
+++    return ok;
+++}
+++
+++/* 早期 au_tone_stage 的功放端順序：PCM 圖先送 100 ms 靜音（CLOCKED），steps 12–26，100 ms，上電，200 ms，檢查，-30 dB，
+++ * 正弦期間每 100 ms 檢查一次，正弦送完（DRAIN）後再檢查一次，下電。任何一步失敗：先標 FAILED 讓 PCM 停送正弦，再下電。
+++ * 呼叫端之後一律把功放壓回 reset。 */
+++static int ampTone(uint8_t address)
+++{
+++    uint32_t status[4] = {0}, status3 = 0, state = FUXI_TONE_PENDING;
+++    unsigned waited = 0, pup = 0, on = 0, checks = 0, stage = 1;
+++    int ok = 0, touched = 0, quiet = 1;
+++
+++    if (!fuxi_amp_tone_move(FUXI_TONE_PENDING, FUXI_TONE_READY)) {
+++        printf("FUXI AMP: tone refused, PCM side already gave up (state %u)\n", fuxi_amp_tone_get());
+++        return 0;
+++    }
+++    printf("FUXI AMP: tone ready, bottom amplifier muted, waiting for the TDM clock\n");
+++    while ((state = fuxi_amp_tone_get()) == FUXI_TONE_READY && waited < FM_TONE_READY_MS) {
+++        IOSleep(5);
+++        waited += 5;
+++    }
+++    if (state == FUXI_TONE_READY && !fuxi_amp_tone_move(FUXI_TONE_READY, FUXI_TONE_FAILED)) state = fuxi_amp_tone_get();
+++    if (state != FUXI_TONE_CLOCKED) goto out;
+++    stage = 2;
+++    touched = 1;
+++    if (!ampTonePrepare(address)) goto out;
+++    IOSleep(100);
+++    stage = 3;
+++    if (!ampTonePowerUp(address, &pup, &status3)) goto out;
+++    IOSleep(200);
+++    stage = 4;
+++    if (!ampToneCheck(address, status)) goto out;
+++    stage = 5;
+++    if (!ampSet(address, FM_DIG_VOL, FM_DIG_VOL_LEVEL)) goto out;
+++    stage = 6;
+++    if (!fuxi_amp_tone_move(FUXI_TONE_CLOCKED, FUXI_TONE_ON)) goto out;
+++    printf("FUXI AMP: tone on -30 dB after %u ms, pup %u ms, pll %#x, irq1=%#x/%#x/%#x/%#x\n", waited, pup, status3,
+++        status[0], status[1], status[2], status[3]);
+++    stage = 7;
+++    while ((state = fuxi_amp_tone_get()) == FUXI_TONE_ON && on < FM_TONE_ON_MS) {
+++        IOSleep(10);
+++        on += 10;
+++        if (on % 100u == 0) {
+++            checks++;
+++            if (!ampToneCheck(address, status)) break;
+++        }
+++    }
+++    if (state != FUXI_TONE_DRAIN) goto out;
+++    stage = 8;
+++    if (!ampToneCheck(address, status)) goto out;
+++    ok = 1;
+++out:
+++    if (!ok && !fuxi_amp_tone_move(FUXI_TONE_DRAIN, FUXI_TONE_FAILED)) fuxi_amp_tone_abandon();
+++    if (touched) quiet = ampToneDown(address);
+++    if (ok && !(quiet && fuxi_amp_tone_move(FUXI_TONE_DRAIN, FUXI_TONE_OFF))) {
+++        ok = 0;
+++        stage = 9;
+++        fuxi_amp_tone_move(FUXI_TONE_DRAIN, FUXI_TONE_FAILED);
+++    }
+++    printf("FUXI AMP: tone %s stage=%u waited=%u ms on=%u ms checks=%u irq1=%#x/%#x/%#x/%#x down %s state=%u\n",
+++        ok ? "done" : "refused", stage, waited, on, checks, status[0], status[1], status[2], status[3],
+++        touched ? (quiet ? "ok" : "incomplete") : "not needed", fuxi_amp_tone_get());
+++    return ok;
+++}
+++
 ++/* Mode 2. Saved state is put back on every exit path. */
 ++static void bringUp(int wasRunning, unsigned mode)
 ++{
-++    uint32_t savedCtl[4], savedIo[4];
+++    uint32_t savedCtl[4], savedIo[4], tdmCtl[3] = {0}, tdmIo[3] = {0};
 ++    for (unsigned i = 0; i < 4; ++i) { savedCtl[i] = pinCtl(i); savedIo[i] = pinIo(i); }
+++    for (unsigned i = 0; mode == 7 && i < 3; ++i) {
+++        tdmCtl[i] = rd(&gTdmPin[i], pinPa(kTdmPins[i]));
+++        tdmIo[i] = rd(&gTdmPin[i], pinPa(kTdmPins[i]) + 4);
+++    }
 ++    const uint32_t savedVote2 = gcc(FM_VOTE2), savedGpll0 = gcc(FM_GPLL0_VOTE);
-++    int bus = 0, step = 0;
+++    int bus = 0, step = 0, tdmMuxed = 0;
 ++    uint32_t config = 0;
 ++
 ++    /* clocks */
@@ -56146,12 +56976,29 @@ index 0000000..b2d96b0
 ++            "no answer", devid, devid == FM_DEVID ? " (CS35L41)" : "", revid, st3, st4, gBus.error, gBus.error_status, gBus.done,
 ++            gBus.failed, gBus.timeouts, kReset[a], ctlNow, lowIn, highIn);
 ++        if (mode >= 3) {
-++            if (ok2 && devid == FM_DEVID && revid == 0xb2 && !(st3 & FM_OTP_BOOT_ERR) && (st4 & FM_OTP_BOOT_DONE))
-++                ampLoadMutedProtection(kAddr[a], mode);
-++            else
+++            if (ok2 && devid == FM_DEVID && revid == 0xb2 && !(st3 & FM_OTP_BOOT_ERR) && (st4 & FM_OTP_BOOT_DONE)) {
+++                if (ampLoadMutedProtection(kAddr[a], mode) && mode == 7) {
+++                    /* 早期 au_pin：TDM 三支腳切到 function 1、8 mA；eGPIO 就從 LPASS 取回。時脈要等 PCM 圖開了才有。 */
+++                    for (unsigned i = 0; i < 3; ++i) {
+++                        const uint32_t egpio = tdmCtl[i] & FM_EGPIO_PRESENT ? FM_EGPIO_PRESENT | FM_EGPIO_ENABLE : 0;
+++                        wr(&gTdmPin[i], pinPa(kTdmPins[i]), egpio | FM_TDM_CTL);
+++                    }
+++                    tdmMuxed = 1;
+++                    ampTone(kAddr[a]);
+++                }
+++            } else {
 ++                printf("FUXI AMP: muted XM skipped; lower amp identity or OTP boot check failed\n");
+++            }
 ++        }
 ++        wr(&gPin[p], pinPa(kReset[a]) + 4, 0);           /* back into reset */
+++        if (tdmMuxed) {
+++            for (unsigned i = 0; i < 3; ++i) {
+++                wr(&gTdmPin[i], pinPa(kTdmPins[i]) + 4, tdmIo[i] & ~1u);
+++                wr(&gTdmPin[i], pinPa(kTdmPins[i]), tdmCtl[i]);
+++            }
+++            tdmMuxed = 0;
+++            printf("FUXI AMP: TDM pins restored gpio121 %#x gpio123 %#x gpio124 %#x\n", tdmCtl[0], tdmCtl[1], tdmCtl[2]);
+++        }
 ++    }
 ++    step = 6;
 ++out:
@@ -56195,12 +57042,24 @@ index 0000000..b2d96b0
 ++        for (unsigned j = 0; j < i; ++j) if (gPin[j].pa == gPin[i].pa) gPin[i].va = gPin[j].va; /* gpio0 and gpio1 share a page */
 ++        ok = fm_map(&gPin[i]) == KERN_SUCCESS;
 ++    }
+++    for (unsigned i = 0; ok && mode == 7 && i < 3; ++i) {
+++        gTdmPin[i].pa = pinPa(kTdmPins[i]) & ~(uint64_t)0x3fffu;
+++        gTdmPin[i].size = 0x4000;
+++        for (unsigned j = 0; j < i; ++j) if (gTdmPin[j].pa == gTdmPin[i].pa) gTdmPin[i].va = gTdmPin[j].va; /* 121、123 同頁 */
+++        ok = fm_map(&gTdmPin[i]) == KERN_SUCCESS;
+++    }
 ++    if (!ok) {
 ++        printf("FUXI AMP: mapping failed\n");
 ++    } else {
 ++        int running = 0;
 ++        survey(&running);
 ++        if (mode >= 2) bringUp(running, mode);
+++    }
+++    /* mode 7 任何沒走到 OFF 的路徑（對應失敗、身分或韌體不符、閘門拒絕）都讓 PCM 端別再等。 */
+++    if (mode == 7) {
+++        const uint32_t was = fuxi_amp_tone_abandon();
+++        if (was >= FUXI_TONE_PENDING && was <= FUXI_TONE_ON)
+++            printf("FUXI AMP: tone abandoned in state %u, PCM side plays zeros only\n", was);
 ++    }
 ++    thread_terminate(current_thread());
 ++}
@@ -56211,9 +57070,12 @@ index 0000000..b2d96b0
 ++    static int started;
 ++    thread_t thread = NULL;
 ++    const unsigned mode = fm_mode();
-++    if (!mode || mode > 6 || started) return;
+++    if (!mode || mode > 7 || started) return;
 ++    started = 1;
+++    /* 先於 ADSP 執行緒設好，PCM 圖一開始就知道要等功放。 */
+++    if (mode == 7) __atomic_store_n(&fuxi_amp_tone, FUXI_TONE_PENDING, __ATOMIC_RELEASE);
 ++    if (kernel_thread_start(ampThread, (void *)(uintptr_t)mode, &thread) != KERN_SUCCESS) {
+++        if (mode == 7) fuxi_amp_tone_abandon();
 ++        printf("FUXI AMP: no thread\n");
 ++        return;
 ++    }
@@ -64470,7 +65332,7 @@ index 0000000..b2d96b0
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_audio_spf.c
-+@@ -0,0 +1,579 @@
++@@ -0,0 +1,841 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/systm.h>
@@ -64481,6 +65343,7 @@ index 0000000..b2d96b0
 ++#include "fuxi_audio_prep_gpr.h"
 ++#include "fuxi_audio_smmu.h"
 ++#include "fuxi_audioreach.h"
+++#include "fuxi_amp_tone.h"
 ++
 ++#define FUXI_SPF_PORT 0x1000u
 ++#define FUXI_SPF_TOKEN 0x53504601u
@@ -64499,6 +65362,22 @@ index 0000000..b2d96b0
 ++#define FUXI_TDM_CLOCK_INVERT 4u
 ++#define FUXI_PCM_BYTES (3840u * 4u * sizeof(uint32_t)) /* 80 ms, four 32-bit slots */
 ++_Static_assert(FUXI_PCM_BYTES <= FUXI_AUDIO_DMA_BYTES, "PCM must fit in the loader buffer");
+++/* 出聲模式（功放 mode 7）：早期 au_tone_pump 的 20 ms 週期、四個緩衝輪替；這裡最多三個在 DSP 手上，第四個供下一次填寫。 */
+++#define FUXI_TONE_PERIOD_FRAMES 960u
+++#define FUXI_TONE_PERIOD_BYTES (FUXI_TONE_PERIOD_FRAMES * 4u * sizeof(uint32_t))
+++#define FUXI_TONE_PERIODS 4u
+++#define FUXI_TONE_AHEAD 3u
+++#define FUXI_TONE_ZEROS 5u        /* 開功放前、以及正弦之後各播 100 ms 靜音（早期先確認 write_done ≥ 5） */
+++#define FUXI_TONE_GATE_MS 120000u /* 功放載入與試跑保護韌體的上限 */
+++#define FUXI_TONE_WAIT_MS 3000u   /* 靜音播放、功放上電、功放下電各自的上限 */
+++_Static_assert(FUXI_TONE_PERIODS * FUXI_TONE_PERIOD_BYTES <= FUXI_AUDIO_DMA_BYTES, "tone periods must fit in the loader buffer");
+++_Static_assert(FUXI_TONE_AHEAD < FUXI_TONE_PERIODS, "the period being filled must not be in the DSP's hands");
+++_Static_assert(FUXI_TONE_FRAMES % FUXI_TONE_PERIOD_FRAMES == 0, "the tone ends on a period boundary");
+++#if defined(__aarch64__)
+++#define FUXI_PCM_BARRIER() __asm__ volatile("dsb sy" ::: "memory")
+++#else
+++#define FUXI_PCM_BARRIER() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+++#endif
 ++
 ++enum fuxi_prm_phase {
 ++    FUXI_PRM_IDLE, FUXI_PRM_VOTE_REPLY, FUXI_PRM_QUEUE_RELEASE, FUXI_PRM_RELEASE_REPLY
@@ -64583,11 +65462,27 @@ index 0000000..b2d96b0
 ++    int up, attempted, waiting, done, accepted, reported_accepted, reported_first, reply_ready, disconnected;
 ++} gSpf;
 ++
+++/* 出聲模式的 PCM 端階段。GATE：圖還沒開，等功放 READY；GRAPH：照 mode 5 建圖；PREROLL：WRITE 步驟送靜音，播滿後交出
+++ * CLOCKED，等功放 ON；PLAY：送一秒正弦；POSTROLL：正弦全部回報後再送靜音，交出 DRAIN，等功放 OFF；FINISH：停送，等手上的緩衝回來。 */
+++enum fuxi_tone_phase {
+++    FUXI_TONE_PCM_OFF, FUXI_TONE_PCM_GATE, FUXI_TONE_PCM_GRAPH, FUXI_TONE_PCM_PREROLL,
+++    FUXI_TONE_PCM_PLAY, FUXI_TONE_PCM_POSTROLL, FUXI_TONE_PCM_FINISH
+++};
+++
+++static struct {
+++    enum fuxi_tone_phase phase;
+++    uint64_t deadline;
+++    uint32_t sent, done, frame, tone_start, tone_end, stray, status;
+++    bool clocked, error;
+++    const char *why;
+++} gTone;
+++
 ++void fuxi_audio_spf_start(void);
 ++void fuxi_audio_spf_poll(void);
 ++extern void fuxi_audio_dma_survey(void);
 ++extern bool fuxi_audio_dma_open(uint64_t *address);
 ++extern void fuxi_audio_dma_close(void);
+++extern void *fuxi_audio_dma_buffer(void);
 ++
 ++static unsigned format(void)
 ++{
@@ -64662,8 +65557,206 @@ index 0000000..b2d96b0
 ++    }
 ++}
 ++
+++/* ---- 出聲模式 ---- */
+++static bool tone_owns_write(void)
+++{
+++    return gGraph.step == FUXI_GRAPH_WRITE && gTone.phase >= FUXI_TONE_PCM_GRAPH;
+++}
+++
+++/* 出錯：把功放狀態改成 FAILED（DRAIN 交給功放自己收尾），不再送新的緩衝。 */
+++static void tone_stop(const char *why)
+++{
+++    if (!gTone.why) {
+++        gTone.why = why;
+++    }
+++    gTone.error = true;
+++    fuxi_amp_tone_abandon();
+++    gTone.phase = FUXI_TONE_PCM_FINISH;
+++    clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gTone.deadline);
+++}
+++
+++/* GATE：PCM 圖還沒送任何命令。功放還在 PENDING 就繼續等；READY 才建圖，否則照 mode 5 只送靜音。回傳 true 表示可以往下走。 */
+++static bool tone_gate(void)
+++{
+++    const uint32_t state = fuxi_amp_tone_get();
+++    clock_interval_to_deadline(FUXI_GRAPH_QUEUE_MS, NSEC_PER_MSEC, &gGraph.deadline);
+++    if (state == FUXI_TONE_PENDING && !gGraph.link_lost && mach_absolute_time() < gTone.deadline) {
+++        return false;
+++    }
+++    if (state == FUXI_TONE_READY && !gGraph.link_lost) {
+++        gTone.phase = FUXI_TONE_PCM_GRAPH;
+++        printf("FUXI AUDIO TONE: bottom amplifier ready, opening the speaker graph\n");
+++    } else {
+++        const uint32_t was = fuxi_amp_tone_abandon();
+++        gTone.phase = FUXI_TONE_PCM_OFF;
+++        printf("FUXI AUDIO TONE: amplifier state %u%s, silent PCM only\n", was,
+++            gGraph.link_lost ? " and GLINK lost" : state == FUXI_TONE_PENDING ? " after the wait" : "");
+++    }
+++    return true;
+++}
+++
+++/* 第 index 個週期：靜音，或剩下的正弦（不足一個週期的部分補零）。裝置記憶體只用 32 位元 volatile 寫入，不讓編譯器換成 DC ZVA。 */
+++static bool tone_fill(uint32_t index, bool tone)
+++{
+++    uint8_t *base = fuxi_audio_dma_buffer();
+++    if (!base) {
+++        return false;
+++    }
+++    volatile uint32_t *out = (volatile uint32_t *)(base + index * FUXI_TONE_PERIOD_BYTES);
+++    for (uint32_t i = 0; i < FUXI_TONE_PERIOD_FRAMES; i++) {
+++        uint32_t value = 0;
+++        if (tone && gTone.frame < FUXI_TONE_FRAMES) {
+++            value = (uint32_t)fuxi_amp_tone_sample(gTone.frame++);
+++        }
+++        for (uint32_t slot = 0; slot < 4; slot++) {
+++            out[4 * i + slot] = value;
+++        }
+++    }
+++    FUXI_PCM_BARRIER();
+++    return true;
+++}
+++
+++/* WRITE_DONE 必須照送出的順序回來（位址與 map handle 都對）；不認得的只計數。在擁有者執行緒的接收回呼裡，不送任何東西。 */
+++static void tone_receive(const uint8_t *data, uint32_t length)
+++{
+++    FuxiAudioPrepGprView view;
+++    if (!gSpf.up || length > FUXI_SPF_INTENT_BYTES || fuxi_audio_prep_gpr_decode(data, length, &view) ||
+++        view.fields.src_domain != FUXI_AUDIO_PREP_DOMAIN_ADSP ||
+++        view.fields.dst_domain != FUXI_AUDIO_PREP_DOMAIN_APPS ||
+++        view.fields.src_port != FUXI_AR_IID_PLAY_SHMEM || view.fields.dst_port != FUXI_SPF_PORT ||
+++        view.fields.token != FUXI_GRAPH_TOKEN + FUXI_GRAPH_WRITE) {
+++        return;
+++    }
+++    if (view.fields.opcode == FUXI_AUDIO_PREP_BASIC_RESULT) {
+++        uint32_t result[2];
+++        if (view.payload_bytes == sizeof(result)) {
+++            memcpy(result, view.payload, sizeof(result));
+++            if (result[0] == FUXI_AR_OP_WRITE && result[1] != 0) {
+++                gTone.error = true;
+++                gTone.status = result[1];
+++            }
+++        }
+++        return;
+++    }
+++    if (view.fields.opcode != FUXI_AR_OP_WRITE_DONE || view.payload_bytes < 16) {
+++        return;
+++    }
+++    uint32_t result[4];
+++    memcpy(result, view.payload, sizeof(result));
+++    const uint64_t returned = (uint64_t)result[1] << 32 | result[0];
+++    const uint64_t expected = gGraph.dma_address + (uint64_t)(gTone.done % FUXI_TONE_PERIODS) * FUXI_TONE_PERIOD_BYTES;
+++    if (gTone.done >= gTone.sent || returned != expected || result[2] != gGraph.map_handle) {
+++        gTone.stray++;
+++        return;
+++    }
+++    if (result[3] != 0) {
+++        gTone.error = true;
+++        gTone.status = result[3];
+++    }
+++    gTone.done++;
+++    clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gGraph.deadline);
+++}
+++
+++/* 出聲模式下 WRITE 步驟由這裡接手。回傳 true 表示結束，呼叫端再 graph_advance(gTone.error) 進入停圖。 */
+++static bool tone_pump(void)
+++{
+++    const uint64_t now = mach_absolute_time();
+++    if (gTone.phase == FUXI_TONE_PCM_GRAPH) {
+++        gTone.phase = FUXI_TONE_PCM_PREROLL;
+++        clock_interval_to_deadline(FUXI_TONE_WAIT_MS, NSEC_PER_MSEC, &gTone.deadline);
+++        clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gGraph.deadline);
+++        printf("FUXI AUDIO TONE: speaker graph started, %u ms of zeros before the amplifier\n", FUXI_TONE_ZEROS * 20u);
+++    }
+++    if (gTone.phase < FUXI_TONE_PCM_FINISH) {
+++        const uint32_t state = fuxi_amp_tone_get();
+++        if (gGraph.link_lost) {
+++            tone_stop("GLINK disconnect");
+++        } else if (gTone.error) {
+++            tone_stop("write error");
+++        } else if (now >= gGraph.deadline) {
+++            tone_stop("write reply timeout");
+++        } else if (gTone.phase == FUXI_TONE_PCM_PREROLL && !gTone.clocked) {
+++            if (gTone.done >= FUXI_TONE_ZEROS) {
+++                if (fuxi_amp_tone_move(FUXI_TONE_READY, FUXI_TONE_CLOCKED)) {
+++                    gTone.clocked = true;
+++                    clock_interval_to_deadline(FUXI_TONE_WAIT_MS, NSEC_PER_MSEC, &gTone.deadline);
+++                    printf("FUXI AUDIO TONE: TDM clock running, %u periods of zeros played\n", gTone.done);
+++                } else {
+++                    tone_stop("amplifier gave up before the clock");
+++                }
+++            } else if (now >= gTone.deadline) {
+++                tone_stop("zeros did not play");
+++            }
+++        } else if (gTone.phase == FUXI_TONE_PCM_PREROLL) {
+++            if (state == FUXI_TONE_ON) {
+++                gTone.phase = FUXI_TONE_PCM_PLAY;
+++                gTone.tone_start = gTone.sent;
+++                printf("FUXI AUDIO TONE: amplifier on, tone starts at period %u\n", gTone.sent);
+++            } else if (state != FUXI_TONE_CLOCKED) {
+++                tone_stop("amplifier did not power up");
+++            } else if (now >= gTone.deadline) {
+++                tone_stop("amplifier power-up timeout");
+++            }
+++        } else if (gTone.phase == FUXI_TONE_PCM_PLAY) {
+++            if (state != FUXI_TONE_ON) {
+++                tone_stop("amplifier left ON during the tone");
+++            } else if (gTone.frame >= FUXI_TONE_FRAMES && gTone.done >= gTone.tone_end + FUXI_TONE_ZEROS) {
+++                if (fuxi_amp_tone_move(FUXI_TONE_ON, FUXI_TONE_DRAIN)) {
+++                    gTone.phase = FUXI_TONE_PCM_POSTROLL;
+++                    clock_interval_to_deadline(FUXI_TONE_WAIT_MS, NSEC_PER_MSEC, &gTone.deadline);
+++                    printf("FUXI AUDIO TONE: tone played, %u frames in periods %u-%u, amplifier powering down\n",
+++                        gTone.frame, gTone.tone_start, gTone.tone_end - 1);
+++                } else {
+++                    tone_stop("amplifier left ON during the tone");
+++                }
+++            }
+++        } else if (gTone.phase == FUXI_TONE_PCM_POSTROLL) {
+++            if (state == FUXI_TONE_OFF) {
+++                gTone.phase = FUXI_TONE_PCM_FINISH;
+++                clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gTone.deadline);
+++            } else if (state != FUXI_TONE_DRAIN) {
+++                tone_stop("amplifier failed while powering down");
+++            } else if (now >= gTone.deadline) {
+++                tone_stop("amplifier power-down timeout");
+++            }
+++        }
+++    }
+++    if (gTone.phase == FUXI_TONE_PCM_FINISH) {
+++        if (gTone.done < gTone.sent && gSpf.up && !gGraph.link_lost && now < gTone.deadline) {
+++            return false;
+++        }
+++        printf("FUXI AUDIO TONE: %s%s%s periods sent=%u done=%u tone_frames=%u stray=%u status=%u amp_state=%u\n",
+++            gTone.error ? "failed" : "complete", gTone.why ? ": " : "", gTone.why ? gTone.why : "", gTone.sent, gTone.done,
+++            gTone.frame, gTone.stray, gTone.status, fuxi_amp_tone_get());
+++        gTone.phase = FUXI_TONE_PCM_OFF;
+++        return true;
+++    }
+++    while (gSpf.up && gTone.sent < gTone.done + FUXI_TONE_AHEAD) {
+++        const uint32_t index = gTone.sent % FUXI_TONE_PERIODS, frame = gTone.frame;
+++        const bool tone = gTone.phase == FUXI_TONE_PCM_PLAY && gTone.frame < FUXI_TONE_FRAMES;
+++        uint8_t packet[FUXI_SPF_INTENT_BYTES];
+++        const uint32_t length = fuxi_ar_write(packet, sizeof(packet), FUXI_SPF_PORT, FUXI_GRAPH_TOKEN + FUXI_GRAPH_WRITE,
+++            gGraph.dma_address + (uint64_t)index * FUXI_TONE_PERIOD_BYTES, gGraph.map_handle, FUXI_TONE_PERIOD_BYTES);
+++        if (!length || !tone_fill(index, tone) || sheng_adsp_send(gSpf.channel, packet, length) != 0) {
+++            gTone.frame = frame;
+++            break;
+++        }
+++        gGraph.queued |= GRAPH_SENT(FUXI_GRAPH_WRITE);
+++        gTone.sent++;
+++        if (tone && gTone.frame >= FUXI_TONE_FRAMES) {
+++            gTone.tone_end = gTone.sent;
+++        }
+++        clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gGraph.deadline);
+++    }
+++    return false;
+++}
+++
 ++static void graph_receive(const uint8_t *data, uint32_t length)
 ++{
+++    if (gGraph.step == FUXI_GRAPH_WRITE && gTone.phase >= FUXI_TONE_PCM_PREROLL) {
+++        tone_receive(data, length);
+++        return;
+++    }
 ++    if (!gGraph.waiting || gGraph.reply_ready || gGraph.link_lost || !gSpf.up ||
 ++        mach_absolute_time() >= gGraph.deadline) {
 ++        return;
@@ -64714,6 +65807,11 @@ index 0000000..b2d96b0
 ++static void graph_advance(bool failed)
 ++{
 ++    gGraph.failed |= failed;
+++    if (failed && gTone.phase == FUXI_TONE_PCM_GRAPH) {
+++        fuxi_amp_tone_abandon();
+++        gTone.phase = FUXI_TONE_PCM_OFF;
+++        printf("FUXI AUDIO TONE: speaker graph failed before the tone, amplifier released\n");
+++    }
 ++    if (failed && gGraph.step < FUXI_GRAPH_STOP_PLAYBACK) {
 ++        graph_set_step(FUXI_GRAPH_STOP_PLAYBACK);
 ++    } else if (gGraph.step == FUXI_GRAPH_CONFIG_PLAYBACK && !gGraph.dma_address) {
@@ -64732,8 +65830,16 @@ index 0000000..b2d96b0
 ++    if (gGraph.step == FUXI_GRAPH_IDLE) {
 ++        return;
 ++    }
+++    if (gTone.phase == FUXI_TONE_PCM_GATE && !tone_gate()) {
+++        return;
+++    }
 ++    const char *name = graph_steps[gGraph.step].name;
-++    if (gGraph.link_lost) {
+++    if (tone_owns_write()) {
+++        if (!tone_pump()) {
+++            return;
+++        }
+++        graph_advance(gTone.error);
+++    } else if (gGraph.link_lost) {
 ++        printf("FUXI AUDIO TDM: %s interrupted by GLINK disconnect\n", name);
 ++        graph_advance(true);
 ++    } else if (gGraph.reply_ready) {
@@ -64752,6 +65858,10 @@ index 0000000..b2d96b0
 ++        graph_set_step(gGraph.step + 1);
 ++    }
 ++    if (gGraph.step == FUXI_GRAPH_COMPLETE) {
+++        if (gTone.phase != FUXI_TONE_PCM_OFF) {
+++            fuxi_amp_tone_abandon();
+++            gTone.phase = FUXI_TONE_PCM_OFF;
+++        }
 ++        if (gGraph.dma_address) {
 ++            fuxi_audio_dma_close();
 ++            printf("FUXI AUDIO PCM: probe complete result=%s\n", gGraph.failed ? "failed" : "ok");
@@ -64761,6 +65871,13 @@ index 0000000..b2d96b0
 ++        return;
 ++    }
 ++    if (!gSpf.up || gGraph.waiting) {
+++        return;
+++    }
+++    if (tone_owns_write()) {
+++        /* 剛從 START_PLAYBACK 進到 WRITE：同一輪就開始送靜音。 */
+++        if (tone_pump()) {
+++            graph_advance(gTone.error);
+++        }
 ++        return;
 ++    }
 ++
@@ -64981,7 +66098,14 @@ index 0000000..b2d96b0
 ++                } else if (gSpf.format == 5) {
 ++                    if (fuxi_audio_dma_open(&gGraph.dma_address)) {
 ++                        graph_set_step(FUXI_GRAPH_VOTE_MACRO);
+++                        if (fuxi_amp_tone_get() != FUXI_TONE_IDLE) {
+++                            /* 功放 mode 7：圖先不開，等功放載入並核對保護韌體。 */
+++                            gTone.phase = FUXI_TONE_PCM_GATE;
+++                            clock_interval_to_deadline(FUXI_TONE_GATE_MS, NSEC_PER_MSEC, &gTone.deadline);
+++                            printf("FUXI AUDIO TONE: waiting for the bottom amplifier\n");
+++                        }
 ++                    } else {
+++                        fuxi_amp_tone_abandon();
 ++                        printf("FUXI AUDIO PCM: loader DMA handoff or live SMMU routes unavailable\n");
 ++                    }
 ++                }
@@ -68106,6 +69230,83 @@ index 0000000..b2d96b0
 ++
 ++#endif
 +--- /dev/null
+++++ b/bsd/dev/fuxi_amp_tone.h
++@@ -0,0 +1,74 @@
+++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
+++/* FUXI 下方喇叭出聲短測（fuxiamp／ADT fuxi,amp = 7，搭配 fuxi,audio-spf = 5）的雙方交握。
+++ * fuxi_amp.c 的功放執行緒和 fuxi_audio_spf.c 的 ADSP 擁有者執行緒只透過 fuxi_amp_tone 這個狀態字溝通；
+++ * 每次轉換都用 CAS，任何一方出錯就改成 FAILED，另一方看到後自行收尾（功放：靜音、下電、回 reset；PCM：停送正弦、關圖）。
+++ *
+++ *   IDLE     不是 mode 7，PCM 圖照 mode 5 只送靜音
+++ *   PENDING  mode 7 已啟動，功放還在載入與核對保護韌體（PCM 圖停在 GATE，不開 TDM）
+++ *   READY    保護韌體試跑通過且 CSPL_STATE／ERRORNO／CAL_STATUS 正常，TDM 腳位已切換，輸出仍關，等 TDM 時脈
+++ *   CLOCKED  PCM 圖已 START 並播完 100 ms 靜音，功放可設旁路與上電
+++ *   ON       功放上電、-30 dB；PCM 開始送 1 秒正弦
+++ *   DRAIN    正弦的每個週期都已回 WRITE_DONE，PCM 改送靜音，功放做最後檢查與下電
+++ *   OFF      功放已下電，PCM 收尾關圖
+++ *   FAILED   任一方放棄
+++ *
+++ * 正弦表、長度與淡入淡出逐項沿用早期 Fuxi shim/fuxi-probe/audio.c au_sine／au_tone_fill（2 kHz、-20 dBFS、1 秒、
+++ * 各 40 ms 淡入淡出，四個槽同值），2026-11-19 對照。 */
+++#ifndef FUXI_AMP_TONE_H
+++#define FUXI_AMP_TONE_H
+++
+++#include <stdint.h>
+++
+++enum {
+++    FUXI_TONE_IDLE = 0,
+++    FUXI_TONE_PENDING = 1,
+++    FUXI_TONE_READY = 2,
+++    FUXI_TONE_CLOCKED = 3,
+++    FUXI_TONE_ON = 4,
+++    FUXI_TONE_DRAIN = 5,
+++    FUXI_TONE_OFF = 6,
+++    FUXI_TONE_FAILED = 7,
+++};
+++
+++#define FUXI_TONE_FRAMES 48000u /* 一秒 */
+++#define FUXI_TONE_FADE 1920u    /* 40 ms */
+++
+++/* fuxi_amp.c 定義。 */
+++extern uint32_t fuxi_amp_tone;
+++
+++static inline uint32_t fuxi_amp_tone_get(void)
+++{
+++    return __atomic_load_n(&fuxi_amp_tone, __ATOMIC_ACQUIRE);
+++}
+++
+++/* from → to；狀態已被另一方改掉就回 0。 */
+++static inline int fuxi_amp_tone_move(uint32_t from, uint32_t to)
+++{
+++    return __atomic_compare_exchange_n(&fuxi_amp_tone, &from, to, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+++}
+++
+++/* PENDING 到 ON 之間的任何狀態改成 FAILED，回傳原本的狀態。DRAIN 由功放自己收尾，OFF／FAILED／IDLE 不動。 */
+++static inline uint32_t fuxi_amp_tone_abandon(void)
+++{
+++    uint32_t state = fuxi_amp_tone_get();
+++    while (state >= FUXI_TONE_PENDING && state <= FUXI_TONE_ON &&
+++        !__atomic_compare_exchange_n(&fuxi_amp_tone, &state, FUXI_TONE_FAILED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+++    }
+++    return state;
+++}
+++
+++/* 第 frame 個取樣（32 位元，四個槽同值）；超過一秒回 0。 */
+++static inline int32_t fuxi_amp_tone_sample(uint32_t frame)
+++{
+++    static const int32_t sine[24] = {0, 55580967, 107374182, 151850025, 185977539, 207430992, 214748365, 207430992,
+++        185977539, 151850025, 107374182, 55580967, 0, -55580967, -107374182, -151850025, -185977539, -207430992,
+++        -214748365, -207430992, -185977539, -151850025, -107374182, -55580967};
+++    if (frame >= FUXI_TONE_FRAMES) {
+++        return 0;
+++    }
+++    const uint32_t left = FUXI_TONE_FRAMES - frame;
+++    const uint32_t gain = frame < FUXI_TONE_FADE ? frame : left < FUXI_TONE_FADE ? left : FUXI_TONE_FADE;
+++    return (int32_t)((int64_t)sine[frame % 24u] * gain / FUXI_TONE_FADE);
+++}
+++
+++#endif /* FUXI_AMP_TONE_H */
++--- /dev/null
 ++++ b/bsd/dev/fuxi_haptic_runtime.h
 +@@ -0,0 +1,223 @@
 ++#ifndef FUXI_HAPTIC_RUNTIME_H
@@ -69285,34 +70486,3 @@ index 0000000..a22cc1a
 + #define G_MEM_SIZE  0x02000000u
 + #define G_IC_PA     (G_MEM + 0x100000)
 + #define G_DATA_PA   (G_MEM + 0x1100000)
-diff --git a/xnu/patches/0043-sweet-console-crash-log.patch b/xnu/patches/0043-sweet-console-crash-log.patch
-index 1c9367c..0c44e8e 100644
---- a/xnu/patches/0043-sweet-console-crash-log.patch
-+++ b/xnu/patches/0043-sweet-console-crash-log.patch
-@@ -63,7 +63,25 @@
-  	exception_type_t        exception,
- --- a/bsd/kern/kern_exit.c
- +++ b/bsd/kern/kern_exit.c
--@@ -1884,6 +1884,13 @@
-+@@ -1433,4 +1433,17 @@
-+ exit(proc_t p, struct exit_args *uap, int *retval)
-+ {
-++#if defined(ARM64_BOARD_CONFIG_SWEET)
-++	if (uap->rval == 1 && strcmp(p->p_comm, "bluetoothd") == 0) {
-++		unsigned enabled = 0;
-++		static unsigned traced;
-++		if (PE_parse_boot_argn("fuxibtexittrace", &enabled, sizeof(enabled)) && enabled &&
-++		    __atomic_fetch_add(&traced, 1u, __ATOMIC_RELAXED) < 3) {
-++			extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
-++
-++			/* The user address space is still intact at syscall entry. */
-++			sweet_crash_log(p->p_comm, proc_getpid(p), 0, 1, 0);
-++		}
-++	}
-++#endif
-+ 	p->p_xhighbits = ((uint32_t)(uap->rval) & 0xFF000000) >> 24;
-+ 	exit1(p, W_EXITCODE((uint32_t)uap->rval, 0), retval);
-+@@ -1884,6 +1897,13 @@
-  		subcode = ut->uu_subcode;
-  		etype = ut->uu_exception;
-  
