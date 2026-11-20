@@ -11502,10 +11502,10 @@ index 0000000..922f6a1
 +    main()
 diff --git a/tools/test-fuxi-bluetooth-pump.py b/tools/test-fuxi-bluetooth-pump.py
 new file mode 100644
-index 0000000..4938edd
+index 0000000..0c596d9
 --- /dev/null
 +++ b/tools/test-fuxi-bluetooth-pump.py
-@@ -0,0 +1,1393 @@
+@@ -0,0 +1,1402 @@
 +#!/usr/bin/env python3
 +"""Compile and run the WCN7850 resident UART pump and H4 tracer (fuxi,bt=5) against a simulated GENI FIFO."""
 +
@@ -12117,8 +12117,7 @@ index 0000000..4938edd
 +    host_send(w, reset, sizeof(reset));
 +    step_n(w, 20);
 +    assert(w->uart.wire_size == 2 + 2 * sizeof(reset) && w->pump.ibs_wakes_sent == 1);
-+    assert(w->pump.host.desync_bytes == 2 && w->pump.host.desync_recent_pos == 2);
-+    assert(w->pump.host.desync_recent[0] == 0xfd && w->pump.host.desync_recent[1] == 0xfc);
++    assert(w->pump.host.desync_bytes == 0 && w->pump.host.desync_recent_pos == 0);
 +    free(w);
 +
 +    /* 等不到 WAKE_ACK：每 RETRY 步重送 WAKE_IND，等滿照送 */
@@ -12145,6 +12144,8 @@ index 0000000..4938edd
 +    run_until_idle(w, 100);
 +    assert(w->uart.wire_size == sizeof(reset) && !memcmp(w->uart.wire, reset, sizeof(reset)));
 +    assert(w->pump.host.ibs_bytes[1] == 1 && !w->pump.ibs_acks_sent && !w->pump.ibs_wakes_sent);
++    assert(w->pump.host.desync_bytes == 1 && w->pump.host.desync_recent_pos == 1);
++    assert(w->pump.host.desync_recent[0] == 0xfd);
 +    free(w);
 +}
 +
@@ -12482,8 +12483,16 @@ index 0000000..4938edd
 +        assert(w->pump.host.packets == 1 && !w->pump.host.header_need);
 +        assert(w->pump.host.ibs_bytes[1] == 1 && w->pump.ibs_acks_sent == 1);
 +        assert(w->uart.wire_size == 1 && w->uart.wire[0] == FUXI_BT_IBS_WAKE_ACK);
-+        /* 04 00 跨塊時只少算上一塊的 00，其餘 byte 都算 desync */
-+        assert(w->pump.host.desync_bytes >= 7 && w->pump.host.desync_bytes <= 8);
++        /* IBS 開啟時 0xfd 不計入 desync；04 00 跨塊時少算 00，其餘 6..7 個垃圾 byte 計入 desync */
++        assert(w->pump.host.desync_bytes >= 6 && w->pump.host.desync_bytes <= 7);
++        bool saw_garbage = false;
++        for (unsigned i = 0; i < w->pump.host.desync_recent_pos && i < sizeof(w->pump.host.desync_recent); i++) {
++            assert(w->pump.host.desync_recent[i] != FUXI_BT_IBS_WAKE_IND);
++            if (w->pump.host.desync_recent[i] == 0xda) {
++                saw_garbage = true;
++            }
++        }
++        assert(saw_garbage);
 +        assert(w->pump.host.invalid_headers <= 1);
 +        assert(!w->pump.to_host.packets[FUXI_BT_H4_COMMAND] && w->pump.to_host.packets[FUXI_BT_H4_EVENT] == 1);
 +        free(w);
@@ -38478,7 +38487,7 @@ index 0000000..78f02f7
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_pump.c b/xnu/fuxi-bluetooth/fuxi_bt_pump.c
 new file mode 100644
-index 0000000..3b82596
+index 0000000..e58b35f
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_pump.c
 @@ -0,0 +1,877 @@
@@ -38790,26 +38799,26 @@ index 0000000..3b82596
 +    }
 +}
 +
-+/* 封包邊界上的非 H4 byte：計數、留樣本；IBS 開啟時處理控制器的 WAKE_IND／WAKE_ACK */
++/* 封包邊界上的非 H4 byte：IBS 開啟時處理控制器的 WAKE_IND／WAKE_ACK／SLEEP_IND（不計入 desync）；
++ * 其餘非 H4 byte 或 IBS 關閉時的 0xfc–0xfe 計入 desync 並留樣本 */
 +static void fuxi_bt_pump_desync(struct fuxi_bt_pump *pump, uint8_t byte)
 +{
 +    struct fuxi_bt_h4_framer *framer = &pump->host;
++    if (byte >= FUXI_BT_IBS_WAKE_ACK && byte <= FUXI_BT_IBS_SLEEP_IND) {
++        framer->ibs_bytes[byte - FUXI_BT_IBS_WAKE_ACK]++;
++        if (pump->ibs) {
++            if (byte == FUXI_BT_IBS_WAKE_IND) {
++                /* 控制器要送資料：回 WAKE_ACK（hci_qca device_want_to_wakeup） */
++                fuxi_bt_pump_queue_ctl(pump, FUXI_BT_IBS_WAKE_ACK);
++            } else if (byte == FUXI_BT_IBS_WAKE_ACK) {
++                /* 主機的 WAKE_IND 得到回應 */
++                pump->ibs_tx_awake = true;
++            }
++            return;
++        }
++    }
 +    framer->desync_bytes++;
 +    framer->desync_recent[framer->desync_recent_pos++ % sizeof(framer->desync_recent)] = byte;
-+    if (byte < FUXI_BT_IBS_WAKE_ACK || byte > FUXI_BT_IBS_SLEEP_IND) {
-+        return;
-+    }
-+    framer->ibs_bytes[byte - FUXI_BT_IBS_WAKE_ACK]++;
-+    if (!pump->ibs) {
-+        return;
-+    }
-+    if (byte == FUXI_BT_IBS_WAKE_IND) {
-+        /* 控制器要送資料：回 WAKE_ACK（hci_qca device_want_to_wakeup） */
-+        fuxi_bt_pump_queue_ctl(pump, FUXI_BT_IBS_WAKE_ACK);
-+    } else if (byte == FUXI_BT_IBS_WAKE_ACK) {
-+        /* 主機的 WAKE_IND 得到回應 */
-+        pump->ibs_tx_awake = true;
-+    }
 +}
 +
 +/* opcode 清單比對；0xfc00 代表所有 vendor（OGF 0x3f）命令 */
@@ -41545,10 +41554,10 @@ index 0000000..0c74011
 +#endif
 diff --git a/xnu/fuxi-bluetooth/fuxi_bt_xnu.c b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
 new file mode 100644
-index 0000000..2f40bff
+index 0000000..0532699
 --- /dev/null
 +++ b/xnu/fuxi-bluetooth/fuxi_bt_xnu.c
-@@ -0,0 +1,915 @@
+@@ -0,0 +1,918 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
 +#include <sys/param.h>
@@ -42176,9 +42185,12 @@ index 0000000..2f40bff
 +                pump.optional_last_opcode, pump.optional_last_status, optional_seen);
 +        }
 +        if (pump.padded != padded_seen) {
++            /* vendor 狀態回應補位經常觸發：前 32 次逐筆印，之後只在次數是 2 的冪時印 */
 +            padded_seen = pump.padded;
-+            printf("FUXI BT PAD: opcode=%#x subop=%#x count=%llu\n", pump.pad_last_opcode,
-+                pump.pad_last_subop, padded_seen);
++            if (padded_seen <= 32 || !(padded_seen & (padded_seen - 1))) {
++                printf("FUXI BT PAD: opcode=%#x subop=%#x count=%llu\n", pump.pad_last_opcode,
++                    pump.pad_last_subop, padded_seen);
++            }
 +        }
 +        if (pump.masked != masked_seen) {
 +            masked_seen = pump.masked;
@@ -55636,10 +55648,10 @@ index 41dbb65..b082005 100644
  +    W w;
 diff --git a/xnu/patches/0117-fuxi-adsp.patch b/xnu/patches/0117-fuxi-adsp.patch
 new file mode 100644
-index 0000000..e12e15a
+index 0000000..f82bcd0
 --- /dev/null
 +++ b/xnu/patches/0117-fuxi-adsp.patch
-@@ -0,0 +1,16162 @@
+@@ -0,0 +1,16165 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -121,6 +121,36 @@
@@ -62178,7 +62190,7 @@ index 0000000..e12e15a
 ++}
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_bt_xnu.c
-+@@ -0,0 +1,915 @@
++@@ -0,0 +1,918 @@
 ++#include <pexpert/arm64/board_config.h>
 ++#if defined(FUXI)
 ++#include <sys/param.h>
@@ -62806,9 +62818,12 @@ index 0000000..e12e15a
 ++                pump.optional_last_opcode, pump.optional_last_status, optional_seen);
 ++        }
 ++        if (pump.padded != padded_seen) {
+++            /* vendor 狀態回應補位經常觸發：前 32 次逐筆印，之後只在次數是 2 的冪時印 */
 ++            padded_seen = pump.padded;
-++            printf("FUXI BT PAD: opcode=%#x subop=%#x count=%llu\n", pump.pad_last_opcode,
-++                pump.pad_last_subop, padded_seen);
+++            if (padded_seen <= 32 || !(padded_seen & (padded_seen - 1))) {
+++                printf("FUXI BT PAD: opcode=%#x subop=%#x count=%llu\n", pump.pad_last_opcode,
+++                    pump.pad_last_subop, padded_seen);
+++            }
 ++        }
 ++        if (pump.masked != masked_seen) {
 ++            masked_seen = pump.masked;
@@ -65559,26 +65574,26 @@ index 0000000..e12e15a
 ++    }
 ++}
 ++
-++/* 封包邊界上的非 H4 byte：計數、留樣本；IBS 開啟時處理控制器的 WAKE_IND／WAKE_ACK */
+++/* 封包邊界上的非 H4 byte：IBS 開啟時處理控制器的 WAKE_IND／WAKE_ACK／SLEEP_IND（不計入 desync）；
+++ * 其餘非 H4 byte 或 IBS 關閉時的 0xfc–0xfe 計入 desync 並留樣本 */
 ++static void fuxi_bt_pump_desync(struct fuxi_bt_pump *pump, uint8_t byte)
 ++{
 ++    struct fuxi_bt_h4_framer *framer = &pump->host;
+++    if (byte >= FUXI_BT_IBS_WAKE_ACK && byte <= FUXI_BT_IBS_SLEEP_IND) {
+++        framer->ibs_bytes[byte - FUXI_BT_IBS_WAKE_ACK]++;
+++        if (pump->ibs) {
+++            if (byte == FUXI_BT_IBS_WAKE_IND) {
+++                /* 控制器要送資料：回 WAKE_ACK（hci_qca device_want_to_wakeup） */
+++                fuxi_bt_pump_queue_ctl(pump, FUXI_BT_IBS_WAKE_ACK);
+++            } else if (byte == FUXI_BT_IBS_WAKE_ACK) {
+++                /* 主機的 WAKE_IND 得到回應 */
+++                pump->ibs_tx_awake = true;
+++            }
+++            return;
+++        }
+++    }
 ++    framer->desync_bytes++;
 ++    framer->desync_recent[framer->desync_recent_pos++ % sizeof(framer->desync_recent)] = byte;
-++    if (byte < FUXI_BT_IBS_WAKE_ACK || byte > FUXI_BT_IBS_SLEEP_IND) {
-++        return;
-++    }
-++    framer->ibs_bytes[byte - FUXI_BT_IBS_WAKE_ACK]++;
-++    if (!pump->ibs) {
-++        return;
-++    }
-++    if (byte == FUXI_BT_IBS_WAKE_IND) {
-++        /* 控制器要送資料：回 WAKE_ACK（hci_qca device_want_to_wakeup） */
-++        fuxi_bt_pump_queue_ctl(pump, FUXI_BT_IBS_WAKE_ACK);
-++    } else if (byte == FUXI_BT_IBS_WAKE_ACK) {
-++        /* 主機的 WAKE_IND 得到回應 */
-++        pump->ibs_tx_awake = true;
-++    }
 ++}
 ++
 ++/* opcode 清單比對；0xfc00 代表所有 vendor（OGF 0x3f）命令 */
