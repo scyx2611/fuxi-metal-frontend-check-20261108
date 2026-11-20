@@ -11,6 +11,7 @@ on:
       - tools/test-vibe-pattern.c
       - tools/test-vibe-worker.py
       - tools/test-oslog-format.c
+      - tools/test-bluetooth-patch.c
       - .github/workflows/sb-shape.yml
 permissions:
   contents: read
@@ -38,6 +39,9 @@ jobs:
           clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
               -Iuserland/fuxi-shape tools/test-oslog-format.c -o /tmp/fuxi-oslog-format
           /tmp/fuxi-oslog-format
+          clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+              -Iuserland/fuxi-shape tools/test-bluetooth-patch.c -o /tmp/fuxi-bluetooth-patch
+          /tmp/fuxi-bluetooth-patch
       - name: Build, sign ad hoc, check
         shell: bash
         run: |

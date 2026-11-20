@@ -1,5 +1,5 @@
 /*
- * bluetoothd os_log 轉錄（fxinj bit 6，ADT fuxi,inject 含 64；/chosen u32 fuxi,bt-oslog 非 0 才動作）。
+ * bluetoothd os_log 轉錄與相容性修正（fxinj bit 6，ADT fuxi,inject 含 64）。
  *
  * 20H392 bluetoothd 的 OI 日誌只走 os_log：0x1001c28d0 → 0x1001c2684 → _os_log_impl("%{public}s")，
  * 自願重啟 0x100090734／0x100090778 先寫「Bluetooth error - restarting { build=…, reason=%d, context=… }」
@@ -13,6 +13,11 @@
  *                 bit 1  info：os_log_type_enabled 對 info 回 true 並轉錄（與 debug 合計最多 1500 行）
  *                 bit 2  debug：同上
  *
+ *   fuxi,bt-fix   bit 0  填補 H4 傳輸表 +0x60（PrepareTerminate）為空函式，避免關藍牙時 pc=0 SIGSEGV
+ *                 bit 1  攔截 CFPreferencesCopyAppValue("LE", "com.apple.MobileBluetooth.debug")，回傳
+ *                        SupportsMultipleAdvertising=false，讓 ChipMgr／LeBroadcaster 原生走單實例標準
+ *                        Legacy BLE 廣播（0x2005／0x2006／0x2008／0x200a），略過 Broadcom VSC 0xfd48
+ *
  * 其他程序或 fuxi,bt-oslog=0 時，每個替身只做尾呼叫轉發（原函式看到的返回位址不變）。
  * 緩衝格式解析在 FuxiOsLogFormat.h（主機測試 tools/test-oslog-format.c）。%@ 只展開 CFString，
  * 其他物件印 <obj>，不在日誌路徑呼叫 -description。private 參數印 <private>，位址形字串遮成 xx。
@@ -23,7 +28,10 @@
  * 與 sys/reason.h（abort_with_payload）。ADT 讀法同 FuxiBlueTool.c。
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <crt_externs.h>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +39,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "FuxiBluetoothPatch.h"
 #include "FuxiOsLogFormat.h"
 
 typedef mach_port_t btlog_io_object_t;
@@ -52,6 +61,8 @@ extern void btlog_real_exit(int status) __asm__("_exit") __attribute__((noreturn
 extern void btlog_real_quick_exit(int status) __asm__("__exit") __attribute__((noreturn));
 extern void btlog_real_abort_payload(uint32_t space, uint64_t code, void *payload, uint32_t payload_size,
     const char *reason, uint64_t flags) __asm__("_abort_with_payload") __attribute__((noreturn));
+extern CFPropertyListRef btlog_real_prefs_copy_app_value(CFStringRef key, CFStringRef application_id)
+    __asm__("_CFPreferencesCopyAppValue");
 
 #define BTLOG_TYPE_INFO 0x01u
 #define BTLOG_TYPE_DEBUG 0x02u
@@ -61,8 +72,12 @@ extern void btlog_real_abort_payload(uint32_t space, uint64_t code, void *payloa
 #define BTLOG_DETAIL_LIMIT 1500u
 #define BTLOG_TEXT_MAX 900u
 #define BTLOG_CHUNK 220u
+#define FUXI_BTFIX_H4_PREPARE 1u
+#define FUXI_BTFIX_SINGLE_ADV 2u
+#define FUXI_BTFIX_ALL (FUXI_BTFIX_H4_PREPARE | FUXI_BTFIX_SINGLE_ADV)
 
 static unsigned btlog_mode;
+static unsigned btfix_mode;
 static unsigned btlog_main_lines;
 static unsigned btlog_detail_lines;
 static unsigned btlog_sequence;
@@ -93,6 +108,97 @@ static unsigned btlog_adt_u32(const char *key)
 static unsigned btlog_active(void)
 {
     return __atomic_load_n(&btlog_mode, __ATOMIC_RELAXED);
+}
+
+static unsigned btfix_active(void)
+{
+    return __atomic_load_n(&btfix_mode, __ATOMIC_RELAXED);
+}
+
+static void fuxi_h4_prepare_terminate(void)
+{
+}
+
+static bool btfix_is_exec(const struct mach_header *hdr)
+{
+    return hdr != NULL && hdr->magic == MH_MAGIC_64 && hdr->filetype == MH_EXECUTE;
+}
+
+/*
+ * 主程式標頭：先用 _NSGetMachExecuteHeader（dyld 啟動時就設定），不行再掃 dyld 映像表找 MH_EXECUTE。
+ * 2026-11-20 02:01 Codex 那趟（native-hw000bt5-complete-1120）只看 _dyld_get_image_header(0)，
+ * bluetoothd 三次都回 bad_header，H4 表沒補，關藍牙照樣 pc=0；失敗時這裡把映像數與第 0 個的型別一起印出。
+ */
+static const struct mach_header_64 *btfix_main_header(const char **how, char *why, size_t why_size)
+{
+    const struct mach_header *hdr = (const struct mach_header *)_NSGetMachExecuteHeader();
+    if (btfix_is_exec(hdr)) {
+        *how = "nsget";
+        return (const struct mach_header_64 *)hdr;
+    }
+    const uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const struct mach_header *image = _dyld_get_image_header(i);
+        if (btfix_is_exec(image)) {
+            *how = i == 0 ? "image0" : "scan";
+            return (const struct mach_header_64 *)image;
+        }
+    }
+    const struct mach_header *first = count ? _dyld_get_image_header(0) : NULL;
+    snprintf(why, why_size, "no_exec(nsget=%s,n=%u,t0=%d)", hdr == NULL ? "null" : "other", count,
+        first == NULL ? -1 : (int)first->filetype);
+    return NULL;
+}
+
+static const char *btfix_apply_h4(char *buf, size_t buf_size)
+{
+    const char *how = "none";
+    const struct mach_header_64 *hdr64 = btfix_main_header(&how, buf, buf_size);
+    if (hdr64 == NULL) {
+        return buf;
+    }
+    /* 滑移量由標頭實際位址減 __TEXT vmaddr 算出，不依賴映像序號 */
+    const uint8_t *cursor = (const uint8_t *)(hdr64 + 1);
+    const uint8_t *limit = cursor + hdr64->sizeofcmds;
+    uint64_t text_vm = 0, text_size = 0, data_vm = 0, data_size = 0;
+    bool have_text = false, have_data = false;
+
+    for (uint32_t i = 0; i < hdr64->ncmds; i++) {
+        if ((size_t)(limit - cursor) < sizeof(struct load_command)) {
+            return "bad_cmds";
+        }
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmdsize < sizeof(struct load_command) || (size_t)(limit - cursor) < lc->cmdsize) {
+            return "bad_cmds";
+        }
+        if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+            if (strncmp(seg->segname, "__TEXT", sizeof(seg->segname)) == 0) {
+                text_vm = seg->vmaddr;
+                text_size = seg->vmsize;
+                have_text = seg->fileoff == 0 && seg->vmsize > 0;
+            } else if (strncmp(seg->segname, "__DATA", sizeof(seg->segname)) == 0) {
+                data_vm = seg->vmaddr;
+                data_size = seg->vmsize;
+                have_data = seg->vmsize > 0;
+            }
+        }
+        cursor += lc->cmdsize;
+    }
+    if (!have_text || !have_data) {
+        return "no_segs";
+    }
+    /* __TEXT 從檔頭（fileoff 0）開始，所以標頭位址就是滑移後的 __TEXT 起點 */
+    const uint64_t slide = (uint64_t)(uintptr_t)hdr64 - text_vm;
+    const uint64_t text_start = text_vm + slide, data_start = data_vm + slide;
+    if (UINT64_MAX - text_start < text_size || UINT64_MAX - data_start < data_size) {
+        return "no_segs";
+    }
+    const uint64_t table_addr = FUXI_BT_H4_STATIC_ADDR + slide;
+    const uint64_t replacement = (uint64_t)(uintptr_t)&fuxi_h4_prepare_terminate;
+    snprintf(buf, buf_size, "%s/%s", fuxi_bt_h4_patch_result_name(fuxi_bt_patch_h4_table(table_addr, text_start,
+        text_start + text_size, data_start, data_start + data_size, replacement)), how);
+    return buf;
 }
 
 static char btlog_letter(uint8_t type)
@@ -269,6 +375,34 @@ __attribute__((noreturn)) static void btlog_abort_payload(uint32_t space, uint64
     btlog_real_abort_payload(space, code, payload, payload_size, reason, flags);
 }
 
+static CFPropertyListRef btlog_prefs_copy_app_value(CFStringRef key, CFStringRef application_id)
+{
+    if (__builtin_expect((btfix_active() & FUXI_BTFIX_SINGLE_ADV) == 0, 1)) {
+        return btlog_real_prefs_copy_app_value(key, application_id);
+    }
+    if (key == NULL || application_id == NULL || CFGetTypeID(key) != CFStringGetTypeID() ||
+        CFGetTypeID(application_id) != CFStringGetTypeID() || !CFEqual(key, CFSTR("LE")) ||
+        !CFEqual(application_id, CFSTR("com.apple.MobileBluetooth.debug"))) {
+        return btlog_real_prefs_copy_app_value(key, application_id);
+    }
+    CFPropertyListRef existing = btlog_real_prefs_copy_app_value(key, application_id);
+    CFMutableDictionaryRef dict = NULL;
+    if (existing != NULL && CFGetTypeID(existing) == CFDictionaryGetTypeID()) {
+        dict = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, (CFDictionaryRef)existing);
+    } else {
+        dict = CFDictionaryCreateMutable(kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks);
+    }
+    if (dict == NULL) {
+        return existing;
+    }
+    if (existing != NULL) {
+        CFRelease(existing);
+    }
+    CFDictionarySetValue(dict, CFSTR("SupportsMultipleAdvertising"), kCFBooleanFalse);
+    return dict;
+}
+
 struct btlog_interpose {
     const void *replacement;
     const void *original;
@@ -287,6 +421,7 @@ BTLOG_INTERPOSE(btlog_compose, btlog_real_compose);
 BTLOG_INTERPOSE(btlog_exit, btlog_real_exit);
 BTLOG_INTERPOSE(btlog_quick_exit, btlog_real_quick_exit);
 BTLOG_INTERPOSE(btlog_abort_payload, btlog_real_abort_payload);
+BTLOG_INTERPOSE(btlog_prefs_copy_app_value, btlog_real_prefs_copy_app_value);
 
 __attribute__((constructor)) static void fuxi_btlog_init(void)
 {
@@ -295,9 +430,20 @@ __attribute__((constructor)) static void fuxi_btlog_init(void)
         return;
     }
     const unsigned mode = btlog_adt_u32("fuxi,bt-oslog") & 7u;
-    if (!mode) {
+    const unsigned fix = btlog_adt_u32("fuxi,bt-fix") & FUXI_BTFIX_ALL;
+    if (!mode && !fix) {
         return;
     }
-    __atomic_store_n(&btlog_mode, mode, __ATOMIC_RELAXED);
-    btlog_note('S', "on mode=%u pid=%d", mode, getpid());
+    if (mode) {
+        __atomic_store_n(&btlog_mode, mode, __ATOMIC_RELAXED);
+    }
+    static char h4_buf[96];
+    const char *h4_status = "off";
+    if (fix & FUXI_BTFIX_H4_PREPARE) {
+        h4_status = btfix_apply_h4(h4_buf, sizeof(h4_buf));
+    }
+    if (fix) {
+        __atomic_store_n(&btfix_mode, fix, __ATOMIC_RELAXED);
+    }
+    btlog_note('S', "on mode=%u fix=%u h4=%s pid=%d", mode, fix, h4_status, getpid());
 }
