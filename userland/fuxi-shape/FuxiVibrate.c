@@ -67,6 +67,7 @@ static const char *vb_name = "?";
  */
 static unsigned vb_ui_ms, vb_envelope, vb_envelope_logs, vb_amp_max;
 static unsigned vb_app_fallback; /* 一般 App：經系統聲音 1519 回退 */
+static unsigned vb_native_pcm;   /* haptic=9 且 hal-haptic>=4：原生 24kHz PCM 串流，停用舊 DIRECT_PLAY UI 回退 */
 static unsigned vb_core_ok; /* SpringBoard／App：任一 CoreHaptics engine 建成過就不再回退 */
 
 __attribute__((format(printf, 1, 2))) static void vb_say(const char *format, ...)
@@ -502,7 +503,8 @@ static uintptr_t vb_dispatch(unsigned index, id self, SEL selector, uintptr_t a,
     vb_hook *hook = &vb_hooks[index];
     vb_forward original = (vb_forward)__atomic_load_n(&hook->original, __ATOMIC_ACQUIRE);
     unsigned call = __atomic_fetch_add(&hook->calls, 1u, __ATOMIC_RELAXED);
-    if (hook->action == VB_PULSE) vb_pulse(VB_TAP_MS);
+    const bool suppressed = hook->action == VB_PULSE && __atomic_load_n(&vb_native_pcm, __ATOMIC_ACQUIRE) != 0u;
+    if (hook->action == VB_PULSE && !suppressed) vb_pulse(VB_TAP_MS);
     if (hook->action == VB_CANCEL) vb_cancel();
     if (call < VB_LOG_CALLS) {
         const char *first = "-";
@@ -513,7 +515,8 @@ static uintptr_t vb_dispatch(unsigned index, id self, SEL selector, uintptr_t a,
             if (vb_skip_qualifiers(type)[0] == '@' && a) first = object_getClassName((id)a);
         }
         vb_say("haptic %s %s call=%u arg=%s/%s%s\n", hook->class_name, hook->selector, call + 1, type, first,
-            hook->action == VB_PULSE ? " pulse=15ms" : hook->action == VB_CANCEL ? " cancel" : "");
+            hook->action == VB_PULSE ? (suppressed ? " pulse=suppressed(pcm)" : " pulse=15ms") :
+            hook->action == VB_CANCEL ? " cancel" : "");
         if (hook->action == VB_LOG && call < 2 && strcmp(type, "@") == 0 && a) vb_describe("haptic arg", (CFTypeRef)a);
     }
     return original(self, selector, a, b, c, d, e, f);
@@ -1652,10 +1655,13 @@ __attribute__((constructor)) static void fuxi_vibrate_init(void)
     if (vb_role == VB_APP) {
         /* 沙盒可能擋 IORegistry：讀得到 fuxi,inject（注入我們的就是它）才算 ADT 可讀，讀不到就照預設開 */
         bool readable = vb_adt_u32(CFSTR("fuxi,inject")) != 0;
-        unsigned ui = readable ? vb_adt_u32(CFSTR("fuxi,haptic-ui")) : 1;
+        bool native_pcm = readable && vb_adt_u32(CFSTR("fuxi,haptic")) == 9u &&
+            vb_adt_u32(CFSTR("fuxi,hal-haptic")) >= 4u;
+        unsigned ui = readable ? (native_pcm ? 0u : vb_adt_u32(CFSTR("fuxi,haptic-ui"))) : 1u;
+        __atomic_store_n(&vb_native_pcm, native_pcm ? 1u : 0u, __ATOMIC_RELEASE);
         __atomic_store_n(&vb_app_fallback, ui != 0, __ATOMIC_RELAXED);
-        vb_say("app haptic fallback=%u adt-readable=%u (UIFeedbackGenerator -> system sound %u)\n", ui != 0,
-            readable, (unsigned)VB_APP_SOUND);
+        vb_say("app haptic fallback=%u adt-readable=%u native-pcm=%u (UIFeedbackGenerator -> system sound %u)\n",
+            ui != 0, readable, native_pcm, (unsigned)VB_APP_SOUND);
         if (ui == 0) return;
         _dyld_register_func_for_add_image(vb_image_added);
         if (readable && vb_adt_u32(CFSTR("fuxi,haptic")) == 3)
@@ -1668,15 +1674,18 @@ __attribute__((constructor)) static void fuxi_vibrate_init(void)
         return;
     }
     if (vb_role == VB_SPRINGBOARD) {
-        unsigned ms = vb_adt_u32(CFSTR("fuxi,haptic-ui"));
+        bool native_pcm = vb_adt_u32(CFSTR("fuxi,haptic")) == 9u &&
+            vb_adt_u32(CFSTR("fuxi,hal-haptic")) >= 4u;
+        __atomic_store_n(&vb_native_pcm, native_pcm ? 1u : 0u, __ATOMIC_RELEASE);
+        unsigned ms = native_pcm ? 0u : vb_adt_u32(CFSTR("fuxi,haptic-ui"));
         if (ms) ms = ms < 8 ? 8 : ms > 40 ? 40 : ms;
         __atomic_store_n(&vb_ui_ms, ms, __ATOMIC_RELAXED);
     }
     if (vb_role == VB_MEDIA) __atomic_store_n(&vb_envelope, vb_adt_u32(CFSTR("fuxi,haptic-env")) != 0, __ATOMIC_RELAXED);
     unsigned amplitude = vb_adt_u32(CFSTR("fuxi,haptic-amp"));
     __atomic_store_n(&vb_amp_max, amplitude > 255 ? 255u : amplitude, __ATOMIC_RELAXED);
-    vb_say("vibrate kern.fuxivibrate ready; installing haptic hooks ui-fallback-ms=%u envelope=%u amplitude-max=%u\n",
-        vb_ui_ms, vb_envelope, vb_amp_max);
+    vb_say("vibrate kern.fuxivibrate ready; installing haptic hooks ui-fallback-ms=%u native-pcm=%u envelope=%u amplitude-max=%u\n",
+        vb_ui_ms, vb_native_pcm, vb_envelope, vb_amp_max);
     _dyld_register_func_for_add_image(vb_image_added);
     if (vb_role == VB_MEDIA) vb_spawn(vb_bridge_thread, "vibe native bridge waiting for MediaExperience vibrator");
     if (vb_adt_u32(CFSTR("fuxi,haptic")) != 3) return;

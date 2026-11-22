@@ -78026,9 +78026,10 @@ index 0000000..a22cc1a
 + #define G_DATA_PA   (G_MEM + 0x1100000)
 diff --git a/tools/test-fuxi-live-audio-haptics.py b/tools/test-fuxi-live-audio-haptics.py
 new file mode 100644
+index 0000000..86d7d2e
 --- /dev/null
 +++ b/tools/test-fuxi-live-audio-haptics.py
-@@ -0,0 +1,1159 @@
+@@ -0,0 +1,1424 @@
 +#!/usr/bin/env python3
 +"""0124 fuxi-live-audio-haptics 主機測試（ASan/UBSan）。
 +
@@ -78575,8 +78576,8 @@ new file mode 100644
 +        assert(d.y >= -FUXI_DAMP_STATE_LIMIT && d.y <= FUXI_DAMP_STATE_LIMIT);
 +    }
 +
-+    /* Stream integration: fast-poll return=2 at fill<=48, tail injection at fill<=14 (not 20) + HW brake */
-+    assert(FUXI_STREAM_TAIL_THRESHOLD == 14 && FUXI_STREAM_FAST_POLL_WATERMARK == 48);
++    /* Stream integration: fast-poll return=2 at fill<=96, tail injection at fill<=14 (not 20) + HW brake */
++    assert(FUXI_STREAM_TAIL_THRESHOLD == 14 && FUXI_STREAM_FAST_POLL_WATERMARK == 96);
 +    m = (MockRtp){0};
 +    m.regs[0x046] = 0x80; m.regs[0x048] = 0x1c; m.regs[0x04c] = FUXI_VIBRATE_IDLE;
 +    m.regs[0x063] = 0x89; m.regs[0x072] = 0x04; m.regs[0x1a0] = 0x0f; m.regs[0x241] = 0xe0;
@@ -78587,10 +78588,10 @@ new file mode 100644
 +    unsigned autores = 0;
 +    assert(fuxi_stream_push(&io, mock_rtp_write, mock_rtp_status, &st, raw_tap, sizeof(raw_tap), 0xa3, 80, MS(0), &autores) == 0);
 +    assert(m.regs[0x04c] == 0x88 && st.burst_raw_peak == 80 && st.burst_out_peak > 0);
-+    m.fifo_fill = 60;
++    m.fifo_fill = 104;
 +    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(10)) == 1);
 +    assert(!st.tail_emitted && st.burst_tail_bytes == 0 && st.burst_tails == 0);
-+    m.fifo_fill = 36;
++    m.fifo_fill = 60;
 +    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(12)) == 2);
 +    assert(!st.tail_emitted && st.burst_tail_bytes == 0 && st.burst_tails == 0);
 +    m.fifo_fill = 20;
@@ -78841,28 +78842,28 @@ new file mode 100644
 +    for (unsigned i = 0; i < 36; i++) sliver36[i] = (uint8_t)(int8_t)lrint(58.0 * sin(3.14159265358979323846 * (i + 10) / 70.0));
 +    for (unsigned i = 0; i < 128; i++) active128[i] = (uint8_t)(int8_t)lrint(66.0 * sin(3.14159265358979323846 * (i + 20) / 70.0));
 +
-+    /* 84B finished keyboard tap (last 16B silent -> last_input_quiet=1): adaptive quiet = 1.33 ms, fires single proportional tail */
++    /* 84B finished keyboard tap (last 16B silent -> last_input_quiet=1): adaptive quiet = 0.5 ms, fires single proportional tail at fill<=48 */
 +    assert(fuxi_stream_push(&io, mock_rtp_write, mock_rtp_status, &st, short_done84, 84, 0xa3, 58, MS(0), &autores) == 0);
 +    assert(m.fifo_fill == 72 && st.last_push_fill == 72 && st.last_input_quiet == 1);
-+    m.fifo_fill = 48;
++    m.fifo_fill = 52;
 +    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(1)) == 2);
 +    assert(!st.tail_emitted && st.burst_tails == 0);
-+    m.fifo_fill = 26;
-+    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, 1900000ull) == 1);
-+    assert(st.tail_emitted && st.burst_tails == 1 && st.burst_tail_bytes >= 8 && m.fifo_fill == 26 + st.burst_tail_bytes);
++    m.fifo_fill = 44;
++    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, 1200000ull) >= 1);
++    assert(st.tail_emitted && st.burst_tails == 1 && st.burst_tail_bytes >= 8 && m.fifo_fill == 44 + st.burst_tail_bytes);
 +    assert(st.burst_out_peak <= (st.burst_drive_peak * 9u) / 8u && st.burst_out_peak < 90);
 +    m.fifo_fill = 0;
 +    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(8)) == 0);
 +    assert(!st.playing && st.burst_tails == 1 && st.burst_underruns == 0);
 +
-+    /* 64B finished tap -> 56B (2.33 ms); adaptive quiet = 0.67 ms, fires cleanly at fill=28 (t=1.2 ms) */
++    /* 64B finished tap -> 56B (2.33 ms); adaptive quiet = 0 ms, fires cleanly at fill=44 (t=0.5 ms) */
 +    st.burst_chunks = st.burst_refills = st.burst_underruns = st.burst_bytes = st.burst_drive_peak = st.burst_out_peak = 0;
 +    st.burst_tail_bytes = st.burst_tails = 0;
 +    assert(fuxi_stream_push(&io, mock_rtp_write, mock_rtp_status, &st, short_done64, 64, 0xa3, 64, MS(20), &autores) == 0);
 +    assert(m.fifo_fill == 56 && st.last_push_fill == 56 && st.last_input_quiet == 1);
-+    m.fifo_fill = 28;
-+    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, 21200000ull) == 1);
-+    assert(st.tail_emitted && st.burst_tails == 1 && st.burst_tail_bytes >= 8 && m.fifo_fill == 28 + st.burst_tail_bytes);
++    m.fifo_fill = 44;
++    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, 20500000ull) >= 1);
++    assert(st.tail_emitted && st.burst_tails == 1 && st.burst_tail_bytes >= 8 && m.fifo_fill == 44 + st.burst_tail_bytes);
 +    m.fifo_fill = 0;
 +    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(28)) == 0);
 +    assert(!st.playing && st.burst_tails == 1 && st.burst_underruns == 0);
@@ -78883,12 +78884,268 @@ new file mode 100644
 +    assert(fuxi_stream_push(&io, mock_rtp_write, mock_rtp_status, &st, short_done84, 84, 0xa3, 58, MS(47), &autores) == 0);
 +    assert(st.last_input_quiet == 1 && st.burst_refills == 2);
 +    m.fifo_fill = 24;
-+    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(50)) == 1);
++    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(50)) >= 1);
 +    assert(st.tail_emitted && st.burst_tails == 1 && st.burst_tail_bytes >= 8 && st.burst_out_peak < 96);
 +    m.fifo_fill = 0;
 +    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(58)) == 0);
 +    assert(!st.playing && st.burst_tails == 1 && st.burst_underruns == 0);
 +    assert(fuxi_stream_close(&io, mock_rtp_write, &st) == 0);
++}
++
++static void sim_lra_split_metrics(const uint8_t *pcm, unsigned drv_len, unsigned total_len,
++    double f0_hz, double *drv_pk, double *tail_pk, double *post_pk) {
++    const double alpha = 2.0 * 3.14159265358979323846 * f0_hz / 24000.0;
++    const double two_z0 = 2.0 * 0.033;
++    double x = 0.0, y = 0.0;
++    double dpk = 0.0, tpk = 0.0, ppk = 0.0;
++    for (unsigned i = 0; i < total_len + 480u; i++) {
++        double q = i < total_len ? (double)(int8_t)pcm[i] : 0.0;
++        double a = q - x - two_z0 * y;
++        y += alpha * a;
++        x += alpha * y;
++        double aa = a < 0 ? -a : a;
++        if (i < drv_len) {
++            if (aa > dpk) dpk = aa;
++        } else if (i < total_len) {
++            if (aa > tpk) tpk = aa;
++        } else {
++            if (aa > ppk) ppk = aa;
++        }
++    }
++    *drv_pk = dpk;
++    *tail_pk = tpk;
++    *post_pk = ppk;
++}
++
++static void test_haptic_mode7(void) {
++    FuxiHapticDamp d;
++    fuxi_damp_init(&d, 0x0007u, 5710);
++    assert(d.mode == 7 && !d.no_pitch && !d.no_tail && d.gain_q8 == 608);
++    assert(d.two_z0_q15 == 2162 && d.c_r_q8 == 874 && d.c_x_q15 == -14347 && d.c_y_q15 == -32416);
++
++    /* Bit 15 (crisp_high) and bit 14 (no_pitch) must NOT bleed into z0_field (bits 10..13) */
++    fuxi_damp_init(&d, 0x8007u, 5710);
++    assert(d.mode == 7 && !d.no_pitch && d.gain_q8 == 592 && d.two_z0_q15 == 2162);
++    assert(d.c_r_q8 == 977 && d.c_x_q15 == -21319 && d.c_y_q15 == -39938);
++    fuxi_damp_init(&d, 0x4007u, 5710);
++    assert(d.mode == 7 && d.no_pitch && d.gain_q8 == 608 && d.two_z0_q15 == 2162);
++    fuxi_damp_init(&d, 0x0047u, 5710);
++    assert(d.mode == 7 && d.gain_q8 == 320 + 4 * 48);
++    fuxi_damp_init(&d, 0x0c07u, 5710);
++    assert(d.mode == 7 && d.two_z0_q15 == 2 * 3 * 328);
++
++    /* Build Apple-like Micro (200 Hz, pk=57), Mini (150 Hz, pk=75), Full (150 Hz, pk=120) waveforms */
++    uint8_t micro[160] = {0}, mini[236] = {0}, full[396] = {0};
++    for (unsigned i = 0; i < 120; i++) {
++        double t = (double)i / 24000.0;
++        double env = 0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / 120.0);
++        int v = (int)lrint(57.0 * env * sin(2.0 * 3.14159265358979323846 * 200.0 * t));
++        micro[i] = (uint8_t)(int8_t)v;
++    }
++    for (unsigned i = 0; i < 160; i++) {
++        double t = (double)i / 24000.0;
++        double env = 0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / 160.0);
++        int v = (int)lrint(75.0 * env * sin(2.0 * 3.14159265358979323846 * 150.0 * t));
++        mini[i] = (uint8_t)(int8_t)v;
++    }
++    for (unsigned i = 0; i < 320; i++) {
++        double t = (double)i / 24000.0;
++        double env = 0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / 320.0);
++        int v = (int)lrint(120.0 * env * sin(2.0 * 3.14159265358979323846 * 150.0 * t));
++        full[i] = (uint8_t)(int8_t)v;
++    }
++
++    const uint32_t cfgs[2] = {0x0007u, 0x8007u};
++    for (unsigned ci = 0; ci < 2; ci++) {
++        double pks[3] = {0};
++        const uint8_t *ins[3] = {micro, mini, full};
++        const unsigned lens[3] = {sizeof(micro), sizeof(mini), sizeof(full)};
++        for (unsigned k = 0; k < 3; k++) {
++            uint8_t buf[640] = {0};
++            unsigned out_pk = 0, tail_pk = 0, zc = 0;
++            fuxi_damp_init(&d, cfgs[ci], 5710);
++            unsigned n = fuxi_damp_process_mode7(&d, ins[k], lens[k], buf, sizeof(buf) - FUXI_DAMP_TAIL_MAX, &out_pk, &zc);
++            assert(n >= 4 && (n & 3u) == 0 && out_pk > 0 && out_pk <= FUXI_DAMP_PCM_LIMIT);
++            if (k < 2) assert(out_pk < FUXI_DAMP_PCM_LIMIT);
++            unsigned tl = fuxi_damp_tail(&d, buf + n, FUXI_DAMP_TAIL_MAX, &tail_pk, &zc);
++            double dpk = 0, tpk = 0, ppk = 0;
++            sim_lra_split_metrics(buf, n, n + tl, 175.13, &dpk, &tpk, &ppk);
++            /* Mode 7 must peak during the drive (center-peaked), not slam harder in the tail, and kill post-ringing < 2% */
++            assert(dpk > tpk);
++            assert(ppk < dpk * 0.02);
++            pks[k] = dpk;
++        }
++        /* Preserve clear tactile hierarchy: Micro < Mini < Full */
++        assert(pks[0] < pks[1] && pks[1] < pks[2]);
++    }
++
++    /* Stream integration with mode 7 + widened 48B tail threshold & 96B fast-poll watermark */
++    MockRtp m = {0};
++    m.regs[0x046] = 0x80; m.regs[0x048] = 0x1c; m.regs[0x04c] = FUXI_VIBRATE_IDLE;
++    m.regs[0x063] = 0x89; m.regs[0x072] = 0x04; m.regs[0x1a0] = 0x0f; m.regs[0x241] = 0xe0;
++    g_mock_rtp = &m;
++    FuxiHapticIo io = {&m, mock_owner, mock_read, mock_write_reg, mock_wait_us, 0};
++    FuxiHapticStream st = {0};
++    fuxi_damp_init(&st.damp, 0x0007u, 5710);
++    unsigned autores = 0;
++    assert(fuxi_stream_push(&io, mock_rtp_write, mock_rtp_status, &st, full, 256, 0xa3, 120, MS(10), &autores) == 0);
++    assert(st.playing && st.burst_chunks == 1 && !st.tail_emitted && !st.last_input_quiet);
++    m.fifo_fill = 80;
++    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(15)) == 2);
++    assert(!st.tail_emitted && st.burst_tails == 0);
++    assert(fuxi_stream_push(&io, mock_rtp_write, mock_rtp_status, &st, full + 256, sizeof(full) - 256, 0xa3, 120, MS(16), &autores) == 0);
++    assert(st.playing && st.burst_chunks == 2 && st.burst_refills == 1 && st.last_input_quiet && !st.tail_emitted);
++    /* At fill=44 (<= 48B pitch threshold) after adaptive quiet window, tail fires cleanly and returns fast-poll if <= 96B */
++    m.fifo_fill = 44;
++    int drain_rc = fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(24));
++    assert(drain_rc >= 1 && st.tail_emitted && st.burst_tails == 1);
++    m.fifo_fill = 0;
++    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(32)) == 0);
++    assert(!st.playing && st.burst_underruns == 0);
++    assert(fuxi_stream_close(&io, mock_rtp_write, &st) == 0);
++}
++
++static void test_haptic_mode8(void) {
++    FuxiHapticDamp d;
++    /* Default 0x0008: native 1:1 timing, ft=150 Hz, zd=0.28 -> zb=0.56, gain=512 */
++    fuxi_damp_init(&d, 0x0008u, 5710);
++    assert(d.mode == 8 && d.no_pitch && !d.no_tail && d.gain_q8 == 512);
++    assert(d.two_z0_q15 == 2162 && d.c_r_q8 == 376 && d.c_x_q15 == 8729 && d.c_y_q15 == -13554);
++    assert(d.c_x_tl_q15 == 8729 && d.c_y_tl_q15 == -29272);
++
++    /* Crisp 0x8008: ft=160 Hz, zd=0.28 -> zb=0.58, gain=528 */
++    fuxi_damp_init(&d, 0x8008u, 5710);
++    assert(d.mode == 8 && d.no_pitch && d.gain_q8 == 528 && d.two_z0_q15 == 2162);
++    assert(d.c_r_q8 == 441 && d.c_x_q15 == 5417 && d.c_y_q15 == -14602);
++    assert(d.c_x_tl_q15 == 5417 && d.c_y_tl_q15 == -32564);
++
++    /* Bit 14 (0x4008): native f0 braking tail (c_x_tl=0) while keeping 150 Hz drive */
++    fuxi_damp_init(&d, 0x4008u, 5710);
++    assert(d.mode == 8 && d.no_pitch && d.c_x_q15 == 8729 && d.c_x_tl_q15 == 0 && d.c_y_tl_q15 == -34538);
++
++    /* Gain override (bits 4..7): 320 + n * 32 */
++    fuxi_damp_init(&d, 0x0078u, 5710);
++    assert(d.mode == 8 && d.gain_q8 == 320 + 7 * 32);
++
++    /* Build native 1:1 Apple waveforms: Micro 200Hz, Mini 100Hz, Full 150Hz */
++    uint8_t micro[160] = {0}, mini100[260] = {0}, full150[396] = {0};
++    for (unsigned i = 0; i < 120; i++) {
++        double t = (double)i / 24000.0;
++        double env = 0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / 120.0);
++        micro[i] = (uint8_t)(int8_t)(int)lrint(57.0 * env * sin(2.0 * 3.14159265358979323846 * 200.0 * t));
++    }
++    for (unsigned i = 0; i < 240; i++) {
++        double t = (double)i / 24000.0;
++        double env = 0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / 240.0);
++        mini100[i] = (uint8_t)(int8_t)(int)lrint(69.0 * env * sin(2.0 * 3.14159265358979323846 * 100.0 * t));
++    }
++    for (unsigned i = 0; i < 320; i++) {
++        double t = (double)i / 24000.0;
++        double env = 0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / 320.0);
++        full150[i] = (uint8_t)(int8_t)(int)lrint(120.0 * env * sin(2.0 * 3.14159265358979323846 * 150.0 * t));
++    }
++
++    const uint32_t cfgs[3] = {0x0008u, 0x8008u, 0x4008u};
++    for (unsigned ci = 0; ci < 3; ci++) {
++        double pks[3] = {0};
++        const uint8_t *ins[3] = {micro, mini100, full150};
++        const unsigned lens[3] = {sizeof(micro), sizeof(mini100), sizeof(full150)};
++        for (unsigned k = 0; k < 3; k++) {
++            uint8_t buf[640] = {0};
++            unsigned out_pk = 0, tail_pk = 0, zc = 0;
++            fuxi_damp_init(&d, cfgs[ci], 5710);
++            unsigned n = fuxi_damp_process_mode7(&d, ins[k], lens[k], buf, sizeof(buf) - FUXI_DAMP_TAIL_MAX, &out_pk, &zc);
++            /* Mode 8 must preserve exact 1:1 native length without pitch compression */
++            assert(n == lens[k] && out_pk > 0 && out_pk <= FUXI_DAMP_PCM_LIMIT);
++            unsigned tl = fuxi_damp_tail(&d, buf + n, FUXI_DAMP_TAIL_MAX, &tail_pk, &zc);
++            assert(tl >= 4 && (tl & 3u) == 0);
++            /* Smooth 24-sample tail ramp must prevent step spike at drive->tail seam */
++            int seam_diff = (int)(int8_t)buf[n] - (int)(int8_t)buf[n - 1];
++            int seam_jump = seam_diff < 0 ? -seam_diff : seam_diff;
++            assert(seam_jump <= 10);
++            double dpk = 0, tpk = 0, ppk = 0;
++            sim_lra_split_metrics(buf, n, n + tl, 175.13, &dpk, &tpk, &ppk);
++            assert(dpk > tpk);
++            assert(ppk < dpk * 0.025);
++            pks[k] = dpk;
++        }
++        assert(pks[0] < pks[2] && pks[1] < pks[2]);
++    }
++
++    /* Stream integration with mode 8 multi-chunk push + smooth ramped braking tail */
++    MockRtp m = {0};
++    m.regs[0x046] = 0x80; m.regs[0x048] = 0x1c; m.regs[0x04c] = FUXI_VIBRATE_IDLE;
++    m.regs[0x063] = 0x89; m.regs[0x072] = 0x04; m.regs[0x1a0] = 0x0f; m.regs[0x241] = 0xe0;
++    g_mock_rtp = &m;
++    FuxiHapticIo io = {&m, mock_owner, mock_read, mock_write_reg, mock_wait_us, 0};
++    FuxiHapticStream st = {0};
++    fuxi_damp_init(&st.damp, 0x0008u, 5710);
++    unsigned autores = 0;
++    assert(fuxi_stream_push(&io, mock_rtp_write, mock_rtp_status, &st, full150, 256, 0xa3, 120, MS(10), &autores) == 0);
++    assert(st.playing && st.burst_chunks == 1 && st.burst_bytes == 256 && !st.tail_emitted);
++    m.fifo_fill = 96;
++    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(16)) == 2);
++    assert(!st.tail_emitted && st.burst_tails == 0);
++    assert(fuxi_stream_push(&io, mock_rtp_write, mock_rtp_status, &st, full150 + 256, sizeof(full150) - 256, 0xa3, 120, MS(17), &autores) == 0);
++    assert(st.playing && st.burst_chunks == 2 && st.burst_refills == 1 && st.burst_bytes == sizeof(full150));
++    m.fifo_fill = 44;
++    int drain_rc = fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(26));
++    assert(drain_rc >= 1 && st.tail_emitted && st.burst_tails == 1);
++    m.fifo_fill = 0;
++    assert(fuxi_stream_poll_drain(&io, mock_rtp_write, mock_rtp_status, &st, MS(35)) == 0);
++    assert(!st.playing && st.burst_underruns == 0);
++    assert(fuxi_stream_close(&io, mock_rtp_write, &st) == 0);
++}
++
++static void test_amp_wake_hold_and_peaks(void) {
++    uint32_t hold = 0;
++    /* Awake or empty ring never holds and clears hold counter */
++    assert(fuxi_audio_should_hold_for_wake(1u, 960u, &hold) == 0 && hold == 0u);
++    assert(fuxi_audio_should_hold_for_wake(0u, 0u, &hold) == 0 && hold == 0u);
++    /* Sleeping amp with pending PCM holds for up to FUXI_AUDIO_WAKE_HOLD_PERIODS (2) periods */
++    assert(fuxi_audio_should_hold_for_wake(0u, 206u, &hold) == 1 && hold == 1u);
++    assert(fuxi_audio_should_hold_for_wake(0u, 206u, &hold) == 1 && hold == 2u);
++    /* 3rd period releases even if amp failed to wake, preventing infinite ring stall */
++    assert(fuxi_audio_should_hold_for_wake(0u, 206u, &hold) == 0 && hold == 2u);
++    /* Once amp wakes, hold counter resets for next standby cycle */
++    assert(fuxi_audio_should_hold_for_wake(1u, 206u, &hold) == 0 && hold == 0u);
++    assert(fuxi_audio_should_hold_for_wake(0u, 206u, &hold) == 1 && hold == 1u);
++
++    const int16_t pcm[6] = { -32768, 1200, 4500, -18000, 0, 500 };
++    uint32_t lpk = 0, rpk = 0;
++    fuxi_audio_pcm_peaks(pcm, 3u, &lpk, &rpk);
++    assert(lpk == 32768u && rpk == 18000u);
++
++    /* Silent-only ring writes while amp is asleep must NOT report nonzero or trigger wake-hold */
++    static FuxiAudioRing r;
++    static uint32_t tdm[960 * 4];
++    static int16_t zeros[960 * 2];
++    static int16_t click[960 * 2];
++    memset(&r, 0, sizeof(r));
++    memset(zeros, 0, sizeof(zeros));
++    memset(click, 0, sizeof(click));
++    click[40] = 6000;
++    click[41] = -6000;
++    assert(fuxi_audio_ring_has_nonzero(&r) == 0u);
++    assert(fuxi_audio_ring_write(&r, zeros, 960u) == 0);
++    assert(fuxi_audio_ring_used(&r) == 960u && fuxi_audio_ring_has_nonzero(&r) == 0u);
++    hold = 0u;
++    assert(fuxi_audio_should_hold_for_wake(0u, fuxi_audio_ring_has_nonzero(&r), &hold) == 0 && hold == 0u);
++    /* Non-zero click sets has_nonzero and triggers wake-hold until amp wakes and drains past click */
++    assert(fuxi_audio_ring_write(&r, click, 960u) == 1);
++    assert(fuxi_audio_ring_has_nonzero(&r) == 1u);
++    assert(fuxi_audio_should_hold_for_wake(0u, fuxi_audio_ring_has_nonzero(&r), &hold) == 1 && hold == 1u);
++    assert(fuxi_audio_ring_write(&r, zeros, 960u) == 0);
++    assert(fuxi_audio_ring_has_nonzero(&r) == 1u);
++    /* Drain first silent chunk (still before click), then click chunk, leaving trailing silence */
++    assert(fuxi_audio_ring_read_tdm(&r, tdm, 960u, 0, 1) == 0u);
++    assert(fuxi_audio_ring_has_nonzero(&r) == 1u);
++    assert(fuxi_audio_ring_read_tdm(&r, tdm, 960u, 0, 1) > 0u);
++    assert(fuxi_audio_ring_has_nonzero(&r) == 0u);
++    /* Trailing silence in ring after click was played must NOT hold while amp sleeps */
++    hold = 0u;
++    assert(fuxi_audio_ring_used(&r) == 960u);
++    assert(fuxi_audio_should_hold_for_wake(0u, fuxi_audio_ring_has_nonzero(&r), &hold) == 0 && hold == 0u);
 +}
 +
 +static void test_amp_idle_standby(void) {
@@ -79087,7 +79344,10 @@ new file mode 100644
 +    test_haptic_stream_v4();
 +    test_haptic_damp_and_tail();
 +    test_haptic_mode5_and_mode6();
++    test_haptic_mode7();
++    test_haptic_mode8();
 +    test_amp_idle_standby();
++    test_amp_wake_hold_and_peaks();
 +    test_audio_mic_hw_and_ring();
 +    printf("live audio + haptic shape v2 host tests ok\n");
 +    return 0;
@@ -79131,7 +79391,7 @@ new file mode 100644
 +    assert 'fuxi_haptic_damp.h' in p124
 +    assert 'fuxi,haptic-damp' in p124
 +    assert 'FUXI_STREAM_TAIL_THRESHOLD = 14' in p124
-+    assert 'FUXI_STREAM_FAST_POLL_WATERMARK = 48' in p124
++    assert 'FUXI_STREAM_FAST_POLL_WATERMARK = 96' in p124
 +    assert 'drain > 1 ? 250000ull : 500000ull' in p124
 +    assert 'fuxi_rtp_write_rc_cal' in p124
 +    assert 'address == 0xf05e && size == 2' in p124
@@ -79159,8 +79419,14 @@ new file mode 100644
 +    assert '0xf066, 0x07' in p124 and 'fuxi_stream_will_absorb' in p124
 +    assert 'FUXI_AUDIO_DIG_VOL_MUTE = 0xa67bu' in p124
 +    assert 'FUXI_STREAM_SYNTH_MAX_IN = 864u' in p124
-+    assert 'FUXI_STREAM_TAIL_THRESHOLD_PITCH = 28' in p124
++    assert 'FUXI_STREAM_TAIL_THRESHOLD_PITCH = 48' in p124
 +    assert 'if (mode == 8) IOSleep(2);' in p124
++    assert 'fp_flash_apid_plus_one' in p124 and 'sid == 1 && peripheral == 0xee' in p124
++    assert 'fuxi_amp_live_awake' in p124 and 'fuxi_amp_live_kick' in p124
++    assert 'fuxi_audio_should_hold_for_wake' in p124 and 'fuxi_audio_ring_has_nonzero' in p124
++    assert 'fuxi_audio_pcm_peaks' in p124
++    assert 'fuxi_damp_process_mode7' in p124 and 'FUXI_DAMP_FLAG_CRISP_HIGH' in p124
++    assert 'fuxi_damp_mode8_tail_step' in p124 and 'FUXI_DAMP_TAIL_RAMP' in p124
 +
 +    with tempfile.TemporaryDirectory(prefix='fuxi-live-audio-') as td:
 +        tmp = Path(td)
@@ -80989,14 +81255,23 @@ new file mode 100644
 +#endif /* FUXI_RTC_PERSIST_H */
 diff --git a/xnu/patches/0124-fuxi-live-audio-haptics.patch b/xnu/patches/0124-fuxi-live-audio-haptics.patch
 new file mode 100644
+index 0000000..b29e043
 --- /dev/null
 +++ b/xnu/patches/0124-fuxi-live-audio-haptics.patch
-@@ -0,0 +1,4007 @@
+@@ -0,0 +1,4319 @@
 +diff --git a/bsd/dev/fuxi_amp.c b/bsd/dev/fuxi_amp.c
-+index 0b1049c..a633551 100644
++index 0b1049c..cbbc6ab 100644
 +--- a/bsd/dev/fuxi_amp.c
 ++++ b/bsd/dev/fuxi_amp.c
-+@@ -39,8 +39,12 @@
++@@ -32,6 +32,7 @@
++ #include <sys/errno.h>
++ #include <kern/clock.h>
++ #include <kern/thread.h>
+++#include <kern/sched_prim.h>
++ #include <machine/machine_routines.h>
++ #include <pexpert/pexpert.h>
++ #include <pexpert/device_tree.h>
++@@ -39,8 +40,14 @@
 + #include <vm/pmap.h>
 + #include "GeniI2c.h"
 + #include "fuxi_amp_tone.h"
@@ -81007,18 +81282,21 @@ new file mode 100644
 ++uint32_t fuxi_audio_vol_packed = 700u; /* kern.fuxiaudiovol：bit 31 = active，bits 0..15 = 0..1000 */
 ++uint64_t fuxi_audio_last_nonzero_ns;   /* 最近一次非零音訊的時間（ns），空閒逾時自動靜音 */
 ++static uint32_t fuxi_amp_live_done;    /* bringUp 離開 ampLive 並壓下 gpio183 後置 1，供關機等待 */
+++uint32_t fuxi_amp_live_awake;          /* mode 8 功放已完成上電且未進入閒置靜音／待機時為 1 */
+++static uint32_t fuxi_amp_live_kick_seq;
 + 
 + extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
 +     unsigned, void *);
-+@@ -49,6 +53,7 @@ extern kern_return_t thread_terminate(thread_t);
++@@ -49,6 +56,8 @@ extern kern_return_t thread_terminate(thread_t);
 + extern void thread_deallocate(thread_t);
 + extern void IOSleep(unsigned milliseconds);
 + void fuxi_amp_init(void);
 ++void fuxi_amp_shutdown(void);
+++void fuxi_amp_live_kick(void);
 + 
 + #define FM_GCC 0x100000ull
 + #define FM_TLMM 0xf100000ull
-+@@ -126,6 +131,7 @@ void fuxi_amp_init(void);
++@@ -126,6 +135,7 @@ void fuxi_amp_init(void);
 + #define FM_DIG_VOL_MUTE 0xa678u         /* HPF 開，音量靜音 */
 + #define FM_DIG_VOL_LEVEL 0xb885u        /* HPF 開，-30 dB：使用者 2026-11-18 只同意這一檔 */
 + #define FM_AMP_GAIN 0x6c04u
@@ -81026,7 +81304,7 @@ new file mode 100644
 + #define FM_TONE_READY_MS 15000u         /* READY 後等 PCM 圖開出 TDM 時脈的上限 */
 + #define FM_TONE_ON_MS 5000u             /* 正弦一秒，加 PCM 端排隊與回報的餘裕 */
 + #define FM_TDM_CTL (1u << 2 | 3u << 6)  /* gpio121／123／124：function 1，8 mA，不拉（早期 au_pin） */
-+@@ -569,7 +575,7 @@ static int ampLoadMutedProtection(uint8_t address, unsigned mode)
++@@ -569,7 +579,7 @@ static int ampLoadMutedProtection(uint8_t address, unsigned mode)
 +     unsigned verified = 0;
 +     const uint8_t *cal = NULL;
 +     uint32_t controls[8] = {0};
@@ -81035,7 +81313,7 @@ new file mode 100644
 +         SecureDTLookupEntry(NULL, mode >= 4 ? "/chosen/fuxi-speaker" : "/chosen", &chosen) != kSuccess ||
 +         SecureDTGetProperty(chosen, "fuxi,cs35l41-prot", &property, &length) != kSuccess ||
 +         length < sizeof(header)) goto refused;
-+@@ -619,7 +625,7 @@ static int ampLoadMutedProtection(uint8_t address, unsigned mode)
++@@ -619,7 +629,7 @@ static int ampLoadMutedProtection(uint8_t address, unsigned mode)
 +     if (mode >= 5 && !ampBottomTuning(address, cal)) goto refused;
 +     if (mode >= 6 && !ampRunMutedProtection(address, controls)) goto refused;
 +     /* 出聲前的閘門：保護韌體在跑（CSPL_ST_RUNNING = 0，Xiaomi cs35l41.h）、沒有錯誤碼、校正已套用。 */
@@ -81044,7 +81322,7 @@ new file mode 100644
 +         printf("FUXI AMP: tone refused cspl_state=%#x errorno=%#x cal_status=%#x\n", controls[1], controls[2], controls[5]);
 +         goto refused;
 +     }
-+@@ -747,13 +753,20 @@ static int ampToneCheck(uint8_t address, uint32_t status[4])
++@@ -747,13 +757,20 @@ static int ampToneCheck(uint8_t address, uint32_t status[4])
 +     return !(status[0] & FM_TONE_ERRORS);
 + }
 + 
@@ -81069,7 +81347,7 @@ new file mode 100644
 +     int down = 0;
 +     for (unsigned i = 0; i < 100; i++) {
 +         if (!ampRead(address, FM_IRQ1_STATUS1, &status)) break;
-+@@ -761,15 +774,16 @@ static int ampToneDown(uint8_t address)
++@@ -761,15 +778,16 @@ static int ampToneDown(uint8_t address)
 +         IOSleep(1);
 +     }
 +     ok = ampWrite32(address, FM_IRQ1_STATUS1, FM_TONE_PDN_DONE) && ok && down;
@@ -81092,10 +81370,28 @@ new file mode 100644
 + /* 早期 au_tone_stage 的功放端順序：PCM 圖先送 100 ms 靜音（CLOCKED），steps 12–26，100 ms，上電，200 ms，檢查，-30 dB，
 +  * 正弦期間每 100 ms 檢查一次，正弦送完（DRAIN）後再檢查一次，下電。任何一步失敗：先標 FAILED 讓 PCM 停送正弦，再下電。
 +  * 呼叫端之後一律把功放壓回 reset。 */
-+@@ -832,12 +846,205 @@ out:
++@@ -832,12 +850,238 @@ out:
 +     return ok;
 + }
 + 
+++void fuxi_amp_live_kick(void)
+++{
+++    __atomic_fetch_add(&fuxi_amp_live_kick_seq, 1u, __ATOMIC_RELEASE);
+++    thread_wakeup((event_t)&fuxi_amp_live_kick_seq);
+++}
+++
+++static void ampLiveSleep(unsigned ms, uint32_t seen)
+++{
+++    uint64_t deadline = 0;
+++    clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+++    assert_wait_deadline((event_t)&fuxi_amp_live_kick_seq, THREAD_UNINT, deadline);
+++    if (__atomic_load_n(&fuxi_amp_live_kick_seq, __ATOMIC_ACQUIRE) != seen) {
+++        clear_wait(current_thread(), THREAD_AWAKENED);
+++        return;
+++    }
+++    thread_block(THREAD_CONTINUE_NULL);
+++}
+++
 ++static uint64_t ampNowNs(void)
 ++{
 ++    uint64_t absolute = 0, nanoseconds = 0;
@@ -81197,9 +81493,10 @@ new file mode 100644
 ++    const uint64_t init_nz = __atomic_load_n(&fuxi_audio_last_nonzero_ns, __ATOMIC_ACQUIRE);
 ++    fuxi_amp_power_init(&pwr, start_ns, fuxi_audio_vol_active(init_packed), init_nz,
 ++        cur_vol == FUXI_AUDIO_DIG_VOL_MUTE);
+++    __atomic_store_n(&fuxi_amp_live_awake, cur_vol != FUXI_AUDIO_DIG_VOL_MUTE ? 1u : 0u, __ATOMIC_RELEASE);
 ++    unsigned ticks = 0;
 ++    while ((state = fuxi_amp_tone_get()) == FUXI_TONE_ON) {
-++        IOSleep(pwr.powered ? 20 : 5);
+++        const uint32_t kick_seen = __atomic_load_n(&fuxi_amp_live_kick_seq, __ATOMIC_ACQUIRE);
 ++        const uint64_t now_ns = ampNowNs();
 ++        const uint32_t packed = __atomic_load_n(&fuxi_audio_vol_packed, __ATOMIC_ACQUIRE);
 ++        const uint64_t last_nz = __atomic_load_n(&fuxi_audio_last_nonzero_ns, __ATOMIC_ACQUIRE);
@@ -81211,6 +81508,7 @@ new file mode 100644
 ++            want_unmute ? fuxi_audio_volume_to_reg(fuxi_audio_vol_milli(packed), max_db_x8) :
 ++            FUXI_AUDIO_DIG_VOL_MUTE;
 ++        if (action == FUXI_AMP_ACT_STANDBY) {
+++            __atomic_store_n(&fuxi_amp_live_awake, 0u, __ATOMIC_RELEASE);
 ++            if (cur_vol != FUXI_AUDIO_DIG_VOL_MUTE) {
 ++                if (!ampWrite32(address, FM_DIG_VOL, FUXI_AUDIO_DIG_VOL_MUTE)) {
 ++                    printf("FUXI AMP: live standby mute write failed\n");
@@ -81245,21 +81543,32 @@ new file mode 100644
 ++            pwr.wake_count++;
 ++            cur_vol = want_reg;
 ++            ticks = 0;
+++            __atomic_store_n(&fuxi_amp_live_awake, 1u, __ATOMIC_RELEASE);
 ++            if (pwr.wake_count <= 24u) {
 ++                printf("FUXI AMP: live wake #%u pup=%u ms pll=%#x\n", pwr.wake_count, wake_pup, wake_st3);
 ++            }
+++            ampLiveSleep(20, kick_seen);
 ++            continue;
 ++        }
 ++        if (!pwr.powered) {
+++            ampLiveSleep(5, kick_seen);
 ++            continue;
 ++        }
 ++        ticks++;
 ++        if (want_reg != cur_vol) {
+++            if (!want_unmute) {
+++                __atomic_store_n(&fuxi_amp_live_awake, 0u, __ATOMIC_RELEASE);
+++            }
 ++            if (!ampWrite32(address, FM_DIG_VOL, want_reg)) {
 ++                printf("FUXI AMP: live volume write failed reg=%#x\n", want_reg);
 ++                break;
 ++            }
 ++            cur_vol = want_reg;
+++            if (want_unmute) {
+++                __atomic_store_n(&fuxi_amp_live_awake, 1u, __ATOMIC_RELEASE);
+++            }
+++        } else if (want_unmute) {
+++            __atomic_store_n(&fuxi_amp_live_awake, 1u, __ATOMIC_RELEASE);
 ++        }
 ++        if (ticks % 10u == 0) {
 ++            checks++;
@@ -81272,9 +81581,11 @@ new file mode 100644
 ++                break;
 ++            }
 ++        }
+++        ampLiveSleep(20, kick_seen);
 ++    }
 ++    ok = state == FUXI_TONE_DRAIN || state == FUXI_TONE_OFF;
 ++out:
+++    __atomic_store_n(&fuxi_amp_live_awake, 0u, __ATOMIC_RELEASE);
 ++    if (!ok && !fuxi_amp_tone_move(FUXI_TONE_DRAIN, FUXI_TONE_FAILED)) fuxi_amp_tone_abandon();
 ++    if (hw_on) {
 ++        if (stage >= 6 && cur_vol != FUXI_AUDIO_DIG_VOL_MUTE) {
@@ -81299,7 +81610,7 @@ new file mode 100644
 +         tdmCtl[i] = rd(&gTdmPin[i], pinPa(kTdmPins[i]));
 +         tdmIo[i] = rd(&gTdmPin[i], pinPa(kTdmPins[i]) + 4);
 +     }
-+@@ -902,20 +1109,23 @@ static void bringUp(int wasRunning, unsigned mode)
++@@ -902,20 +1146,23 @@ static void bringUp(int wasRunning, unsigned mode)
 +             gBus.failed, gBus.timeouts, kReset[a], ctlNow, lowIn, highIn);
 +         if (mode >= 3) {
 +             if (ok2 && devid == FM_DEVID && revid == 0xb2 && !(st3 & FM_OTP_BOOT_ERR) && (st4 & FM_OTP_BOOT_DONE)) {
@@ -81325,7 +81636,7 @@ new file mode 100644
 +         if (tdmMuxed) {
 +             for (unsigned i = 0; i < 3; ++i) {
 +                 wr(&gTdmPin[i], pinPa(kTdmPins[i]) + 4, tdmIo[i] & ~1u);
-+@@ -967,7 +1177,7 @@ static void ampThread(void *arg, wait_result_t result)
++@@ -967,7 +1214,7 @@ static void ampThread(void *arg, wait_result_t result)
 +         for (unsigned j = 0; j < i; ++j) if (gPin[j].pa == gPin[i].pa) gPin[i].va = gPin[j].va; /* gpio0 and gpio1 share a page */
 +         ok = fm_map(&gPin[i]) == KERN_SUCCESS;
 +     }
@@ -81334,7 +81645,7 @@ new file mode 100644
 +         gTdmPin[i].pa = pinPa(kTdmPins[i]) & ~(uint64_t)0x3fffu;
 +         gTdmPin[i].size = 0x4000;
 +         for (unsigned j = 0; j < i; ++j) if (gTdmPin[j].pa == gTdmPin[i].pa) gTdmPin[i].va = gTdmPin[j].va; /* 121、123 同頁 */
-+@@ -981,26 +1191,37 @@ static void ampThread(void *arg, wait_result_t result)
++@@ -981,26 +1228,38 @@ static void ampThread(void *arg, wait_result_t result)
 +         if (mode >= 2) bringUp(running, mode);
 +     }
 +     /* mode 7 任何沒走到 OFF 的路徑（對應失敗、身分或韌體不符、閘門拒絕）都讓 PCM 端別再等。 */
@@ -81353,6 +81664,7 @@ new file mode 100644
 ++{
 ++    if (fuxi_amp_tone_get() != FUXI_TONE_ON) return;
 ++    (void)fuxi_amp_tone_move(FUXI_TONE_ON, FUXI_TONE_DRAIN);
+++    fuxi_amp_live_kick();
 ++    for (unsigned i = 0; i < 60u; i++) {
 ++        if (__atomic_load_n(&fuxi_amp_live_done, __ATOMIC_ACQUIRE)) break;
 ++        IOSleep(5);
@@ -82014,7 +82326,7 @@ new file mode 100644
 ++
 ++#endif /* FUXI_AUDIO_MIC_H */
 +diff --git a/bsd/dev/fuxi_audio_spf.c b/bsd/dev/fuxi_audio_spf.c
-+index 88e8d82..f80066f 100644
++index 88e8d82..aca915a 100644
 +--- a/bsd/dev/fuxi_audio_spf.c
 ++++ b/bsd/dev/fuxi_audio_spf.c
 +@@ -1,14 +1,27 @@
@@ -82067,12 +82379,14 @@ new file mode 100644
 + _Static_assert(FUXI_TONE_PERIODS * FUXI_TONE_PERIOD_BYTES <= FUXI_AUDIO_DMA_BYTES, "tone periods must fit in the loader buffer");
 + _Static_assert(FUXI_TONE_AHEAD < FUXI_TONE_PERIODS, "the period being filled must not be in the DSP's hands");
 + _Static_assert(FUXI_TONE_FRAMES % FUXI_TONE_PERIOD_FRAMES == 0, "the tone ends on a period boundary");
-+@@ -148,6 +176,790 @@ extern void fuxi_audio_dma_survey(void);
++@@ -148,6 +176,816 @@ extern void fuxi_audio_dma_survey(void);
 + extern bool fuxi_audio_dma_open(uint64_t *address);
 + extern void fuxi_audio_dma_close(void);
 + extern void *fuxi_audio_dma_buffer(void);
 ++extern uint32_t fuxi_audio_vol_packed;
 ++extern uint64_t fuxi_audio_last_nonzero_ns;
+++extern uint32_t fuxi_amp_live_awake;
+++extern void fuxi_amp_live_kick(void);
 ++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
 ++    unsigned, void *);
 ++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
@@ -82091,6 +82405,9 @@ new file mode 100644
 ++static uint32_t gLiveFirstAudio;
 ++static uint32_t gLiveLastWrites;
 ++static uint64_t gLiveNextReport;
+++static uint32_t gLiveWakeHold;
+++static uint32_t gLiveWakeHolds;
+++static uint32_t gLivePeakLogs;
 ++
 ++static uint64_t spf_now_ns(void)
 ++{
@@ -82103,6 +82420,9 @@ new file mode 100644
 ++static void fuxi_audio_touch_active(void)
 ++{
 ++    __atomic_store_n(&fuxi_audio_last_nonzero_ns, spf_now_ns(), __ATOMIC_RELEASE);
+++    if (!__atomic_load_n(&fuxi_amp_live_awake, __ATOMIC_ACQUIRE)) {
+++        fuxi_amp_live_kick();
+++    }
 ++}
 ++
 ++static int fuxi_audio_write_allowed(void)
@@ -82135,14 +82455,29 @@ new file mode 100644
 ++    lck_mtx_lock(&gAudioCopyLock);
 ++    int error = SYSCTL_IN(req, gAudioCopyBuf, length);
 ++    int nonzero = 0;
+++    uint32_t l_pk = 0u, r_pk = 0u;
+++    uint32_t log_idx = 0u;
+++    const uint32_t frames = (uint32_t)(length / 4u);
 ++    if (!error) {
+++        const uint64_t prev_nz_ns = __atomic_load_n(&fuxi_audio_last_nonzero_ns, __ATOMIC_ACQUIRE);
+++        const uint64_t now_ns = spf_now_ns();
 ++        lck_mtx_lock(&gAudioRingLock);
-++        nonzero = fuxi_audio_ring_write(&gAudioRing, gAudioCopyBuf, (uint32_t)(length / 4u));
+++        nonzero = fuxi_audio_ring_write(&gAudioRing, gAudioCopyBuf, frames);
 ++        lck_mtx_unlock(&gAudioRingLock);
+++        if (nonzero && (gLivePeakLogs < 16u ||
+++            (prev_nz_ns != 0ull && now_ns >= prev_nz_ns + 500000000ull && gLivePeakLogs < 32u))) {
+++            fuxi_audio_pcm_peaks(gAudioCopyBuf, frames, &l_pk, &r_pk);
+++            log_idx = ++gLivePeakLogs;
+++        }
 ++    }
 ++    lck_mtx_unlock(&gAudioCopyLock);
 ++    if (!error && nonzero) {
+++        const uint32_t was_awake = __atomic_load_n(&fuxi_amp_live_awake, __ATOMIC_ACQUIRE);
 ++        fuxi_audio_touch_active();
+++        if (log_idx) {
+++            printf("FUXI AUDIO LIVE: pcm_in #%u frames=%u l_pk=%u r_pk=%u awake=%u\n",
+++                log_idx, frames, l_pk, r_pk, was_awake);
+++        }
 ++    }
 ++    return error;
 ++}
@@ -82164,6 +82499,9 @@ new file mode 100644
 ++    uint32_t sanitized = fuxi_audio_vol_pack(fuxi_audio_vol_milli((uint32_t)value),
 ++        fuxi_audio_vol_active((uint32_t)value));
 ++    __atomic_store_n(&fuxi_audio_vol_packed, sanitized, __ATOMIC_RELEASE);
+++    if (fuxi_audio_vol_active(sanitized) && !__atomic_load_n(&fuxi_amp_live_awake, __ATOMIC_ACQUIRE)) {
+++        fuxi_amp_live_kick();
+++    }
 ++    return 0;
 ++}
 ++
@@ -82858,7 +83196,7 @@ new file mode 100644
 + 
 + static unsigned format(void)
 + {
-+@@ -160,7 +972,7 @@ static unsigned format(void)
++@@ -160,7 +998,7 @@ static unsigned format(void)
 +         SecureDTGetProperty(chosen, "fuxi,audio-spf", &property, &bytes) == kSuccess &&
 +         bytes == sizeof(value))
 +         memcpy(&value, property, sizeof(value));
@@ -82867,7 +83205,7 @@ new file mode 100644
 + }
 + 
 + static void graph_set_step(enum fuxi_graph_step step)
-+@@ -235,6 +1047,7 @@ static void tone_stop(const char *why)
++@@ -235,6 +1073,7 @@ static void tone_stop(const char *why)
 +         gTone.why = why;
 +     }
 +     gTone.error = true;
@@ -82875,7 +83213,7 @@ new file mode 100644
 +     fuxi_amp_tone_abandon();
 +     gTone.phase = FUXI_TONE_PCM_FINISH;
 +     clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gTone.deadline);
-+@@ -268,6 +1081,34 @@ static bool tone_fill(uint32_t index, bool tone)
++@@ -268,6 +1107,47 @@ static bool tone_fill(uint32_t index, bool tone)
 +         return false;
 +     }
 +     volatile uint32_t *out = (volatile uint32_t *)(base + index * FUXI_TONE_PERIOD_BYTES);
@@ -82892,10 +83230,23 @@ new file mode 100644
 ++        } else {
 ++            const uint32_t vol = __atomic_load_n(&fuxi_audio_vol_packed, __ATOMIC_ACQUIRE);
 ++            const int active = fuxi_audio_vol_active(vol);
+++            const uint32_t awake = __atomic_load_n(&fuxi_amp_live_awake, __ATOMIC_ACQUIRE);
+++            uint32_t nonzero = 0u;
+++            int held = 0;
 ++            lck_mtx_lock(&gAudioRingLock);
-++            const uint32_t nonzero = fuxi_audio_ring_read_tdm(&gAudioRing, out, FUXI_TONE_PERIOD_FRAMES, 0, active);
+++            if (fuxi_audio_should_hold_for_wake(awake, fuxi_audio_ring_has_nonzero(&gAudioRing), &gLiveWakeHold)) {
+++                held = 1;
+++                for (uint32_t i = 0; i < FUXI_TONE_PERIOD_FRAMES * 4u; i++) {
+++                    out[i] = 0u;
+++                }
+++            } else {
+++                nonzero = fuxi_audio_ring_read_tdm(&gAudioRing, out, FUXI_TONE_PERIOD_FRAMES, 0, active);
+++            }
 ++            lck_mtx_unlock(&gAudioRingLock);
-++            if (nonzero) {
+++            if (held) {
+++                gLiveWakeHolds++;
+++                fuxi_audio_touch_active();
+++            } else if (nonzero) {
 ++                fuxi_audio_touch_active();
 ++                if (!gLiveFirstAudio) {
 ++                    gLiveFirstAudio = 1u;
@@ -82910,7 +83261,7 @@ new file mode 100644
 +     for (uint32_t i = 0; i < FUXI_TONE_PERIOD_FRAMES; i++) {
 +         uint32_t value = 0;
 +         if (tone && gTone.frame < FUXI_TONE_FRAMES) {
-+@@ -356,7 +1197,13 @@ static bool tone_pump(void)
++@@ -356,7 +1236,13 @@ static bool tone_pump(void)
 +             if (state == FUXI_TONE_ON) {
 +                 gTone.phase = FUXI_TONE_PCM_PLAY;
 +                 gTone.tone_start = gTone.sent;
@@ -82925,7 +83276,7 @@ new file mode 100644
 +             } else if (state != FUXI_TONE_CLOCKED) {
 +                 tone_stop("amplifier did not power up");
 +             } else if (now >= gTone.deadline) {
-+@@ -365,6 +1212,23 @@ static bool tone_pump(void)
++@@ -365,6 +1251,23 @@ static bool tone_pump(void)
 +         } else if (gTone.phase == FUXI_TONE_PCM_PLAY) {
 +             if (state != FUXI_TONE_ON) {
 +                 tone_stop("amplifier left ON during the tone");
@@ -82941,15 +83292,15 @@ new file mode 100644
 ++                    lck_mtx_unlock(&gAudioRingLock);
 ++                    if (writes != gLiveLastWrites) {
 ++                        gLiveLastWrites = writes;
-++                        printf("FUXI AUDIO LIVE: periods=%u writes=%u nonzero=%u underruns=%u overflows=%u max_used=%u\n",
-++                            gTone.done, writes, nz, underruns, overflows, max_used);
+++                        printf("FUXI AUDIO LIVE: periods=%u writes=%u nonzero=%u underruns=%u overflows=%u max_used=%u wake_holds=%u\n",
+++                            gTone.done, writes, nz, underruns, overflows, max_used, gLiveWakeHolds);
 ++                    }
 ++                    clock_interval_to_deadline(30000, NSEC_PER_MSEC, &gLiveNextReport);
 ++                }
 +             } else if (gTone.frame >= FUXI_TONE_FRAMES && gTone.done >= gTone.tone_end + FUXI_TONE_ZEROS) {
 +                 if (fuxi_amp_tone_move(FUXI_TONE_ON, FUXI_TONE_DRAIN)) {
 +                     gTone.phase = FUXI_TONE_PCM_POSTROLL;
-+@@ -396,9 +1260,9 @@ static bool tone_pump(void)
++@@ -396,9 +1299,9 @@ static bool tone_pump(void)
 +         gTone.phase = FUXI_TONE_PCM_OFF;
 +         return true;
 +     }
@@ -82961,7 +83312,7 @@ new file mode 100644
 +         uint8_t packet[FUXI_SPF_INTENT_BYTES];
 +         const uint32_t length = fuxi_ar_write(packet, sizeof(packet), FUXI_SPF_PORT, FUXI_GRAPH_TOKEN + FUXI_GRAPH_WRITE,
 +             gGraph.dma_address + (uint64_t)index * FUXI_TONE_PERIOD_BYTES, gGraph.map_handle, FUXI_TONE_PERIOD_BYTES);
-+@@ -408,7 +1272,7 @@ static bool tone_pump(void)
++@@ -408,7 +1311,7 @@ static bool tone_pump(void)
 +         }
 +         gGraph.queued |= GRAPH_SENT(FUXI_GRAPH_WRITE);
 +         gTone.sent++;
@@ -82970,7 +83321,7 @@ new file mode 100644
 +             gTone.tone_end = gTone.sent;
 +         }
 +         clock_interval_to_deadline(FUXI_SPF_REPLY_MS, NSEC_PER_MSEC, &gGraph.deadline);
-+@@ -418,6 +1282,9 @@ static bool tone_pump(void)
++@@ -418,6 +1321,9 @@ static bool tone_pump(void)
 + 
 + static void graph_receive(const uint8_t *data, uint32_t length)
 + {
@@ -82980,7 +83331,7 @@ new file mode 100644
 +     if (gGraph.step == FUXI_GRAPH_WRITE && gTone.phase >= FUXI_TONE_PCM_PREROLL) {
 +         tone_receive(data, length);
 +         return;
-+@@ -523,6 +1390,7 @@ static void graph_poll(void)
++@@ -523,6 +1429,7 @@ static void graph_poll(void)
 +         graph_set_step(gGraph.step + 1);
 +     }
 +     if (gGraph.step == FUXI_GRAPH_COMPLETE) {
@@ -82988,7 +83339,7 @@ new file mode 100644
 +         if (gTone.phase != FUXI_TONE_PCM_OFF) {
 +             fuxi_amp_tone_abandon();
 +             gTone.phase = FUXI_TONE_PCM_OFF;
-+@@ -689,6 +1557,30 @@ void fuxi_audio_spf_start(void)
++@@ -689,6 +1596,30 @@ void fuxi_audio_spf_start(void)
 +     gSpf.format = format();
 +     if (!gSpf.format)
 +         return;
@@ -83019,7 +83370,7 @@ new file mode 100644
 +     gSpf.channel = sheng_adsp_channel("adsp_apps", FUXI_SPF_INTENT_BYTES, 20, 0, &client, NULL);
 +     if (!gSpf.channel) {
 +         gSpf.done = 1;
-+@@ -719,6 +1611,7 @@ void fuxi_audio_spf_poll(void)
++@@ -719,6 +1650,7 @@ void fuxi_audio_spf_poll(void)
 +     int result;
 +     prm_poll();
 +     graph_poll();
@@ -83027,7 +83378,7 @@ new file mode 100644
 +     if (!gSpf.channel || gSpf.done)
 +         return;
 +     if (gSpf.disconnected) {
-+@@ -760,7 +1653,7 @@ void fuxi_audio_spf_poll(void)
++@@ -760,7 +1692,7 @@ void fuxi_audio_spf_poll(void)
 +                 } else if (gSpf.format == 4) {
 +                     fuxi_audio_dma_survey();
 +                     graph_set_step(FUXI_GRAPH_OPEN_SPEAKER);
@@ -83038,10 +83389,10 @@ new file mode 100644
 +                         if (fuxi_amp_tone_get() != FUXI_TONE_IDLE) {
 +diff --git a/bsd/dev/fuxi_audio_stream.h b/bsd/dev/fuxi_audio_stream.h
 +new file mode 100644
-+index 0000000..4d80651
++index 0000000..2dd698c
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_audio_stream.h
-+@@ -0,0 +1,360 @@
++@@ -0,0 +1,415 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* FUXI 即時喇叭音訊串流（ADT fuxi,amp=8 搭配 fuxi,audio-spf=6）：
 ++ * - 64 KiB 48 kHz 16-bit 立體聲環形緩衝（341 ms），由 FuxiAudio.driver 經 kern.fuxiaudiopcm 寫入，
@@ -83076,6 +83427,7 @@ new file mode 100644
 ++    FUXI_AUDIO_MAX_LATENCY_FRAMES = 9600u, /* 200 ms 延遲上限，容納 2048 幀批次與排程抖動 */
 ++    FUXI_AUDIO_TRIM_TARGET_FRAMES = 4800u, /* 超出上限時裁回 100 ms（高於預緩衝避免裁切後欠載） */
 ++    FUXI_AUDIO_FADE_FRAMES = 32u,     /* ~0.67 ms 邊界淡入淡出，消除起停／欠載 DC 爆音 */
+++    FUXI_AUDIO_WAKE_HOLD_PERIODS = 2u, /* 功放待機喚醒期間最多暫緩消耗 2 個 TDM 週期（40 ms），防止 5 ms 提示音被截頭 */
 ++};
 ++
 ++enum fuxi_amp_power_action {
@@ -83191,6 +83543,8 @@ new file mode 100644
 ++    uint32_t nonzero_periods;
 ++    uint32_t primed;
 ++    uint32_t max_used;
+++    uint32_t has_nonzero;
+++    uint32_t last_nz_end;
 ++    int16_t samples[FUXI_AUDIO_RING_FRAMES * 2u];
 ++} FuxiAudioRing;
 ++
@@ -83254,6 +83608,46 @@ new file mode 100644
 ++    return ring ? (ring->write_pos - ring->read_pos) : 0u;
 ++}
 ++
+++static inline uint32_t fuxi_audio_ring_has_nonzero(const FuxiAudioRing *ring)
+++{
+++    return (ring && ring->has_nonzero &&
+++        (int32_t)(ring->last_nz_end - ring->read_pos) > 0) ? 1u : 0u;
+++}
+++
+++/* 判斷本次 TDM 週期是否應先送靜音而不消耗環形緩衝，等 CS35L41 離開待機上電並解靜音。
+++ * 最多連續暫緩 FUXI_AUDIO_WAKE_HOLD_PERIODS 個週期，避免異常時永久卡住排空。 */
+++static inline int fuxi_audio_should_hold_for_wake(uint32_t amp_awake, uint32_t ring_avail, uint32_t *hold_count)
+++{
+++    if (amp_awake || !ring_avail) {
+++        if (hold_count) {
+++            *hold_count = 0u;
+++        }
+++        return 0;
+++    }
+++    if (hold_count && *hold_count < FUXI_AUDIO_WAKE_HOLD_PERIODS) {
+++        (*hold_count)++;
+++        return 1;
+++    }
+++    return 0;
+++}
+++
+++static inline void fuxi_audio_pcm_peaks(const int16_t *pcm, uint32_t frames, uint32_t *left_peak, uint32_t *right_peak)
+++{
+++    uint32_t lpk = 0u, rpk = 0u;
+++    if (pcm) {
+++        for (uint32_t i = 0; i < frames; i++) {
+++            int32_t l = pcm[i * 2u];
+++            int32_t r = pcm[i * 2u + 1u];
+++            uint32_t al = (uint32_t)(l < 0 ? -l : l);
+++            uint32_t ar = (uint32_t)(r < 0 ? -r : r);
+++            if (al > lpk) lpk = al;
+++            if (ar > rpk) rpk = ar;
+++        }
+++    }
+++    if (left_peak) *left_peak = lpk;
+++    if (right_peak) *right_peak = rpk;
+++}
+++
 ++/* 寫入 stereo int16 PCM。若緩衝滿則丟棄最舊樣點，避免延遲越積越大。回傳是否含非零樣點。 */
 ++static inline int fuxi_audio_ring_write(FuxiAudioRing *ring, const int16_t *pcm, uint32_t frames)
 ++{
@@ -83272,6 +83666,7 @@ new file mode 100644
 ++    }
 ++    int nonzero = 0;
 ++    uint32_t pos = ring->write_pos;
+++    uint32_t last_nz = 0u;
 ++    for (uint32_t i = 0; i < frames; i++) {
 ++        uint32_t slot = (pos + i) & FUXI_AUDIO_RING_MASK;
 ++        int16_t left = pcm[i * 2u];
@@ -83280,9 +83675,14 @@ new file mode 100644
 ++        ring->samples[slot * 2u + 1u] = right;
 ++        if (left || right) {
 ++            nonzero = 1;
+++            last_nz = pos + i + 1u;
 ++        }
 ++    }
 ++    ring->write_pos = pos + frames;
+++    if (nonzero) {
+++        ring->has_nonzero = 1u;
+++        ring->last_nz_end = last_nz;
+++    }
 ++    uint32_t after = ring->write_pos - ring->read_pos;
 ++    if (after > ring->max_used) {
 ++        ring->max_used = after;
@@ -83290,6 +83690,9 @@ new file mode 100644
 ++    if (after > FUXI_AUDIO_MAX_LATENCY_FRAMES) {
 ++        ring->read_pos = ring->write_pos - FUXI_AUDIO_TRIM_TARGET_FRAMES;
 ++        ring->overflows++;
+++    }
+++    if (ring->has_nonzero && (int32_t)(ring->last_nz_end - ring->read_pos) <= 0) {
+++        ring->has_nonzero = 0u;
 ++    }
 ++    ring->writes++;
 ++    return nonzero;
@@ -83361,6 +83764,9 @@ new file mode 100644
 ++    }
 ++    if (ring) {
 ++        ring->read_pos = pos + take;
+++        if (ring->has_nonzero && (int32_t)(ring->last_nz_end - ring->read_pos) <= 0) {
+++            ring->has_nonzero = 0u;
+++        }
 ++        if (take < frames) {
 ++            ring->primed = 0u;
 ++            if (active) {
@@ -83404,10 +83810,10 @@ new file mode 100644
 ++#endif /* FUXI_AUDIO_STREAM_H */
 +diff --git a/bsd/dev/fuxi_haptic_damp.h b/bsd/dev/fuxi_haptic_damp.h
 +new file mode 100644
-+index 0000000..7074b58
++index 0000000..26a2d16
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_haptic_damp.h
-+@@ -0,0 +1,418 @@
++@@ -0,0 +1,556 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* HAP525_HV LRA 主動阻尼濾波器與反向剎車尾段產生器（ADT /chosen fuxi,haptic-damp；預設 0＝關閉）。
 ++ *
@@ -83419,11 +83825,15 @@ new file mode 100644
 ++ *
 ++ * ADT /chosen fuxi,haptic-damp（uint32）：
 ++ *   bits 0..3 : 模式（0=關，1..4=速度負回授阻尼，5=TLRA 鎖定單峰主動剎車合成 Micro-2L/Mini-4L/Full-5L，
-++ *               6=145->f_LRA 頻率重取樣＋無起振阻力＋終端死拍主動剎車）
-++ *   bits 4..7 : 增益覆寫（mode 1..4: 0=預設, 1..15=(8+n)*32 Q8；mode 5..6: 0=預設, 1..15=(128+n*16) Q8，即 0.56x..1.44x）
+++ *               6=145->f_LRA 頻率重取樣＋無起振阻力＋終端死拍主動剎車，
+++ *               7=逆模型參考系統即時追蹤：將 Q=15 LRA 等效重塑為寬頻阻尼 Taptic 系統 (ft, ζt)，全程含抗飽和尾段，
+++ *               8=原生 1:1 頻率 D22 雙相逆模型：驅動期模擬 D22 150 Hz 飽滿體感 (ζd=0.28)，尾段 1 ms 平滑切入主動剎車 (ζb=0.56)）
+++ *   bits 4..7 : 增益覆寫（mode 1..4: (8+n)*32 Q8；mode 5..6: (128+n*16) Q8；mode 7: (320+n*48) Q8；mode 8: (320+n*32) Q8）
 ++ *   bit  8    : 0x100 啟用 HAP525 硬體 BRAKE_EN（僅在 fuxi_vibrate_stock_brake 通過時生效）
 ++ *   bit  9    : 0x200 關閉軟體反向剎車尾段（A/B 對照）
-++ *   bits 10..15: ζ0 覆寫（0=預設 0.033=1081 Q15；1..15 = n*328 Q15）
+++ *   bits 10..13: ζ0 覆寫（0=預設 0.033=1081 Q15；1..15 = n*328 Q15）
+++ *   bit  14   : 0x4000 mode 7 關閉 145->f_LRA 頻率重取樣；mode 8 尾段改以原生 f0 剎車（A/B 對照）
+++ *   bit  15   : 0x8000 mode 7 高俐落檔（225 Hz, ζ=0.50）；mode 8 緊實檔（160 Hz, ζd=0.28->ζb=0.58, g=2.0625x）
 ++ */
 ++#ifndef FUXI_HAPTIC_DAMP_H
 ++#define FUXI_HAPTIC_DAMP_H
@@ -83441,9 +83851,12 @@ new file mode 100644
 ++    FUXI_DAMP_TAIL_MAX = 192u,
 ++    FUXI_DAMP_SYNTH_MAX = 512u,
 ++    FUXI_DAMP_TAIL_ZERO_STOP = 16u,
+++    FUXI_DAMP_TAIL_RAMP = 24u,
 ++    FUXI_DAMP_KICK_SAMPLES = 48u,
 ++    FUXI_DAMP_FLAG_HW_BRAKE = 0x100u,
 ++    FUXI_DAMP_FLAG_NO_TAIL = 0x200u,
+++    FUXI_DAMP_FLAG_NO_PITCH = 0x4000u,
+++    FUXI_DAMP_FLAG_CRISP_HIGH = 0x8000u,
 ++};
 ++
 ++typedef struct {
@@ -83455,8 +83868,14 @@ new file mode 100644
 ++    int32_t k_fb_q15;
 ++    int32_t gain_q8;
 ++    int32_t kick_q8;
+++    int32_t c_r_q8;
+++    int32_t c_x_q15;
+++    int32_t c_y_q15;
+++    int32_t c_x_tl_q15;
+++    int32_t c_y_tl_q15;
 ++    uint32_t pitch_step_q16;
 ++    int no_tail;
+++    int no_pitch;
 ++    int hw_brake_req;
 ++    int32_t x;
 ++    int32_t y;
@@ -83502,15 +83921,19 @@ new file mode 100644
 ++    damp->tlra_us = tlra_us;
 ++    damp->hw_brake_req = (cfg & FUXI_DAMP_FLAG_HW_BRAKE) != 0;
 ++    damp->no_tail = (cfg & FUXI_DAMP_FLAG_NO_TAIL) != 0;
+++    damp->no_pitch = (cfg & FUXI_DAMP_FLAG_NO_PITCH) != 0;
 ++
 ++    uint32_t mode = cfg & 0x0fu;
-++    if (mode > 6u) mode = 0u;
+++    if (mode > 8u) mode = 0u;
 ++    damp->mode = mode;
 ++    if (!mode) return;
 ++
 ++    int32_t zd_q15 = 21299; /* 0.65 */
+++    int32_t zb_q15 = 18350; /* 0.56 */
 ++    int32_t gain_q8 = 410;  /* 1.60x */
 ++    int32_t kick_q8 = 0;
+++    const int crisp_high = (cfg & FUXI_DAMP_FLAG_CRISP_HIGH) != 0;
+++    const int tail_f0 = damp->no_pitch;
 ++    if (mode == 1u) {
 ++        zd_q15 = 14746;     /* 0.45 */
 ++        gain_q8 = 384;      /* 1.50x */
@@ -83527,18 +83950,29 @@ new file mode 100644
 ++    } else if (mode == 6u) {
 ++        zd_q15 = 0;
 ++        gain_q8 = 288;      /* 1.125x */
+++    } else if (mode == 7u) {
+++        zd_q15 = crisp_high ? 16384 : 14418; /* 0.50 vs 0.44 */
+++        gain_q8 = crisp_high ? 592 : 608;    /* 2.3125x vs 2.375x */
+++    } else if (mode == 8u) {
+++        zd_q15 = 9175;                        /* 0.28：保留 D22 低頻飽滿體感 */
+++        zb_q15 = crisp_high ? 19005 : 18350;  /* 0.58 vs 0.56：尾段平滑剎車收尾 */
+++        gain_q8 = crisp_high ? 528 : 512;     /* 2.0625x vs 2.00x */
+++        damp->no_pitch = 1;                   /* 原生 1:1 頻率與時長，不做升頻壓縮 */
 ++    }
 ++
 ++    uint32_t gain_nibble = (cfg >> 4) & 0x0fu;
 ++    if (gain_nibble != 0u) {
-++        if (mode >= 5u) {
+++        if (mode == 7u) {
+++            gain_q8 = (int32_t)(320u + gain_nibble * 48u);
+++        } else if (mode == 8u) {
+++            gain_q8 = (int32_t)(320u + gain_nibble * 32u);
+++        } else if (mode >= 5u) {
 ++            gain_q8 = (int32_t)(128u + gain_nibble * 16u);
 ++        } else {
 ++            gain_q8 = (int32_t)((8u + gain_nibble) * 32u);
 ++        }
 ++    }
-++    uint32_t z0_field = (cfg >> 10) & 0x3fu;
-++    if (z0_field > 15u) z0_field = 15u;
+++    uint32_t z0_field = (cfg >> 10) & 0x0fu;
 ++    int32_t z0_q15 = z0_field ? (int32_t)(z0_field * 328u) : 1081; /* default 0.033 */
 ++
 ++    int32_t diff = zd_q15 - z0_q15;
@@ -83549,6 +83983,29 @@ new file mode 100644
 ++    damp->k_fb_q15 = 2 * diff;
 ++    damp->gain_q8 = gain_q8;
 ++    damp->kick_q8 = kick_q8;
+++    if (mode == 7u) {
+++        const int64_t ft_hz = crisp_high ? 225 : 210;
+++        const int64_t zt_q15 = zd_q15;
+++        const int64_t rho_q15 = (ft_hz * (int64_t)tlra_us * 32768 + 500000) / 1000000;
+++        const int64_t rho2_q15 = (rho_q15 * rho_q15 + 16384) / 32768;
+++        damp->c_r_q8 = (int32_t)((rho2_q15 * (int64_t)gain_q8 + 16384) / 32768);
+++        damp->c_x_q15 = (int32_t)(32768 - rho2_q15);
+++        damp->c_y_q15 = (int32_t)(2 * (int64_t)z0_q15 - 2 * ((rho_q15 * zt_q15 + 16384) / 32768));
+++    } else if (mode == 8u) {
+++        const int64_t ft_hz = crisp_high ? 160 : 150;
+++        const int64_t rho_q15 = (ft_hz * (int64_t)tlra_us * 32768 + 500000) / 1000000;
+++        const int64_t rho2_q15 = (rho_q15 * rho_q15 + 16384) / 32768;
+++        damp->c_r_q8 = (int32_t)((rho2_q15 * (int64_t)gain_q8 + 16384) / 32768);
+++        damp->c_x_q15 = (int32_t)(32768 - rho2_q15);
+++        damp->c_y_q15 = (int32_t)(2 * (int64_t)z0_q15 - 2 * ((rho_q15 * (int64_t)zd_q15 + 16384) / 32768));
+++        if (tail_f0) {
+++            damp->c_x_tl_q15 = 0;
+++            damp->c_y_tl_q15 = (int32_t)(2 * (int64_t)z0_q15 - 2 * (int64_t)zb_q15);
+++        } else {
+++            damp->c_x_tl_q15 = damp->c_x_q15;
+++            damp->c_y_tl_q15 = (int32_t)(2 * (int64_t)z0_q15 - 2 * ((rho_q15 * (int64_t)zb_q15 + 16384) / 32768));
+++        }
+++    }
 ++    /* pitch_step = (f_LRA / 145 Hz) in Q16 = (1000000 * 65536) / (145 * tlra_us) */
 ++    uint64_t denom = 145ull * (uint64_t)tlra_us;
 ++    uint32_t step = (uint32_t)((65536000000ull + denom / 2ull) / denom);
@@ -83763,6 +84220,89 @@ new file mode 100644
 ++    return padded;
 ++}
 ++
+++/* mode 7 單步逆模型參考追蹤：u = ρ²*g*r + (1-ρ²)*x + 2*(ζ0 - ρ*ζt)*y，限幅後回灌觀測器防積分飽和。 */
+++static inline int8_t fuxi_damp_mode7_step(FuxiHapticDamp *damp, int8_t raw, unsigned limit, unsigned *zc_out)
+++{
+++    int32_t lim = (int32_t)(limit > FUXI_DAMP_PCM_LIMIT ? FUXI_DAMP_PCM_LIMIT : limit);
+++    int64_t fb = ((int64_t)damp->c_x_q15 * (int64_t)damp->x +
+++        (int64_t)damp->c_y_q15 * (int64_t)damp->y) / 32768;
+++    int64_t cmd_s = (int64_t)raw * (int64_t)damp->c_r_q8 * 2 + fb;
+++    int64_t rounded = cmd_s >= 0 ? (cmd_s + FUXI_DAMP_SCALE / 2) / FUXI_DAMP_SCALE
+++        : -((-cmd_s + FUXI_DAMP_SCALE / 2) / FUXI_DAMP_SCALE);
+++    int8_t out = (int8_t)fuxi_damp_clamp(rounded, -lim, lim);
+++    fuxi_damp_observe(damp, out, zc_out);
+++    return out;
+++}
+++
+++/* mode 8 尾段剎車單步：前 24 樣本 (1 ms) 由驅動阻尼線性斜坡切入剎車阻尼，消除交界階躍雜訊。 */
+++static inline int8_t fuxi_damp_mode8_tail_step(FuxiHapticDamp *damp, unsigned step_idx,
+++    unsigned limit, unsigned *zc_out)
+++{
+++    int32_t lim = (int32_t)(limit > FUXI_DAMP_PCM_LIMIT ? FUXI_DAMP_PCM_LIMIT : limit);
+++    int32_t cx = damp->c_x_tl_q15;
+++    int32_t cy = damp->c_y_tl_q15;
+++    if (step_idx < FUXI_DAMP_TAIL_RAMP) {
+++        int64_t k = (int64_t)(step_idx + 1u);
+++        cx = damp->c_x_q15 + (int32_t)(((int64_t)(damp->c_x_tl_q15 - damp->c_x_q15) * k) / FUXI_DAMP_TAIL_RAMP);
+++        cy = damp->c_y_q15 + (int32_t)(((int64_t)(damp->c_y_tl_q15 - damp->c_y_q15) * k) / FUXI_DAMP_TAIL_RAMP);
+++    }
+++    int64_t fb = ((int64_t)cx * (int64_t)damp->x + (int64_t)cy * (int64_t)damp->y) / 32768;
+++    int64_t rounded = fb >= 0 ? (fb + FUXI_DAMP_SCALE / 2) / FUXI_DAMP_SCALE
+++        : -((-fb + FUXI_DAMP_SCALE / 2) / FUXI_DAMP_SCALE);
+++    int8_t out = (int8_t)fuxi_damp_clamp(rounded, -lim, lim);
+++    fuxi_damp_observe(damp, out, zc_out);
+++    return out;
+++}
+++
+++/* mode 7：可選 145->f_LRA 頻率重取樣，經逆模型參考追蹤轉出 4B 對齊 24 kHz PCM。 */
+++static inline unsigned fuxi_damp_process_mode7(FuxiHapticDamp *damp, const uint8_t *in, unsigned in_len,
+++    uint8_t *out, unsigned max_len, unsigned *out_peak, unsigned *zc_out)
+++{
+++    if (!damp || !in || !in_len || !out || max_len < 4u) return 0;
+++    const unsigned cap = max_len & ~3u;
+++    unsigned out_n = 0, peak = 0;
+++    if (damp->no_pitch) {
+++        unsigned n = in_len < cap ? in_len : cap;
+++        for (unsigned i = 0; i < n; i++) {
+++            int8_t sample = fuxi_damp_mode7_step(damp, (int8_t)in[i], FUXI_DAMP_PCM_LIMIT, zc_out);
+++            out[out_n++] = (uint8_t)sample;
+++            unsigned mag = (unsigned)(sample < 0 ? -(int)sample : (int)sample);
+++            if (mag > peak) peak = mag;
+++        }
+++    } else {
+++        uint32_t phase = damp->pitch_phase_q16;
+++        uint32_t step = damp->pitch_step_q16 ? damp->pitch_step_q16 : 65536u;
+++        while ((phase >> 16) < in_len && out_n < cap) {
+++            unsigned idx = phase >> 16;
+++            uint32_t frac = phase & 0xffffu;
+++            int32_t s0 = (int8_t)in[idx];
+++            int32_t s1 = (idx + 1u < in_len) ? (int8_t)in[idx + 1u] : s0;
+++            int32_t interp = s0 + (((s1 - s0) * (int32_t)frac) >> 16);
+++            int8_t sample = fuxi_damp_mode7_step(damp, (int8_t)interp, FUXI_DAMP_PCM_LIMIT, zc_out);
+++            out[out_n++] = (uint8_t)sample;
+++            unsigned mag = (unsigned)(sample < 0 ? -(int)sample : (int)sample);
+++            if (mag > peak) peak = mag;
+++            phase += step;
+++        }
+++        if ((phase >> 16) >= in_len) {
+++            damp->pitch_phase_q16 = phase - (in_len << 16);
+++        } else {
+++            damp->pitch_phase_q16 = 0;
+++        }
+++    }
+++    if (!out_n) return 0;
+++    unsigned padded = (out_n + 3u) & ~3u;
+++    if (padded > cap) padded = cap;
+++    for (unsigned i = out_n; i < padded; i++) {
+++        int8_t sample = fuxi_damp_mode7_step(damp, 0, FUXI_DAMP_PCM_LIMIT, zc_out);
+++        out[i] = (uint8_t)sample;
+++        unsigned mag = (unsigned)(sample < 0 ? -(int)sample : (int)sample);
+++        if (mag > peak) peak = mag;
+++    }
+++    if (out_peak) *out_peak = peak;
+++    return padded;
+++}
+++
 ++static inline void fuxi_damp_process(FuxiHapticDamp *damp, const uint8_t *in, uint8_t *out,
 ++    unsigned length, unsigned *out_peak, unsigned *zc_out)
 ++{
@@ -83792,7 +84332,11 @@ new file mode 100644
 ++    unsigned limit = max_len > FUXI_DAMP_TAIL_MAX ? FUXI_DAMP_TAIL_MAX : (max_len & ~3u);
 ++    unsigned zeros = 0, last_nz = 0, produced = 0, peak = 0;
 ++    for (unsigned i = 0; i < limit; i++) {
-++        int8_t sample = damp->mode >= 5u ?
+++        int8_t sample = damp->mode == 8u ?
+++            fuxi_damp_mode8_tail_step(damp, i, tail_limit, zc_out) :
+++            damp->mode == 7u ?
+++            fuxi_damp_mode7_step(damp, 0, tail_limit, zc_out) :
+++            damp->mode >= 5u ?
 ++            fuxi_damp_deadbeat_step(damp, tail_limit, zc_out) :
 ++            fuxi_damp_step(damp, 0, zc_out);
 ++        out[i] = (uint8_t)sample;
@@ -84064,10 +84608,10 @@ new file mode 100644
 ++#endif /* FUXI_HAPTIC_SHAPE_V3_H */
 +diff --git a/bsd/dev/fuxi_haptic_stream.h b/bsd/dev/fuxi_haptic_stream.h
 +new file mode 100644
-+index 0000000..0366e19
++index 0000000..48a1e40
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_haptic_stream.h
-+@@ -0,0 +1,518 @@
++@@ -0,0 +1,532 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* HAP525_HV 連續低延遲 24 kHz 有號 PCM FIFO 串流引擎（ADT /chosen fuxi,haptic=9；預設關）。
 ++ *
@@ -84095,8 +84639,8 @@ new file mode 100644
 ++    FUXI_STREAM_STOP_STEP_US = 500,
 ++    FUXI_STREAM_MAX_DRAIN_POLLS = 400,
 ++    FUXI_STREAM_TAIL_THRESHOLD = 14,
-++    FUXI_STREAM_TAIL_THRESHOLD_PITCH = 28,
-++    FUXI_STREAM_FAST_POLL_WATERMARK = 48,
+++    FUXI_STREAM_TAIL_THRESHOLD_PITCH = 48,
+++    FUXI_STREAM_FAST_POLL_WATERMARK = 96,
 ++    FUXI_STREAM_TAIL_QUIET_NS = 6000000ull,     /* 最後一段輸入後至少靜默 6 ms 才補剎車尾段，杜絕突發中段誤補 */
 ++    FUXI_STREAM_TAIL_MARGIN_NS = 500000ull,
 ++    FUXI_STREAM_IDLE_WAIT_POLLS = 20,
@@ -84415,6 +84959,12 @@ new file mode 100644
 ++                st->synth_input_samples = length;
 ++                st->synth_input_end_ns = now_ns + chunk_dur_ns;
 ++                st->burst_profile = profile;
+++            } else if (st->damp.mode == 7u || st->damp.mode == 8u) {
+++                out_len = fuxi_damp_process_mode7(&st->damp, samples, length, shaped, sizeof(shaped),
+++                    &out_peak, &st->burst_zc);
+++                if (!out_len) return 0;
+++                uint64_t base = now_ns > st->synth_input_end_ns ? now_ns : st->synth_input_end_ns;
+++                st->synth_input_end_ns = base + chunk_dur_ns;
 ++            } else if (st->damp.mode >= 5u) {
 ++                out_len = fuxi_damp_process_pitch(&st->damp, samples, length, shaped, sizeof(shaped),
 ++                    &out_peak, &st->burst_zc);
@@ -84486,6 +85036,14 @@ new file mode 100644
 ++        st->synth_input_end_ns = now_ns + chunk_dur_ns;
 ++        st->burst_profile = profile;
 ++        st->burst_absorbed = 0;
+++    } else if (st->damp.mode == 7u || st->damp.mode == 8u) {
+++        out_len = fuxi_damp_process_mode7(&st->damp, samples, length, shaped, sizeof(shaped),
+++            &out_peak, &st->burst_zc);
+++        if (!out_len) {
+++            st->owns_fifo = 0;
+++            return 0;
+++        }
+++        st->synth_input_end_ns = now_ns + chunk_dur_ns;
 ++    } else if (st->damp.mode >= 5u) {
 ++        out_len = fuxi_damp_process_pitch(&st->damp, samples, length, shaped, sizeof(shaped),
 ++            &out_peak, &st->burst_zc);
@@ -84523,7 +85081,7 @@ new file mode 100644
 ++    return fuxi_stream_close(io, write, st) ? -2 : -1;
 ++}
 ++
-++/* 回傳 2 表示低水位（<=48B）需 250 us 快速輪詢，1 表示仍在排空，
+++/* 回傳 2 表示低水位（<=96B）需 250 us 快速輪詢，1 表示仍在排空，
 ++ * 0 表示本段突發已正常結束（保持 warm），負值表示錯誤（已關閉還原）。 */
 ++static inline int fuxi_stream_poll_drain(const FuxiHapticIo *io, FuxiRtpWrite write,
 ++    FuxiRtpReadStatus read_status, FuxiHapticStream *st, uint64_t now_ns)
@@ -84551,7 +85109,7 @@ new file mode 100644
 ++            uint8_t tail[FUXI_DAMP_TAIL_MAX];
 ++            unsigned tail_peak = 0;
 ++            unsigned tail_lim = FUXI_DAMP_PCM_LIMIT;
-++            if (st->damp.mode >= 5u && st->burst_drive_peak > 0u) {
+++            if ((st->damp.mode == 5u || st->damp.mode == 6u) && st->burst_drive_peak > 0u) {
 ++                unsigned scaled = (st->burst_drive_peak * 9u) / 8u;
 ++                if (scaled < FUXI_STREAM_TAIL_LIMIT_MIN) scaled = FUXI_STREAM_TAIL_LIMIT_MIN;
 ++                if (scaled > FUXI_DAMP_PCM_LIMIT) scaled = FUXI_DAMP_PCM_LIMIT;
@@ -84587,7 +85145,7 @@ new file mode 100644
 ++
 ++#endif /* FUXI_HAPTIC_STREAM_H */
 +diff --git a/bsd/dev/fuxi_pmic.c b/bsd/dev/fuxi_pmic.c
-+index 9c23b6b..53df2d5 100644
++index 9c23b6b..6104ca6 100644
 +--- a/bsd/dev/fuxi_pmic.c
 ++++ b/bsd/dev/fuxi_pmic.c
 +@@ -24,6 +24,9 @@
@@ -84600,7 +85158,16 @@ new file mode 100644
 + #include "sweet_spmi_bus.h"
 + 
 + extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t, uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t,
-+@@ -56,7 +59,9 @@ static unsigned fp_torch_audit_enabled;
++@@ -49,6 +52,8 @@ static uint8_t fp_poisoned[1024];
++ static unsigned fp_started;
++ static unsigned fp_rejected_logged;
++ static struct fp_window fp_flash_channel;
+++/* 0xee (sid=1, EE0) 快取 APID 並做即時 map/owner 核對，避免手電筒每次讀寫掃描 768 筆 SPMI arbiter 餓死震動鎖。 */
+++static unsigned fp_flash_apid_plus_one;
++ static LCK_MTX_DECLARE(fp_torch_lock, &fp_group);
++ static FuxiTorchRuntime fp_torch_state;
++ static unsigned fp_torch_ready;
++@@ -56,7 +61,9 @@ static unsigned fp_torch_audit_enabled;
 + static struct fp_window fp_haptic_channels[2];
 + /* Linux spmi-pmic-arb v5/v7 retains the PPID to APID mapping. Enable the
 +  * fast path only for the two verified EE0 haptic channels on a test boot. */
@@ -84611,7 +85178,7 @@ new file mode 100644
 + static FuxiHapticState fp_haptic_state;
 + static LCK_MTX_DECLARE(fp_vibrate_lock, &fp_group);
 + static FuxiVibrateRuntime fp_vibrate_state;
-+@@ -65,18 +70,25 @@ static unsigned fp_vibrate_kick;
++@@ -65,18 +72,25 @@ static unsigned fp_vibrate_kick;
 + static unsigned fp_vibrate_selftest;
 + static unsigned fp_vibrate_transient, fp_vibrate_brake;
 + static const uint8_t *fp_rtp_wave;
@@ -84638,7 +85205,7 @@ new file mode 100644
 + static unsigned fp_rtp_head, fp_rtp_count;
 + #define FP_HAPTIC_ATTACK_NS 5710000ull /* Fuxi DT 的 LRA 週期 */
 + 
-+@@ -115,15 +127,16 @@ static int fp_find(unsigned sid, unsigned peripheral, unsigned *owner)
++@@ -115,8 +129,20 @@ static int fp_find(unsigned sid, unsigned peripheral, unsigned *owner)
 + {
 +     int selected = -1;
 +     const unsigned ppid = sid << 8 | peripheral;
@@ -84646,19 +85213,31 @@ new file mode 100644
 +-        unsigned cached = __atomic_load_n(&fp_haptic_apid_plus_one[peripheral-0xf0], __ATOMIC_ACQUIRE);
 ++    if (sid == 7 && (peripheral == 0xf0 || peripheral == 0xf1 || peripheral == 0xf2)) {
 ++        unsigned cached = __atomic_load_n(&fp_haptic_apid_plus_one[peripheral - 0xf0], __ATOMIC_ACQUIRE);
+++        if (cached) {
+++            unsigned apid = cached - 1;
+++            if (apid >= fp_apids) return -1;
+++            uint32_t map = fp_read32(&fp_core, 0x2000 + 4 * apid);
+++            if (((map >> 8) & 0xfff) != ppid) return -1;
+++            *owner = fp_read32(&fp_config, 0x1000 + 4 * apid) & 7u;
+++            unsigned expected_owner = peripheral == 0xf2 ? 3u : 0u;
+++            return *owner == expected_owner ? (int)apid : -1;
+++        }
+++    }
+++    if (sid == 1 && peripheral == 0xee) {
+++        unsigned cached = __atomic_load_n(&fp_flash_apid_plus_one, __ATOMIC_ACQUIRE);
 +         if (cached) {
 +             unsigned apid = cached - 1;
 +             if (apid >= fp_apids) return -1;
-+             uint32_t map = fp_read32(&fp_core, 0x2000 + 4 * apid);
-+             if (((map >> 8) & 0xfff) != ppid) return -1;
-+             *owner = fp_read32(&fp_config, 0x1000 + 4 * apid) & 7u;
-+-            return *owner == 0 ? (int)apid : -1;
-++            unsigned expected_owner = peripheral == 0xf2 ? 3u : 0u;
-++            return *owner == expected_owner ? (int)apid : -1;
-+         }
++@@ -265,6 +291,8 @@ static int fp_flash_prepare(void)
++         printf("FUXI PMIC: flash channel mapping failed\n");
++         return -1;
 +     }
-+     for (unsigned apid = 0; apid < fp_apids; apid++) {
-+@@ -487,9 +500,12 @@ static int fp_rtp_write(unsigned address, const uint8_t *data, unsigned size)
+++    __atomic_store_n(&fp_flash_apid_plus_one, (unsigned)apid + 1u, __ATOMIC_RELEASE);
+++    printf("FUXI PMIC: flash cached APID=%d owner=0 with live map and owner checks\n", apid);
++     return 0;
++ }
++ 
++@@ -487,9 +515,12 @@ static int fp_rtp_write(unsigned address, const uint8_t *data, unsigned size)
 +         return fp_haptic_transfer(address, (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
 +             ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24), size);
 +     }
@@ -84672,7 +85251,7 @@ new file mode 100644
 +     case 0xf072: case 0xf124: case 0xf12a: case 0xf12d:
 +         return fp_haptic_transfer(address, data[0], 1);
 +     default:
-+@@ -523,13 +539,18 @@ static int fp_haptic_prepare(void)
++@@ -523,13 +554,18 @@ static int fp_haptic_prepare(void)
 +     const void *prop;
 +     unsigned bytes;
 +     uint32_t opt = 0;
@@ -84694,7 +85273,7 @@ new file mode 100644
 +     }
 +     return 0;
 + }
-+@@ -560,14 +581,23 @@ static int fp_vibrate_pcm_sysctl SYSCTL_HANDLER_ARGS
++@@ -560,14 +596,23 @@ static int fp_vibrate_pcm_sysctl SYSCTL_HANDLER_ARGS
 +     if (!req->newptr || req->oldptr) return EINVAL;
 +     if (!fp_vibrate_write_allowed()) return EPERM;
 +     size_t length = req->newlen;
@@ -84723,7 +85302,7 @@ new file mode 100644
 +     }
 +     lck_mtx_lock(&fp_vibrate_lock);
 +     if (fp_vibrate_state.failed || !__atomic_load_n(&fp_rtp_ready, __ATOMIC_RELAXED)) {
-+@@ -576,9 +606,12 @@ static int fp_vibrate_pcm_sysctl SYSCTL_HANDLER_ARGS
++@@ -576,9 +621,12 @@ static int fp_vibrate_pcm_sysctl SYSCTL_HANDLER_ARGS
 +         error = EAGAIN;
 +     } else {
 +         unsigned slot = (fp_rtp_head + fp_rtp_count) % (sizeof(fp_rtp_pending) / sizeof(fp_rtp_pending[0]));
@@ -84737,7 +85316,7 @@ new file mode 100644
 +         fp_rtp_count++;
 +     }
 +     lck_mtx_unlock(&fp_vibrate_lock);
-+@@ -621,7 +654,9 @@ static int fp_vibrate_sysctl SYSCTL_HANDLER_ARGS
++@@ -621,7 +669,9 @@ static int fp_vibrate_sysctl SYSCTL_HANDLER_ARGS
 +     if (click) {
 +         fp_shape_level = 0;
 +     } else if (fp_vibrate_shape && !fp_vibrate_state.failed && __atomic_load_n(&fp_rtp_ready, __ATOMIC_ACQUIRE)) {
@@ -84748,7 +85327,7 @@ new file mode 100644
 +         if (shape == FUXI_SHAPE_CLICK) {
 +             /* 與 HAL 的 RTP 點按同一條路：停掉 DIRECT，排 40 ms 內的點按 */
 +             click = 1;
-+@@ -689,12 +724,15 @@ static void fp_vibrate_worker(void *argument, wait_result_t wait_result)
++@@ -689,12 +739,15 @@ static void fp_vibrate_worker(void *argument, wait_result_t wait_result)
 +     const FuxiHapticIo io = {NULL, fp_haptic_owner, fp_haptic_read, fp_haptic_write, fp_flash_wait, 0};
 +     unsigned playing = 0, logged = 0, health_checks = 0, amplitude_writes = 0, amplitude_logged = 0;
 +     unsigned autores_cleared = 0, autores_plays = 0, autores_logged = 0;
@@ -84766,7 +85345,7 @@ new file mode 100644
 +         printf("FUXI PMIC: haptic RTP FIFO boot click bytes=%u polls=%u rc=%d pre=%u refill=%u last=%u\n",
 +             stats.sent, stats.polls, result, stats.before_start, stats.before_refill, stats.last_fill);
 +         if (result == -2) {
-+@@ -707,7 +745,7 @@ static void fp_vibrate_worker(void *argument, wait_result_t wait_result)
++@@ -707,7 +760,7 @@ static void fp_vibrate_worker(void *argument, wait_result_t wait_result)
 +         unsigned seen = __atomic_load_n(&fp_vibrate_kick, __ATOMIC_ACQUIRE);
 +         uint64_t now = fp_torch_now();
 +         uint8_t pcm[FUXI_RTP_BYTES];
@@ -84775,7 +85354,7 @@ new file mode 100644
 +         uint64_t queued_ns = 0;
 +         lck_mtx_lock(&fp_vibrate_lock);
 +         unsigned failed = fp_vibrate_state.failed;
-+@@ -719,9 +757,10 @@ static void fp_vibrate_worker(void *argument, wait_result_t wait_result)
++@@ -719,9 +772,10 @@ static void fp_vibrate_worker(void *argument, wait_result_t wait_result)
 +         unsigned shape_level = fp_shape_level, shape_clicks = fp_shape_clicks, shape_swallowed = fp_shape_swallowed;
 +         if (!click && !want && !playing && !failed && fp_rtp_count) {
 +             unsigned slot = fp_rtp_head;
@@ -84787,7 +85366,7 @@ new file mode 100644
 +                 memcpy(pcm, fp_rtp_pending[slot].samples, pcm_length);
 +             }
 +             fp_rtp_head = (fp_rtp_head + 1) % (sizeof(fp_rtp_pending) / sizeof(fp_rtp_pending[0]));
-+@@ -730,23 +769,107 @@ static void fp_vibrate_worker(void *argument, wait_result_t wait_result)
++@@ -730,23 +784,107 @@ static void fp_vibrate_worker(void *argument, wait_result_t wait_result)
 +                 lck_mtx_unlock(&fp_vibrate_lock);
 +                 if (++pcm_expired <= 8)
 +                     printf("FUXI PMIC: haptic RTP FIFO UI PCM expired=%u played=%u queue_us=%llu\n",
@@ -84898,7 +85477,7 @@ new file mode 100644
 +             }
 +             if (!result) result = fuxi_rtp_click(&io, fp_rtp_write, fp_rtp_read_status, wave, length, click_vmax, &stats);
 +             if (pcm_length && !result) pcm_played++;
-+@@ -917,6 +1040,10 @@ static void fp_vibrate_runtime_start(void)
++@@ -917,6 +1055,10 @@ static void fp_vibrate_runtime_start(void)
 +         fp_vibrate_brake = fuxi_vibrate_stock_brake(&io) ? 0x08u : 0;
 +         printf("FUXI PMIC: haptic transient attack-us=5710 stock-brake=%u\n", !!fp_vibrate_brake);
 +     }
@@ -84909,7 +85488,7 @@ new file mode 100644
 +     thread_t thread = NULL;
 +     if (kernel_thread_start(fp_vibrate_worker, NULL, &thread) != KERN_SUCCESS) {
 +         printf("FUXI PMIC: vibrate runtime worker failed\n");
-+@@ -1061,7 +1188,7 @@ void fuxi_pmic_init(void)
++@@ -1061,7 +1203,7 @@ void fuxi_pmic_init(void)
 +     }
 +     fp_torch_audit_enabled = torch_audit == 1 && mode == 3;
 +     if ((!mode && !haptic) || __atomic_exchange_n(&fp_started, 1u, __ATOMIC_ACQ_REL)) return;
@@ -84918,7 +85497,7 @@ new file mode 100644
 +         printf("FUXI PMIC: unsupported mode=%u haptic=%u; hardware untouched\n", mode, haptic);
 +         return;
 +     }
-+@@ -1080,31 +1207,56 @@ void fuxi_pmic_init(void)
++@@ -1080,31 +1222,56 @@ void fuxi_pmic_init(void)
 +     fp_survey(7, 0xf200, "haptic-boost");
 +     fp_haptic_fifo_survey(mode);
 +     if (haptic == 1) fp_haptic_diagnostic();
