@@ -30,6 +30,7 @@
 #define FUXI_OSLOG_KIND_MASK 7u
 #define FUXI_OSLOG_FLAG_PRIVATE 0x1u
 #define FUXI_OSLOG_STRING_MAX 400u
+#define FUXI_OSLOG_FMT_ALLOW_PRIVATE_DIAG 1u
 
 /* %@ 物件轉文字：寫進 out（不含結尾 0），回寫入長度；0 表示不認得 */
 typedef size_t (*fuxi_oslog_describe_fn)(const void *object, char *out, size_t capacity);
@@ -155,13 +156,14 @@ static inline const void *fuxi_oslog_pointer(const struct fuxi_oslog_item *item)
     return pointer;
 }
 
-static inline void fuxi_oslog_string(struct fuxi_oslog_out *out, const struct fuxi_oslog_item *item, long precision)
+static inline void fuxi_oslog_string(struct fuxi_oslog_out *out, const struct fuxi_oslog_item *item, long precision,
+    bool allow_private)
 {
     if (item->kind != FUXI_OSLOG_KIND_STRING || item->size != sizeof(void *)) {
         fuxi_oslog_puts(out, item->kind == FUXI_OSLOG_KIND_WIDE ? "<wide>" : "<?>");
         return;
     }
-    if (item->flags & FUXI_OSLOG_FLAG_PRIVATE) {
+    if (!allow_private && (item->flags & FUXI_OSLOG_FLAG_PRIVATE)) {
         fuxi_oslog_puts(out, "<private>");
         return;
     }
@@ -182,12 +184,13 @@ static inline void fuxi_oslog_string(struct fuxi_oslog_out *out, const struct fu
 }
 
 /* format＋buf → out（cap ≥ 1，結尾補 0），回輸出長度 */
-static inline size_t fuxi_oslog_format(char *buffer, size_t cap, const char *format, const uint8_t *buf,
-    uint32_t size, fuxi_oslog_describe_fn describe)
+static inline size_t fuxi_oslog_format_flags(char *buffer, size_t cap, const char *format, const uint8_t *buf,
+    uint32_t size, fuxi_oslog_describe_fn describe, unsigned fmt_flags)
 {
     struct fuxi_oslog_out out = { buffer, cap, 0 };
     struct fuxi_oslog_reader reader = { buf, buf ? size : 0, 2, buf && size >= 2 ? buf[1] : 0 };
     struct fuxi_oslog_item item;
+    const bool allow_private = (fmt_flags & FUXI_OSLOG_FMT_ALLOW_PRIVATE_DIAG) != 0;
     if (!cap) {
         return 0;
     }
@@ -271,12 +274,12 @@ static inline size_t fuxi_oslog_format(char *buffer, size_t cap, const char *for
         }
         switch (conversion) {
         case 's':
-            fuxi_oslog_string(&out, &item, precision);
+            fuxi_oslog_string(&out, &item, precision, allow_private);
             break;
         case '@':
             if (item.kind != FUXI_OSLOG_KIND_OBJECT || item.size != sizeof(void *)) {
                 fuxi_oslog_puts(&out, "<?>");
-            } else if (item.flags & FUXI_OSLOG_FLAG_PRIVATE) {
+            } else if (!allow_private && (item.flags & FUXI_OSLOG_FLAG_PRIVATE)) {
                 fuxi_oslog_puts(&out, "<private>");
             } else if (!fuxi_oslog_pointer(&item)) {
                 fuxi_oslog_puts(&out, "(null)");
@@ -335,6 +338,12 @@ static inline size_t fuxi_oslog_format(char *buffer, size_t cap, const char *for
         }
     }
     return out.len;
+}
+
+static inline size_t fuxi_oslog_format(char *buffer, size_t cap, const char *format, const uint8_t *buf,
+    uint32_t size, fuxi_oslog_describe_fn describe)
+{
+    return fuxi_oslog_format_flags(buffer, cap, format, buf, size, describe, 0u);
 }
 
 static inline bool fuxi_oslog_hex(char c)

@@ -197,6 +197,21 @@ int main(void)
     EXPECT_TEXT(run("%@ %@ %@ %{public}@", &b, 512, describe_hello), "hello <private> (null) hello");
     EXPECT_TEXT(run("%@", &b, 512, NULL), "<obj>");
 
+    /* 診斷旗標允許展開 private %s／%@，原 API 預設仍遮蔽 */
+    begin(&b, 0x03, 2);
+    item_ptr(&b, 0x21, "fn");
+    item_ptr(&b, 0x41, (const void *)&b);
+    EXPECT_TEXT(run("%s err=%@", &b, 512, describe_hello), "<private> err=<private>");
+    {
+        char diag_out[128];
+        const size_t diag_len = fuxi_oslog_format_flags(diag_out, sizeof(diag_out), "%s err=%@", b.bytes, b.size,
+            describe_hello, FUXI_OSLOG_FMT_ALLOW_PRIVATE_DIAG);
+        if (diag_len != strlen("fn err=hello") || strcmp(diag_out, "fn err=hello") != 0) {
+            fprintf(stderr, "FAIL diag private format: got '%s'\n", diag_out);
+            failures++;
+        }
+    }
+
     /* mask 項在參數前（2026-11-19 bluetoothd SIGSEGV 的形狀）：要略過，不可把 "hash" 當物件 */
     begin(&b, 0x03, 3);
     item_ptr(&b, 0x42, (const void *)&b);

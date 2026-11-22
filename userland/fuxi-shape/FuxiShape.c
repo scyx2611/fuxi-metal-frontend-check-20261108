@@ -54,8 +54,10 @@ static const fx_rect x_notch = { 249.0, 0.0, 627.0, 90.0 };
 static double shape_w = 300.0, shape_h = 98.0;
 static unsigned shape_said;
 static int hooked;                      /* 0 not yet, 1 replaced */
+static bool shape_disabled;
 static IMP original_shape;
 extern bool fuxi_flashlight_hook(void);
+extern bool fuxi_volhud_hook(void);
 
 static void
 say(const char *format, ...)
@@ -185,8 +187,11 @@ image_added(const struct mach_header *header, intptr_t slide)
 {
 	(void)header;
 	(void)slide;
-	(void)try_hook();
+	if (!shape_disabled) {
+		(void)try_hook();
+	}
 	(void)fuxi_flashlight_hook();
+	(void)fuxi_volhud_hook();
 }
 
 __attribute__((constructor)) static void
@@ -205,11 +210,12 @@ fuxi_shape_init(void)
 	}
 	arg = adt_shape(&shape_w, &shape_h);
 	if (arg == 1) {
+		shape_disabled = true;
 		say("fuxi: SpringBoard: fuxi,sbshape=0, status-bar cut-out unchanged\n");
-		return;
-	}
-	if (!try_hook()) {
+	} else if (!try_hook()) {
 		say("fuxi: SpringBoard: -[%s %s] not there yet; waiting for images\n", SHAPE_CLASS, SHAPE_SELECTOR);
 	}
+	(void)fuxi_flashlight_hook();
+	(void)fuxi_volhud_hook();
 	_dyld_register_func_for_add_image(image_added);
 }

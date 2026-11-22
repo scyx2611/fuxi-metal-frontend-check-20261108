@@ -1640,6 +1640,7 @@ __attribute__((constructor)) static void fuxi_vibrate_init(void)
     const char *path = _dyld_get_image_name(0);
     if (strcmp(name, "mediaserverd") == 0) vb_role = VB_MEDIA;
     else if (strcmp(name, "SpringBoard") == 0) vb_role = VB_SPRINGBOARD;
+    else if (strcmp(name, "VoiceMemos") == 0 || strcmp(name, "voicememod") == 0) return;
     /* 設定的執行檔可能從 Cryptex 載入，constructor 裡的 image[0] 路徑不一定能辨認它。 */
     else if (strcmp(name, "Preferences") == 0 || (path && strstr(path, ".app/"))) vb_role = VB_APP;
     else return;

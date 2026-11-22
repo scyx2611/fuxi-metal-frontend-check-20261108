@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "FuxiBluetoothPatch.h"
@@ -81,6 +82,9 @@ static unsigned btfix_mode;
 static unsigned btlog_main_lines;
 static unsigned btlog_detail_lines;
 static unsigned btlog_sequence;
+static uint64_t btlog_after_ns;
+static unsigned btlog_fmt_flags;
+static const char *btlog_tag = "BTLOG";
 static __thread unsigned btlog_busy;
 
 static unsigned btlog_adt_u32(const char *key)
@@ -223,6 +227,9 @@ static char btlog_letter(uint8_t type)
 static bool btlog_admit(uint8_t type)
 {
     const unsigned mode = btlog_active();
+    if (btlog_after_ns != 0 && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < btlog_after_ns) {
+        return false;
+    }
     if (type == BTLOG_TYPE_INFO || type == BTLOG_TYPE_DEBUG) {
         if (!(mode & (type == BTLOG_TYPE_INFO ? 2u : 4u))) {
             return false;
@@ -247,8 +254,8 @@ static void btlog_write(char letter, char *text, size_t length)
         if (chunk > BTLOG_CHUNK) {
             chunk = BTLOG_CHUNK;
         }
-        int used = snprintf(line, sizeof(line), "BTLOG%s %c %u %.*s\n", part ? "+" : "", letter, sequence, (int)chunk,
-            text + offset);
+        int used = snprintf(line, sizeof(line), "%s%s %c %u %.*s\n", btlog_tag, part ? "+" : "", letter, sequence,
+            (int)chunk, text + offset);
         if (used > 0) {
             (void)write(2, line, (size_t)used < sizeof(line) ? (size_t)used : sizeof(line) - 1);
         }
@@ -257,16 +264,75 @@ static void btlog_write(char letter, char *text, size_t length)
     } while (offset < length);
 }
 
-static size_t btlog_describe(const void *object, char *out, size_t capacity)
+static size_t btlog_copy_cfstr(CFStringRef str, char *out, size_t capacity)
 {
-    CFTypeRef value = object;
-    if (capacity < 2 || CFGetTypeID(value) != CFStringGetTypeID()) {
+    if (!str || capacity < 2) {
         return 0;
     }
     CFIndex used = 0;
-    CFStringGetBytes((CFStringRef)value, CFRangeMake(0, CFStringGetLength((CFStringRef)value)), kCFStringEncodingUTF8,
+    CFStringGetBytes(str, CFRangeMake(0, CFStringGetLength(str)), kCFStringEncodingUTF8,
         '?', false, (UInt8 *)out, (CFIndex)capacity - 1, &used);
-    return used > 0 ? (size_t)used : 0;
+    if (used < 0) {
+        used = 0;
+    }
+    out[used] = 0;
+    return (size_t)used;
+}
+
+static size_t btlog_describe(const void *object, char *out, size_t capacity)
+{
+    CFTypeRef value = object;
+    if (!value || capacity < 2) {
+        return 0;
+    }
+    const CFTypeID tid = CFGetTypeID(value);
+    if (tid == CFStringGetTypeID()) {
+        return btlog_copy_cfstr((CFStringRef)value, out, capacity);
+    }
+    if (tid == CFErrorGetTypeID()) {
+        CFErrorRef err = (CFErrorRef)value;
+        char domain[96];
+        char desc[160];
+        char under_dom[64];
+        domain[0] = 0;
+        desc[0] = 0;
+        under_dom[0] = 0;
+        btlog_copy_cfstr(CFErrorGetDomain(err), domain, sizeof(domain));
+        CFStringRef cf_desc = CFErrorCopyDescription(err);
+        if (cf_desc) {
+            btlog_copy_cfstr(cf_desc, desc, sizeof(desc));
+            CFRelease(cf_desc);
+        }
+        long under_code = 0;
+        bool has_under = false;
+        CFDictionaryRef info = CFErrorCopyUserInfo(err);
+        if (info) {
+            CFTypeRef under = CFDictionaryGetValue(info, kCFErrorUnderlyingErrorKey);
+            if (under && CFGetTypeID(under) == CFErrorGetTypeID()) {
+                btlog_copy_cfstr(CFErrorGetDomain((CFErrorRef)under), under_dom, sizeof(under_dom));
+                under_code = (long)CFErrorGetCode((CFErrorRef)under);
+                has_under = true;
+            }
+            CFRelease(info);
+        }
+        int n = has_under
+            ? snprintf(out, capacity, "Err(%s:%ld %s [under=%s:%ld])", domain[0] ? domain : "?",
+                (long)CFErrorGetCode(err), desc, under_dom[0] ? under_dom : "?", under_code)
+            : snprintf(out, capacity, "Err(%s:%ld %s)", domain[0] ? domain : "?",
+                (long)CFErrorGetCode(err), desc);
+        return n > 0 ? ((size_t)n < capacity ? (size_t)n : capacity - 1) : 0;
+    }
+    if (tid == CFNumberGetTypeID()) {
+        int64_t ival = 0;
+        if (CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, &ival)) {
+            int n = snprintf(out, capacity, "%lld", (long long)ival);
+            return n > 0 ? ((size_t)n < capacity ? (size_t)n : capacity - 1) : 0;
+        }
+    }
+    if (tid == CFURLGetTypeID()) {
+        return btlog_copy_cfstr(CFURLGetString((CFURLRef)value), out, capacity);
+    }
+    return 0;
 }
 
 __attribute__((noinline)) static void btlog_record(uint8_t type, const char *format, const uint8_t *buf, uint32_t size)
@@ -276,7 +342,7 @@ __attribute__((noinline)) static void btlog_record(uint8_t type, const char *for
     }
     btlog_busy++;
     char text[BTLOG_TEXT_MAX];
-    const size_t length = fuxi_oslog_format(text, sizeof(text), format, buf, size, btlog_describe);
+    const size_t length = fuxi_oslog_format_flags(text, sizeof(text), format, buf, size, btlog_describe, btlog_fmt_flags);
     btlog_write(btlog_letter(type), text, length);
     btlog_busy--;
 }
@@ -426,7 +492,38 @@ BTLOG_INTERPOSE(btlog_prefs_copy_app_value, btlog_real_prefs_copy_app_value);
 __attribute__((constructor)) static void fuxi_btlog_init(void)
 {
     const char *name = getprogname();
-    if (name == NULL || strcmp(name, "bluetoothd") != 0) {
+    if (name == NULL) {
+        return;
+    }
+    if (strcmp(name, "mediaserverd") == 0) {
+        const unsigned raw = btlog_adt_u32("fuxi,media-oslog");
+        const unsigned mode = raw & 7u;
+        const unsigned delay_s = (raw >> 8) & 0x3ffu;
+        if (!mode) {
+            return;
+        }
+        btlog_tag = "MDLOG";
+        btlog_after_ns = (uint64_t)delay_s * 1000000000ULL;
+        __atomic_store_n(&btlog_mode, mode, __ATOMIC_RELEASE);
+        btlog_note('S', "on mode=%u delay_s=%u pid=%d", mode, delay_s, getpid());
+        return;
+    }
+    if (strcmp(name, "VoiceMemos") == 0 || strcmp(name, "voicememod") == 0) {
+        const unsigned inject = btlog_adt_u32("fuxi,inject");
+        const unsigned raw = inject ? btlog_adt_u32("fuxi,vm-oslog") : 3u;
+        const unsigned mode = raw & 7u;
+        const unsigned delay_s = (raw >> 8) & 0x3ffu;
+        if (!mode) {
+            return;
+        }
+        btlog_tag = (name[0] == 'V') ? "VMLOG" : "VMDLOG";
+        btlog_fmt_flags = FUXI_OSLOG_FMT_ALLOW_PRIVATE_DIAG;
+        btlog_after_ns = (uint64_t)delay_s * 1000000000ULL;
+        __atomic_store_n(&btlog_mode, mode, __ATOMIC_RELEASE);
+        btlog_note('S', "on mode=%u delay_s=%u adt=%u pid=%d", mode, delay_s, inject != 0 ? 1u : 0u, getpid());
+        return;
+    }
+    if (strcmp(name, "bluetoothd") != 0) {
         return;
     }
     const unsigned mode = btlog_adt_u32("fuxi,bt-oslog") & 7u;
