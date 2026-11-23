@@ -40,6 +40,7 @@ on:
       - patches/kernel-adsp-battery.patch
       - patches/kernel-modem-volte.patch
       - patches/kernel-wifi-softap.patch
+      - patches/kernel-sensors-v8.patch
       - tests/test-backlight-dsi.py
       - tests/test-perf-governor.py
       - tests/test-ib-profile.py
@@ -120,8 +121,11 @@ jobs:
           git -C source apply ../harness/patches/kernel-modem-volte.patch
           git -C source apply --check ../harness/patches/kernel-wifi-softap.patch
           git -C source apply ../harness/patches/kernel-wifi-softap.patch
+          git -C source apply --check ../harness/patches/kernel-sensors-v8.patch
+          git -C source apply ../harness/patches/kernel-sensors-v8.patch
           (cd source && python3 tools/sync-fuxi-modem.py --check && python3 tools/test-fuxi-modem.py --sanitize)
           (cd source && python3 tools/sync-fuxi-camera.py --check && python3 tools/test-fuxi-camera.py --sanitize)
+          (cd source && python3 tools/sync-fuxi-sensors.py --check && python3 tools/test-fuxi-sensors.py --sanitize)
           (cd source && python3 tools/sync-fuxi-adsp.py --check && python3 tools/sync-fuxi-unixnu.py --check && python3 tools/sync-fuxi-backlight.py --check)
           (cd source && python3 tools/test-fuxi-prof.py)
           (cd source && python3 tools/test-fuxi-mfb-align.py --sanitize)

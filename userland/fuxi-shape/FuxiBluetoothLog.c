@@ -363,6 +363,9 @@ __attribute__((noinline)) static void btlog_note(char letter, const char *format
 
 static void btlog_impl(void *dso, void *log, uint8_t type, const char *format, uint8_t *buf, uint32_t size)
 {
+    if (log == NULL) {
+        return;
+    }
     if (__builtin_expect(btlog_active() != 0, 0)) {
         btlog_record(type, format, buf, size);
     }
@@ -371,6 +374,9 @@ static void btlog_impl(void *dso, void *log, uint8_t type, const char *format, u
 
 static void btlog_error(void *dso, void *log, uint8_t type, const char *format, uint8_t *buf, uint32_t size)
 {
+    if (log == NULL) {
+        return;
+    }
     if (__builtin_expect(btlog_active() != 0, 0)) {
         btlog_record(type, format, buf, size);
     }
@@ -379,6 +385,9 @@ static void btlog_error(void *dso, void *log, uint8_t type, const char *format, 
 
 static void btlog_fault(void *dso, void *log, uint8_t type, const char *format, uint8_t *buf, uint32_t size)
 {
+    if (log == NULL) {
+        return;
+    }
     if (__builtin_expect(btlog_active() != 0, 0)) {
         btlog_record(type, format, buf, size);
     }
@@ -387,6 +396,9 @@ static void btlog_fault(void *dso, void *log, uint8_t type, const char *format, 
 
 static void btlog_debug(void *dso, void *log, uint8_t type, const char *format, uint8_t *buf, uint32_t size)
 {
+    if (log == NULL) {
+        return;
+    }
     if (__builtin_expect(btlog_active() != 0, 0)) {
         btlog_record(type, format, buf, size);
     }
@@ -396,8 +408,9 @@ static void btlog_debug(void *dso, void *log, uint8_t type, const char *format, 
 static bool btlog_enabled(void *log, uint8_t type)
 {
     const unsigned mode = btlog_active();
-    if (__builtin_expect(mode != 0, 0) &&
-        ((type == BTLOG_TYPE_INFO && (mode & 2u)) || (type == BTLOG_TYPE_DEBUG && (mode & 4u)))) {
+    if (__builtin_expect(mode != 0, 0) && log != NULL &&
+        ((type == BTLOG_TYPE_INFO && (mode & 2u)) || (type == BTLOG_TYPE_DEBUG && (mode & 4u))) &&
+        btlog_real_enabled(log, BTLOG_TYPE_FAULT)) {
         return true;
     }
     return btlog_real_enabled(log, type);
@@ -521,6 +534,30 @@ __attribute__((constructor)) static void fuxi_btlog_init(void)
         btlog_after_ns = (uint64_t)delay_s * 1000000000ULL;
         __atomic_store_n(&btlog_mode, mode, __ATOMIC_RELEASE);
         btlog_note('S', "on mode=%u delay_s=%u adt=%u pid=%d", mode, delay_s, inject != 0 ? 1u : 0u, getpid());
+        return;
+    }
+    const char *dict_tag = NULL;
+    if (strcmp(name, "assistantd") == 0) {
+        dict_tag = "ASLOG";
+    } else if (strcmp(name, "assistant_service") == 0) {
+        dict_tag = "ASSVCLOG";
+    } else if (strcmp(name, "corespeechd") == 0) {
+        dict_tag = "CSLOG";
+    } else if (strcmp(name, "kbd") == 0) {
+        dict_tag = "KBDLOG";
+    }
+    if (dict_tag != NULL) {
+        const unsigned raw = btlog_adt_u32("fuxi,dict-oslog");
+        const unsigned mode = raw & 7u;
+        const unsigned delay_s = (raw >> 8) & 0x3ffu;
+        if (!mode) {
+            return;
+        }
+        btlog_tag = dict_tag;
+        btlog_fmt_flags = FUXI_OSLOG_FMT_ALLOW_PRIVATE_DIAG;
+        btlog_after_ns = (uint64_t)delay_s * 1000000000ULL;
+        __atomic_store_n(&btlog_mode, mode, __ATOMIC_RELEASE);
+        btlog_note('S', "on mode=%u delay_s=%u pid=%d", mode, delay_s, getpid());
         return;
     }
     if (strcmp(name, "bluetoothd") != 0) {
