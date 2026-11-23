@@ -22,6 +22,17 @@
 #define FX_CAPSRC_BIT_FLASHLIGHT (1u << 3)
 #define FX_CAPSRC_MASK_DEFAULT   (FX_CAPSRC_BIT_SOURCE | FX_CAPSRC_BIT_SESSION | FX_CAPSRC_BIT_DEFERRED)
 #define FX_CAPSRC_MASK_ALL       (FX_CAPSRC_BIT_SOURCE | FX_CAPSRC_BIT_SESSION | FX_CAPSRC_BIT_DEFERRED | FX_CAPSRC_BIT_FLASHLIGHT)
+/*
+ * Services started natively by /Developer/libfuxi-camera.dylib
+ * (cam-1122/userland/fuxi-camera/inject_media.c:fuxi_start_capture_servers,
+ * matching CMCaptureCore._FigStartCaptureServers minus FigPreloadShaders):
+ *   - FigCaptureSourceServerStart                   -> com.apple.coremedia.capturesource
+ *   - FigCaptureSessionServerStart                  -> com.apple.coremedia.capturesession
+ *   - FigCaptureDeferredContainerManagerServerStart -> com.apple.coremedia.capture.deferred.containermanager.xpc
+ *   - FigFlashlightServerStart                      -> com.apple.coremedia.flashlight
+ */
+#define FX_CAPSRC_MASK_CAMERA_OWNED \
+	(FX_CAPSRC_BIT_SOURCE | FX_CAPSRC_BIT_SESSION | FX_CAPSRC_BIT_DEFERRED | FX_CAPSRC_BIT_FLASHLIGHT)
 
 #define FX_CAPSRC_OP_CSRC        0x63737263u /* 'csrc' */
 #define FX_CAPSRC_OP_MJDS        0x6d6a6473u /* 'mjds' */
@@ -65,6 +76,29 @@ fuxi_capsrc_decode_adt(uint32_t raw, uint32_t *mask_out)
 	}
 	*mask_out = raw;
 	return true;
+}
+
+static inline bool
+fuxi_capsrc_camera_owns_servers(uint32_t camera_mode, uint32_t camera_dylib)
+{
+	return camera_mode != 0u && camera_dylib != 0u;
+}
+
+static inline uint32_t
+fuxi_capsrc_resolve_mask(uint32_t requested_mask, uint32_t camera_mode, uint32_t camera_dylib,
+    uint32_t *yielded_mask_out)
+{
+	uint32_t effective = requested_mask & FX_CAPSRC_MASK_ALL;
+	uint32_t yielded = 0u;
+
+	if (fuxi_capsrc_camera_owns_servers(camera_mode, camera_dylib)) {
+		yielded = effective & FX_CAPSRC_MASK_CAMERA_OWNED;
+		effective &= ~FX_CAPSRC_MASK_CAMERA_OWNED;
+	}
+	if (yielded_mask_out != NULL) {
+		*yielded_mask_out = yielded;
+	}
+	return effective;
 }
 
 static inline fx_capsrc_action

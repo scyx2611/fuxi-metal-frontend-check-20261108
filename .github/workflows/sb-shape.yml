@@ -16,6 +16,7 @@ on:
       - tools/test-capsrc-stub.c
       - tools/test-rtc-persist.c
       - tools/test-atx-fix.c
+      - tools/test-audio-mic-dsp.c
       - .github/workflows/sb-shape.yml
 permissions:
   contents: read
@@ -58,6 +59,9 @@ jobs:
           clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
               -Iuserland/fuxi-shape tools/test-atx-fix.c -o /tmp/fuxi-atx-fix
           /tmp/fuxi-atx-fix
+          clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+              -Iuserland/fuxi-shape tools/test-audio-mic-dsp.c -o /tmp/fuxi-audio-mic-dsp
+          /tmp/fuxi-audio-mic-dsp
       - name: Build, sign ad hoc, check
         shell: bash
         run: |
@@ -71,7 +75,7 @@ jobs:
               userland/fuxi-shape/FuxiVolHud.c userland/fuxi-shape/FuxiBatteryAudit.c userland/fuxi-shape/FuxiVibrate.c \
               userland/fuxi-shape/FuxiWifiAudit.c userland/fuxi-shape/FuxiBluetoothProbe.c userland/fuxi-shape/FuxiBlueTool.c \
               userland/fuxi-shape/FuxiBluetoothLog.c userland/fuxi-shape/FuxiCaptureStub.c userland/fuxi-shape/FuxiRtcPersist.c \
-              userland/fuxi-shape/FuxiAtxFix.c \
+              userland/fuxi-shape/FuxiAtxFix.c userland/fuxi-shape/FuxiAudioMicDsp.c \
               -lobjc -framework CoreFoundation -framework IOKit \
               -install_name /usr/local/lib/fuxi/libfuxi-sb.dylib -o out/libfuxi-sb.dylib
           codesign -f -s - out/libfuxi-sb.dylib

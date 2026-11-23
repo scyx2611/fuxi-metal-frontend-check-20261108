@@ -21,6 +21,12 @@
  *       bit 1 (2): com.apple.coremedia.capturesession (-12782)
  *       bit 2 (4): com.apple.coremedia.capture.deferred.containermanager.xpc (-12782)
  *       bit 3 (8): com.apple.coremedia.flashlight (-12782)
+ *   - Camera coexistence: when ADT /chosen enables native camera (fuxi,camera != 0 and
+ *     fuxi,camera-dylib != 0), /Developer/libfuxi-camera.dylib starts Apple's real CMCapture
+ *     XPC servers (FigCaptureSourceServerStart, FigCaptureSessionServerStart,
+ *     FigCaptureDeferredContainerManagerServerStart, FigFlashlightServerStart, plus
+ *     viewfinder/memory reporter). Yield FX_CAPSRC_MASK_CAMERA_OWNED so Camera.app receives
+ *     real capture sources while Voice Memos/Dictation continue using those native servers.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
@@ -243,18 +249,16 @@ capsrc_worker(void *context)
 }
 
 static bool
-capsrc_read_adt_u32(uint32_t *raw_out)
+capsrc_read_chosen_u32(fx_io_object_t chosen, CFStringRef prop_key, uint32_t *raw_out)
 {
-	fx_io_object_t chosen = IORegistryEntryFromPath(MACH_PORT_NULL, "IODeviceTree:/chosen");
 	CFTypeRef value;
 	uint32_t raw = 0u;
 	bool found = false;
 
-	if (chosen == MACH_PORT_NULL) {
+	if (chosen == MACH_PORT_NULL || prop_key == NULL) {
 		return false;
 	}
-	value = IORegistryEntryCreateCFProperty(chosen, CFSTR("fuxi,capsrc-stub"), kCFAllocatorDefault, 0);
-	(void)IOObjectRelease(chosen);
+	value = IORegistryEntryCreateCFProperty(chosen, prop_key, kCFAllocatorDefault, 0);
 	if (value == NULL) {
 		return false;
 	}
@@ -263,7 +267,7 @@ capsrc_read_adt_u32(uint32_t *raw_out)
 		found = true;
 	}
 	CFRelease(value);
-	if (found) {
+	if (found && raw_out != NULL) {
 		*raw_out = raw;
 	}
 	return found;
@@ -273,18 +277,41 @@ __attribute__((constructor)) static void
 fuxi_capsrc_init(void)
 {
 	const char *prog = getprogname();
+	fx_io_object_t chosen;
 	uint32_t raw = 0u;
+	uint32_t requested_mask = 0u;
+	uint32_t camera_mode = 0u;
+	uint32_t camera_dylib = 0u;
+	uint32_t yielded_mask = 0u;
 	pthread_attr_t attr;
 	pthread_t thread_id;
 
 	if (prog == NULL || strcmp(prog, "mediaserverd") != 0) {
 		return;
 	}
-	if (!capsrc_read_adt_u32(&raw) || raw == 0u) {
+	chosen = IORegistryEntryFromPath(MACH_PORT_NULL, "IODeviceTree:/chosen");
+	if (chosen == MACH_PORT_NULL) {
 		return;
 	}
-	if (!fuxi_capsrc_decode_adt(raw, &capsrc_mask)) {
+	if (!capsrc_read_chosen_u32(chosen, CFSTR("fuxi,capsrc-stub"), &raw) || raw == 0u) {
+		(void)IOObjectRelease(chosen);
+		return;
+	}
+	if (!fuxi_capsrc_decode_adt(raw, &requested_mask)) {
+		(void)IOObjectRelease(chosen);
 		capsrc_say("fuxi: mediaserverd: fuxi,capsrc-stub=0x%x out of range; disabled\n", (unsigned)raw);
+		return;
+	}
+	(void)capsrc_read_chosen_u32(chosen, CFSTR("fuxi,camera"), &camera_mode);
+	(void)capsrc_read_chosen_u32(chosen, CFSTR("fuxi,camera-dylib"), &camera_dylib);
+	(void)IOObjectRelease(chosen);
+
+	capsrc_mask = fuxi_capsrc_resolve_mask(requested_mask, camera_mode, camera_dylib, &yielded_mask);
+	if (yielded_mask != 0u) {
+		capsrc_say("fuxi: mediaserverd: capsrc-stub yielding mask=0x%x to libfuxi-camera (camera=%u dylib=%u) remaining=0x%x\n",
+		    (unsigned)yielded_mask, (unsigned)camera_mode, (unsigned)camera_dylib, (unsigned)capsrc_mask);
+	}
+	if (capsrc_mask == 0u) {
 		return;
 	}
 	if (pthread_attr_init(&attr) != 0) {
