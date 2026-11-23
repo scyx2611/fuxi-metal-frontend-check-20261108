@@ -78026,7 +78026,7 @@ index 0000000..a22cc1a
 + #define G_DATA_PA   (G_MEM + 0x1100000)
 diff --git a/tools/test-fuxi-live-audio-haptics.py b/tools/test-fuxi-live-audio-haptics.py
 new file mode 100644
-index 0000000..372c692
+index 0000000..7767a46
 --- /dev/null
 +++ b/tools/test-fuxi-live-audio-haptics.py
 @@ -0,0 +1,1770 @@
@@ -79313,7 +79313,7 @@ index 0000000..372c692
 +        unsigned n = fuxi_damp_process_mode9(&d, ui_sw, sizeof(ui_sw), buf, 512, 1, &opk, &zc);
 +        unsigned t = fuxi_damp_tail(&d, buf + n, FUXI_DAMP_TAIL_MAX, &tlpk, &zc);
 +        assert(d.m9_prof == FUXI_DAMP_M9_PROF_UNI);
-+        assert(n >= 260 && (n & 3u) == 0 && t >= 4 && opk <= 112);
++        assert(n >= 260 && (n & 3u) == 0 && t >= 4 && opk >= 110 && opk <= 122 && opk < FUXI_DAMP_PCM_LIMIT);
 +        double dk = 0, tk = 0, pk_post = 0;
 +        sim_lra_split_metrics(buf, n, n + t, 175.13, &dk, &tk, &pk_post);
 +        assert(dk > tk * 2.5 && pk_post < dk * 0.02);
@@ -81601,7 +81601,7 @@ new file mode 100644
 +#endif /* FUXI_RTC_PERSIST_H */
 diff --git a/xnu/patches/0124-fuxi-live-audio-haptics.patch b/xnu/patches/0124-fuxi-live-audio-haptics.patch
 new file mode 100644
-index 0000000..40ebb02
+index 0000000..0b954b0
 --- /dev/null
 +++ b/xnu/patches/0124-fuxi-live-audio-haptics.patch
 @@ -0,0 +1,4770 @@
@@ -84211,12 +84211,12 @@ index 0000000..40ebb02
 ++    FUXI_DAMP_M9_PROF_UNI = 1u,
 ++    FUXI_DAMP_M9_PROF_LP = 2u,
 ++    FUXI_DAMP_M9_PROF_SUS = 3u,
-++    FUXI_DAMP_M9_UNI_SCALE_Q8 = 180,     /* 0.703x：單極性開關（MicroTap100Hz）柔化至略輕於後台切換 */
-++    FUXI_DAMP_M9_UNI_MAX_STEP = 70800u,  /* 1.08x：保留圓潤低頻質感，不尖硬 */
-++    FUXI_DAMP_M9_LP_ZD_Q15 = 31130,      /* 0.95：長按驅動近臨界阻尼，消除共振過衝與彈簧餘振 */
+++    FUXI_DAMP_M9_UNI_SCALE_Q8 = 224,     /* 0.875x：單極性開關（MicroTap100Hz）落於 hap9c/hap9d 中位，保留圓潤手感 */
+++    FUXI_DAMP_M9_UNI_MAX_STEP = 74711u,  /* 1.14x：略收緊至貼近後台切換，避免過輕或尖硬 */
+++    FUXI_DAMP_M9_LP_ZD_Q15 = 29491,      /* 0.90：長按驅動近臨界阻尼，消除共振過衝與彈簧餘振（zc=3） */
 ++    FUXI_DAMP_M9_LP_ZB_Q15 = 36700,      /* 1.12：長按尾段臨界死拍剎車 */
 ++    FUXI_DAMP_M9_LP_KX_Q15 = 11469,      /* 0.35：尾段剛度補償加速收斂 */
-++    FUXI_DAMP_M9_LP_GAIN_Q8 = 358,       /* 1.398x：補償高阻尼衰減，保留乾脆單擊「棟」一下衝擊力 */
+++    FUXI_DAMP_M9_LP_GAIN_Q8 = 420,       /* 1.641x：加重長按單擊「棟」衝擊力（+19%），零 clip 零回彈 */
 ++    FUXI_DAMP_M9_LP_TAIL_RAMP = 8u,      /* 0.33 ms 快速切入死拍剎車 */
 ++    FUXI_DAMP_M9_SUS_GAIN_Q8 = 132,      /* 0.516x：來電／長震安全連續驅動（<=2.0 Vrms 熱保護） */
 ++    FUXI_DAMP_M9_SUS_ZETA_Q15 = 7537,    /* 0.23：閉迴路壓制 170-175 Hz 共振撞底異響 */
@@ -86219,7 +86219,7 @@ index 0000000..40ebb02
 ++            }
 ++            if (drain == 0) {
 ++                stream_bursts++;
-++                if (stream_bursts <= 32) {
+++                if (stream_bursts <= 64) {
 ++                    printf("FUXI PMIC: haptic stream burst=%u warm=%u chunks=%u refills=%u underruns=%u bytes=%u peak=%u raw_pk=%u drv_pk=%u out_pk=%u zc=%u tail_b=%u tails=%u clp=%u step=%u prof=%u abs=%u tlra=%u vmax=%#x vpre=%#x hpre=%#x open_us=%llu dur_us=%llu queue_us=%llu\n",
 ++                        stream_bursts, (unsigned)stream.warm_burst, stream.burst_chunks, stream.burst_refills,
 ++                        stream.burst_underruns, stream.burst_bytes, stream.burst_peak,
