@@ -1,0 +1,145 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index dfd1605..33313ac 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -9,6 +9,7 @@
+ #import <Foundation/Foundation.h>
+ #import <Metal/Metal.h>
+ #import <IOSurface/IOSurfaceRef.h>
++#import <objc/message.h>
+ #import <objc/runtime.h>
+ #include <algorithm>
+ #include <atomic>
+@@ -251,11 +252,29 @@ static std::atomic<uint64_t> gSurfaceTextures,gSurfaceRefusals,gSurfacePlanar;
+ // planes, requested plane, plane offset, plane row bytes and allocation, and the descriptor's size and pixel format.
+ struct SurfaceRefusal {uint32_t step,format,planes,plane,pixelFormat;uint64_t offset,row,allocation,width,height;};
+ static SurfaceRefusal gSurfaceLastRefusal;
++static NSUInteger descriptorRotation(MTLTextureDescriptor *d) {
++ if([d respondsToSelector:@selector(rotation)])
++  return ((NSUInteger(*)(id,SEL))objc_msgSend)(d,@selector(rotation));
++ return 0;
++}
++static uint64_t descriptorFramebufferOnly(MTLTextureDescriptor *d) {
++ if([d respondsToSelector:@selector(framebufferOnly)])
++  return ((BOOL(*)(id,SEL))objc_msgSend)(d,@selector(framebufferOnly))?1:0;
++ if([d respondsToSelector:@selector(isFramebufferOnly)])
++  return ((BOOL(*)(id,SEL))objc_msgSend)(d,@selector(isFramebufferOnly))?1:0;
++ return 0;
++}
++static uint64_t descriptorIsDrawable(MTLTextureDescriptor *d) {
++ if([d respondsToSelector:@selector(isDrawable)])
++  return ((BOOL(*)(id,SEL))objc_msgSend)(d,@selector(isDrawable))?1:0;
++ return 0;
++}
+ static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
+- noteProblem([NSString stringWithFormat:@"IOSurface refused step=%u fourcc=0x%08x plane=%lu planes=%lu offset=%llu row=%llu bytes=%lu size=%lux%lu pixel=%lu",
++ noteProblem([NSString stringWithFormat:@"IOSurface refused step=%u fourcc=0x%08x plane=%lu planes=%lu offset=%llu row=%llu bytes=%lu size=%lux%lu pixel=%lu rot=%lu fb=%llu",
+   step,surface?IOSurfaceGetPixelFormat(surface):0,(unsigned long)plane,(unsigned long)(surface?IOSurfaceGetPlaneCount(surface):0),
+   (unsigned long long)offset,(unsigned long long)row,(unsigned long)(surface?IOSurfaceGetAllocSize(surface):0),
+-  (unsigned long)(d?d.width:0),(unsigned long)(d?d.height:0),(unsigned long)(d?d.pixelFormat:0)]);
++  (unsigned long)(d?d.width:0),(unsigned long)(d?d.height:0),(unsigned long)(d?d.pixelFormat:0),
++  (unsigned long)(d?descriptorRotation(d):0),(unsigned long long)(d?descriptorFramebufferOnly(d):0)]);
+  gSurfaceRefusals++;
+  SurfaceRefusal r={step,surface?IOSurfaceGetPixelFormat(surface):0,surface?(uint32_t)IOSurfaceGetPlaneCount(surface):0,(uint32_t)plane,
+                    d?(uint32_t)d.pixelFormat:0,offset,row,surface?IOSurfaceGetAllocSize(surface):0,d?d.width:0,d?d.height:0};
+@@ -327,6 +346,7 @@ static void waitForResource(id resource);
+ @property(nonatomic) NmbTextureDescriptor descriptor;
+ @property(nonatomic,strong) NBBuffer *buffer;
+ @property(nonatomic) IOSurfaceRef surface;
++@property(nonatomic) NSUInteger surfacePlane;
+ @property(nonatomic) NSUInteger offset,rowBytes;
+ @property(nonatomic,strong) id<MTLTexture> parent;
+ @property(nonatomic,strong) id<MTLHeap> parentHeap;
+@@ -395,7 +415,8 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+ }
+ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
+  if(!d){noteProblem(@"nil texture descriptor");return false;}
+- *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
++ *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions,
++  (uint64_t)descriptorRotation(d),descriptorFramebufferOnly(d),descriptorIsDrawable(d)};
+  return true;
+ }
+ @implementation NBTexture
+@@ -412,14 +433,15 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+ - (MTLResourceOptions)resourceOptions { try { @try {return (MTLResourceOptions)_descriptor.options;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (MTLStorageMode)storageMode { try { @try {return (MTLStorageMode)((_descriptor.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (MTLCPUCacheMode)cpuCacheMode { try { @try {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (BOOL)isFramebufferOnly { try { @try {return NO;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)isFramebufferOnly { try { @try {return _descriptor.framebuffer_only!=0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (IOSurfaceRef)iosurface { try { @try {return _surface;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (NSUInteger)iosurfacePlane { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)iosurfacePlane { try { @try {return _surfacePlane;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLBuffer>)buffer { try { @try {return _surface?nil:(id<MTLBuffer>)_buffer;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (NSUInteger)bufferOffset { try { @try {return _offset;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (NSUInteger)bufferBytesPerRow { try { @try {return _rowBytes;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLTexture>)parentTexture { try { @try {return _parent;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (NSUInteger)rotation { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)rotation { try { @try {return _descriptor.rotation;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)isDrawable { try { @try {return _descriptor.is_drawable!=0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { try { @try {
+  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
+  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
+@@ -429,7 +451,7 @@ NB_RESOURCE_SPI
+ - (id<MTLTexture>)view:(NmbTexture *)handle { try { @try {
+  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
+  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
+- view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
++ view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;view.surfacePlane=_surfacePlane;
+  if(_surface)view.surface=(IOSurfaceRef)CFRetain(_surface);
+  return (id<MTLTexture>)view;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1985,7 +2007,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  FrameMake make(&FrameMakes::imports);NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
+  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+- gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
++ gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);texture.surfacePlane=plane;return (id<MTLTexture>)texture;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error { try { @try {
+  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index b834c98..70f6eba 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -75,6 +75,7 @@ uint64_t nmb_buffer_gpu_address(const NmbBuffer *);
+ 
+ struct NmbTextureDescriptor {
+     uint64_t type, format, width, height, depth, levels, samples, array_length, usage, options;
++    uint64_t rotation, framebuffer_only, is_drawable;
+ };
+ /* Heaps: type 0 automatic / 1 placement; offset UINT64_MAX asks an automatic heap to place the resource. */
+ NmbHeap *nmb_heap_new(NmbDevice *, uint64_t type, uint64_t size, uint64_t options);
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index cf7800c..799aadc 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -722,6 +722,9 @@ pub struct NmbTextureDescriptor {
+     pub array_length: u64,
+     pub usage: u64,
+     pub options: u64,
++    pub rotation: u64,
++    pub framebuffer_only: u64,
++    pub is_drawable: u64,
+ }
+ 
+ pub struct NmbTexture(Texture);
+@@ -739,6 +742,9 @@ fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescripto
+     out.array_length = d.array_length;
+     out.usage = raw::<TextureUsage>(d.usage, "texture usage")?;
+     out.resource_options = options(d.options)?;
++    out.rotation = d.rotation;
++    out.framebuffer_only = d.framebuffer_only != 0;
++    out.is_drawable = d.is_drawable != 0;
+     Ok(out)
+ }
+ 
+@@ -856,6 +862,9 @@ pub extern "C" fn nmb_texture_describe(texture: *const NmbTexture, out: *mut Nmb
+             array_length: t.array_length(),
+             usage: t.usage().as_raw() as u64,
+             options: t.resource_options().raw(),
++            rotation: t.rotation(),
++            framebuffer_only: u64::from(t.framebuffer_only()),
++            is_drawable: u64::from(t.is_drawable()),
+         };
+         Ok(())
+     })

@@ -1,0 +1,633 @@
+diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+index a0ee078..c6f1e32 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+@@ -601,9 +601,10 @@ impl Buffer {
+         // A rotated texture: its plane holds it turned, as Metal checks it, its CPU access and
+         // blits address the plane as the texture's own extent at the plane's rows, and its
+         // functions the stored frame (`texture/rotation.rs`).
+-        // A rotated two-plane YCbCr texture is not measured: the runtime's gap. Nor is a rotated
+-        // two-plane extended-range one over a surface.
+-        if (converted.is_some() || alpha_plane.is_some()) && descriptor.rotation != 0 {
++        // A rotated two-plane YCbCr texture is not measured: the runtime's gap.
++        // A rotated two-plane extended-range texture (`RGB10A8_2P_XR10`, `'b3a8'`) IS supported
++        // via `new_rotated_surface_planes_texture` + `ShadowTarget::RotatedPlanes`.
++        if converted.is_some() && descriptor.rotation != 0 {
+             return Err(Error::Unsupported(
+                 Unsupported::not_implemented(Feature::Format).naming_format(pf),
+             ));
+@@ -632,6 +633,16 @@ impl Buffer {
+             );
+             let stored = Texels::placed(self.clone(), stored, texel_bytes, descriptor);
+             let id_use = IdUse::Program(descriptor.placement);
++            if let Some(alpha) = alpha_plane {
++                return self.device().new_rotated_surface_planes_texture(
++                    call,
++                    [rows, stored].map(|texels| texels.with_options(options)),
++                    descriptor,
++                    (&layout, rotation),
++                    id_use,
++                    alpha,
++                );
++            }
+             return self.device().new_rotated_texture(
+                 call,
+                 [rows, stored].map(|texels| texels.with_options(options)),
+diff --git a/crates/metal2vulkan-runtime/src/render/unused_bits_load.rs b/crates/metal2vulkan-runtime/src/render/unused_bits_load.rs
+index 880e1d6..0440167 100644
+--- a/crates/metal2vulkan-runtime/src/render/unused_bits_load.rs
++++ b/crates/metal2vulkan-runtime/src/render/unused_bits_load.rs
+@@ -264,9 +264,12 @@ fn takes(color: &ColorTarget, late: bool) -> Option<Taken<'_>> {
+     let target = own(color);
+     let texture = &target.texture;
+     let form = ExtendedRange::of(texture.pixel_format())?;
+-    let turned = texture
+-        .shadow()
+-        .is_some_and(|copies| matches!(copies.target(), Some(ShadowTarget::Rotated { .. })));
++    let turned = texture.shadow().is_some_and(|copies| {
++        matches!(
++            copies.target(),
++            Some(ShadowTarget::Rotated { .. } | ShadowTarget::RotatedPlanes { .. })
++        )
++    });
+     if target.samples != 1 {
+         return None;
+     }
+diff --git a/crates/metal2vulkan-runtime/src/rotated.rs b/crates/metal2vulkan-runtime/src/rotated.rs
+index 22af3ce..87422ad 100644
+--- a/crates/metal2vulkan-runtime/src/rotated.rs
++++ b/crates/metal2vulkan-runtime/src/rotated.rs
+@@ -166,6 +166,17 @@ impl RotatedCopies {
+         staging: &ShadowStaging,
+         frame: Frame,
+         hazard: HazardTrackingMode,
++    ) -> Result<RotatedCopies, Error> {
++        Self::new_with_backing(device, (staging.raw(), staging.into.dst_offset), frame, hazard)
++    }
++
++    /// The turns of `frame` through a caller-supplied backing buffer `(backing_raw, backing_at)`
++    /// holding the stored frame's rows (either a `ShadowStaging` or a two-plane unpack buffer).
++    pub(super) fn new_with_backing(
++        device: &Device,
++        (staging_raw, staging_at): (vk::Buffer, u64),
++        frame: Frame,
++        hazard: HazardTrackingMode,
+     ) -> Result<RotatedCopies, Error> {
+         let Frame {
+             rotation,
+@@ -189,7 +200,6 @@ impl RotatedCopies {
+         let shapes = device.own_buffer(2 * SHAPE_SLOT, options)?;
+         let (tight_raw, tight_at) = tight.at(0);
+         let (shapes_raw, shapes_at) = shapes.at(0);
+-        let (staging_raw, staging_at) = (staging.raw(), staging.into.dst_offset);
+         let narrow = |v: u64| u32::try_from(v).map_err(|_| internal("a rotated frame past u32"));
+         let grid = |words: u64| -> Result<[u32; 2], Error> {
+             let local = u64::from(RotateTexelsModule::LOCAL_SIZE);
+@@ -363,4 +373,67 @@ impl RotatedCopies {
+             }
+         }
+     }
++
++    /// Record the `turn` between the caller's bound backing buffer (already populated on Load/Keep,
++    /// or consumed after Store) and `image`, without copying external surface bytes.
++    ///
++    /// # Safety
++    ///
++    /// `command_buffer` is recording, outside a render pass; the image, the backing buffer, and
++    /// the sets are live until it completes, and the image rests in `GENERAL`.
++    pub(super) unsafe fn record_with_backing(
++        &self,
++        device: &ash::Device,
++        command_buffer: vk::CommandBuffer,
++        image: vk::Image,
++        turn: Turn,
++    ) {
++        let into = turn != Turn::Store;
++        let (step, shape, set) = match turn {
++            Turn::Load => (&self.moves[0], &self.moves[0].shape, self.sets.sets[0]),
++            Turn::Keep => (&self.moves[0], &self.keep, self.sets.sets[0]),
++            Turn::Store => (&self.moves[1], &self.moves[1].shape, self.sets.sets[1]),
++        };
++        let general = vk::ImageLayout::GENERAL;
++        // SAFETY: the caller's contract; the copies lie in the buffers and the image, the shape's
++        // 52 bytes fit its slot, and the sets bind the texture's own buffers and backing buffer.
++        unsafe {
++            Barrier::everything().record(device, command_buffer);
++            if !into {
++                device.cmd_copy_image_to_buffer(
++                    command_buffer,
++                    image,
++                    general,
++                    self.tight_raw,
++                    &self.regions,
++                );
++            }
++            device.cmd_update_buffer(command_buffer, self.shapes_raw, step.at, shape);
++            Barrier::everything().record(device, command_buffer);
++            device.cmd_bind_pipeline(
++                command_buffer,
++                vk::PipelineBindPoint::COMPUTE,
++                self.kernel.pipeline,
++            );
++            device.cmd_bind_descriptor_sets(
++                command_buffer,
++                vk::PipelineBindPoint::COMPUTE,
++                self.kernel.layout,
++                0,
++                &[set],
++                &[],
++            );
++            device.cmd_dispatch(command_buffer, step.groups[0], step.groups[1], 1);
++            Barrier::everything().record(device, command_buffer);
++            if into {
++                device.cmd_copy_buffer_to_image(
++                    command_buffer,
++                    self.tight_raw,
++                    image,
++                    general,
++                    &self.regions,
++                );
++            }
++        }
++    }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index 5cafe7e..4cda776 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -340,6 +340,16 @@ pub(super) enum ShadowTarget {
+         /// The texture's format, which a refusal names.
+         pixel_format: PixelFormat,
+     },
++    /// A rotated two-plane extended-range texture's pass frame image (`RGB10A8_2P_XR10`,
++    /// `RGB10A8_2P_XR10_sRGB`): `planes` unpacks/packs plane 0 + plane 1 through `staging` into
++    /// its stored tight 8-byte-per-texel buffer, and `turn` rotates that buffer to/from `image`.
++    RotatedPlanes {
++        image: vk::Image,
++        staging: ShadowStaging,
++        planes: Box<HeapPlaneCopies>,
++        turn: Box<RotatedCopies>,
++        pixel_format: PixelFormat,
++    },
+     /// A heap texture's image over host pages: `staging` holds its elements as Metal tiles them
+     /// in the heap's bytes, and `tiles` moves them to and from the image
+     /// (`texture/heap_tiled.rs`).
+@@ -372,7 +382,10 @@ impl ShadowCopies {
+     /// Whether the shadow is a heap's two-plane texture's, whose truth is its two planes in the
+     /// heap's bytes ([`ShadowTarget::Planes`]).
+     pub(super) fn holds_planes(&self) -> bool {
+-        matches!(self.target(), Some(ShadowTarget::Planes { .. }))
++        matches!(
++            self.target(),
++            Some(ShadowTarget::Planes { .. } | ShadowTarget::RotatedPlanes { .. })
++        )
+     }
+ 
+     /// The truth's identity and the range of it the shadow copies.
+@@ -408,7 +421,11 @@ impl ShadowCopies {
+     /// Whether a render pass that draws loads this shadow other than by the inverse of its
+     /// store: a rotated texture's frame of rotation 4 (`rotated.rs`).
+     pub(super) fn loads_apart(&self) -> bool {
+-        matches!(self.target(), Some(ShadowTarget::Rotated { turn, .. }) if turn.loads_apart())
++        matches!(
++            self.target(),
++            Some(ShadowTarget::Rotated { turn, .. } | ShadowTarget::RotatedPlanes { turn, .. })
++                if turn.loads_apart()
++        )
+     }
+ 
+     /// Whether `used` touches the texture's truth: its bytes, or its image's levels and layers.
+@@ -429,7 +446,9 @@ impl ShadowCopies {
+             } => Some(Error::NotImplemented(RuntimeGap::RotatedTexture)),
+             // Its texels lie in two planes of its bytes, which no merge reaches.
+             ShadowSource::Bytes {
+-                target: ShadowTarget::Planes { pixel_format, .. },
++                target:
++                    ShadowTarget::Planes { pixel_format, .. }
++                    | ShadowTarget::RotatedPlanes { pixel_format, .. },
+                 ..
+             } => Some(Error::Unsupported(
+                 Unsupported::not_implemented(Feature::Format).naming_format(*pixel_format),
+@@ -476,6 +495,7 @@ impl ShadowCopies {
+             | ShadowTarget::Buffer(staging)
+             | ShadowTarget::Rotated { staging, .. }
+             | ShadowTarget::Planes { staging, .. }
++            | ShadowTarget::RotatedPlanes { staging, .. }
+             | ShadowTarget::Tiled { staging, .. } => Some(staging.into.src_offset),
+             // Slice 0's region starts at the first texel.
+             ShadowTarget::Image { regions, .. } => {
+@@ -506,7 +526,9 @@ impl ShadowCopies {
+             return;
+         };
+         match target {
+-            ShadowTarget::Rotated { .. } | ShadowTarget::Planes { .. } => {}
++            ShadowTarget::Rotated { .. }
++            | ShadowTarget::Planes { .. }
++            | ShadowTarget::RotatedPlanes { .. } => {}
+             ShadowTarget::Tiled {
+                 image,
+                 staging,
+@@ -615,7 +637,11 @@ impl ShadowCopy {
+         let rotated = tiled
+             || matches!(
+                 self.copies.target(),
+-                Some(ShadowTarget::Rotated { .. } | ShadowTarget::Planes { .. })
++                Some(
++                    ShadowTarget::Rotated { .. }
++                        | ShadowTarget::Planes { .. }
++                        | ShadowTarget::RotatedPlanes { .. }
++                )
+             );
+         let converted = matches!(self.copies.source, ShadowSource::Converted { .. });
+         let encoded = matches!(self.copies.source, ShadowSource::YCbCrWrite { .. });
+@@ -850,6 +876,41 @@ impl ShadowCopy {
+                 }
+                 return;
+             }
++            ShadowTarget::RotatedPlanes {
++                image,
++                staging,
++                planes,
++                turn,
++                ..
++            } => {
++                let turned = match (into_shadow, self.kept) {
++                    (true, false) => Turn::Load,
++                    (true, true) => Turn::Keep,
++                    (false, _) => Turn::Store,
++                };
++                // SAFETY: the caller's contract; `planes` and `turn` share `planes.tight_backing()`
++                // and both record full barriers around their dispatches.
++                unsafe {
++                    if into_shadow {
++                        planes.record_staging_only(
++                            device,
++                            command_buffer,
++                            (buffer, staging),
++                            true,
++                        );
++                        turn.record_with_backing(device, command_buffer, *image, turned);
++                    } else {
++                        turn.record_with_backing(device, command_buffer, *image, Turn::Store);
++                        planes.record_staging_only(
++                            device,
++                            command_buffer,
++                            (buffer, staging),
++                            false,
++                        );
++                    }
++                }
++                return;
++            }
+             ShadowTarget::Tiled {
+                 image,
+                 staging,
+diff --git a/crates/metal2vulkan-runtime/src/tests/surface_two_planes.rs b/crates/metal2vulkan-runtime/src/tests/surface_two_planes.rs
+index 811c963..e39bdbe 100644
+--- a/crates/metal2vulkan-runtime/src/tests/surface_two_planes.rs
++++ b/crates/metal2vulkan-runtime/src/tests/surface_two_planes.rs
+@@ -146,3 +146,26 @@ fn a_surface_two_plane_texture_takes_plane_1_from_the_surface_s_facts() {
+         }
+     }
+ }
++
++/// Real iOS 16.7.16 landscape MobileNotes `'b3a8'` surfaces (699x1125 stored in 1125x699, and
++/// 147x1125 stored in 1125x147) satisfy `surface_layout` once `stored_extent` un-rotates them.
++#[test]
++fn rotated_b3a8_surface_layout_matches_ios_landscape_notes() {
++    use crate::rotated::stored_extent;
++    let cases: [([u32; 2], u64, [u64; 2], u64); 2] = [
++        ([699, 1125], 4608, [3_227_648, 1152], 4_128_768),
++        ([147, 1125], 4608, [688_128, 1152], 884_736),
++    ];
++    for rotation in [1u8, 3u8, 4u8] {
++        for (logical, color_pitch, alpha, alloc_size) in cases {
++            let [sw, sh] = stored_extent(rotation, logical);
++            assert_eq!([sw, sh], [logical[1], logical[0]]);
++            let plane0 = color(0, color_pitch, [u64::from(sw), u64::from(sh)]);
++            let (layout, plane1) = surface_layout(&plane0, alpha, alloc_size)
++                .unwrap_or_else(|why| panic!("rot={rotation} {logical:?}: {why}"));
++            assert_eq!((layout.width, layout.height), (u64::from(sw), u64::from(sh)));
++            assert!(layout.span() <= alloc_size);
++            assert_eq!(plane1.rows, u64::from(sh));
++        }
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/texture/heap_two_planes.rs b/crates/metal2vulkan-runtime/src/texture/heap_two_planes.rs
+index f7cb373..f65cd57 100644
+--- a/crates/metal2vulkan-runtime/src/texture/heap_two_planes.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap_two_planes.rs
+@@ -346,4 +346,59 @@ impl HeapPlaneCopies {
+             }
+         }
+     }
++
++    /// The unpacked 8-byte-per-texel tight buffer `(VkBuffer, offset)` holding the stored frame's
++    /// `(color_word, alpha_byte)` pairs, used as the backing buffer for rotated two-plane copies.
++    pub(crate) fn tight_backing(&self) -> (vk::Buffer, u64) {
++        (self.tight_raw, self.regions[0].buffer_offset)
++    }
++
++    /// Record only the surface-bytes <-> unpacked tight-buffer half of a two-plane copy, leaving
++    /// the tight buffer populated for a chained rotation pass (`into`) or consuming it back into
++    /// the two surface planes (`!into`).
++    ///
++    /// # Safety
++    ///
++    /// `command_buffer` is recording, outside a render pass; the buffers and sets are live until
++    /// it completes.
++    pub(crate) unsafe fn record_staging_only(
++        &self,
++        device: &ash::Device,
++        command_buffer: vk::CommandBuffer,
++        (bytes, staging): (vk::Buffer, &ShadowStaging),
++        into: bool,
++    ) {
++        let (step, set) = match into {
++            true => (&self.moves[0], self.sets.sets[0]),
++            false => (&self.moves[1], self.sets.sets[1]),
++        };
++        // SAFETY: the caller's contract; the copies lie in the buffers (planned when the texture
++        // was made), the shape's 52 bytes fit its slot, and the sets bind the texture's own buffers.
++        unsafe {
++            Barrier::everything().record(device, command_buffer);
++            if into {
++                device.cmd_copy_buffer(command_buffer, bytes, staging.raw(), &[staging.into]);
++            }
++            device.cmd_update_buffer(command_buffer, self.shapes_raw, step.at, &step.shape);
++            Barrier::everything().record(device, command_buffer);
++            device.cmd_bind_pipeline(
++                command_buffer,
++                vk::PipelineBindPoint::COMPUTE,
++                self.kernel.pipeline,
++            );
++            device.cmd_bind_descriptor_sets(
++                command_buffer,
++                vk::PipelineBindPoint::COMPUTE,
++                self.kernel.layout,
++                0,
++                &[set],
++                &[],
++            );
++            device.cmd_dispatch(command_buffer, step.groups[0], step.groups[1], 1);
++            Barrier::everything().record(device, command_buffer);
++            if !into {
++                device.cmd_copy_buffer(command_buffer, staging.raw(), bytes, &staging.back);
++            }
++        }
++    }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/texture/rotation.rs b/crates/metal2vulkan-runtime/src/texture/rotation.rs
+index bf8f0c7..780a323 100644
+--- a/crates/metal2vulkan-runtime/src/texture/rotation.rs
++++ b/crates/metal2vulkan-runtime/src/texture/rotation.rs
+@@ -143,8 +143,19 @@ impl Texture {
+             let layout = descriptor
+                 .check(device.properties().texture_rules())
+                 .map_err(|refused| refused.error(CALL))?;
+-            let turned = Arc::new(texels.turned(rotation, [width, height]));
+-            let storage = device.rotated_storage(CALL, turned, &descriptor, &layout, rotation)?;
++            let turned = texels.turned(rotation, [width, height]);
++            let storage = if let Some(alpha) = texels.alpha() {
++                device.rotated_surface_planes_storage(
++                    CALL,
++                    turned,
++                    alpha,
++                    &descriptor,
++                    &layout,
++                    rotation,
++                )?
++            } else {
++                device.rotated_storage(CALL, Arc::new(turned), &descriptor, &layout, rotation)?
++            };
+             let record = ViewRecord::of_descriptor(&layout, &descriptor);
+             Ok(Texture::made(device, storage, record, None, IdUse::Runtime))
+         })
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
+index 3042919..f6f5c05 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
+@@ -59,6 +59,7 @@ use crate::error::{Error, RuntimeGap};
+ use crate::image_plan::plan_image;
+ use crate::linear_plan::{BufferLayout, LINEAR_ALIGNMENT};
+ use crate::resource::Identity;
++use crate::rotated::{self, Frame, RotatedCopies};
+ use crate::shadow::{ShadowBuffer, ShadowCopies, ShadowSource, ShadowTarget};
+ use crate::texture_descriptor::{texture_usage, TextureDescriptor, TextureLayout};
+ use crate::tracker::UseRange;
+@@ -263,4 +264,215 @@ impl Device {
+         let record = ViewRecord::of_descriptor(layout, descriptor);
+         Ok(Texture::made(self, storage, record, None, id_use))
+     }
++
++    /// A rotated two-plane extended-range texture (`RGB10A8_2P_XR10`, `RGB10A8_2P_XR10_sRGB`)
++    /// over plane 0 and plane 1 of a `'b3a8'` IOSurface: its functions see an unturned
++    /// `R32G32_UINT` image of the stored frame (drops writes, like `rotated_frame`), while its
++    /// render-pass twin (`pass_texture` -> `rotated_surface_planes_storage`) renders into the
++    /// logical frame and turns both planes into the surface on store.
++    pub(crate) fn new_rotated_surface_planes_texture(
++        &self,
++        call: &'static str,
++        [rows, stored]: [Texels; 2],
++        descriptor: &TextureDescriptor,
++        (layout, rotation): (&TextureLayout, u8),
++        id_use: IdUse,
++        alpha: [u64; 2],
++    ) -> Result<Texture, Error> {
++        let pf = layout.pixel_format;
++        let color = stored.layout;
++        let cpu = stored.cpu_layout();
++        if cpu.rows > 1 && cpu.row_pitch < LINEAR_ALIGNMENT {
++            return Err(refused(
++                pf,
++                format!("with plane 0's rows {} bytes apart", cpu.row_pitch),
++            ));
++        }
++        let (planes, alpha_layout) = surface_layout(&color, alpha, stored.buffer.length())
++            .map_err(|what| refused(pf, what))?;
++        if !HeapPlaneCopies::fit(self, &planes) {
++            return Err(refused(
++                pf,
++                format!(
++                    "of {} bytes, past the device's storage buffer range",
++                    planes.span()
++                ),
++            ));
++        }
++        let [width, height, depth] = layout.extent;
++        let [stored_width, stored_height] = rotated::stored_extent(rotation, [width, height]);
++        let frame = TextureLayout {
++            extent: [stored_width, stored_height, depth],
++            ..*layout
++        };
++        let facts = self
++            .shared()
++            .textures
++            .facts(self.compile_device().profile());
++        let usage = texture_usage(descriptor.usage, descriptor.swizzle);
++        let plan = plan_image(&frame, usage, false, &facts)
++            .map_err(|refusal| image_error(call, refusal))?;
++        let plan = self.with_undeclared_usage(plan, &frame, usage, false, &facts)?;
++        let copies = ImageUsageFlags::TRANSFER_SRC | ImageUsageFlags::TRANSFER_DST;
++        if !plan.usage.contains(copies) || plan.samples != SampleCountFlags::COUNT_1 {
++            return Err(Error::NotImplemented(RuntimeGap::RotatedTexture));
++        }
++        let hazard = rows.options().hazard_tracking_mode()?;
++        let identity = Identity::new(hazard, false);
++        let image =
++            self.new_image_as_it_lies(plan, &frame, descriptor, identity, Device::runtime_owner)?;
++        let (raw, start) = stored.buffer.at(color.offset);
++        let staging = HeapPlaneCopies::staging(self, &planes, start, hazard)?;
++        let moves = Box::new(HeapPlaneCopies::new(self, &staging, &planes, hazard)?);
++        let (bytes, tracked) = stored
++            .buffer
++            .tracked(color.offset..color.offset + planes.span());
++        let copies = ShadowCopies {
++            source: ShadowSource::Bytes {
++                buffer: ShadowBuffer::of(&stored.buffer, raw),
++                key: bytes.key,
++                bytes: tracked,
++                target: ShadowTarget::Planes {
++                    image: image.raw.get(),
++                    staging,
++                    planes: moves,
++                    pixel_format: pf,
++                },
++                alias: stored.buffer.alias().map(|alias| alias.key),
++            },
++            shadow_key: image.identity.key,
++            shadow_range: UseRange::Image {
++                aspects: vk::ImageAspectFlags::COLOR,
++                levels: 0..1,
++                layers: 0..1,
++            },
++            tracked: rows.tracked(),
++            drops_writes: true,
++        };
++        self.degrade(Degradation::ShadowedTexture, || {
++            let object = format!(
++                "a {width}x{height} {} texture of rotation {rotation} over a surface's two planes",
++                pf.name()
++            );
++            let why = format!(
++                "its functions read an image of the surface's {stored_width}x{stored_height} \
++                 stored two-plane frame, whose writes are dropped as Metal drops them"
++            );
++            (object, why)
++        });
++        let storage = Storage::Shadow {
++            image: image.shared(),
++            texels: Arc::new(rows.with_alpha(alpha_layout)),
++            copies: Arc::new(copies),
++        };
++        let record = ViewRecord::of_descriptor(layout, descriptor);
++        Ok(Texture::made(self, storage, record, None, id_use))
++    }
++
++    /// The pass-twin storage of a rotated two-plane extended-range texture: an `R32G32_UINT`
++    /// image of the logical pass frame (`layout`), backed by chained two-plane unpack/pack +
++    /// 8-byte-per-texel rotation (`ShadowTarget::RotatedPlanes`).
++    pub(super) fn rotated_surface_planes_storage(
++        &self,
++        call: &'static str,
++        turned: Texels,
++        alpha_layout: &BufferLayout,
++        descriptor: &TextureDescriptor,
++        layout: &TextureLayout,
++        rotation: u8,
++    ) -> Result<Storage, Error> {
++        let pf = layout.pixel_format;
++        let color = turned.layout;
++        let alpha = [alpha_layout.offset, alpha_layout.row_pitch];
++        let (planes_layout, alpha_checked) =
++            surface_layout(&color, alpha, turned.buffer.length())
++                .map_err(|what| refused(pf, what))?;
++        if !HeapPlaneCopies::fit(self, &planes_layout) {
++            return Err(refused(
++                pf,
++                format!(
++                    "of {} bytes, past the device's storage buffer range",
++                    planes_layout.span()
++                ),
++            ));
++        }
++        let facts = self
++            .shared()
++            .textures
++            .facts(self.compile_device().profile());
++        let usage = texture_usage(descriptor.usage, descriptor.swizzle);
++        let plan = plan_image(layout, usage, false, &facts)
++            .map_err(|refusal| image_error(call, refusal))?;
++        let plan = self.with_undeclared_usage(plan, layout, usage, false, &facts)?;
++        let copies = ImageUsageFlags::TRANSFER_SRC | ImageUsageFlags::TRANSFER_DST;
++        if !plan.usage.contains(copies) || plan.samples != SampleCountFlags::COUNT_1 {
++            return Err(Error::NotImplemented(RuntimeGap::RotatedTexture));
++        }
++        let hazard = turned.options().hazard_tracking_mode()?;
++        let identity = Identity::new(hazard, false);
++        let image =
++            self.new_image_as_it_lies(plan, layout, descriptor, identity, Device::runtime_owner)?;
++        let (raw, start) = turned.buffer.at(color.offset);
++        let staging = HeapPlaneCopies::staging(self, &planes_layout, start, hazard)?;
++        let planes = Box::new(HeapPlaneCopies::new(self, &staging, &planes_layout, hazard)?);
++        let [width, height, _] = layout.extent;
++        let stored_row_pitch = 8u64 * planes_layout.width;
++        let stored_span = stored_row_pitch * planes_layout.height;
++        let turn = Box::new(RotatedCopies::new_with_backing(
++            self,
++            planes.tight_backing(),
++            Frame {
++                rotation,
++                extent: [width, height],
++                texel_bytes: 8,
++                row_pitch: stored_row_pitch,
++                span: stored_span,
++            },
++            hazard,
++        )?);
++        let (bytes, tracked) = turned
++            .buffer
++            .tracked(color.offset..color.offset + planes_layout.span());
++        let copies = ShadowCopies {
++            source: ShadowSource::Bytes {
++                buffer: ShadowBuffer::of(&turned.buffer, raw),
++                key: bytes.key,
++                bytes: tracked,
++                target: ShadowTarget::RotatedPlanes {
++                    image: image.raw.get(),
++                    staging,
++                    planes,
++                    turn,
++                    pixel_format: pf,
++                },
++                alias: turned.buffer.alias().map(|alias| alias.key),
++            },
++            shadow_key: image.identity.key,
++            shadow_range: UseRange::Image {
++                aspects: vk::ImageAspectFlags::COLOR,
++                levels: 0..1,
++                layers: 0..1,
++            },
++            tracked: turned.tracked(),
++            drops_writes: false,
++        };
++        self.degrade(Degradation::ShadowedTexture, || {
++            let [stored_width, stored_height] = rotated::stored_extent(rotation, [width, height]);
++            let object = format!(
++                "a {width}x{height} {} texture of rotation {rotation} over a surface's two planes",
++                pf.name()
++            );
++            let why = format!(
++                "it renders through an image of its pass's frame, whose texels are turned into \
++                 the surface's {stored_width}x{stored_height} two-plane rows after each pass that \
++                 stores it and back before each that uses it"
++            );
++            (object, why)
++        });
++        Ok(Storage::Shadow {
++            image: image.shared(),
++            texels: Arc::new(turned.with_alpha(alpha_checked)),
++            copies: Arc::new(copies),
++        })
++    }
+ }
