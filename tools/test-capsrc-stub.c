@@ -71,6 +71,36 @@ main(void)
 		combined_bits |= fuxi_capsrc_services[idx].bit;
 	}
 	assert(combined_bits == FX_CAPSRC_MASK_ALL);
+	assert(FX_CAPSRC_MASK_CAMERA_OWNED ==
+	    (FX_CAPSRC_BIT_SOURCE | FX_CAPSRC_BIT_SESSION | FX_CAPSRC_BIT_DEFERRED | FX_CAPSRC_BIT_FLASHLIGHT));
+
+	/* Camera coexistence: yield camera-owned CoreMedia XPC services iff fuxi,camera!=0 && fuxi,camera-dylib!=0 */
+	assert(!fuxi_capsrc_camera_owns_servers(0u, 0u));
+	assert(!fuxi_capsrc_camera_owns_servers(7u, 0u));
+	assert(!fuxi_capsrc_camera_owns_servers(8u, 0u));
+	assert(!fuxi_capsrc_camera_owns_servers(0u, 1u));
+	assert(fuxi_capsrc_camera_owns_servers(1u, 1u));
+	assert(fuxi_capsrc_camera_owns_servers(7u, 1u));
+	assert(fuxi_capsrc_camera_owns_servers(8u, 2u));
+
+	uint32_t yielded = 99u;
+	for (uint32_t raw = 1u; raw <= FX_CAPSRC_MASK_ALL; raw++) {
+		/* fuxi,camera==0 or fuxi,camera-dylib==0: 100% unchanged legacy stub behavior */
+		assert(fuxi_capsrc_resolve_mask(raw, 0u, 0u, &yielded) == raw && yielded == 0u);
+		assert(fuxi_capsrc_resolve_mask(raw, 7u, 0u, &yielded) == raw && yielded == 0u);
+		assert(fuxi_capsrc_resolve_mask(raw, 0u, 1u, &yielded) == raw && yielded == 0u);
+
+		/* fuxi,camera!=0 && fuxi,camera-dylib!=0: yield all 4 camera-owned services */
+		assert(fuxi_capsrc_resolve_mask(raw, 7u, 1u, &yielded) == 0u && yielded == raw);
+		assert(fuxi_capsrc_resolve_mask(raw, 8u, 1u, &yielded) == 0u && yielded == raw);
+	}
+	/* Edge cases: NULL out pointer, zero request, out-of-range high bits */
+	assert(fuxi_capsrc_resolve_mask(FX_CAPSRC_MASK_DEFAULT, 7u, 1u, NULL) == 0u);
+	assert(fuxi_capsrc_resolve_mask(FX_CAPSRC_MASK_DEFAULT, 0u, 0u, NULL) == FX_CAPSRC_MASK_DEFAULT);
+	assert(fuxi_capsrc_resolve_mask(0u, 7u, 1u, &yielded) == 0u && yielded == 0u);
+	assert(fuxi_capsrc_resolve_mask(0u, 0u, 0u, &yielded) == 0u && yielded == 0u);
+	assert(fuxi_capsrc_resolve_mask(0xffffffffu, 0u, 0u, &yielded) == FX_CAPSRC_MASK_ALL && yielded == 0u);
+	assert(fuxi_capsrc_resolve_mask(0xffffffffu, 7u, 1u, &yielded) == 0u && yielded == FX_CAPSRC_MASK_ALL);
 
 	/* Opcode classification */
 	assert(fuxi_capsrc_classify_op(FX_CAPSRC_BIT_SOURCE, FX_CAPSRC_OP_CSRC) == FX_CAPSRC_ACT_EMPTY_ARRAY);
@@ -113,6 +143,6 @@ main(void)
 	assert(simulate_dispatch(FX_CAPSRC_BIT_SESSION, 0x63736573u, &env, true) == FX_CAPSRC_ERR_UNSUPPORTED);
 	assert(!env.array_set && !env.u64_set);
 
-	puts("PASS: FuxiCaptureStubLogic ADT decode, service table, opcode dispatch, and fourcc format");
+	puts("PASS: FuxiCaptureStubLogic ADT decode, camera yield, service table, opcode dispatch, and fourcc format");
 	return 0;
 }

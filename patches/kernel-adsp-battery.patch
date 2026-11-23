@@ -22048,10 +22048,10 @@ index 0000000..295f9f5
 +    main()
 diff --git a/tools/test-fuxi-live-audio-haptics.py b/tools/test-fuxi-live-audio-haptics.py
 new file mode 100644
-index 0000000..07a9102
+index 0000000..322196b
 --- /dev/null
 +++ b/tools/test-fuxi-live-audio-haptics.py
-@@ -0,0 +1,1778 @@
+@@ -0,0 +1,2091 @@
 +#!/usr/bin/env python3
 +"""0124 fuxi-live-audio-haptics 主機測試（ASan/UBSan）。
 +
@@ -23460,6 +23460,314 @@ index 0000000..07a9102
 +    }
 +}
 +
++typedef struct {
++    double x175, y175, xpk175;
++    double x170, y170, xpk170;
++} TestLraPlant;
++
++static void test_lra_step(TestLraPlant *p, int8_t u) {
++    const double dt = 1.0 / 24000.0;
++    const double z0 = 0.033;
++    const double w175 = 2.0 * 3.14159265358979323846 * 175.13;
++    const double w170 = 2.0 * 3.14159265358979323846 * 170.6;
++    double a1 = (double)u - p->x175 - 2.0 * z0 * p->y175;
++    p->y175 += w175 * dt * a1;
++    p->x175 += w175 * dt * p->y175;
++    if (fabs(p->x175) > p->xpk175) p->xpk175 = fabs(p->x175);
++    double a2 = (double)u - p->x170 - 2.0 * z0 * p->y170;
++    p->y170 += w170 * dt * a2;
++    p->x170 += w170 * dt * p->y170;
++    if (fabs(p->x170) > p->xpk170) p->xpk170 = fabs(p->x170);
++}
++
++static void test_lra_consume_fifo_log(MockRtp *m, TestLraPlant *p) {
++    for (unsigned i = 0; i < m->fifo_log_n; i++) {
++        test_lra_step(p, (int8_t)m->fifo_log[i]);
++    }
++    m->fifo_log_n = 0;
++}
++
++static void test_reset_stream_burst_stats(FuxiHapticStream *st) {
++    st->burst_chunks = st->burst_bytes = st->burst_peak = 0;
++    st->burst_raw_peak = st->burst_drive_peak = st->burst_out_peak = st->burst_zc = 0;
++    st->burst_tail_bytes = st->burst_tails = st->burst_refills = st->burst_underruns = 0;
++    st->burst_profile = st->burst_repeat_level = st->burst_gap_ms = st->burst_absorbed = 0;
++    st->burst_clips = st->burst_max_step = 0;
++    st->burst_has_prev = 0;
++    st->burst_prev_sample = 0;
++}
++
++static void test_make_rampsine_pcm8(uint8_t *buf, unsigned n24, double freq, double att_ms, double rel_ms, double pk8) {
++    unsigned att = (unsigned)lrint(att_ms * 24.0);
++    unsigned rel = (unsigned)lrint(rel_ms * 24.0);
++    for (unsigned i = 0; i < n24; i++) {
++        double env = 1.0;
++        if (att && i < att) env = (double)i / (double)att;
++        if (rel && i >= n24 - rel) {
++            double r = (double)(n24 - i) / (double)rel;
++            if (r < env) env = r;
++        }
++        int s = (int)lrint(pk8 * env * sin(2.0 * 3.14159265358979323846 * freq * (double)i / 24000.0));
++        if (s > 126) s = 126;
++        if (s < -126) s = -126;
++        buf[i] = (uint8_t)(int8_t)s;
++    }
++}
++
++static void test_push_pcm8_burst(const FuxiHapticIo *io, MockRtp *m, FuxiHapticStream *st,
++                                 TestLraPlant *pl, const uint8_t *pcm, unsigned n24,
++                                 unsigned first_len, uint64_t *t_ns, int drain_to_stop,
++                                 unsigned *autores) {
++    if (!st->playing) test_reset_stream_burst_stats(st);
++    unsigned pos = 0, ci = 0;
++    while (pos < n24) {
++        unsigned clen = (ci == 0) ? first_len : 128u;
++        if (pos + clen > n24) clen = n24 - pos;
++        uint8_t ck[376] = {0};
++        unsigned pk = 0;
++        for (unsigned i = 0; i < clen; i++) {
++            ck[i] = pcm[pos + i];
++            int v = (int)(int8_t)ck[i];
++            unsigned mag = (unsigned)(v < 0 ? -v : v);
++            if (mag > pk) pk = mag;
++        }
++        unsigned pad = (clen + 3u) & ~3u;
++        if (ci > 0) {
++            *t_ns += 5333333ull;
++            m->fifo_fill = m->fifo_fill > 128u ? (m->fifo_fill - 128u) : 16u;
++        }
++        assert(fuxi_stream_push(io, mock_rtp_write, mock_rtp_status, st, ck, pad, 0xa3, pk, *t_ns, autores) == 0);
++        test_lra_consume_fifo_log(m, pl);
++        pos += clen;
++        ci++;
++    }
++    m->fifo_fill = 44u;
++    *t_ns += MS(8);
++    assert(fuxi_stream_poll_drain(io, mock_rtp_write, mock_rtp_status, st, *t_ns) >= 1);
++    test_lra_consume_fifo_log(m, pl);
++    if (drain_to_stop) {
++        m->fifo_fill = 0u;
++        *t_ns += MS(8);
++        assert(fuxi_stream_poll_drain(io, mock_rtp_write, mock_rtp_status, st, *t_ns) == 0);
++        assert(!st->playing);
++    }
++}
++
++/* Mode 9 v2.2 回歸：消除交響樂／斷音起震共振撞底與連發強拍爆震，同時嚴格保留既有單發／雙擊 UI 手感。 */
++static void test_haptic_mode9_symphony_staccato_and_repeat(void) {
++    MockRtp m = {0};
++    m.regs[0x046] = 0x80; m.regs[0x048] = 0x1c; m.regs[0x04c] = FUXI_VIBRATE_IDLE;
++    m.regs[0x063] = 0x89; m.regs[0x072] = 0x04; m.regs[0x1a0] = 0x0f; m.regs[0x241] = 0xe0;
++    g_mock_rtp = &m;
++    FuxiHapticIo io = {&m, mock_owner, mock_read, mock_write_reg, mock_wait_us, 0};
++    unsigned autores = 0;
++
++    /* 基礎測試波形：LP 短強拍 (MiniTap200Hz raw_pk=120)、ResCalibration (145Hz 13ms raw_pk=120)、
++     * 上滑後台 (raw_pk=75)、設定開關 UNI (raw_pk=96)、鍵盤 (raw_pk=57) */
++    uint8_t tap_lp[236] = {0}, res_cal[320] = {0}, ui_sw[316] = {0}, kbd[208] = {0}, app_sw[528] = {0};
++    for (unsigned i = 0; i < 208; i++) {
++        double env = 0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / 208.0);
++        tap_lp[i] = (uint8_t)(int8_t)(int)lrint(120.0 * env * sin(2.0 * 3.14159265358979323846 * 200.0 * i / 24000.0));
++    }
++    for (unsigned i = 0; i < 280; i++) {
++        double env = 0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / 280.0);
++        res_cal[i] = (uint8_t)(int8_t)(int)lrint(120.0 * env * sin(2.0 * 3.14159265358979323846 * 145.0 * i / 24000.0));
++    }
++    for (unsigned i = 0; i < 232; i++) {
++        double env = 0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / 232.0);
++        ui_sw[i] = (uint8_t)(int8_t)(int)lrint(96.0 * env);
++    }
++    for (unsigned i = 0; i < 180; i++) {
++        double env = 0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / 180.0);
++        kbd[i] = (uint8_t)(int8_t)(int)lrint(57.0 * env * sin(2.0 * 3.14159265358979323846 * 220.0 * i / 24000.0));
++    }
++    for (unsigned i = 0; i < 528; i++) {
++        double env = 0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / 528.0);
++        app_sw[i] = (uint8_t)(int8_t)(int)lrint(75.0 * env * sin(2.0 * 3.14159265358979323846 * 80.0 * i / 24000.0));
++    }
++
++    /* 1) 高頻連發短脈衝（6x raw_pk=120 @ 82ms，斷音短拍／Radar 連擊）：
++     *    首發全幅，第 2 發降 rep=2 (<=72)，第 3..6 發收斂至 rep=3 (<=56, x_pk<=160)，靜置 >1s 恢復全幅。 */
++    {
++        FuxiHapticStream st = {0};
++        fuxi_damp_init(&st.damp, 0x0009u, 5710);
++        uint64_t t_ns = MS(1000);
++        for (unsigned k = 0; k < 6; k++) {
++            if (k > 0) t_ns += MS(82);
++            TestLraPlant pl = {0};
++            test_push_pcm8_burst(&io, &m, &st, &pl, tap_lp, sizeof(tap_lp), sizeof(tap_lp), &t_ns, 1, &autores);
++            assert(st.burst_profile == FUXI_DAMP_M9_PROF_LP && st.burst_clips == 0 && st.burst_underruns == 0);
++            if (k == 0) {
++                assert(st.burst_repeat_level == 0 && st.burst_drive_peak >= 118u);
++            } else if (k == 1) {
++                assert(st.burst_repeat_level == 2 && st.burst_drive_peak <= (unsigned)FUXI_DAMP_M9_LP_REP2_LIMIT);
++                assert(pl.xpk175 <= 185.0 && pl.xpk170 <= 185.0);
++            } else {
++                assert(st.burst_repeat_level == 3 && st.burst_drive_peak <= (unsigned)FUXI_DAMP_M9_LP_REP3_LIMIT);
++                assert(st.burst_max_step <= 12u && pl.xpk175 <= 160.0 && pl.xpk170 <= 160.0);
++            }
++        }
++        /* 靜置 1100 ms 後再單次長按：連發記憶自動清零，恢復單發滿幅手感 */
++        t_ns += MS(1100);
++        TestLraPlant pl_rec = {0};
++        test_push_pcm8_burst(&io, &m, &st, &pl_rec, tap_lp, sizeof(tap_lp), sizeof(tap_lp), &t_ns, 1, &autores);
++        assert(st.burst_profile == FUXI_DAMP_M9_PROF_LP && st.burst_repeat_level == 0 && st.burst_drive_peak >= 118u);
++        assert(fuxi_stream_close(&io, mock_rtp_write, &st) == 0);
++    }
++
++    /* 2) 「交響樂 (Beethoven - Symphony No. 5)」完整序列：
++     *    3x RampSineORBrake(100ms, 145Hz, 20ms attack, pk8=102, m=2=256B, gap=100ms)
++     *    + ResCalibration(13ms, pk8=120, gap=80ms) + RampSineORBrake(400ms, gap=20ms)。 */
++    {
++        static uint8_t note100[2400], note400[9600];
++        test_make_rampsine_pcm8(note100, sizeof(note100), 145.0, 20.0, 20.0, 102.0);
++        test_make_rampsine_pcm8(note400, sizeof(note400), 145.0, 20.0, 20.0, 102.0);
++        FuxiHapticStream st = {0};
++        fuxi_damp_init(&st.damp, 0x0009u, 5710);
++        TestLraPlant pl = {0};
++        uint64_t t_ns = MS(2000);
++        const unsigned gaps[5] = {0, 100, 100, 80, 20};
++        for (unsigned k = 0; k < 5; k++) {
++            t_ns += MS(gaps[k]);
++            pl.xpk175 = pl.xpk170 = 0.0;
++            if (k < 3) {
++                test_push_pcm8_burst(&io, &m, &st, &pl, note100, sizeof(note100), 256u, &t_ns, 1, &autores);
++                assert(st.burst_profile == FUXI_DAMP_M9_PROF_SUS && st.burst_clips == 0 && st.burst_underruns == 0);
++                assert(st.burst_max_step <= 10u && pl.xpk175 <= 190.0 && pl.xpk170 <= 190.0);
++                if (k >= 1) {
++                    assert(st.burst_repeat_level == 3 && st.burst_drive_peak <= (unsigned)FUXI_DAMP_M9_SUS_LIMIT);
++                }
++            } else if (k == 3) {
++                test_push_pcm8_burst(&io, &m, &st, &pl, res_cal, sizeof(res_cal), sizeof(res_cal), &t_ns, 1, &autores);
++                assert(st.burst_profile == FUXI_DAMP_M9_PROF_LP && st.burst_repeat_level == 3);
++                assert(st.burst_drive_peak <= (unsigned)FUXI_DAMP_M9_LP_REP3_LIMIT && st.burst_clips == 0);
++                assert(pl.xpk175 <= 165.0 && pl.xpk170 <= 165.0);
++            } else {
++                test_push_pcm8_burst(&io, &m, &st, &pl, note400, sizeof(note400), 256u, &t_ns, 1, &autores);
++                assert(st.burst_profile == FUXI_DAMP_M9_PROF_SUS && st.burst_repeat_level == 3);
++                assert(st.burst_drive_peak <= (unsigned)FUXI_DAMP_M9_SUS_LIMIT && st.burst_clips == 0);
++                assert(st.burst_underruns == 0 && st.burst_max_step <= 10u && pl.xpk175 <= 165.0 && pl.xpk170 <= 165.0);
++            }
++            for (unsigned z = 0; z < 480; z++) test_lra_step(&pl, 0);
++        }
++        assert(fuxi_stream_close(&io, mock_rtp_write, &st) == 0);
++    }
++
++    /* 3) 「斷音 (Staccato)」完整序列 + 背靠背未排空尾段切換：
++     *    Stac1(200ms, pk8=118) -> ResCal1(@55ms, 留 tail 未排空) -> 背靠背 Stac2(400ms, @15ms) -> Loop1(200ms, @75ms)。 */
++    {
++        static uint8_t stac200[4800], stac400[9600];
++        test_make_rampsine_pcm8(stac200, sizeof(stac200), 145.0, 20.0, 20.0, 118.0);
++        test_make_rampsine_pcm8(stac400, sizeof(stac400), 145.0, 20.0, 20.0, 118.0);
++        FuxiHapticStream st = {0};
++        fuxi_damp_init(&st.damp, 0x0009u, 5710);
++        TestLraPlant pl = {0};
++        uint64_t t_ns = MS(5000);
++        /* Stac1 */
++        test_push_pcm8_burst(&io, &m, &st, &pl, stac200, sizeof(stac200), 256u, &t_ns, 1, &autores);
++        assert(st.burst_profile == FUXI_DAMP_M9_PROF_SUS && st.burst_clips == 0 && st.burst_underruns == 0);
++        assert(st.burst_max_step <= 10u && pl.xpk175 <= 195.0 && pl.xpk170 <= 195.0);
++        /* ResCal1 (不排空至 0，驗證 tail_emitted==1 背靠背接 Stac2！) */
++        t_ns += MS(55);
++        pl.xpk175 = pl.xpk170 = 0.0;
++        test_push_pcm8_burst(&io, &m, &st, &pl, res_cal, sizeof(res_cal), sizeof(res_cal), &t_ns, 0, &autores);
++        assert(st.playing && st.tail_emitted && st.burst_profile == FUXI_DAMP_M9_PROF_LP && st.burst_repeat_level == 3);
++        assert(st.burst_drive_peak <= (unsigned)FUXI_DAMP_M9_LP_REP3_LIMIT && pl.xpk175 <= 165.0);
++        /* 背靠背 Stac2（ResCal1 尾段尚未排空即到達） */
++        m.fifo_fill = 32u;
++        t_ns += MS(15);
++        pl.xpk175 = pl.xpk170 = 0.0;
++        test_push_pcm8_burst(&io, &m, &st, &pl, stac400, sizeof(stac400), 256u, &t_ns, 1, &autores);
++        assert(st.burst_profile == FUXI_DAMP_M9_PROF_SUS && st.burst_repeat_level == 3);
++        assert(st.burst_clips == 0 && st.burst_underruns == 0 && st.burst_max_step <= 10u);
++        assert(pl.xpk175 <= 170.0 && pl.xpk170 <= 170.0);
++        /* Loop1 @75ms */
++        t_ns += MS(75);
++        pl.xpk175 = pl.xpk170 = 0.0;
++        test_push_pcm8_burst(&io, &m, &st, &pl, stac200, sizeof(stac200), 256u, &t_ns, 1, &autores);
++        assert(st.burst_profile == FUXI_DAMP_M9_PROF_SUS && st.burst_repeat_level == 3);
++        assert(st.burst_drive_peak <= (unsigned)FUXI_DAMP_M9_SUS_LIMIT && pl.xpk175 <= 170.0 && pl.xpk170 <= 170.0);
++        assert(fuxi_stream_close(&io, mock_rtp_write, &st) == 0);
++    }
++
++    /* 4) 0 dB (pk8=126) 與 5 ms 快起振 RampSineORBrake 邊界：首段即鎖 SUS，零撞底零毛刺 */
++    {
++        static uint8_t fast_sine[2400];
++        const double amps[2] = {126.0, 102.0};
++        const double atts[2] = {20.0, 5.0};
++        for (unsigned ci = 0; ci < 2; ci++) {
++            test_make_rampsine_pcm8(fast_sine, sizeof(fast_sine), 145.0, atts[ci], 20.0, amps[ci]);
++            FuxiHapticStream st = {0};
++            fuxi_damp_init(&st.damp, 0x0009u, 5710);
++            TestLraPlant pl = {0};
++            uint64_t t_ns = MS(9000 + ci * 1000u);
++            test_push_pcm8_burst(&io, &m, &st, &pl, fast_sine, sizeof(fast_sine), 256u, &t_ns, 1, &autores);
++            assert(st.burst_profile == FUXI_DAMP_M9_PROF_SUS && st.burst_clips == 0 && st.burst_underruns == 0);
++            assert(st.burst_drive_peak <= (unsigned)FUXI_DAMP_M9_SUS_LIMIT && st.burst_max_step <= 8u);
++            assert(pl.xpk175 <= 165.0 && pl.xpk170 <= 165.0);
++            assert(fuxi_stream_close(&io, mock_rtp_write, &st) == 0);
++        }
++    }
++
++    /* 5) 既有好評 UI 手感保護：手電筒按放雙擊 (199ms) 全幅、第 3+ 次連按 (250ms) 退讓、
++     *    上滑後台 / 設定開關 / 鍵盤連打永遠不受連發限幅影響。 */
++    {
++        FuxiHapticStream st = {0};
++        fuxi_damp_init(&st.damp, 0x0009u, 5710);
++        uint64_t t_ns = MS(12000);
++        /* 鎖屏手電筒按放雙擊 (199ms) + 連續第 3/4 次 (250ms) */
++        const unsigned torch_gaps[4] = {0, 199, 250, 250};
++        for (unsigned k = 0; k < 4; k++) {
++            t_ns += MS(torch_gaps[k]);
++            TestLraPlant pl = {0};
++            test_push_pcm8_burst(&io, &m, &st, &pl, tap_lp, sizeof(tap_lp), sizeof(tap_lp), &t_ns, 1, &autores);
++            assert(st.burst_profile == FUXI_DAMP_M9_PROF_LP && st.burst_clips == 0);
++            if (k < 2) {
++                assert(st.burst_repeat_level == 0 && st.burst_drive_peak >= 118u);
++            } else if (k == 2) {
++                assert(st.burst_repeat_level == 2 && st.burst_drive_peak <= (unsigned)FUXI_DAMP_M9_LP_REP2_LIMIT);
++            } else {
++                assert(st.burst_repeat_level == 3 && st.burst_drive_peak <= (unsigned)FUXI_DAMP_M9_LP_REP3_LIMIT);
++            }
++        }
++        /* 設定開關 (UNI) 連切 4 次 @ 120ms：始終 prof=1、不降幅且清零 lp_streak */
++        for (unsigned k = 0; k < 4; k++) {
++            t_ns += MS(120);
++            TestLraPlant pl = {0};
++            test_push_pcm8_burst(&io, &m, &st, &pl, ui_sw, sizeof(ui_sw), sizeof(ui_sw), &t_ns, 1, &autores);
++            assert(st.burst_profile == FUXI_DAMP_M9_PROF_UNI && st.burst_drive_peak >= 110u && st.burst_clips == 0);
++        }
++        /* 緊接設定開關後的單次長按：因 UNI 已清零 lp_streak，單次長按保持滿幅 */
++        t_ns += MS(120);
++        {
++            TestLraPlant pl = {0};
++            test_push_pcm8_burst(&io, &m, &st, &pl, tap_lp, sizeof(tap_lp), sizeof(tap_lp), &t_ns, 1, &autores);
++            assert(st.burst_profile == FUXI_DAMP_M9_PROF_LP && st.burst_repeat_level == 0 && st.burst_drive_peak >= 118u);
++        }
++        /* 上滑後台 (prof=0, raw_pk=75) 連續 3 次 @ 100ms：始終 STD 原味 */
++        unsigned sw_pk0 = 0;
++        for (unsigned k = 0; k < 3; k++) {
++            t_ns += MS(100);
++            TestLraPlant pl = {0};
++            test_push_pcm8_burst(&io, &m, &st, &pl, app_sw, sizeof(app_sw), 296u, &t_ns, 1, &autores);
++            assert(st.burst_profile == FUXI_DAMP_M9_PROF_STD && st.burst_clips == 0);
++            if (k == 0) sw_pk0 = st.burst_drive_peak;
++            else assert(st.burst_drive_peak == sw_pk0);
++        }
++        /* 鍵盤連打 8 次 @ 65ms：每次 STD 輸出完全一致 */
++        unsigned kbd_pk0 = 0;
++        for (unsigned k = 0; k < 8; k++) {
++            t_ns += MS(65);
++            TestLraPlant pl = {0};
++            test_push_pcm8_burst(&io, &m, &st, &pl, kbd, sizeof(kbd), sizeof(kbd), &t_ns, 1, &autores);
++            assert(st.burst_profile == FUXI_DAMP_M9_PROF_STD && st.burst_repeat_level == 0 && st.burst_clips == 0);
++            if (k == 0) kbd_pk0 = st.burst_drive_peak;
++            else assert(st.burst_drive_peak == kbd_pk0);
++        }
++        assert(fuxi_stream_close(&io, mock_rtp_write, &st) == 0);
++    }
++}
++
 +static void test_amp_wake_hold_and_peaks(void) {
 +    uint32_t hold = 0;
 +    /* Awake or empty ring never holds and clears hold counter */
@@ -23718,6 +24026,7 @@ index 0000000..07a9102
 +    test_haptic_mode7();
 +    test_haptic_mode8();
 +    test_haptic_mode9();
++    test_haptic_mode9_symphony_staccato_and_repeat();
 +    test_amp_idle_standby();
 +    test_amp_wake_hold_and_peaks();
 +    test_audio_mic_hw_and_ring();
@@ -23803,6 +24112,10 @@ index 0000000..07a9102
 +    assert 'fuxi_damp_trim_chunk_pad' in p124 and 'FUXI_DAMP_TAIL_STOP_TIGHT' in p124
 +    assert 'FUXI_DAMP_M9_PROF_SUS' in p124 and 'FUXI_DAMP_M9_SUS_LIMIT' in p124
 +    assert 'fuxi_damp_mode9_classify_chunk' in p124 and 'fuxi_damp_mode9_restart_burst' in p124
++    assert 'fuxi_damp_mode9_on_burst_start' in p124 and 'fuxi_damp_mode9_on_burst_end' in p124
++    assert 'FUXI_DAMP_M9_LP_REP2_LIMIT' in p124 and 'FUXI_DAMP_M9_LP_REP3_LIMIT' in p124
++    assert 'FUXI_DAMP_M9_ENV_KNEE_NORM_S' in p124 and 'm9_repeat_level' in p124
++    assert 'burst_repeat_level' in p124 and 'stream_notable' in p124
 +
 +    with tempfile.TemporaryDirectory(prefix='fuxi-live-audio-') as td:
 +        tmp = Path(td)
@@ -29234,10 +29547,10 @@ index 12e012d..68891af 100755
  '''
 diff --git a/tools/test-fuxi-wlan-ath12k.py b/tools/test-fuxi-wlan-ath12k.py
 new file mode 100644
-index 0000000..63d210d
+index 0000000..db13099
 --- /dev/null
 +++ b/tools/test-fuxi-wlan-ath12k.py
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,346 @@
 +import argparse
 +import json
 +import os
@@ -29377,13 +29690,19 @@ index 0000000..63d210d
 +            CHECK(!fwa_map(&arena, slot->memory, 1));
 +            slot->memory = NULL;
 +        } else {
-+            uint32_t sizes[] = {1, 63, 64, 65, 4095, 4096, 4097, 65535, 524289, 1048577};
-+            slot->bytes = sizes[random % 10];
++            uint32_t sizes[] = {1, 63, 64, 65, 128, 256, 512, 1024, 2048, 4095, 4096, 4097, 65535, 524289, 1048577};
++            slot->bytes = sizes[random % (sizeof(sizes) / sizeof(sizes[0]))];
 +            slot->memory = fwa_alloc(&arena, slot->bytes, &slot->bus);
 +            if (slot->memory) {
 +                CHECK(fwa_map(&arena, slot->memory, slot->bytes) == slot->bus);
 +                CHECK(fwa_map(&arena, (uint8_t *)slot->memory + slot->bytes - 1, 1) == slot->bus + slot->bytes - 1);
 +                CHECK(!fwa_map(&arena, (uint8_t *)slot->memory + slot->bytes - 1, 2));
++                if (slot->bytes <= 4096) {
++                    uint32_t rounded = (slot->bytes + 63u) & ~63u, align = 64u;
++                    while (align < rounded && align < 4096u) { align <<= 1; }
++                    CHECK((slot->bus & (align - 1u)) == 0);
++                    CHECK((slot->bus >> 12) == ((slot->bus + slot->bytes - 1u) >> 12));
++                }
 +                const uint8_t *bytes = slot->memory;
 +                for (unsigned at = 0; at < slot->bytes; at++) {
 +                    if (bytes[at]) { CHECK(0); }
@@ -29395,6 +29714,33 @@ index 0000000..63d210d
 +    }
 +    for (unsigned index = 0; index < 256; index++) {
 +        if (slots[index].memory) CHECK(!fwa_free(&arena, slots[index].bytes, slots[index].memory, slots[index].bus));
++    }
++    verify(&arena); CHECK(arena.count == 2);
++    /* Regression: place free space at offset 0xfc0 within a 4 KiB page and ensure sub-page
++     * DMA pool classes (256/512/1024/2048 B) never straddle a 4 KiB boundary and stay 128 B aligned. */
++    void *fillers[63];
++    uint64_t filler_bus[63];
++    for (unsigned index = 0; index < 63; index++) {
++        fillers[index] = fwa_alloc(&arena, 64, &filler_bus[index]);
++        CHECK(fillers[index] != NULL);
++    }
++    CHECK((filler_bus[62] & 4095u) == 0xf80u);
++    uint32_t pool_classes[] = {256, 512, 1024, 2048};
++    void *pool_ptrs[4];
++    uint64_t pool_bus[4];
++    for (unsigned index = 0; index < 4; index++) {
++        uint32_t sz = pool_classes[index];
++        pool_ptrs[index] = fwa_alloc(&arena, sz, &pool_bus[index]);
++        CHECK(pool_ptrs[index] != NULL);
++        CHECK((pool_bus[index] & (sz - 1u)) == 0);
++        CHECK((pool_bus[index] & 127u) == 0);
++        CHECK((pool_bus[index] >> 12) == ((pool_bus[index] + sz - 1u) >> 12));
++    }
++    for (unsigned index = 0; index < 4; index++) {
++        CHECK(!fwa_free(&arena, pool_classes[index], pool_ptrs[index], pool_bus[index]));
++    }
++    for (unsigned index = 0; index < 63; index++) {
++        CHECK(!fwa_free(&arena, 64, fillers[index], filler_bus[index]));
 +    }
 +    verify(&arena); CHECK(arena.count == 2);
 +    CHECK(!fwa_init(&arena, memory, 0xa0000000, 8192, blocks, 2));
@@ -56072,10 +56418,10 @@ index 1b46ea1..09ba683 100644
  	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_arena.h b/xnu/fuxi-wlan/fuxi_wlan_arena.h
 new file mode 100644
-index 0000000..b8e3263
+index 0000000..86d6f98
 --- /dev/null
 +++ b/xnu/fuxi-wlan/fuxi_wlan_arena.h
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,135 @@
 +#ifndef FUXI_WLAN_ARENA_H
 +#define FUXI_WLAN_ARENA_H
 +#include <stdint.h>
@@ -56122,6 +56468,10 @@ index 0000000..b8e3263
 +		alignment = 4096;
 +		while (alignment < rounded && alignment < 0x80000000u) { alignment <<= 1; }
 +		if (alignment < rounded) { return NULL; }
++	} else {
++		/* Match Linux SLUB/dma_pool natural alignment so sub-page TX/ext_desc buffers
++		 * never straddle a 4 KiB PCIe boundary and satisfy WCN7850 128-byte IOVA alignment. */
++		while (alignment < rounded && alignment < 4096) { alignment <<= 1; }
 +	}
 +	for (uint32_t index = 1; index < arena->count; index++) {
 +		struct fwa_block whole = arena->blocks[index];
@@ -83567,10 +83917,10 @@ index 0000000..bb97d28
 ++#endif
 diff --git a/xnu/patches/0124-fuxi-live-audio-haptics.patch b/xnu/patches/0124-fuxi-live-audio-haptics.patch
 new file mode 100644
-index 0000000..88269c5
+index 0000000..6d3b5ad
 --- /dev/null
 +++ b/xnu/patches/0124-fuxi-live-audio-haptics.patch
-@@ -0,0 +1,4787 @@
+@@ -0,0 +1,4943 @@
 +diff --git a/bsd/dev/fuxi_amp.c b/bsd/dev/fuxi_amp.c
 +index 0b1049c..cbbc6ab 100644
 +--- a/bsd/dev/fuxi_amp.c
@@ -86142,7 +86492,7 @@ index 0000000..88269c5
 +index 0000000..26a2d16
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_haptic_damp.h
-+@@ -0,0 +1,944 @@
++@@ -0,0 +1,1069 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* HAP525_HV LRA 主動阻尼濾波器與反向剎車尾段產生器（ADT /chosen fuxi,haptic-damp；預設 0＝關閉）。
 ++ *
@@ -86205,9 +86555,21 @@ index 0000000..88269c5
 ++    FUXI_DAMP_M9_SUS_ZETA_Q15 = 7537,    /* 0.23：閉迴路壓制 170-175 Hz 共振撞底異響 */
 ++    FUXI_DAMP_M9_SUS_LIMIT = 43,         /* ±43（~2.78 Vpk / <=1.98 Vrms 連續安全上限，軟拐點 37..43） */
 ++    FUXI_DAMP_M9_SUS_KNEE_SPAN = 6,
-++    FUXI_DAMP_M9_SUS_RAMP = 192u,        /* 8 ms 平滑過渡至 1:1 連續模式 */
+++    FUXI_DAMP_M9_SUS_RAMP = 96u,         /* 4 ms 平滑過渡至 1:1 連續模式，抑制 20 ms 起震前段共振過衝 */
 ++    FUXI_DAMP_M9_SUS_FALLBACK_IN = 864u, /* 36 ms：超過單次 FullTap(34ms) 之長震動在 FIFO 排空前自動切入 1:1 連續模式 */
 ++    FUXI_DAMP_M9_TAIL_REL_RAMP = 16u,    /* 0.67 ms：連續震動突停（如接聽來電）平滑淡出末值消爆音 */
+++    FUXI_DAMP_M9_LP_REP_SHORT_MS = 150u, /* <=150 ms 短間隔連發強拍（斷音／交響樂／連擊）立即退讓 */
+++    FUXI_DAMP_M9_LP_REP_STREAK_MS = 380u,/* <=380 ms 累計連發（保留 2 次手電筒雙擊全幅，第 3 次起退讓） */
+++    FUXI_DAMP_M9_SUS_CHAIN_GAP_MS = 300u,/* <=300 ms 緊接長震後之強拍／續段直接繼承連續安全保護 */
+++    FUXI_DAMP_M9_LP_REP2_GAIN_Q8 = 260,  /* 1.016x：連發第 2 級退讓增益 */
+++    FUXI_DAMP_M9_LP_REP2_LIMIT = 72,     /* ±72：連發第 2 級軟拐點上限 */
+++    FUXI_DAMP_M9_LP_REP3_GAIN_Q8 = 210,  /* 0.820x：高頻連發／SUS 夾擊強拍（ResCalibration）安全增益 */
+++    FUXI_DAMP_M9_LP_REP3_LIMIT = 56,     /* ±56：高頻連發／SUS 夾擊強拍軟拐點上限 */
+++    FUXI_DAMP_M9_REP_KNEE_SPAN = 10,     /* ±50..109 中檔軟拐點寬度 */
+++    FUXI_DAMP_M9_ENV_KNEE_NORM_S = 244 * FUXI_DAMP_SCALE, /* 單發瞬態位移護欄起點（高於單次長按 243.1，單發零改動） */
+++    FUXI_DAMP_M9_ENV_CEIL_NORM_S = 284 * FUXI_DAMP_SCALE, /* 單發瞬態位移護欄頂點（寬 40 單位平滑降驅動，杜絕撞底） */
+++    FUXI_DAMP_M9_ENV_KNEE_SUS_S = 155 * FUXI_DAMP_SCALE,  /* 連續／連發位移護欄起點 */
+++    FUXI_DAMP_M9_ENV_CEIL_SUS_S = 195 * FUXI_DAMP_SCALE,  /* 連續／連發位移護欄頂點 */
 ++    FUXI_DAMP_FLAG_HW_BRAKE = 0x100u,
 ++    FUXI_DAMP_FLAG_NO_TAIL = 0x200u,
 ++    FUXI_DAMP_FLAG_NO_PITCH = 0x4000u,
@@ -86249,9 +86611,16 @@ index 0000000..88269c5
 ++    uint32_t pitch_phase_q16;
 ++    uint32_t m9_burst_in;
 ++    uint16_t m9_sus_prog;
+++    uint16_t m9_in_zc;
+++    uint16_t m9_repeat_energy;
 ++    uint8_t m9_prof;
 ++    uint8_t m9_sus_active;
 ++    int8_t m9_last_r;
+++    int8_t m9_in_sign;
+++    uint8_t m9_repeat_level;
+++    uint8_t m9_prev_prof;
+++    uint8_t m9_prev_was_sus;
+++    uint8_t m9_lp_streak;
 ++    uint8_t out_rem[4];
 ++    uint8_t out_rem_len;
 ++    int8_t prev_in;
@@ -86284,9 +86653,67 @@ index 0000000..88269c5
 ++    damp->prev_in2 = 0;
 ++    damp->m9_burst_in = 0;
 ++    damp->m9_sus_prog = 0;
+++    damp->m9_in_zc = 0;
 ++    damp->m9_prof = FUXI_DAMP_M9_PROF_STD;
 ++    damp->m9_sus_active = 0;
 ++    damp->m9_last_r = 0;
+++    damp->m9_in_sign = 0;
+++}
+++
+++/* 新突發起播前依與前次結束之間隔指數衰減連發能量，更新 m9_repeat_level 並重設突發內狀態（不更動觀測器 x/y 以相容背靠背接續）。 */
+++static inline void fuxi_damp_mode9_on_burst_start(FuxiHapticDamp *damp, uint64_t gap_ns)
+++{
+++    if (!damp) return;
+++    fuxi_damp_mode9_restart_burst(damp);
+++    if (damp->mode != 9u) return;
+++    uint64_t gap_ms = gap_ns / 1000000ull;
+++    if (gap_ms >= 1000ull) {
+++        damp->m9_repeat_energy = 0;
+++        damp->m9_lp_streak = 0;
+++        damp->m9_prev_was_sus = 0;
+++    } else {
+++        unsigned steps = (unsigned)(gap_ms / 32ull);
+++        uint32_t e = damp->m9_repeat_energy;
+++        for (unsigned i = 0; i < steps && e > 0u; i++) {
+++            e = (e * 226u) >> 8;
+++        }
+++        damp->m9_repeat_energy = (uint16_t)e;
+++        if (gap_ms > FUXI_DAMP_M9_LP_REP_STREAK_MS) damp->m9_lp_streak = 0;
+++        if (gap_ms > FUXI_DAMP_M9_SUS_CHAIN_GAP_MS) damp->m9_prev_was_sus = 0;
+++    }
+++    uint8_t lvl = 0;
+++    if (damp->m9_prev_was_sus && gap_ms <= FUXI_DAMP_M9_SUS_CHAIN_GAP_MS) {
+++        lvl = 3u;
+++    } else if (damp->m9_lp_streak >= 1u && gap_ms <= FUXI_DAMP_M9_LP_REP_SHORT_MS) {
+++        lvl = (damp->m9_lp_streak >= 2u || damp->m9_repeat_energy >= 380u) ? 3u : 2u;
+++    } else if (damp->m9_lp_streak >= 2u && gap_ms <= FUXI_DAMP_M9_LP_REP_STREAK_MS) {
+++        lvl = (damp->m9_lp_streak >= 3u || damp->m9_repeat_energy >= 420u) ? 3u : 2u;
+++    }
+++    damp->m9_repeat_level = lvl;
+++}
+++
+++/* 突發結束（排空、停振或背靠背尾段切換）時累計長震／高能強拍歷史，避免交響樂／斷音與高頻連擊爆震撞底。 */
+++static inline void fuxi_damp_mode9_on_burst_end(FuxiHapticDamp *damp, unsigned raw_pk, unsigned burst_bytes)
+++{
+++    if (!damp || damp->mode != 9u) return;
+++    damp->m9_prev_prof = damp->m9_prof;
+++    int was_sus = (damp->m9_prof == FUXI_DAMP_M9_PROF_SUS || damp->m9_sus_active) ? 1 : 0;
+++    if (was_sus) {
+++        damp->m9_prev_was_sus = 1;
+++        uint32_t add = burst_bytes >= 2400u ? 512u : 384u;
+++        uint32_t ne = (uint32_t)damp->m9_repeat_energy + add;
+++        damp->m9_repeat_energy = (uint16_t)(ne > 1024u ? 1024u : ne);
+++        if (damp->m9_lp_streak < 15u) damp->m9_lp_streak++;
+++    } else if (damp->m9_prof == FUXI_DAMP_M9_PROF_LP ||
+++               (damp->m9_prof == FUXI_DAMP_M9_PROF_STD && raw_pk >= 100u)) {
+++        if (damp->m9_repeat_level < 3u) damp->m9_prev_was_sus = 0;
+++        uint32_t ne = (uint32_t)damp->m9_repeat_energy + 256u;
+++        damp->m9_repeat_energy = (uint16_t)(ne > 1024u ? 1024u : ne);
+++        if (damp->m9_lp_streak < 15u) damp->m9_lp_streak++;
+++    } else if (damp->m9_prof == FUXI_DAMP_M9_PROF_UNI || raw_pk < 80u) {
+++        damp->m9_lp_streak = 0;
+++        damp->m9_prev_was_sus = 0;
+++    }
 ++}
 ++
 ++static inline void fuxi_damp_reset(FuxiHapticDamp *damp)
@@ -86733,11 +87160,12 @@ index 0000000..88269c5
 ++    return padded;
 ++}
 ++
-++/* 軟拐點壓限：短按 ±108..126、連續安全模式 ±37..43 皆以有理曲線平滑逼近，避免平頂諧波雜訊。 */
+++/* 軟拐點壓限：短按 ±108..126、連發退讓 ±50..109、連續安全模式 ±37..43 皆以有理曲線平滑逼近，避免平頂諧波雜訊。 */
 ++static inline int32_t fuxi_damp_soft_clamp(int64_t val, int32_t lim)
 ++{
 ++    int64_t span = 0;
 ++    if (lim >= 110) span = FUXI_DAMP_SOFT_KNEE_SPAN;
+++    else if (lim >= 50) span = FUXI_DAMP_M9_REP_KNEE_SPAN;
 ++    else if (lim >= 36) span = FUXI_DAMP_M9_SUS_KNEE_SPAN;
 ++    if (span > 0) {
 ++        int64_t knee = (int64_t)lim - span;
@@ -86794,36 +87222,65 @@ index 0000000..88269c5
 ++}
 ++
 ++static inline void fuxi_damp_mode9_eval_coeffs(const FuxiHapticDamp *damp,
-++    int32_t *cr_out, int32_t *cx_out, int32_t *cy_out, uint32_t *step_out, int32_t *lim_out)
+++    int32_t *cr_out, int32_t *cx_out, int32_t *cy_out, uint32_t *step_out, int32_t *lim_out,
+++    int32_t *knee_out, int32_t *ceil_out)
 ++{
-++    int32_t b_cr = 0, b_cx = 0, b_cy = 0;
+++    int32_t b_cr = 0, b_cx = 0, b_cy = 0, b_lim = FUXI_DAMP_PCM_LIMIT;
 ++    uint32_t b_step = 65536u;
+++    int32_t b_knee = FUXI_DAMP_M9_ENV_KNEE_NORM_S, b_ceil = FUXI_DAMP_M9_ENV_CEIL_NORM_S;
 ++    fuxi_damp_mode9_base_coeffs(damp, &b_cr, &b_cx, &b_cy, &b_step);
+++    if (damp->m9_prof == FUXI_DAMP_M9_PROF_LP && damp->m9_repeat_level >= 2u) {
+++        const int64_t rep_g = (damp->m9_repeat_level >= 3u) ?
+++            FUXI_DAMP_M9_LP_REP3_GAIN_Q8 : FUXI_DAMP_M9_LP_REP2_GAIN_Q8;
+++        b_cr = (int32_t)(((int64_t)damp->m9_lp_cr_q8 * rep_g + FUXI_DAMP_M9_LP_GAIN_Q8 / 2) /
+++            FUXI_DAMP_M9_LP_GAIN_Q8);
+++        b_lim = (damp->m9_repeat_level >= 3u) ? FUXI_DAMP_M9_LP_REP3_LIMIT : FUXI_DAMP_M9_LP_REP2_LIMIT;
+++        b_step = 65536u;
+++        b_cx = 0;
+++        b_knee = FUXI_DAMP_M9_ENV_KNEE_SUS_S;
+++        b_ceil = FUXI_DAMP_M9_ENV_CEIL_SUS_S;
+++    }
 ++    if (damp->m9_sus_prog > 0u) {
 ++        int64_t p = (int64_t)damp->m9_sus_prog;
 ++        const int64_t r = (int64_t)FUXI_DAMP_M9_SUS_RAMP;
+++        if (p > r) p = r;
 ++        *cr_out = b_cr + (int32_t)(((int64_t)(damp->m9_sus_cr_q8 - b_cr) * p) / r);
 ++        *cx_out = b_cx + (int32_t)(((int64_t)(0 - b_cx) * p) / r);
 ++        *cy_out = b_cy + (int32_t)(((int64_t)(damp->m9_sus_cy_q15 - b_cy) * p) / r);
 ++        *step_out = (uint32_t)((int64_t)b_step + (((int64_t)65536 - (int64_t)b_step) * p) / r);
-++        *lim_out = FUXI_DAMP_PCM_LIMIT + (int32_t)(((int64_t)(FUXI_DAMP_M9_SUS_LIMIT - FUXI_DAMP_PCM_LIMIT) * p) / r);
+++        *lim_out = b_lim + (int32_t)(((int64_t)(FUXI_DAMP_M9_SUS_LIMIT - b_lim) * p) / r);
+++        *knee_out = b_knee + (int32_t)(((int64_t)(FUXI_DAMP_M9_ENV_KNEE_SUS_S - b_knee) * p) / r);
+++        *ceil_out = b_ceil + (int32_t)(((int64_t)(FUXI_DAMP_M9_ENV_CEIL_SUS_S - b_ceil) * p) / r);
 ++    } else {
 ++        *cr_out = b_cr;
 ++        *cx_out = b_cx;
 ++        *cy_out = b_cy;
 ++        *step_out = b_step;
-++        *lim_out = FUXI_DAMP_PCM_LIMIT;
+++        *lim_out = b_lim;
+++        *knee_out = b_knee;
+++        *ceil_out = b_ceil;
 ++    }
 ++}
 ++
 ++static inline void fuxi_damp_mode9_classify_chunk(FuxiHapticDamp *damp, const uint8_t *in, unsigned eff_len)
 ++{
-++    unsigned pos_pk = 0, neg_pk = 0;
+++    unsigned pos_pk = 0, neg_pk = 0, chunk_zc = 0;
+++    int8_t sg = damp->m9_in_sign;
 ++    for (unsigned i = 0; i < eff_len; i++) {
 ++        int v = (int)(int8_t)in[i];
 ++        if (v > 0 && (unsigned)v > pos_pk) pos_pk = (unsigned)v;
 ++        else if (v < 0 && (unsigned)(-v) > neg_pk) neg_pk = (unsigned)(-v);
+++        if (v >= 6) {
+++            if (sg < 0) chunk_zc++;
+++            sg = 1;
+++        } else if (v <= -6) {
+++            if (sg > 0) chunk_zc++;
+++            sg = -1;
+++        }
 ++    }
+++    damp->m9_in_sign = sg;
+++    if (damp->m9_in_zc < 60000u) damp->m9_in_zc = (uint16_t)(damp->m9_in_zc + chunk_zc);
+++
 ++    unsigned raw_pk = pos_pk > neg_pk ? pos_pk : neg_pk;
 ++    unsigned minor_pk = pos_pk < neg_pk ? pos_pk : neg_pk;
 ++    unsigned tail_start = eff_len > 12u ? (eff_len - 12u) : 0u;
@@ -86837,7 +87294,8 @@ index 0000000..88269c5
 ++        }
 ++    }
 ++    if (damp->m9_burst_in == 0u) {
-++        if (raw_pk >= 112u && !ends_quiet) {
+++        if (!ends_quiet && (raw_pk >= 112u || (raw_pk >= 84u && chunk_zc >= 3u) ||
+++            (damp->m9_prev_was_sus && damp->m9_repeat_level >= 3u && raw_pk >= 48u))) {
 ++            damp->m9_prof = FUXI_DAMP_M9_PROF_SUS;
 ++            damp->m9_sus_active = 1;
 ++            damp->m9_sus_prog = (uint16_t)FUXI_DAMP_M9_SUS_RAMP;
@@ -86848,18 +87306,32 @@ index 0000000..88269c5
 ++        } else {
 ++            damp->m9_prof = FUXI_DAMP_M9_PROF_STD;
 ++        }
-++    } else if (!damp->m9_sus_active && raw_pk >= 112u && !ends_quiet) {
+++    } else if (!damp->m9_sus_active && !ends_quiet &&
+++               (raw_pk >= 112u || (raw_pk >= 76u && damp->m9_in_zc >= 4u))) {
 ++        damp->m9_sus_active = 1;
 ++        damp->m9_prof = FUXI_DAMP_M9_PROF_SUS;
 ++    }
 ++}
 ++
 ++static inline int8_t fuxi_damp_mode9_step_ex(FuxiHapticDamp *damp, int8_t raw,
-++    int32_t cr, int32_t cx, int32_t cy, int32_t lim, unsigned *zc_out)
+++    int32_t cr, int32_t cx, int32_t cy, int32_t lim, int32_t env_knee, int32_t env_ceil, unsigned *zc_out)
 ++{
 ++    if (lim > FUXI_DAMP_PCM_LIMIT) lim = FUXI_DAMP_PCM_LIMIT;
 ++    int64_t fb = ((int64_t)cx * (int64_t)damp->x + (int64_t)cy * (int64_t)damp->y) / 32768;
 ++    int64_t cmd_s = (int64_t)raw * (int64_t)cr * 2 + fb;
+++    int32_t ax = damp->x < 0 ? -damp->x : damp->x;
+++    int32_t ay = damp->y < 0 ? -damp->y : damp->y;
+++    int32_t hi = ax > ay ? ax : ay;
+++    int32_t lo = ax > ay ? ay : ax;
+++    int32_t env_s = (int32_t)(((int64_t)hi * 31 + (int64_t)lo * 13) >> 5);
+++    if (env_s > env_knee && env_ceil > env_knee &&
+++        ((cmd_s > 0 && damp->y > 0) || (cmd_s < 0 && damp->y < 0))) {
+++        if (env_s >= env_ceil) {
+++            cmd_s = 0;
+++        } else {
+++            cmd_s = (cmd_s * (int64_t)(env_ceil - env_s)) / (int64_t)(env_ceil - env_knee);
+++        }
+++    }
 ++    int64_t rounded = cmd_s >= 0 ? (cmd_s + FUXI_DAMP_SCALE / 2) / FUXI_DAMP_SCALE
 ++        : -((-cmd_s + FUXI_DAMP_SCALE / 2) / FUXI_DAMP_SCALE);
 ++    int8_t out = (int8_t)(damp->soft_knee ? fuxi_damp_soft_clamp(rounded, lim) : fuxi_damp_clamp(rounded, -lim, lim));
@@ -86871,13 +87343,14 @@ index 0000000..88269c5
 ++    unsigned limit, unsigned *zc_out)
 ++{
 ++    int32_t cr0 = 0, cx0 = 0, cy0 = 0, tlim = FUXI_DAMP_PCM_LIMIT;
+++    int32_t unused_knee = 0, unused_ceil = 0;
 ++    uint32_t unused_step = 0;
-++    fuxi_damp_mode9_eval_coeffs(damp, &cr0, &cx0, &cy0, &unused_step, &tlim);
+++    fuxi_damp_mode9_eval_coeffs(damp, &cr0, &cx0, &cy0, &unused_step, &tlim, &unused_knee, &unused_ceil);
 ++    if ((int32_t)limit < tlim) tlim = (int32_t)limit;
 ++    if (tlim > FUXI_DAMP_PCM_LIMIT) tlim = FUXI_DAMP_PCM_LIMIT;
 ++
 ++    const int is_lp = (damp->m9_prof == FUXI_DAMP_M9_PROF_LP && damp->m9_sus_prog == 0u);
-++    const int32_t cxt = is_lp ? damp->m9_lp_cxt_q15 : damp->c_x_tl_q15;
+++    const int32_t cxt = is_lp ? (damp->m9_repeat_level >= 2u ? 0 : damp->m9_lp_cxt_q15) : damp->c_x_tl_q15;
 ++    const int32_t cyt = is_lp ? damp->m9_lp_cyt_q15 : damp->c_y_tl_q15;
 ++    const unsigned tramp = is_lp ? FUXI_DAMP_M9_LP_TAIL_RAMP : FUXI_DAMP_TAIL_RAMP;
 ++
@@ -86953,9 +87426,10 @@ index 0000000..88269c5
 ++            damp->m9_sus_prog++;
 ++        }
 ++        int32_t cr = 0, cx = 0, cy = 0, lim = FUXI_DAMP_PCM_LIMIT;
+++        int32_t env_knee = 0, env_ceil = 0;
 ++        uint32_t cur_step = 65536u;
-++        fuxi_damp_mode9_eval_coeffs(damp, &cr, &cx, &cy, &cur_step, &lim);
-++        int8_t sample = fuxi_damp_mode9_step_ex(damp, (int8_t)interp, cr, cx, cy, lim, zc_out);
+++        fuxi_damp_mode9_eval_coeffs(damp, &cr, &cx, &cy, &cur_step, &lim, &env_knee, &env_ceil);
+++        int8_t sample = fuxi_damp_mode9_step_ex(damp, (int8_t)interp, cr, cx, cy, lim, env_knee, env_ceil, zc_out);
 ++        out[out_n++] = (uint8_t)sample;
 ++        phase += cur_step;
 ++    }
@@ -86977,10 +87451,11 @@ index 0000000..88269c5
 ++    if (!out_n) return 0;
 ++    if (flush_short && out_n < 4u) {
 ++        int32_t cr = 0, cx = 0, cy = 0, lim = FUXI_DAMP_PCM_LIMIT;
+++        int32_t env_knee = 0, env_ceil = 0;
 ++        uint32_t unused_step = 65536u;
-++        fuxi_damp_mode9_eval_coeffs(damp, &cr, &cx, &cy, &unused_step, &lim);
+++        fuxi_damp_mode9_eval_coeffs(damp, &cr, &cx, &cy, &unused_step, &lim, &env_knee, &env_ceil);
 ++        while (out_n < 4u && out_n < max_len) {
-++            int8_t sample = fuxi_damp_mode9_step_ex(damp, 0, cr, cx, cy, lim, zc_out);
+++            int8_t sample = fuxi_damp_mode9_step_ex(damp, 0, cr, cx, cy, lim, env_knee, env_ceil, zc_out);
 ++            out[out_n++] = (uint8_t)sample;
 ++        }
 ++    }
@@ -87328,7 +87803,7 @@ index 0000000..88269c5
 +index 0000000..48a1e40
 +--- /dev/null
 ++++ b/bsd/dev/fuxi_haptic_stream.h
-+@@ -0,0 +1,591 @@
++@@ -0,0 +1,617 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 ++/* HAP525_HV 連續低延遲 24 kHz 有號 PCM FIFO 串流引擎（ADT /chosen fuxi,haptic=9；預設關）。
 ++ *
@@ -87394,6 +87869,7 @@ index 0000000..88269c5
 ++    uint64_t last_push_ns;
 ++    unsigned last_push_fill;
 ++    uint64_t idle_since_ns;
+++    uint64_t last_burst_end_ns;
 ++    uint64_t burst_start_ns;
 ++    uint64_t burst_open_us;
 ++    uint64_t burst_queue_us;
@@ -87409,6 +87885,8 @@ index 0000000..88269c5
 ++    unsigned burst_refills;
 ++    unsigned burst_underruns;
 ++    unsigned burst_profile;
+++    unsigned burst_repeat_level;
+++    unsigned burst_gap_ms;
 ++    unsigned burst_absorbed;
 ++    unsigned burst_clips;
 ++    unsigned burst_max_step;
@@ -87495,6 +87973,9 @@ index 0000000..88269c5
 ++static inline int fuxi_stream_stop_play(const FuxiHapticIo *io, FuxiRtpWrite write, FuxiHapticStream *st)
 ++{
 ++    int restore_error = 0;
+++    if (st->playing && st->damp.mode == 9u) {
+++        fuxi_damp_mode9_on_burst_end(&st->damp, st->burst_raw_peak, st->burst_bytes);
+++    }
 ++    if (st->playing) {
 ++        if (fuxi_rtp_register(write, io, 0xf04c, st->hw_brake)) restore_error = 1;
 ++        if (fuxi_stream_wait_disabled(io)) restore_error = 1;
@@ -87534,7 +88015,11 @@ index 0000000..88269c5
 ++
 ++static inline int fuxi_stream_close(const FuxiHapticIo *io, FuxiRtpWrite write, FuxiHapticStream *st)
 ++{
+++    int was_playing = st->playing;
 ++    int restore_error = fuxi_stream_stop_play(io, write, st) ? 1 : 0;
+++    if (was_playing && st->last_push_ns > st->last_burst_end_ns) {
+++        st->last_burst_end_ns = st->last_push_ns;
+++    }
 ++    while (st->prepared) {
 ++        unsigned i = --st->prepared;
 ++        if (fuxi_stream_config[i].addr == 0xf05f && i > 0) {
@@ -87701,7 +88186,12 @@ index 0000000..88269c5
 ++                st->burst_profile = profile;
 ++            } else if (st->damp.mode == 9u) {
 ++                if (st->tail_emitted) {
-++                    fuxi_damp_mode9_restart_burst(&st->damp);
+++                    fuxi_damp_mode9_on_burst_end(&st->damp, st->burst_raw_peak, st->burst_bytes);
+++                    uint64_t b2b_gap = now_ns > st->synth_input_end_ns ? (now_ns - st->synth_input_end_ns) : 0ull;
+++                    uint64_t b2b_ms = b2b_gap / 1000000ull;
+++                    st->burst_gap_ms = (unsigned)(b2b_ms > 99999u ? 99999u : b2b_ms);
+++                    fuxi_damp_mode9_on_burst_start(&st->damp, b2b_gap);
+++                    st->burst_repeat_level = st->damp.m9_repeat_level;
 ++                }
 ++                out_len = fuxi_damp_process_mode9(&st->damp, samples, length, shaped, sizeof(shaped),
 ++                    0, &out_peak, &st->burst_zc);
@@ -87767,6 +88257,7 @@ index 0000000..88269c5
 ++            (void)fuxi_stream_close(io, write, st);
 ++            return -2;
 ++        }
+++        st->last_burst_end_ns = now_ns;
 ++        st->burst_underruns++;
 ++    }
 ++
@@ -87783,6 +88274,15 @@ index 0000000..88269c5
 ++    st->owns_fifo = 1;
 ++    if (write(0xf12d, &flush, 1) || fuxi_rtp_register(write, io, 0xf12d, 0)) goto fail;
 ++    fuxi_damp_reset(&st->damp);
+++    if (st->damp.mode == 9u) {
+++        uint64_t gap_ns = st->last_burst_end_ns ?
+++            (now_ns > st->last_burst_end_ns ? (now_ns - st->last_burst_end_ns) : 0ull) :
+++            10000000000ull;
+++        uint64_t gap_ms = st->last_burst_end_ns ? (gap_ns / 1000000ull) : 0ull;
+++        st->burst_gap_ms = (unsigned)(gap_ms > 99999u ? 99999u : gap_ms);
+++        fuxi_damp_mode9_on_burst_start(&st->damp, gap_ns);
+++        st->burst_repeat_level = st->damp.m9_repeat_level;
+++    }
 ++    if (mode5_fresh_synth) {
 ++        unsigned profile = 0;
 ++        out_len = fuxi_damp_synth_transient(&st->damp, samples, length, shaped, sizeof(shaped),
@@ -87913,6 +88413,7 @@ index 0000000..88269c5
 ++        (void)fuxi_stream_close(io, write, st);
 ++        return -2;
 ++    }
+++    st->last_burst_end_ns = now_ns;
 ++    st->idle_since_ns = now_ns;
 ++    return 0;
 ++fail:
@@ -88108,7 +88609,7 @@ index 0000000..88269c5
 +     unsigned playing = 0, logged = 0, health_checks = 0, amplitude_writes = 0, amplitude_logged = 0;
 +     unsigned autores_cleared = 0, autores_plays = 0, autores_logged = 0;
 +-    unsigned pcm_played = 0, pcm_expired = 0;
-++    unsigned pcm_played = 0, pcm_expired = 0, stream_bursts = 0;
+++    unsigned pcm_played = 0, pcm_expired = 0, stream_bursts = 0, stream_notable = 0;
 ++    FuxiHapticStream stream = {0};
 ++    fuxi_damp_init(&stream.damp, fp_haptic_damp_cfg, fp_haptic_tlra_us);
 ++    stream.hw_brake = (uint8_t)fp_haptic_stream_hw_brake;
@@ -88142,7 +88643,7 @@ index 0000000..88269c5
 +                 memcpy(pcm, fp_rtp_pending[slot].samples, pcm_length);
 +             }
 +             fp_rtp_head = (fp_rtp_head + 1) % (sizeof(fp_rtp_pending) / sizeof(fp_rtp_pending[0]));
-+@@ -730,23 +784,111 @@ static void fp_vibrate_worker(void *argument, wait_result_t wait_result)
++@@ -730,23 +784,116 @@ static void fp_vibrate_worker(void *argument, wait_result_t wait_result)
 +                 lck_mtx_unlock(&fp_vibrate_lock);
 +                 if (++pcm_expired <= 8)
 +                     printf("FUXI PMIC: haptic RTP FIFO UI PCM expired=%u played=%u queue_us=%llu\n",
@@ -88167,7 +88668,7 @@ index 0000000..88269c5
 ++                stream.burst_chunks = stream.burst_bytes = stream.burst_peak = 0;
 ++                stream.burst_raw_peak = stream.burst_drive_peak = stream.burst_out_peak = stream.burst_zc = stream.burst_tail_bytes = stream.burst_tails = 0;
 ++                stream.burst_refills = stream.burst_underruns = 0;
-++                stream.burst_profile = stream.burst_absorbed = 0;
+++                stream.burst_profile = stream.burst_repeat_level = stream.burst_gap_ms = stream.burst_absorbed = 0;
 ++                stream.burst_clips = stream.burst_max_step = 0;
 ++                stream.burst_has_prev = 0;
 ++                stream.burst_prev_sample = 0;
@@ -88202,13 +88703,18 @@ index 0000000..88269c5
 ++            }
 ++            if (drain == 0) {
 ++                stream_bursts++;
-++                if (stream_bursts <= 64) {
-++                    printf("FUXI PMIC: haptic stream burst=%u warm=%u chunks=%u refills=%u underruns=%u bytes=%u peak=%u raw_pk=%u drv_pk=%u out_pk=%u zc=%u tail_b=%u tails=%u clp=%u step=%u prof=%u abs=%u tlra=%u vmax=%#x vpre=%#x hpre=%#x open_us=%llu dur_us=%llu queue_us=%llu\n",
+++                int notable = (stream_bursts > 64u) && (stream_notable < 64u) &&
+++                    (stream.burst_profile >= 2u || stream.burst_drive_peak >= 110u ||
+++                     stream.burst_repeat_level > 0u || stream.burst_underruns > 0u ||
+++                     stream.burst_clips > 0u);
+++                if (stream_bursts <= 64u || notable) {
+++                    if (notable) stream_notable++;
+++                    printf("FUXI PMIC: haptic stream burst=%u warm=%u chunks=%u refills=%u underruns=%u bytes=%u peak=%u raw_pk=%u drv_pk=%u out_pk=%u zc=%u tail_b=%u tails=%u clp=%u step=%u prof=%u rep=%u gap=%u abs=%u tlra=%u vmax=%#x vpre=%#x hpre=%#x open_us=%llu dur_us=%llu queue_us=%llu\n",
 ++                        stream_bursts, (unsigned)stream.warm_burst, stream.burst_chunks, stream.burst_refills,
 ++                        stream.burst_underruns, stream.burst_bytes, stream.burst_peak,
 ++                        stream.burst_raw_peak, stream.burst_drive_peak, stream.burst_out_peak, stream.burst_zc, stream.burst_tail_bytes, stream.burst_tails,
 ++                        stream.burst_clips, stream.burst_max_step,
-++                        stream.burst_profile, stream.burst_absorbed,
+++                        stream.burst_profile, stream.burst_repeat_level, stream.burst_gap_ms, stream.burst_absorbed,
 ++                        stream.damp.tlra_us,
 ++                        fp_rtp_vmax ? fp_rtp_vmax : fp_vibrate_android_vmax,
 ++                        (unsigned)stream.last_vmax_pre, (unsigned)stream.last_hbst_pre,
@@ -88257,7 +88763,7 @@ index 0000000..88269c5
 +             }
 +             if (!result) result = fuxi_rtp_click(&io, fp_rtp_write, fp_rtp_read_status, wave, length, click_vmax, &stats);
 +             if (pcm_length && !result) pcm_played++;
-+@@ -917,6 +1059,10 @@ static void fp_vibrate_runtime_start(void)
++@@ -917,6 +1064,10 @@ static void fp_vibrate_runtime_start(void)
 +         fp_vibrate_brake = fuxi_vibrate_stock_brake(&io) ? 0x08u : 0;
 +         printf("FUXI PMIC: haptic transient attack-us=5710 stock-brake=%u\n", !!fp_vibrate_brake);
 +     }
@@ -88268,7 +88774,7 @@ index 0000000..88269c5
 +     thread_t thread = NULL;
 +     if (kernel_thread_start(fp_vibrate_worker, NULL, &thread) != KERN_SUCCESS) {
 +         printf("FUXI PMIC: vibrate runtime worker failed\n");
-+@@ -1061,7 +1207,7 @@ void fuxi_pmic_init(void)
++@@ -1061,7 +1212,7 @@ void fuxi_pmic_init(void)
 +     }
 +     fp_torch_audit_enabled = torch_audit == 1 && mode == 3;
 +     if ((!mode && !haptic) || __atomic_exchange_n(&fp_started, 1u, __ATOMIC_ACQ_REL)) return;
@@ -88277,7 +88783,7 @@ index 0000000..88269c5
 +         printf("FUXI PMIC: unsupported mode=%u haptic=%u; hardware untouched\n", mode, haptic);
 +         return;
 +     }
-+@@ -1080,31 +1226,56 @@ void fuxi_pmic_init(void)
++@@ -1080,31 +1231,56 @@ void fuxi_pmic_init(void)
 +     fp_survey(7, 0xf200, "haptic-boost");
 +     fp_haptic_fifo_survey(mode);
 +     if (haptic == 1) fp_haptic_diagnostic();

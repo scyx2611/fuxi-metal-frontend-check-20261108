@@ -1293,10 +1293,10 @@ index 0000000..e553d3d
 +    main()
 diff --git a/tools/test-fuxi-modem.py b/tools/test-fuxi-modem.py
 new file mode 100644
-index 0000000..629c65b
+index 0000000..310454f
 --- /dev/null
 +++ b/tools/test-fuxi-modem.py
-@@ -0,0 +1,1138 @@
+@@ -0,0 +1,1340 @@
 +#!/usr/bin/env python3
 +"""主機測試：xnu/fuxi-modem/fuxi_modem_proto.h（核心 fuxi_modem.c 用的同一份純邏輯）。
 +
@@ -1316,7 +1316,11 @@ index 0000000..629c65b
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
++#define FUXI 1
 +#include "fuxi_modem_proto.h"
++#include "coachz_bb_qmux.h"
++#include "coachz_bb_data.h"
++#include "coachz_bb_pdp.h"
 +static unsigned checks;
 +#define CHECK(test) do { checks++; if (!(test)) { fprintf(stderr, "line %d: %s\n", __LINE__, #test); exit(1); } } while (0)
 +static uint64_t le64(const uint8_t *p) { return (uint64_t)fm_le32(p) | (uint64_t)fm_le32(p + 4) << 32; }
@@ -2388,6 +2392,151 @@ index 0000000..629c65b
 +    CHECK(fm_sandbox_check_wants_sandboxed("MessagesBlastDoorService", &bad_out) == 0);
 +}
 +
++static uint32_t build_dpm_rsp(uint8_t *out, uint16_t txn, uint16_t err) {
++    out[0] = 0x02u;
++    cbd_wr16(out + 1, txn);
++    cbd_wr16(out + 3, CBD_DPM_OPEN_PORT);
++    cbd_wr16(out + 5, 7u);
++    out[7] = 0x02u; cbd_wr16(out + 8, 4u);
++    cbd_wr16(out + 10, err ? 1u : 0u);
++    cbd_wr16(out + 12, err);
++    return 14u;
++}
++
++static uint32_t build_wda_rsp(uint8_t *out, uint16_t txn, uint16_t err, uint32_t llp, uint32_t ul, uint32_t dl, uint32_t dgrams, uint32_t dsize) {
++    uint32_t w = 0u;
++    uint8_t *t = out + 7u;
++    uint8_t res[4];
++    cbd_wr16(res, err ? 1u : 0u);
++    cbd_wr16(res + 2, err);
++    w += cbd_tlv(t + w, 128u - w, 0x02u, res, 4u);
++    if (!err) {
++        w += cbd_tlv_u32(t + w, 128u - w, 0x11u, llp);
++        w += cbd_tlv_u32(t + w, 128u - w, 0x12u, ul);
++        w += cbd_tlv_u32(t + w, 128u - w, 0x13u, dl);
++        w += cbd_tlv_u32(t + w, 128u - w, 0x15u, dgrams);
++        w += cbd_tlv_u32(t + w, 128u - w, 0x16u, dsize);
++    }
++    out[0] = 0x02u;
++    cbd_wr16(out + 1, txn);
++    cbd_wr16(out + 3, CBD_WDA_SET_DATA_FORMAT);
++    cbd_wr16(out + 5, w);
++    return 7u + w;
++}
++
++static int bb_pdp_is_ready(const struct cbd_setup *s) {
++    return s->step == CBD_DONE && !s->dpm_error && !s->wda_error &&
++           s->llp == CBD_LLP_RAW_IP && s->ul_dap == CBD_DAP_QMAP && s->dl_dap == CBD_DAP_QMAP;
++}
++
++static void b020_data_port_race(void) {
++    uint8_t sdu[128], rsp[140];
++    uint32_t svc = 0u, n = 0u;
++
++    /* 1. 正常情境：DPM 與 WDA 皆已存在，一次跑完 DPM -> WDA -> CBD_DONE */
++    struct cbd_setup s;
++    memset(&s, 0, sizeof s);
++    s.has_dpm = 1; s.has_wda = 1;
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_DPM && s.step == CBD_DPM && s.txn == 1u);
++    CHECK(cbd_rd16(sdu + 3) == CBD_DPM_OPEN_PORT);
++    uint32_t rlen = build_dpm_rsp(rsp, (uint16_t)s.txn, 0u);
++    CHECK(cbd_answer(&s, CBD_SVC_DPM, rsp, rlen) == 1 && s.step == CBD_WAIT_WDA && s.dpm_error == 0u);
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_WDA && s.step == CBD_WDA && s.txn == 2u);
++    CHECK(cbd_rd16(sdu + 3) == CBD_WDA_SET_DATA_FORMAT);
++    rlen = build_wda_rsp(rsp, (uint16_t)s.txn, 0u, CBD_LLP_RAW_IP, CBD_DAP_QMAP, CBD_DAP_QMAP, 16u, 63u);
++    CHECK(cbd_answer(&s, CBD_SVC_WDA, rsp, rlen) == 1 && s.step == CBD_DONE && s.wda_error == 0u);
++    CHECK(bb_pdp_is_ready(&s) == 1);
++    CHECK(cbd_next(&s, sdu, sizeof sdu, &svc) == 0u && s.step == CBD_DONE);
++
++    /* 2. 完整復現 B-020 實機競態：DPM(0x2f@47) 與 WDS(0x01@49) 先到，WDA(0x1a@4b) 延後到達 */
++    struct cbq_bridge qmux;
++    cbq_init(&qmux);
++    CHECK(cbq_server_new(&qmux, CBD_SVC_DPM, 1u, 0u, 0x47u) == 1);
++    CHECK(cbq_server_new(&qmux, CBD_SVC_WDS, 1u, 0u, 0x49u) == 1);
++    memset(&s, 0, sizeof s);
++    s.has_dpm = cbq_server_find(&qmux, CBD_SVC_DPM) != NULL;
++    s.has_wda = cbq_server_find(&qmux, CBD_SVC_WDA) != NULL;
++    CHECK(s.has_dpm == 1u && s.has_wda == 0u);
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_DPM && s.step == CBD_DPM && s.txn == 1u);
++    /* 在途時誤呼 cbd_next 絕不破壞狀態或 txn */
++    CHECK(cbd_next(&s, sdu, sizeof sdu, &svc) == 0u && s.step == CBD_DPM && s.txn == 1u);
++    /* DPM 回答成功，但 WDA 仍未到達：必須停在 CBD_WAIT_WDA，絕不跳 CBD_DONE(0xffff) */
++    rlen = build_dpm_rsp(rsp, (uint16_t)s.txn, 0u);
++    CHECK(cbd_answer(&s, CBD_SVC_DPM, rsp, rlen) == 1 && s.step == CBD_WAIT_WDA && s.dpm_error == 0u);
++    for (int retry = 0; retry < 3; ++retry) {
++        s.has_wda = cbq_server_find(&qmux, CBD_SVC_WDA) != NULL;
++        CHECK(cbd_next(&s, sdu, sizeof sdu, &svc) == 0u && s.step == CBD_WAIT_WDA);
++    }
++    /* 此時 WDS 雖已 active 1，在 WDA 完成前 pdp 尚未 ready */
++    struct cbp_client pdp_clients[2];
++    memset(pdp_clients, 0, sizeof pdp_clients);
++    pdp_clients[0].mux = 1u; pdp_clients[0].family = 4u; pdp_clients[0].active = 1u;
++    pdp_clients[1].mux = 2u; pdp_clients[1].family = 4u; pdp_clients[1].active = 1u;
++    CHECK(bb_pdp_is_ready(&s) == 0);
++    /* 幾毫秒後 WDA (0x1a@4b) 到達 -> 立刻推進送出 WDA Set Data Format */
++    CHECK(cbq_server_new(&qmux, CBD_SVC_WDA, 1u, 0u, 0x4bu) == 1);
++    s.has_wda = cbq_server_find(&qmux, CBD_SVC_WDA) != NULL;
++    CHECK(s.has_wda == 1u);
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_WDA && s.step == CBD_WDA && s.txn == 2u);
++    CHECK(cbd_next(&s, sdu, sizeof sdu, &svc) == 0u && s.step == CBD_WDA && s.txn == 2u);
++    /* 錯 txn / 錯 service 回應必須被拒 */
++    rlen = build_wda_rsp(rsp, 99u, 0u, CBD_LLP_RAW_IP, CBD_DAP_QMAP, CBD_DAP_QMAP, 16u, 63u);
++    CHECK(cbd_answer(&s, CBD_SVC_WDA, rsp, rlen) == 0 && s.step == CBD_WDA);
++    rlen = build_wda_rsp(rsp, (uint16_t)s.txn, 0u, CBD_LLP_RAW_IP, CBD_DAP_QMAP, CBD_DAP_QMAP, 16u, 63u);
++    CHECK(cbd_answer(&s, CBD_SVC_DPM, rsp, rlen) == 0 && s.step == CBD_WDA);
++    /* 正確 WDA 回覆 -> CBD_DONE 且 pdp_ip0 / pdp_ip1 解鎖 */
++    CHECK(cbd_answer(&s, CBD_SVC_WDA, rsp, rlen) == 1 && s.step == CBD_DONE);
++    CHECK(bb_pdp_is_ready(&s) == 1);
++    CHECK(cbp_active_families(pdp_clients, 2u, 1u) == 1u);
++    CHECK(cbp_active_families(pdp_clients, 2u, 2u) == 1u);
++
++    /* 3. 極端競態：WDS 先到時 DPM 與 WDA 皆未到，且 WDA 比 DPM 先到 -> 絕不跳過 DPM */
++    memset(&s, 0, sizeof s);
++    CHECK(cbd_next(&s, sdu, sizeof sdu, &svc) == 0u && s.step == CBD_IDLE);
++    s.has_wda = 1u;
++    CHECK(cbd_next(&s, sdu, sizeof sdu, &svc) == 0u && s.step == CBD_IDLE);
++    /* room 太小不破壞狀態 */
++    s.has_dpm = 1u;
++    CHECK(cbd_next(&s, sdu, 8u, &svc) == 0u && s.step == CBD_IDLE && s.txn == 0u);
++    /* DPM 到後先 DPM 再 WDA */
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_DPM && s.step == CBD_DPM && s.txn == 1u);
++    rlen = build_dpm_rsp(rsp, (uint16_t)s.txn, 0u);
++    CHECK(cbd_answer(&s, CBD_SVC_DPM, rsp, rlen) == 1 && s.step == CBD_WAIT_WDA);
++    CHECK(cbd_next(&s, sdu, 8u, &svc) == 0u && s.step == CBD_WAIT_WDA && s.txn == 1u);
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_WDA && s.step == CBD_WDA && s.txn == 2u);
++    rlen = build_wda_rsp(rsp, (uint16_t)s.txn, 0u, CBD_LLP_RAW_IP, CBD_DAP_QMAP, CBD_DAP_QMAP, 16u, 63u);
++    CHECK(cbd_answer(&s, CBD_SVC_WDA, rsp, rlen) == 1 && s.step == CBD_DONE && bb_pdp_is_ready(&s) == 1);
++
++    /* 4. 請求在途收到 DEL_SERVER -> cbd_server_lost 退回等待狀態，服務重來可恢復 */
++    memset(&s, 0, sizeof s);
++    s.has_dpm = 1u; s.has_wda = 1u;
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_DPM && s.step == CBD_DPM && s.txn == 1u);
++    cbd_server_lost(&s, CBD_SVC_DPM);
++    CHECK(s.step == CBD_IDLE && s.has_dpm == 0u);
++    CHECK(cbd_next(&s, sdu, sizeof sdu, &svc) == 0u && s.step == CBD_IDLE);
++    s.has_dpm = 1u;
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_DPM && s.step == CBD_DPM && s.txn == 2u);
++    rlen = build_dpm_rsp(rsp, (uint16_t)s.txn, 0u);
++    CHECK(cbd_answer(&s, CBD_SVC_DPM, rsp, rlen) == 1 && s.step == CBD_WAIT_WDA);
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_WDA && s.step == CBD_WDA && s.txn == 3u);
++    cbd_server_lost(&s, CBD_SVC_WDA);
++    CHECK(s.step == CBD_WAIT_WDA && s.has_wda == 0u);
++    s.has_wda = 1u;
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_WDA && s.step == CBD_WDA && s.txn == 4u);
++    rlen = build_wda_rsp(rsp, (uint16_t)s.txn, 0u, CBD_LLP_RAW_IP, CBD_DAP_QMAP, CBD_DAP_QMAP, 16u, 63u);
++    CHECK(cbd_answer(&s, CBD_SVC_WDA, rsp, rlen) == 1 && s.step == CBD_DONE && bb_pdp_is_ready(&s) == 1);
++}
++
 +int main(void) {
 +    assign_page();
 +    qmi_tlvs();
@@ -2401,7 +2550,59 @@ index 0000000..629c65b
 +    m6_ipa_gsi_qmi();
 +    m7_qmap_cell_wms();
 +    m8b3_sandbox_check();
-+    printf("PASS fuxi modem proto: %u checks; MP_ASSIGN page, QMI TLVs, rmtfs open/alloc/rw/close/refusals, QRTR lookup and control packets, QMI DMS/NAS/WMS/UIM/DPM/WDA/WDS/IND codecs, TFTP over QRTR, IPA v5.5/GSI v5.0/QMI IPA 0x31/QMAP/en1/SMMU/BlastDoor-sandbox\n", checks);
++    b020_data_port_race();
++    printf("PASS fuxi modem proto: %u checks; MP_ASSIGN page, QMI TLVs, rmtfs open/alloc/rw/close/refusals, QRTR lookup and control packets, QMI DMS/NAS/WMS/UIM/DPM/WDA/WDS/IND codecs, TFTP over QRTR, IPA v5.5/GSI v5.0/QMI IPA 0x31/QMAP/en1/SMMU/BlastDoor-sandbox/B020-WDA-race\n", checks);
++    return 0;
++}
++'''
++
++
++FALLBACK_SOURCE = r'''
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "coachz_bb_data.h"
++static unsigned checks;
++#define CHECK(test) do { checks++; if (!(test)) { fprintf(stderr, "fallback line %d: %s\n", __LINE__, #test); exit(1); } } while (0)
++
++static uint32_t dpm_ok(uint8_t *out, uint16_t txn) {
++    out[0] = 0x02u; cbd_wr16(out + 1, txn); cbd_wr16(out + 3, CBD_DPM_OPEN_PORT); cbd_wr16(out + 5, 7u);
++    out[7] = 0x02u; cbd_wr16(out + 8, 4u); cbd_wr16(out + 10, 0u); cbd_wr16(out + 12, 0u);
++    return 14u;
++}
++static uint32_t wda_rsp(uint8_t *out, uint16_t txn, uint16_t err, uint32_t dap) {
++    uint32_t w = 0u; uint8_t *t = out + 7u; uint8_t res[4];
++    cbd_wr16(res, err ? 1u : 0u); cbd_wr16(res + 2, err);
++    w += cbd_tlv(t + w, 96u - w, 0x02u, res, 4u);
++    if (!err) {
++        w += cbd_tlv_u32(t + w, 96u - w, 0x11u, CBD_LLP_RAW_IP);
++        w += cbd_tlv_u32(t + w, 96u - w, 0x12u, dap);
++        w += cbd_tlv_u32(t + w, 96u - w, 0x13u, dap);
++    }
++    out[0] = 0x02u; cbd_wr16(out + 1, txn); cbd_wr16(out + 3, CBD_WDA_SET_DATA_FORMAT); cbd_wr16(out + 5, w);
++    return 7u + w;
++}
++int main(void) {
++    uint8_t sdu[128], rsp[128]; uint32_t svc = 0u, n = 0u;
++    struct cbd_setup s;
++    memset(&s, 0, sizeof s);
++    s.has_dpm = 1u; s.has_wda = 1u;
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_DPM && s.step == CBD_DPM);
++    CHECK(cbd_answer(&s, CBD_SVC_DPM, rsp, dpm_ok(rsp, (uint16_t)s.txn)) == 1 && s.step == CBD_WAIT_WDA);
++    /* 首輪問 QMAPv4 (8) -> modem 回錯誤 0x03 -> 進入 CBD_WDA_NEXT */
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_WDA && s.step == CBD_WDA && s.dap_index == 0u);
++    CHECK(cbd_answer(&s, CBD_SVC_WDA, rsp, wda_rsp(rsp, (uint16_t)s.txn, 0x03u, 0u)) == 1 && s.step == CBD_WDA_NEXT);
++    /* 若 WDA 暫失則留在 CBD_WDA_NEXT；回來後送第二個 DAP (QMAP=5) -> 完成 */
++    s.has_wda = 0u;
++    CHECK(cbd_next(&s, sdu, sizeof sdu, &svc) == 0u && s.step == CBD_WDA_NEXT);
++    s.has_wda = 1u;
++    n = cbd_next(&s, sdu, sizeof sdu, &svc);
++    CHECK(n > 0u && svc == CBD_SVC_WDA && s.step == CBD_WDA && s.dap_index == 1u);
++    CHECK(cbd_answer(&s, CBD_SVC_WDA, rsp, wda_rsp(rsp, (uint16_t)s.txn, 0u, CBD_DAP_QMAP)) == 1);
++    CHECK(s.step == CBD_DONE && s.wda_error == 0u && s.dl_dap == CBD_DAP_QMAP);
++    printf("PASS coachz_bb_data dual-DAP fallback: %u checks\n", checks);
 +    return 0;
 +}
 +'''
@@ -2416,21 +2617,22 @@ index 0000000..629c65b
 +    microsoft = Path(compiler[0].strip('"')).name.lower() in ('cl', 'cl.exe')
 +    with tempfile.TemporaryDirectory(prefix='fuxi-modem-') as temporary:
 +        directory = Path(temporary)
-+        source = directory / 'modem.c'
-+        source.write_text(SOURCE, encoding='utf-8', newline='\n')
-+        binary = directory / ('modem.exe' if os.name == 'nt' else 'modem')
-+        if microsoft:
-+            flags = ['/nologo', '/std:c11', '/W4', '/WX', '/Zi', '/Od', '/MD', '/utf-8']
-+            if arguments.sanitize:
-+                flags.append('/fsanitize=address')
-+            command = compiler + flags + [f'/I{ROOT / "xnu/fuxi-modem"}', str(source), f'/Fe:{binary}']
-+        else:
-+            flags = ['-std=c11', '-g', '-Wall', '-Wextra', '-Werror', '-O1']
-+            if arguments.sanitize:
-+                flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
-+            command = compiler + flags + ['-I', str(ROOT / 'xnu/fuxi-modem'), str(source), '-o', str(binary)]
-+        subprocess.run(command, cwd=directory, env=environment, check=True, timeout=120)
-+        subprocess.run([str(binary)], cwd=directory, env=environment, check=True, timeout=120)
++        for stem, code in (('modem', SOURCE), ('cbd_fallback', FALLBACK_SOURCE)):
++            source = directory / f'{stem}.c'
++            source.write_text(code, encoding='utf-8', newline='\n')
++            binary = directory / (f'{stem}.exe' if os.name == 'nt' else stem)
++            if microsoft:
++                flags = ['/nologo', '/std:c11', '/W4', '/WX', '/Zi', '/Od', '/MD', '/utf-8']
++                if arguments.sanitize:
++                    flags.append('/fsanitize=address')
++                command = compiler + flags + [f'/I{ROOT / "xnu/fuxi-modem"}', str(source), f'/Fe:{binary}']
++            else:
++                flags = ['-std=c11', '-g', '-Wall', '-Wextra', '-Werror', '-O1']
++                if arguments.sanitize:
++                    flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
++                command = compiler + flags + ['-I', str(ROOT / 'xnu/fuxi-modem'), str(source), '-o', str(binary)]
++            subprocess.run(command, cwd=directory, env=environment, check=True, timeout=120)
++            subprocess.run([str(binary)], cwd=directory, env=environment, check=True, timeout=120)
 +
 +
 +if __name__ == '__main__':
@@ -37403,10 +37605,10 @@ index 0000000..20b645e
 +#endif
 diff --git a/xnu/fuxi-modem/FuxiBaseband.cpp b/xnu/fuxi-modem/FuxiBaseband.cpp
 new file mode 100644
-index 0000000..3bce09f
+index 0000000..4d638e3
 --- /dev/null
 +++ b/xnu/fuxi-modem/FuxiBaseband.cpp
-@@ -0,0 +1,1743 @@
+@@ -0,0 +1,1784 @@
 +// SPDX-License-Identifier: BSD-2-Clause
 +// Adapted from UniXNU/QcomBaseband (commit dd0199cf3300, baseband/coachz_baseband.cpp,
 +// HoshinoYumeka @chiba233) for Xiaomi 13 (fuxi / SM8550 IPA v5.5). Opt-in via ADT /chosen "fuxi,modem-bb".
@@ -37483,6 +37685,7 @@ index 0000000..3bce09f
 +static uint32_t bb_pdp_owners[CBQ_MAX_CLIENTS];
 +static struct cbd_setup bb_data;         // the data port setup ModemManager runs for IPA (coachz_bb_data.h)
 +static int bb_data_slot[2] = { -1, -1 }; // the bridge's own DPM and WDA clients
++static uint8_t bb_data_wanted, bb_data_logged, bb_data_wait_logged;
 +static uint32_t bb_endpoint_fixes, bb_activations;
 +static uint8_t bb_fix[2048];
 +static struct cbe bb_esim;
@@ -37907,26 +38110,58 @@ index 0000000..3bce09f
 +}
 +
 +// ------------------------------------------------------------------ data port setup (bb_lock held)
-+static void bb_data_step(void)
++static void bb_data_log_done(void)
 +{
++  if (bb_data_logged) return;
++  bb_data_logged = 1;
++  printf("COACHZ baseband: data port: DPM open %s 0x%x; WDA set data format error 0x%x, link %d, uplink %d, downlink %d (asked %u), %d datagrams, %d bytes\n",
++         (bb_data.has_dpm || bb_data.dpm_error != 0xffffu) ? "error" : "skipped, no service,", bb_data.dpm_error, bb_data.wda_error,
++         (int)bb_data.llp, (int)bb_data.ul_dap, (int)bb_data.dl_dap, cbd_daps[bb_data.dap_index], (int)bb_data.dl_datagrams, (int)bb_data.dl_size);
++}
++
++static void bb_data_try(void)
++{
++  if (!bb_data_wanted || bb_data.step == CBD_DONE || bb_data.step == CBD_DPM || bb_data.step == CBD_WDA)
++    return;
++  bb_data.has_dpm = cbq_server_find(&bb_qmux, CBD_SVC_DPM) != nullptr;
++  bb_data.has_wda = cbq_server_find(&bb_qmux, CBD_SVC_WDA) != nullptr;
++  if (bb_data.step == CBD_IDLE && !bb_data.has_dpm) {
++    if (!(bb_data_wait_logged & 1u)) {
++      bb_data_wait_logged |= 1u;
++      printf("COACHZ baseband: data port: waiting for DPM service\n");
++    }
++    return;
++  }
++  if ((bb_data.step == CBD_WAIT_WDA || bb_data.step == CBD_WDA_NEXT) && !bb_data.has_wda) {
++    if (!(bb_data_wait_logged & 2u)) {
++      bb_data_wait_logged |= 2u;
++      printf("COACHZ baseband: data port: DPM open error 0x%x; waiting for WDA service\n", bb_data.dpm_error);
++    }
++    return;
++  }
++  if (bb_tx_count >= BB_TX) return;
++  const uint32_t next_svc = bb_data.step == CBD_IDLE ? CBD_SVC_DPM : CBD_SVC_WDA;
++  const struct cbq_server *server = cbq_server_find(&bb_qmux, next_svc);
++  if (!server) return;
++  int *slot = &bb_data_slot[next_svc == CBD_SVC_DPM ? 0 : 1];
++  if (*slot < 0) *slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, next_svc);
++  if (*slot < 0) {
++    static uint32_t noslot_logged;
++    if (noslot_logged++ < 4u)
++      printf("COACHZ baseband: data port: no client for service %u (retrying)\n", next_svc);
++    return;
++  }
 +  uint8_t sdu[128];
 +  uint32_t service = 0;
++  const struct cbd_setup saved = bb_data;
 +  const uint32_t n = cbd_next(&bb_data, sdu, sizeof sdu, &service);
-+  if (!n) {
-+    printf("COACHZ baseband: data port: DPM open %s 0x%x; WDA set data format error 0x%x, link %d, uplink %d, downlink %d (asked %u), %d datagrams, %d bytes\n",
-+           bb_data.has_dpm ? "error" : "skipped, no service,", bb_data.dpm_error, bb_data.wda_error, (int)bb_data.llp, (int)bb_data.ul_dap,
-+           (int)bb_data.dl_dap, cbd_daps[bb_data.dap_index], (int)bb_data.dl_datagrams, (int)bb_data.dl_size);
++  if (!n || service != next_svc) {
++    if (bb_data.step == CBD_DONE) bb_data_log_done();
 +    return;
 +  }
-+  int *slot = &bb_data_slot[service == CBD_SVC_DPM ? 0 : 1];
-+  if (*slot < 0) *slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, service);
-+  const struct cbq_server *server = cbq_server_find(&bb_qmux, service);
-+  if (*slot < 0 || !server) {
-+    printf("COACHZ baseband: data port: no client for service %u\n", service);
-+    bb_data.step = CBD_DONE;
-+    return;
-+  }
++  const uint32_t queued = bb_tx_count;
 +  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)*slot, server->node, server->port, sdu, n);
++  if (bb_tx_count == queued) bb_data = saved;
 +}
 +
 +// 2026-11-22 bit 0x10: the bridge's own read-only IMSA (0x21) and IMS settings (0x12) clients. Asked at every report (each 30 s
@@ -38089,10 +38324,8 @@ index 0000000..3bce09f
 +
 +static void bb_data_start(void)
 +{
-+  if (bb_data.step != CBD_IDLE) return;
-+  bb_data.has_dpm = cbq_server_find(&bb_qmux, CBD_SVC_DPM) != nullptr;
-+  bb_data.has_wda = cbq_server_find(&bb_qmux, CBD_SVC_WDA) != nullptr;
-+  bb_data_step();
++  bb_data_wanted = 1;
++  bb_data_try();
 +}
 +
 +// WDS is still entirely owned by CommCenter. Observe only wire lifecycle facts, never credentials or addresses.
@@ -38130,7 +38363,10 @@ index 0000000..3bce09f
 +// A request for the modem, with the data port named as this modem has it.
 +static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
 +{
-+  if (r.service == CBD_SVC_WDS) bb_pdp_note(r.local_port, r.cid, r.channel, sdu, r.len);
++  if (r.service == CBD_SVC_WDS) {
++    if (!bb_data_wanted) bb_data_start();
++    bb_pdp_note(r.local_port, r.cid, r.channel, sdu, r.len);
++  }
 +  bb_sim_request(r, sdu);
 +  if (r.service == CBE_SVC_UIM && bb_esim.route_failed) {
 +    const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, CBE_ERR_INTERNAL, nullptr, 0, bb_out, sizeof bb_out);
@@ -39016,6 +39252,7 @@ index 0000000..3bce09f
 +  bb_init();
 +  IOLockLock(bb_lock);
 +  cbq_server_new(&bb_qmux, service, version_instance, node, port);
++  if (service == CBD_SVC_DPM || service == CBD_SVC_WDA) bb_data_try();
 +  IOLockUnlock(bb_lock);
 +}
 +
@@ -39025,6 +39262,8 @@ index 0000000..3bce09f
 +  IOLockLock(bb_lock);
 +  cbq_server_del(&bb_qmux, service, node, port);
 +  if (service == CBD_SVC_WDS) bzero(bb_pdp_clients, sizeof bb_pdp_clients);
++  if ((service == CBD_SVC_DPM || service == CBD_SVC_WDA) && !cbq_server_find(&bb_qmux, service))
++    cbd_server_lost(&bb_data, service);
 +  IOLockUnlock(bb_lock);
 +}
 +
@@ -39043,7 +39282,10 @@ index 0000000..3bce09f
 +      bb_ims_answer(0, static_cast<const uint8_t *>(body), size);
 +    } else if (bb_ims_slot[1] >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_ims_slot[1]) {
 +      bb_ims_answer(1, static_cast<const uint8_t *>(body), size);
-+    } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
++    } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) {
++      if (bb_data.step == CBD_DONE) bb_data_log_done();
++      else bb_data_try();
++    }
 +  } else if (r.kind == CBQ_TO_HOST) {
 +    if (r.service == CBD_SVC_WDS) bb_pdp_note(dst_port, r.cid, r.channel, static_cast<const uint8_t *>(body), size);
 +    // A temporary eUICC card-status indication is not the restored logical SIM.
@@ -39076,6 +39318,7 @@ index 0000000..3bce09f
 +  bb_tx batch[16];
 +  uint32_t n = 0, released[16], r = 0, port;
 +  IOLockLock(bb_lock);
++  bb_data_try();
 +  bb_esim_step();
 +  bb_ims_cfg_poll();
 +  if (bb_ims_probe() && bb_imsa_step >= 3u && cbq_server_find(&bb_qmux, BB_SVC_IMSA)) {
@@ -39355,10 +39598,10 @@ index 0000000..323caf6
 +#endif /* COACHZ_BB_CONTROL_H */
 diff --git a/xnu/fuxi-modem/coachz_bb_data.h b/xnu/fuxi-modem/coachz_bb_data.h
 new file mode 100644
-index 0000000..7c7b06f
+index 0000000..370ec07
 --- /dev/null
 +++ b/xnu/fuxi-modem/coachz_bb_data.h
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,456 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * The data port as this modem has it. Portable and host-tested; no kernel code.
@@ -39560,36 +39803,59 @@ index 0000000..7c7b06f
 +    return v && len >= 4u ? cbd_rd32(v) : 0xffffffffu;
 +}
 +
-+/* The setup ModemManager runs before its first bind, as a sequence of requests and answers. */
-+enum cbd_step { CBD_IDLE, CBD_DPM, CBD_WDA, CBD_DONE };
++/* The setup ModemManager runs before its first bind, as a sequence of requests and answers.
++ * QRTR servers arrive asynchronously (on SM8550, WDS 0x01 can appear before WDA 0x1a). Never
++ * skip DPM or WDA when its service has not announced yet: hold in CBD_IDLE / CBD_WAIT_WDA
++ * until the service appears, then continue to CBD_DONE. */
++enum cbd_step { CBD_IDLE = 0, CBD_DPM = 1, CBD_WDA = 2, CBD_DONE = 3, CBD_WAIT_WDA = 4, CBD_WDA_NEXT = 5 };
 +struct cbd_setup {
 +    enum cbd_step step;
 +    uint32_t txn, dap_index, dpm_error, wda_error;
 +    uint32_t llp, ul_dap, dl_dap, dl_datagrams, dl_size;   /* as the modem reports them, 0xffffffff when it did not */
 +    uint8_t has_dpm, has_wda;
 +};
-+/* Next request: its service in *service and its SDU in `sdu`; 0 when there is none. Call at the start and after each answer. */
++/* Next request: its service in *service and its SDU in `sdu`; 0 when none can be sent now (either done,
++ * a request is already in flight, or the required service has not arrived on QRTR yet). */
 +static inline uint32_t cbd_next(struct cbd_setup *s, uint8_t *sdu, uint32_t room, uint32_t *service)
 +{
-+    s->txn = (s->txn + 1u) & 0xffffu;
-+    if (!s->txn) s->txn = 1;
++    uint32_t next_txn = (s->txn + 1u) & 0xffffu;
++    if (!next_txn) next_txn = 1u;
 +    if (s->step == CBD_IDLE) {
++        if (!s->has_dpm) return 0;
++        const uint32_t n = cbd_dpm_open(sdu, room, next_txn);
++        if (!n) return 0;
++        s->txn = next_txn;
++        s->dap_index = 0;
 +        s->dpm_error = s->wda_error = 0xffffu;
 +        s->llp = s->ul_dap = s->dl_dap = s->dl_datagrams = s->dl_size = 0xffffffffu;
 +        s->step = CBD_DPM;
-+        if (s->has_dpm) { *service = CBD_SVC_DPM; return cbd_dpm_open(sdu, room, s->txn); }
++        *service = CBD_SVC_DPM;
++        return n;
 +    }
-+    if (s->step == CBD_DPM) {
-+        s->step = CBD_WDA;
++    if (s->step == CBD_WAIT_WDA) {
++        if (!s->has_wda) return 0;
++        const uint32_t n = cbd_wda_set(sdu, room, next_txn, cbd_daps[0]);
++        if (!n) return 0;
++        s->txn = next_txn;
 +        s->dap_index = 0;
-+        if (s->has_wda) { *service = CBD_SVC_WDA; return cbd_wda_set(sdu, room, s->txn, cbd_daps[0]); }
-+    } else if (s->step == CBD_WDA && s->has_wda && (s->wda_error || s->dl_dap != cbd_daps[s->dap_index]) &&
-+               s->dap_index + 1u < sizeof cbd_daps / sizeof cbd_daps[0]) {
-+        s->dap_index++;
++        s->step = CBD_WDA;
 +        *service = CBD_SVC_WDA;
-+        return cbd_wda_set(sdu, room, s->txn, cbd_daps[s->dap_index]);
++        return n;
 +    }
-+    s->step = CBD_DONE;
++    if (s->step == CBD_WDA_NEXT) {
++        if (s->dap_index + 1u >= sizeof cbd_daps / sizeof cbd_daps[0]) {
++            s->step = CBD_DONE;
++            return 0;
++        }
++        if (!s->has_wda) return 0;
++        const uint32_t n = cbd_wda_set(sdu, room, next_txn, cbd_daps[s->dap_index + 1u]);
++        if (!n) return 0;
++        s->txn = next_txn;
++        s->dap_index++;
++        s->step = CBD_WDA;
++        *service = CBD_SVC_WDA;
++        return n;
++    }
 +    return 0;
 +}
 +/* An answer for the request in flight. 1 when it was that one. */
@@ -39598,6 +39864,7 @@ index 0000000..7c7b06f
 +    if (n < 7u || sdu[0] != 0x02 || cbd_rd16(sdu + 1) != s->txn) return 0;
 +    if (s->step == CBD_DPM && service == CBD_SVC_DPM && cbd_rd16(sdu + 3) == CBD_DPM_OPEN_PORT) {
 +        s->dpm_error = cbd_error(sdu, n);
++        s->step = CBD_WAIT_WDA;
 +        return 1;
 +    }
 +    if (s->step == CBD_WDA && service == CBD_SVC_WDA && cbd_rd16(sdu + 3) == CBD_WDA_SET_DATA_FORMAT) {
@@ -39607,9 +39874,26 @@ index 0000000..7c7b06f
 +        s->dl_dap = cbd_u32(sdu, n, 0x13);
 +        s->dl_datagrams = cbd_u32(sdu, n, 0x15);
 +        s->dl_size = cbd_u32(sdu, n, 0x16);
++        if ((s->wda_error || s->dl_dap != cbd_daps[s->dap_index]) &&
++            s->dap_index + 1u < sizeof cbd_daps / sizeof cbd_daps[0]) {
++            s->step = CBD_WDA_NEXT;
++        } else {
++            s->step = CBD_DONE;
++        }
 +        return 1;
 +    }
 +    return 0;
++}
++/* When a QRTR service disappears while a request to it is in flight, step back to wait for it. */
++static inline void cbd_server_lost(struct cbd_setup *s, uint32_t service)
++{
++    if (service == CBD_SVC_DPM) {
++        s->has_dpm = 0;
++        if (s->step == CBD_DPM) s->step = CBD_IDLE;
++    } else if (service == CBD_SVC_WDA) {
++        s->has_wda = 0;
++        if (s->step == CBD_WDA) s->step = CBD_WAIT_WDA;
++    }
 +}
 +
 +/*
@@ -47071,10 +47355,10 @@ index 0000000..6268206
 +#endif
 diff --git a/xnu/patches/0126-fuxi-modem.patch b/xnu/patches/0126-fuxi-modem.patch
 new file mode 100644
-index 0000000..6974a41
+index 0000000..9eed8aa
 --- /dev/null
 +++ b/xnu/patches/0126-fuxi-modem.patch
-@@ -0,0 +1,9680 @@
+@@ -0,0 +1,9762 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -154,5 +154,7 @@
@@ -52603,7 +52887,7 @@ index 0000000..6974a41
 ++#endif
 +--- /dev/null
 ++++ b/iokit/Kernel/arm/FuxiBaseband.cpp
-+@@ -0,0 +1,1743 @@
++@@ -0,0 +1,1784 @@
 ++// SPDX-License-Identifier: BSD-2-Clause
 ++// Adapted from UniXNU/QcomBaseband (commit dd0199cf3300, baseband/coachz_baseband.cpp,
 ++// HoshinoYumeka @chiba233) for Xiaomi 13 (fuxi / SM8550 IPA v5.5). Opt-in via ADT /chosen "fuxi,modem-bb".
@@ -52680,6 +52964,7 @@ index 0000000..6974a41
 ++static uint32_t bb_pdp_owners[CBQ_MAX_CLIENTS];
 ++static struct cbd_setup bb_data;         // the data port setup ModemManager runs for IPA (coachz_bb_data.h)
 ++static int bb_data_slot[2] = { -1, -1 }; // the bridge's own DPM and WDA clients
+++static uint8_t bb_data_wanted, bb_data_logged, bb_data_wait_logged;
 ++static uint32_t bb_endpoint_fixes, bb_activations;
 ++static uint8_t bb_fix[2048];
 ++static struct cbe bb_esim;
@@ -53104,26 +53389,58 @@ index 0000000..6974a41
 ++}
 ++
 ++// ------------------------------------------------------------------ data port setup (bb_lock held)
-++static void bb_data_step(void)
+++static void bb_data_log_done(void)
 ++{
+++  if (bb_data_logged) return;
+++  bb_data_logged = 1;
+++  printf("COACHZ baseband: data port: DPM open %s 0x%x; WDA set data format error 0x%x, link %d, uplink %d, downlink %d (asked %u), %d datagrams, %d bytes\n",
+++         (bb_data.has_dpm || bb_data.dpm_error != 0xffffu) ? "error" : "skipped, no service,", bb_data.dpm_error, bb_data.wda_error,
+++         (int)bb_data.llp, (int)bb_data.ul_dap, (int)bb_data.dl_dap, cbd_daps[bb_data.dap_index], (int)bb_data.dl_datagrams, (int)bb_data.dl_size);
+++}
+++
+++static void bb_data_try(void)
+++{
+++  if (!bb_data_wanted || bb_data.step == CBD_DONE || bb_data.step == CBD_DPM || bb_data.step == CBD_WDA)
+++    return;
+++  bb_data.has_dpm = cbq_server_find(&bb_qmux, CBD_SVC_DPM) != nullptr;
+++  bb_data.has_wda = cbq_server_find(&bb_qmux, CBD_SVC_WDA) != nullptr;
+++  if (bb_data.step == CBD_IDLE && !bb_data.has_dpm) {
+++    if (!(bb_data_wait_logged & 1u)) {
+++      bb_data_wait_logged |= 1u;
+++      printf("COACHZ baseband: data port: waiting for DPM service\n");
+++    }
+++    return;
+++  }
+++  if ((bb_data.step == CBD_WAIT_WDA || bb_data.step == CBD_WDA_NEXT) && !bb_data.has_wda) {
+++    if (!(bb_data_wait_logged & 2u)) {
+++      bb_data_wait_logged |= 2u;
+++      printf("COACHZ baseband: data port: DPM open error 0x%x; waiting for WDA service\n", bb_data.dpm_error);
+++    }
+++    return;
+++  }
+++  if (bb_tx_count >= BB_TX) return;
+++  const uint32_t next_svc = bb_data.step == CBD_IDLE ? CBD_SVC_DPM : CBD_SVC_WDA;
+++  const struct cbq_server *server = cbq_server_find(&bb_qmux, next_svc);
+++  if (!server) return;
+++  int *slot = &bb_data_slot[next_svc == CBD_SVC_DPM ? 0 : 1];
+++  if (*slot < 0) *slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, next_svc);
+++  if (*slot < 0) {
+++    static uint32_t noslot_logged;
+++    if (noslot_logged++ < 4u)
+++      printf("COACHZ baseband: data port: no client for service %u (retrying)\n", next_svc);
+++    return;
+++  }
 ++  uint8_t sdu[128];
 ++  uint32_t service = 0;
+++  const struct cbd_setup saved = bb_data;
 ++  const uint32_t n = cbd_next(&bb_data, sdu, sizeof sdu, &service);
-++  if (!n) {
-++    printf("COACHZ baseband: data port: DPM open %s 0x%x; WDA set data format error 0x%x, link %d, uplink %d, downlink %d (asked %u), %d datagrams, %d bytes\n",
-++           bb_data.has_dpm ? "error" : "skipped, no service,", bb_data.dpm_error, bb_data.wda_error, (int)bb_data.llp, (int)bb_data.ul_dap,
-++           (int)bb_data.dl_dap, cbd_daps[bb_data.dap_index], (int)bb_data.dl_datagrams, (int)bb_data.dl_size);
+++  if (!n || service != next_svc) {
+++    if (bb_data.step == CBD_DONE) bb_data_log_done();
 ++    return;
 ++  }
-++  int *slot = &bb_data_slot[service == CBD_SVC_DPM ? 0 : 1];
-++  if (*slot < 0) *slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, service);
-++  const struct cbq_server *server = cbq_server_find(&bb_qmux, service);
-++  if (*slot < 0 || !server) {
-++    printf("COACHZ baseband: data port: no client for service %u\n", service);
-++    bb_data.step = CBD_DONE;
-++    return;
-++  }
+++  const uint32_t queued = bb_tx_count;
 ++  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)*slot, server->node, server->port, sdu, n);
+++  if (bb_tx_count == queued) bb_data = saved;
 ++}
 ++
 ++// 2026-11-22 bit 0x10: the bridge's own read-only IMSA (0x21) and IMS settings (0x12) clients. Asked at every report (each 30 s
@@ -53286,10 +53603,8 @@ index 0000000..6974a41
 ++
 ++static void bb_data_start(void)
 ++{
-++  if (bb_data.step != CBD_IDLE) return;
-++  bb_data.has_dpm = cbq_server_find(&bb_qmux, CBD_SVC_DPM) != nullptr;
-++  bb_data.has_wda = cbq_server_find(&bb_qmux, CBD_SVC_WDA) != nullptr;
-++  bb_data_step();
+++  bb_data_wanted = 1;
+++  bb_data_try();
 ++}
 ++
 ++// WDS is still entirely owned by CommCenter. Observe only wire lifecycle facts, never credentials or addresses.
@@ -53327,7 +53642,10 @@ index 0000000..6974a41
 ++// A request for the modem, with the data port named as this modem has it.
 ++static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
 ++{
-++  if (r.service == CBD_SVC_WDS) bb_pdp_note(r.local_port, r.cid, r.channel, sdu, r.len);
+++  if (r.service == CBD_SVC_WDS) {
+++    if (!bb_data_wanted) bb_data_start();
+++    bb_pdp_note(r.local_port, r.cid, r.channel, sdu, r.len);
+++  }
 ++  bb_sim_request(r, sdu);
 ++  if (r.service == CBE_SVC_UIM && bb_esim.route_failed) {
 ++    const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, CBE_ERR_INTERNAL, nullptr, 0, bb_out, sizeof bb_out);
@@ -54213,6 +54531,7 @@ index 0000000..6974a41
 ++  bb_init();
 ++  IOLockLock(bb_lock);
 ++  cbq_server_new(&bb_qmux, service, version_instance, node, port);
+++  if (service == CBD_SVC_DPM || service == CBD_SVC_WDA) bb_data_try();
 ++  IOLockUnlock(bb_lock);
 ++}
 ++
@@ -54222,6 +54541,8 @@ index 0000000..6974a41
 ++  IOLockLock(bb_lock);
 ++  cbq_server_del(&bb_qmux, service, node, port);
 ++  if (service == CBD_SVC_WDS) bzero(bb_pdp_clients, sizeof bb_pdp_clients);
+++  if ((service == CBD_SVC_DPM || service == CBD_SVC_WDA) && !cbq_server_find(&bb_qmux, service))
+++    cbd_server_lost(&bb_data, service);
 ++  IOLockUnlock(bb_lock);
 ++}
 ++
@@ -54240,7 +54561,10 @@ index 0000000..6974a41
 ++      bb_ims_answer(0, static_cast<const uint8_t *>(body), size);
 ++    } else if (bb_ims_slot[1] >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_ims_slot[1]) {
 ++      bb_ims_answer(1, static_cast<const uint8_t *>(body), size);
-++    } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
+++    } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) {
+++      if (bb_data.step == CBD_DONE) bb_data_log_done();
+++      else bb_data_try();
+++    }
 ++  } else if (r.kind == CBQ_TO_HOST) {
 ++    if (r.service == CBD_SVC_WDS) bb_pdp_note(dst_port, r.cid, r.channel, static_cast<const uint8_t *>(body), size);
 ++    // A temporary eUICC card-status indication is not the restored logical SIM.
@@ -54273,6 +54597,7 @@ index 0000000..6974a41
 ++  bb_tx batch[16];
 ++  uint32_t n = 0, released[16], r = 0, port;
 ++  IOLockLock(bb_lock);
+++  bb_data_try();
 ++  bb_esim_step();
 ++  bb_ims_cfg_poll();
 ++  if (bb_ims_probe() && bb_imsa_step >= 3u && cbq_server_find(&bb_qmux, BB_SVC_IMSA)) {
@@ -54519,7 +54844,7 @@ index 0000000..6974a41
 ++#endif /* COACHZ_BB_CONTROL_H */
 +--- /dev/null
 ++++ b/iokit/Kernel/arm/coachz_bb_data.h
-+@@ -0,0 +1,415 @@
++@@ -0,0 +1,456 @@
 ++/* SPDX-License-Identifier: BSD-2-Clause */
 ++/*
 ++ * The data port as this modem has it. Portable and host-tested; no kernel code.
@@ -54721,36 +55046,59 @@ index 0000000..6974a41
 ++    return v && len >= 4u ? cbd_rd32(v) : 0xffffffffu;
 ++}
 ++
-++/* The setup ModemManager runs before its first bind, as a sequence of requests and answers. */
-++enum cbd_step { CBD_IDLE, CBD_DPM, CBD_WDA, CBD_DONE };
+++/* The setup ModemManager runs before its first bind, as a sequence of requests and answers.
+++ * QRTR servers arrive asynchronously (on SM8550, WDS 0x01 can appear before WDA 0x1a). Never
+++ * skip DPM or WDA when its service has not announced yet: hold in CBD_IDLE / CBD_WAIT_WDA
+++ * until the service appears, then continue to CBD_DONE. */
+++enum cbd_step { CBD_IDLE = 0, CBD_DPM = 1, CBD_WDA = 2, CBD_DONE = 3, CBD_WAIT_WDA = 4, CBD_WDA_NEXT = 5 };
 ++struct cbd_setup {
 ++    enum cbd_step step;
 ++    uint32_t txn, dap_index, dpm_error, wda_error;
 ++    uint32_t llp, ul_dap, dl_dap, dl_datagrams, dl_size;   /* as the modem reports them, 0xffffffff when it did not */
 ++    uint8_t has_dpm, has_wda;
 ++};
-++/* Next request: its service in *service and its SDU in `sdu`; 0 when there is none. Call at the start and after each answer. */
+++/* Next request: its service in *service and its SDU in `sdu`; 0 when none can be sent now (either done,
+++ * a request is already in flight, or the required service has not arrived on QRTR yet). */
 ++static inline uint32_t cbd_next(struct cbd_setup *s, uint8_t *sdu, uint32_t room, uint32_t *service)
 ++{
-++    s->txn = (s->txn + 1u) & 0xffffu;
-++    if (!s->txn) s->txn = 1;
+++    uint32_t next_txn = (s->txn + 1u) & 0xffffu;
+++    if (!next_txn) next_txn = 1u;
 ++    if (s->step == CBD_IDLE) {
+++        if (!s->has_dpm) return 0;
+++        const uint32_t n = cbd_dpm_open(sdu, room, next_txn);
+++        if (!n) return 0;
+++        s->txn = next_txn;
+++        s->dap_index = 0;
 ++        s->dpm_error = s->wda_error = 0xffffu;
 ++        s->llp = s->ul_dap = s->dl_dap = s->dl_datagrams = s->dl_size = 0xffffffffu;
 ++        s->step = CBD_DPM;
-++        if (s->has_dpm) { *service = CBD_SVC_DPM; return cbd_dpm_open(sdu, room, s->txn); }
+++        *service = CBD_SVC_DPM;
+++        return n;
 ++    }
-++    if (s->step == CBD_DPM) {
-++        s->step = CBD_WDA;
+++    if (s->step == CBD_WAIT_WDA) {
+++        if (!s->has_wda) return 0;
+++        const uint32_t n = cbd_wda_set(sdu, room, next_txn, cbd_daps[0]);
+++        if (!n) return 0;
+++        s->txn = next_txn;
 ++        s->dap_index = 0;
-++        if (s->has_wda) { *service = CBD_SVC_WDA; return cbd_wda_set(sdu, room, s->txn, cbd_daps[0]); }
-++    } else if (s->step == CBD_WDA && s->has_wda && (s->wda_error || s->dl_dap != cbd_daps[s->dap_index]) &&
-++               s->dap_index + 1u < sizeof cbd_daps / sizeof cbd_daps[0]) {
-++        s->dap_index++;
+++        s->step = CBD_WDA;
 ++        *service = CBD_SVC_WDA;
-++        return cbd_wda_set(sdu, room, s->txn, cbd_daps[s->dap_index]);
+++        return n;
 ++    }
-++    s->step = CBD_DONE;
+++    if (s->step == CBD_WDA_NEXT) {
+++        if (s->dap_index + 1u >= sizeof cbd_daps / sizeof cbd_daps[0]) {
+++            s->step = CBD_DONE;
+++            return 0;
+++        }
+++        if (!s->has_wda) return 0;
+++        const uint32_t n = cbd_wda_set(sdu, room, next_txn, cbd_daps[s->dap_index + 1u]);
+++        if (!n) return 0;
+++        s->txn = next_txn;
+++        s->dap_index++;
+++        s->step = CBD_WDA;
+++        *service = CBD_SVC_WDA;
+++        return n;
+++    }
 ++    return 0;
 ++}
 ++/* An answer for the request in flight. 1 when it was that one. */
@@ -54759,6 +55107,7 @@ index 0000000..6974a41
 ++    if (n < 7u || sdu[0] != 0x02 || cbd_rd16(sdu + 1) != s->txn) return 0;
 ++    if (s->step == CBD_DPM && service == CBD_SVC_DPM && cbd_rd16(sdu + 3) == CBD_DPM_OPEN_PORT) {
 ++        s->dpm_error = cbd_error(sdu, n);
+++        s->step = CBD_WAIT_WDA;
 ++        return 1;
 ++    }
 ++    if (s->step == CBD_WDA && service == CBD_SVC_WDA && cbd_rd16(sdu + 3) == CBD_WDA_SET_DATA_FORMAT) {
@@ -54768,9 +55117,26 @@ index 0000000..6974a41
 ++        s->dl_dap = cbd_u32(sdu, n, 0x13);
 ++        s->dl_datagrams = cbd_u32(sdu, n, 0x15);
 ++        s->dl_size = cbd_u32(sdu, n, 0x16);
+++        if ((s->wda_error || s->dl_dap != cbd_daps[s->dap_index]) &&
+++            s->dap_index + 1u < sizeof cbd_daps / sizeof cbd_daps[0]) {
+++            s->step = CBD_WDA_NEXT;
+++        } else {
+++            s->step = CBD_DONE;
+++        }
 ++        return 1;
 ++    }
 ++    return 0;
+++}
+++/* When a QRTR service disappears while a request to it is in flight, step back to wait for it. */
+++static inline void cbd_server_lost(struct cbd_setup *s, uint32_t service)
+++{
+++    if (service == CBD_SVC_DPM) {
+++        s->has_dpm = 0;
+++        if (s->step == CBD_DPM) s->step = CBD_IDLE;
+++    } else if (service == CBD_SVC_WDA) {
+++        s->has_wda = 0;
+++        if (s->step == CBD_WDA) s->step = CBD_WAIT_WDA;
+++    }
 ++}
 ++
 ++/*

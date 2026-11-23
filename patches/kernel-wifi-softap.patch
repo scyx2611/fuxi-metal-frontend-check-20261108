@@ -364,7 +364,7 @@ index 68891af..46c1609 100755
          source += stripped('fuxi_wifi_ios.c') + TEST
          compile_run(source, directory, 'ios')
 diff --git a/tools/test-fuxi-wlan-ios.py b/tools/test-fuxi-wlan-ios.py
-index 73b74ce..572ab91 100644
+index 73b74ce..6f7acdf 100644
 --- a/tools/test-fuxi-wlan-ios.py
 +++ b/tools/test-fuxi-wlan-ios.py
 @@ -77,6 +77,8 @@ bool fuxi_wifi_sta_powered(void) { return test_powered; }
@@ -376,15 +376,17 @@ index 73b74ce..572ab91 100644
  int fuxi_wifi_sta_ask_power(bool on) { (void)on; return 0; }
  struct fuxi_wifi_sta_scan;
  struct fuxi_wifi_sta_bss;
-@@ -136,6 +138,23 @@ int nw_wifi_tx(const uint8_t *frame, size_t length) {
+@@ -136,6 +138,25 @@ int nw_wifi_tx(const uint8_t *frame, size_t length) {
  static unsigned phy_reads;
  void nw_wifi_link_state(char *text,int size) { phy_reads++; snprintf(text,(size_t)size,"fixture rate"); }
  bool fuxi_wifi_ios_native_ready(void) { return ready; }
++static unsigned ap_start_calls, ap_stop_calls;
++static int ap_start_status;
 +void nw_wifi_ap_set_events(const struct nw_ap_events *ev) { (void)ev; }
 +int nw_wifi_ap_start(const struct nw_ap_config *cfg, uint32_t *freq) {
-+    (void)cfg; if (freq) *freq = 2437; return 0;
++    (void)cfg; ap_start_calls++; if (freq) *freq = 2437; return ap_start_status;
 +}
-+int nw_wifi_ap_stop(void) { return 0; }
++int nw_wifi_ap_stop(void) { ap_stop_calls++; return 0; }
 +int nw_wifi_ap_set_key(const uint8_t *mac, uint8_t idx, uint32_t cipher,
 +    const uint8_t *key, size_t klen, const uint8_t *seq, size_t slen, int del) {
 +    (void)mac; (void)idx; (void)cipher; (void)key; (void)klen; (void)seq; (void)slen; (void)del; return 0;
@@ -400,6 +402,163 @@ index 73b74ce..572ab91 100644
  '''
  
  TEST = r'''
+@@ -171,6 +192,7 @@ static void reset_peer(void) {
+     memset(&wli_backend,0,sizeof(wli_backend)); memset(&wli_target,0,sizeof(wli_target));
+     wli.session = 9; wli_bss_count = wli_channel_count = 0; wli_input = NULL; events = NULL;
+     captured_length = 0; power_calls = attachments = 0; fake_now = 1;
++    ap_start_calls = ap_stop_calls = 0; ap_start_status = 0;
+ }
+ static size_t header(uint8_t *bytes, unsigned kind, unsigned operation, uint64_t generation) {
+     memset(bytes,0,MESSAGE);
+@@ -616,6 +638,20 @@ static void event_lost(const uint8_t *bssid,unsigned reason,unsigned local) {
+     length=wli_put(bytes,length,3,bssid,6); length=put32(bytes,length,8,reason);
+     length=put32(bytes,length,39,local); assert(!deliver(bytes,length));
+ }
++static void event_eapol_status(unsigned acked) {
++    uint8_t bytes[MESSAGE], frame[14]={0};
++    size_t length=header(bytes,3,0x107,wli.generation);
++    length=wli_put(bytes,length,26,frame,sizeof(frame));
++    length=put32(bytes,length,41,acked);
++    assert(!deliver(bytes,length));
++}
++static void event_power(bool on,uint64_t generation) {
++    uint8_t bytes[MESSAGE], value[4]={0};
++    size_t length=header(bytes,3,0x10a,generation);
++    fwc_write(value,on,4);
++    length=wli_put(bytes,length,32,value,4);
++    assert(!deliver(bytes,length));
++}
+ static void ask_join(const char *ssid,const char *passphrase,int security) {
+     memset(&caller_join,0,sizeof(caller_join));
+     caller_join.ssid_length=(uint8_t)strlen(ssid); memcpy(caller_join.ssid,ssid,caller_join.ssid_length);
+@@ -929,6 +965,119 @@ static void keep_tests(void) {
+     test_ux=0; wli_bss_count=0;
+     puts("PASS fuxi,wifi-ux bit 2: same access point kept, unheard rescan kept, better one switched, default leaves");
+ }
++static atomic_bool ap_starter_done;
++static int ap_starter_result;
++static void *ap_starter_thread(void *context) {
++    (void)context;
++    struct fuxi_wifi_ap_config cfg={0};
++    memcpy(cfg.ssid,"Hotspot",7); cfg.ssid_len=7; cfg.wpa2=1;
++    uint32_t freq=0;
++    ap_starter_result=wli_ap_start_op(&cfg,&freq);
++    atomic_store(&ap_starter_done,true);
++    return NULL;
++}
++static void softap_recovery_tests(void) {
++    struct fuxi_wifi_ap_config cfg={0};
++    memcpy(cfg.ssid,"Hotspot",7); cfg.ssid_len=7; cfg.wpa2=1;
++    uint32_t freq=0;
++    test_ap_enabled=true;
++    bootstrap();
++    assert(wli_backend.ap == &wli_ap_ops);
++    memset(&caller_scan,0,sizeof(caller_scan));
++    pthread_t thread=begin(2,false); step(); expect_request(2); scan_accept(true); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && !caller_result && wli_bss_count==5);
++
++    /* 1. SoftAP start/stop does not call nw_wifi_power on stop (fast band switch safe),
++     *    but transparently recycles primary netdev on next direct STA join without clearing BSS or flashing OFF. */
++    unsigned pcalls=power_calls, downs=link_downs;
++    assert(!wli_ap_start_op(&cfg,&freq) && ap_start_calls==1 && wli.ap_active && wli.sta_reset_needed);
++    assert(!wli_ap_stop_op() && ap_stop_calls==1 && !wli.ap_active && wli.sta_reset_needed);
++    assert(power_calls==pcalls);
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK);
++    thread=begin(3,false);
++    step();
++    assert(power_calls==pcalls+1 && requested_power==0 && wli.reset_stage==WLI_RESET_OFF_WAIT);
++    assert(wli_state.phase==FUXI_WIFI_STA_JOINING && wli_bss_count==5 && link_downs==downs);
++    event_power(false,wli.generation+1);
++    assert(wli.reset_stage==WLI_RESET_ON_SEND && wli_state.phase==FUXI_WIFI_STA_JOINING && wli_bss_count==5);
++    step();
++    assert(power_calls==pcalls+2 && requested_power==1 && wli.reset_stage==WLI_RESET_ON_WAIT);
++    event_power(true,wli.generation+1);
++    assert(wli.reset_stage==WLI_RESET_DONE && !wli.sta_reset_needed && link_downs==downs);
++    /* Next step finishes recycle and immediately sends AUTHENTICATE (through_association). */
++    through_association(); message_two(true); keys_and_port();
++    assert(!pthread_join(thread,NULL) && !caller_result && wli_state.phase==FUXI_WIFI_STA_JOINED);
++    assert(link_downs==downs);
++
++    /* 2. ap_start waits for an in-flight WLI_LEAVE before starting SoftAP. */
++    unsigned starts_before=ap_start_calls;
++    thread=begin(4,false);
++    atomic_store(&ap_starter_done,false);
++    pthread_t ap_thread;
++    assert(!pthread_create(&ap_thread,NULL,ap_starter_thread,NULL));
++    struct timespec pause={.tv_nsec=20000000}; nanosleep(&pause,NULL);
++    assert(!atomic_load(&ap_starter_done) && ap_start_calls==starts_before);
++    step(); expect_request(6); respond(6,0); step();
++    assert(!pthread_join(thread,NULL) && !caller_result);
++    assert(!pthread_join(ap_thread,NULL) && !ap_starter_result && ap_start_calls==starts_before+1);
++    assert(wli.ap_active && wli.sta_reset_needed);
++
++    /* 3. Fast ap_stop -> ap_start (Maximize Compatibility toggle) triggers zero power recycles,
++     *    and the first subsequent WLI_SCAN performs one transparent recycle before scanning. */
++    pcalls=power_calls;
++    assert(!wli_ap_stop_op() && !wli.ap_active);
++    assert(!wli_ap_start_op(&cfg,&freq) && wli.ap_active);
++    assert(!wli_ap_stop_op() && !wli.ap_active);
++    assert(power_calls==pcalls);
++    memset(&caller_scan,0,sizeof(caller_scan));
++    thread=begin(2,false);
++    step(); assert(power_calls==pcalls+1 && requested_power==0 && wli.reset_stage==WLI_RESET_OFF_WAIT);
++    assert(wli_state.phase==FUXI_WIFI_STA_SCANNING);
++    event_power(false,wli.generation+1);
++    step(); assert(power_calls==pcalls+2 && requested_power==1 && wli.reset_stage==WLI_RESET_ON_WAIT);
++    event_power(true,wli.generation+1);
++    step(); expect_request(2);
++    scan_accept(false); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && !caller_result && wli_bss_count==5 && !wli.sta_reset_needed);
++
++    /* 4. Manual radio off clears sta_reset_needed so no redundant recycle happens afterwards. */
++    assert(!wli_ap_start_op(&cfg,&freq) && !wli_ap_stop_op() && wli.sta_reset_needed);
++    power_test(false,wli.generation+1);
++    assert(!wli.sta_reset_needed);
++    power_test(true,wli.generation+1);
++    pcalls=power_calls;
++    memset(&caller_scan,0,sizeof(caller_scan));
++    thread=begin(2,false); step(); expect_request(2); scan_accept(true); serve_bss(6,0);
++    assert(!pthread_join(thread,NULL) && !caller_result && wli_bss_count==5);
++    assert(power_calls==pcalls);
++
++    /* 5. 0x107 EAPOL TX status telemetry + 2 consecutive Reason 15 timeouts trigger recycle & recovery. */
++    pcalls=power_calls;
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=begin(3,false);
++    through_association(); message_two(true);
++    event_eapol_status(0); event_eapol_status(1);
++    assert(wlj.eapol_tx_nack==1 && wlj.eapol_tx_ack==1);
++    event_lost(ap,15,0); step(); step();
++    assert(failed_join(thread)==EAUTH && wli.handshake_timeouts==1 && !wli.sta_reset_needed);
++    /* Second consecutive Reason 15 (0x107 silent drop) schedules primary interface recycle. */
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=begin(3,false);
++    through_association(); message_two(true);
++    assert(wlj.eapol_tx_nack==0 && wlj.eapol_tx_ack==0);
++    event_lost(ap,15,0); step(); step();
++    assert(failed_join(thread)==EAUTH && wli.handshake_timeouts==0 && wli.sta_reset_needed);
++    /* Third attempt transparently recycles primary netdev and succeeds cleanly. */
++    ask_join("IEEE","password",FUXI_WIFI_STA_WPA2_PSK); thread=begin(3,false);
++    step(); assert(power_calls==pcalls+1 && requested_power==0);
++    event_power(false,wli.generation+1);
++    step(); assert(power_calls==pcalls+2 && requested_power==1);
++    event_power(true,wli.generation+1);
++    through_association(); message_two(true); keys_and_port();
++    assert(!pthread_join(thread,NULL) && !caller_result && wli_state.phase==FUXI_WIFI_STA_JOINED);
++    assert(!wli.sta_reset_needed && !wli.handshake_timeouts);
++
++    test_ap_enabled=false;
++    puts("PASS SoftAP recovery: ap_start waits for leave, fast toggle untouched, post-AP recycle on scan/join, 0x107 telemetry & repeated Reason 15 recovery");
++}
+ int main(void) {
+     unsigned config_offset;
+     assert(!fwa_config_offset(0,4,0,&config_offset));
+@@ -954,6 +1103,7 @@ int main(void) {
+     join_tests();
+     pick_tests();
+     keep_tests();
++    softap_recovery_tests();
+     bootstrap();
+     uint8_t bytes[MESSAGE]; size_t length=header(bytes,3,0x102,2);
+     assert(deliver(bytes,length)==2 && wli.fatal==EPROTO);
 diff --git a/xnu/fuxi-wifi-ios/FuxiWLAN.cpp b/xnu/fuxi-wifi-ios/FuxiWLAN.cpp
 index f9378cc..0b4b4c8 100644
 --- a/xnu/fuxi-wifi-ios/FuxiWLAN.cpp
@@ -2065,10 +2224,46 @@ index 528aa15..c6a80f5 100644
  fwa_mac_text(const void *property, size_t length, char text[13])
  {
 diff --git a/xnu/fuxi-wlan/fuxi_wlan_ios.inc b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-index 92e0eac..6a6cf58 100644
+index 92e0eac..8ffdbd3 100644
 --- a/xnu/fuxi-wlan/fuxi_wlan_ios.inc
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ios.inc
-@@ -763,6 +763,123 @@ wli_start(const struct fuxi_wifi_input *input)
+@@ -32,6 +32,7 @@
+ #define WLI_DIAG_LINES 48
+ 
+ enum { WLI_POWER = 1, WLI_SCAN, WLI_JOIN, WLI_LEAVE };
++enum { WLI_RESET_NONE, WLI_RESET_OFF_WAIT, WLI_RESET_ON_SEND, WLI_RESET_ON_WAIT, WLI_RESET_DONE };
+ enum {
+ 	WLJ_NONE, WLJ_AUTH, WLJ_AUTH_WAIT, WLJ_ASSOC, WLJ_ASSOC_WAIT, WLJ_KEYS_WAIT,
+ 	WLJ_PAIRWISE, WLJ_GROUP, WLJ_PORT, WLJ_OPERSTATE, WLJ_UP, WLJ_JOINED, WLJ_REKEY,
+@@ -71,6 +72,10 @@ static struct {
+ 	unsigned cache_enabled, cache_valid, cache_hits, scan_rejections;
+ 	unsigned batch_enabled, scan_count, scan_limit, scan_offset;
+ 	unsigned ux;                            /* fuxi,wifi-ux（FUXI_WIFI_UX_*），發布時讀一次 */
++	unsigned ap_active;                     /* under wli_lock: SoftAP interface currently active */
++	unsigned sta_reset_needed;              /* under wli_lock: recycle primary netdev before next STA scan/join */
++	unsigned reset_stage;                   /* under wli_lock: internal WLI_RESET_* state while busy */
++	unsigned handshake_timeouts;            /* worker only: consecutive Reason 15 4-way handshake timeouts */
+ 	int result, fatal;
+ 	struct fuxi_wifi_sta_scan scan;
+ } wli;
+@@ -88,7 +93,7 @@ static struct {
+ 	uint64_t deadline;
+ 	uint32_t group;
+ 	unsigned step, security, joined, leaving, answered, auth_seen, assoc_seen, timed_out;
+-	unsigned lost, lost_reason, eapol_ready, rekeys;
++	unsigned lost, lost_reason, eapol_ready, rekeys, eapol_tx_ack, eapol_tx_nack;
+ 	int auth_status, assoc_status, error;
+ 	size_t eapol_length;
+ 	uint8_t eapol[WLI_EAPOL_MOST];
+@@ -115,6 +120,7 @@ wli_complete(int error)
+ 	wli_state.last_error = error;
+ 	if (wli_state.phase == FUXI_WIFI_STA_SCANNING) { wli_state.phase = FUXI_WIFI_STA_IDLE; }
+ 	wli.busy = wli.submitted = wli.power_waiting = wli.fetching = 0;
++	wli.reset_stage = WLI_RESET_NONE;
+ 	lck_mtx_unlock(&wli_lock);
+ 	thread_wakeup((event_t)&wli.busy);
+ }
+@@ -763,6 +769,152 @@ wli_start(const struct fuxi_wifi_input *input)
  	wli_input = input;
  }
  
@@ -2149,13 +2344,42 @@ index 92e0eac..6a6cf58 100644
 +	nc.freq_mhz = cfg->freq_mhz;
 +	nc.extra_ie_len = cfg->extra_ie_len;
 +	if (cfg->extra_ie_len) { memcpy(nc.extra_ie, cfg->extra_ie, cfg->extra_ie_len); }
-+	return wli_ap_errno(nw_wifi_ap_start(&nc, actual_freq_mhz));
++	/* Wait for any in-flight STA leave or primary recycle to finish before starting SoftAP
++	 * so ap1 creation does not race with wlan0 deauthentication or dev_close/dev_open. */
++	lck_mtx_lock(&wli_lock);
++	if (wli.busy && (wli.operation == WLI_LEAVE || wli.reset_stage != WLI_RESET_NONE) && !wli.fatal) {
++		uint64_t wait_deadline;
++		clock_interval_to_deadline(2000, NSEC_PER_MSEC, &wait_deadline);
++		while (wli.busy && (wli.operation == WLI_LEAVE || wli.reset_stage != WLI_RESET_NONE) && !wli.fatal) {
++			if (lck_mtx_sleep_deadline(&wli_lock, LCK_SLEEP_DEFAULT, (event_t)&wli.busy,
++			    THREAD_UNINT, wait_deadline) == THREAD_TIMED_OUT) {
++				break;
++			}
++		}
++	}
++	wli.ap_active = 1;
++	wli.sta_reset_needed = 1;
++	wli.cache_valid = 0;
++	lck_mtx_unlock(&wli_lock);
++	int error = wli_ap_errno(nw_wifi_ap_start(&nc, actual_freq_mhz));
++	if (error) {
++		lck_mtx_lock(&wli_lock);
++		wli.ap_active = 0;
++		lck_mtx_unlock(&wli_lock);
++	}
++	return error;
 +}
 +
 +static int
 +wli_ap_stop_op(void)
 +{
-+	return wli_ap_errno(nw_wifi_ap_stop());
++	int error = wli_ap_errno(nw_wifi_ap_stop());
++	lck_mtx_lock(&wli_lock);
++	wli.ap_active = 0;
++	wli.sta_reset_needed = 1;
++	wli.cache_valid = 0;
++	lck_mtx_unlock(&wli_lock);
++	return error;
 +}
 +
 +static int
@@ -2192,7 +2416,101 @@ index 92e0eac..6a6cf58 100644
  /* Elements an iOS scan record cannot do without; the rest is kept while there is room. */
  static bool
  wli_essential(const uint8_t *element)
-@@ -1634,10 +1751,28 @@ wli_step(uint64_t now)
+@@ -1076,6 +1228,13 @@ wli_join_event(unsigned operation, const uint8_t *bytes, size_t length)
+ 		wlj.eapol_length = size;
+ 		wlj.eapol_ready = 1;
+ 		return;
++	case 0x107:
++		value = fwc_attribute(bytes, length, 41, &size);
++		if (value && size == 4) {
++			if (fwc_read32(value)) { wlj.eapol_tx_ack++; }
++			else { wlj.eapol_tx_nack++; }
++		}
++		return;
+ 	case 0x10c:
+ 	case 0x10d:
+ 		if ((operation == 0x10c && wlj.step == WLJ_AUTH_WAIT) ||
+@@ -1116,14 +1275,36 @@ wli_receive(void *context, uint64_t session, const void *message, size_t length)
+ 		bool recover = (wli.ux & (FUXI_WIFI_UX_SCAN_RECOVER | FUXI_WIFI_UX_POWER_OFF_FIRST)) != 0;
+ 		if (operation == 0x10a) {
+ 			value = fwc_attribute(bytes, length, 32, &size);
++			lck_mtx_lock(&wli_lock);
++			unsigned reset_stage = wli.reset_stage;
++			lck_mtx_unlock(&wli_lock);
++			if (reset_stage == WLI_RESET_OFF_WAIT || reset_stage == WLI_RESET_ON_WAIT) {
++				unsigned expected = reset_stage == WLI_RESET_ON_WAIT ? 1u : 0u;
++				if (status || !value || size != 4 || fwc_read32(value) != expected ||
++				    generation < wli.generation || generation - wli.generation > 1) { goto invalid; }
++				bool power_changed = generation != wli.generation;
++				wli.generation = generation;
++				lck_mtx_lock(&wli_lock);
++				if (power_changed) { wli.scan_draining = false; }
++				if (reset_stage == WLI_RESET_OFF_WAIT) {
++					wli.reset_stage = WLI_RESET_ON_SEND;
++				} else {
++					wli.reset_stage = WLI_RESET_DONE;
++					wli.sta_reset_needed = 0;
++				}
++				lck_mtx_unlock(&wli_lock);
++				return 0;
++			}
+ 			if (!wli.power_waiting || status || !value || size != 4 ||
+ 			    fwc_read32(value) != wli.power_on || generation < wli.generation ||
+ 			    generation - wli.generation > 1) { goto invalid; }
+ 			bool power_changed = generation != wli.generation;
+ 			wli.generation = generation;
++			wli.handshake_timeouts = 0;
+ 			wli_forget();
+ 			lck_mtx_lock(&wli_lock);
+ 			if (power_changed) { wli.scan_draining = false; }
++			if (!wli.power_on) { wli.sta_reset_needed = 0; }
+ 			wli_state.phase = wli.power_on ? FUXI_WIFI_STA_IDLE : FUXI_WIFI_STA_OFF;
+ 			wli_bss_count = 0;
+ 			wli.cache_valid = 0;
+@@ -1136,7 +1317,8 @@ wli_receive(void *context, uint64_t session, const void *message, size_t length)
+ 			lck_mtx_lock(&wli_lock);
+ 			bool draining = wli.scan_draining;
+ 			if (draining && operation == 0x102) { wli.scan_draining = false; }
+-			bool scanning = wli.busy && wli.submitted && wli.operation == WLI_SCAN && !wli.fetching;
++			bool scanning = wli.busy && wli.submitted && wli.operation == WLI_SCAN &&
++			    !wli.fetching && wli.reset_stage == WLI_RESET_NONE;
+ 			lck_mtx_unlock(&wli_lock);
+ 			if (draining) { return 0; }
+ 			if (!scanning) { goto invalid; }
+@@ -1226,7 +1408,23 @@ static void
+ wli_join_stop(int error, const char *why)
+ {
+ 	if (!wlj.error) { wlj.error = error; }
+-	printf("FUXI WIFI IOS: join stopped at step %u: %s, error %d\n", wlj.step, why, wlj.error);
++	if (wlj.answered) {
++		printf("FUXI WIFI IOS: join stopped at step %u: %s, error %d (eapol_tx ack %u nack %u)\n",
++		    wlj.step, why, wlj.error, wlj.eapol_tx_ack, wlj.eapol_tx_nack);
++	} else {
++		printf("FUXI WIFI IOS: join stopped at step %u: %s, error %d\n", wlj.step, why, wlj.error);
++	}
++	if (wlj.step == WLJ_KEYS_WAIT && wlj.lost && wlj.lost_reason == 15 && wlj.answered) {
++		if (++wli.handshake_timeouts >= 2) {
++			wli.handshake_timeouts = 0;
++			lck_mtx_lock(&wli_lock);
++			wli.sta_reset_needed = 1;
++			lck_mtx_unlock(&wli_lock);
++			printf("FUXI WIFI IOS: repeated 4-way handshake timeout; scheduling primary interface recycle\n");
++		}
++	} else {
++		wli.handshake_timeouts = 0;
++	}
+ 	wlj.step = wlj.lost ? WLJ_FAILED : WLJ_ABORT;
+ }
+ 
+@@ -1418,6 +1616,7 @@ wli_join_step(uint64_t now)
+ 		if (wlj.lost) { wli_join_stop(ECONNRESET, "lost as the link came up"); return; }
+ 		wlj.step = WLJ_JOINED;
+ 		wlj.joined = 1;
++		wli.handshake_timeouts = 0;
+ 		memset(wlj.wpa.pmk, 0, sizeof(wlj.wpa.pmk));
+ 		__atomic_store_n(&wli_link, 1, __ATOMIC_RELEASE);
+ 		lck_mtx_lock(&wli_lock);
+@@ -1634,10 +1833,28 @@ wli_step(uint64_t now)
  		wli_backend.station.channels = wli_channel_snapshot;
  		wli_backend.tx_frame = wli_tx;
  		wli_backend.start = wli_start;
@@ -2221,11 +2539,108 @@ index 92e0eac..6a6cf58 100644
  		bool batch_rx = (wli.ux & FUXI_WIFI_UX_RX_BATCH) && wli_input &&
  		    wli_input->rx_packet && wli_input->rx_flush;
  		if (batch_rx) { printf("FUXI WIFI IOS: batched ath12k receive enabled\n"); }
+@@ -1651,6 +1868,7 @@ wli_step(uint64_t now)
+ 	bool begin = wli.busy && !wli.submitted;
+ 	unsigned operation = wli.operation, power_on = wli.power_on;
+ 	bool leave_now = false;
++	bool start_reset = false;
+ 	if (begin) {
+ 		wli.submitted = 1;
+ 		wli.deadline = now + 30000;
+@@ -1660,10 +1878,14 @@ wli_step(uint64_t now)
+ 		wli.scan_accepted = wli.scan_done = wli.fetching = 0;
+ 		wli.scan_error = 0;
+ 		if (operation == WLI_SCAN) {
++			start_reset = !wli.ap_active && wli.sta_reset_needed &&
++			    wli_state.phase != FUXI_WIFI_STA_OFF && wlj.step == WLJ_NONE;
+ 			if (wli_state.phase == FUXI_WIFI_STA_IDLE) { wli_state.phase = FUXI_WIFI_STA_SCANNING; }
+ 			wli_bss_count = 0;
+ 			wli.cache_valid = 0;
+ 		} else if (operation == WLI_JOIN) {
++			start_reset = !wli.ap_active && wli.sta_reset_needed &&
++			    wli_state.phase != FUXI_WIFI_STA_OFF;
+ 			memset(&wlj, 0, sizeof(wlj));
+ 			wlj.bss = wli_target.bss;
+ 			memcpy(wlj.wpa.pmk, wli_target.pmk, sizeof(wlj.wpa.pmk));
+@@ -1678,11 +1900,17 @@ wli_step(uint64_t now)
+ 			leave_now = wlj.step != WLJ_JOINED && wlj.step != WLJ_REKEY;
+ 			wlj.leaving = 1;
+ 		}
++		if (start_reset) { wli.reset_stage = WLI_RESET_OFF_WAIT; }
+ 	}
++	unsigned reset_stage = wli.reset_stage;
+ 	bool busy = wli.busy;
+ 	lck_mtx_unlock(&wli_lock);
+ 	if (begin) {
+-		if (operation == WLI_POWER) {
++		if (start_reset) {
++			printf("FUXI WIFI IOS: recycling primary STA interface before op %u\n", operation);
++			nw_wifi_power(0);
++			return now >= wli.deadline ? ETIMEDOUT : 0;
++		} else if (operation == WLI_POWER) {
+ 			wli.power_waiting = 1;
+ 			nw_wifi_power(power_on);
+ 		} else if (operation == WLI_SCAN) {
+@@ -1695,6 +1923,34 @@ wli_step(uint64_t now)
+ 			wli_complete(0);
+ 			busy = false;
+ 		}
++	} else if (reset_stage != WLI_RESET_NONE) {
++		if (reset_stage == WLI_RESET_ON_SEND) {
++			lck_mtx_lock(&wli_lock);
++			wli.reset_stage = WLI_RESET_ON_WAIT;
++			lck_mtx_unlock(&wli_lock);
++			nw_wifi_power(1);
++			return now >= wli.deadline ? ETIMEDOUT : 0;
++		}
++		if (reset_stage == WLI_RESET_DONE) {
++			lck_mtx_lock(&wli_lock);
++			wli.reset_stage = WLI_RESET_NONE;
++			lck_mtx_unlock(&wli_lock);
++			thread_wakeup((event_t)&wli.busy);
++			printf("FUXI WIFI IOS: primary STA interface recycled (generation %llu)\n",
++			    (unsigned long long)wli.generation);
++			if (operation == WLI_SCAN) {
++				if (fuxi_wifi_sta_power_off_pending()) {
++					wli_complete(ECANCELED);
++					return 0;
++				}
++				int error = wli_request(2);
++				if (error) { return error; }
++			} else if (operation == WLI_JOIN) {
++				wli_join_begin(now);
++			}
++		} else {
++			return now >= wli.deadline ? ETIMEDOUT : 0;
++		}
+ 	}
+ 	if (busy && operation == WLI_SCAN && wli.scan_accepted && !wli.fetching &&
+ 	    (wli.ux & (FUXI_WIFI_UX_SCAN_RECOVER | FUXI_WIFI_UX_POWER_OFF_FIRST))) {
 diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
-index f635b87..cf7584e 100644
+index f635b87..beda35a 100644
 --- a/xnu/patches/0099-fuxi-wlan.patch
 +++ b/xnu/patches/0099-fuxi-wlan.patch
-@@ -6228,7 +6228,7 @@
+@@ -6094,7 +6094,7 @@
+ +}
+ --- /dev/null
+ +++ b/bsd/dev/fuxi_wlan_arena.h
+-@@ -0,0 +1,131 @@
++@@ -0,0 +1,135 @@
+ +#ifndef FUXI_WLAN_ARENA_H
+ +#define FUXI_WLAN_ARENA_H
+ +#include <stdint.h>
+@@ -6141,6 +6141,10 @@
+ +		alignment = 4096;
+ +		while (alignment < rounded && alignment < 0x80000000u) { alignment <<= 1; }
+ +		if (alignment < rounded) { return NULL; }
+++	} else {
+++		/* Match Linux SLUB/dma_pool natural alignment so sub-page TX/ext_desc buffers
+++		 * never straddle a 4 KiB PCIe boundary and satisfy WCN7850 128-byte IOVA alignment. */
+++		while (alignment < rounded && alignment < 4096) { alignment <<= 1; }
+ +	}
+ +	for (uint32_t index = 1; index < arena->count; index++) {
+ +		struct fwa_block whole = arena->blocks[index];
+@@ -6228,7 +6232,7 @@
  +#endif
  --- /dev/null
  +++ b/bsd/dev/fuxi_wlan_ath12k.h
@@ -2234,7 +2649,7 @@ index f635b87..cf7584e 100644
  +#ifndef FUXI_WLAN_ATH12K_H
  +#define FUXI_WLAN_ATH12K_H
  +#include <stdint.h>
-@@ -6311,6 +6311,34 @@
+@@ -6311,6 +6315,34 @@
  +extern int nw_wifi_bss_get(int, struct nw_bss_info *);
  +extern struct nw_wifi_stats nw_wifi_stats;
  +
@@ -2269,16 +2684,52 @@ index f635b87..cf7584e 100644
  +static inline int
  +fwa_mac_text(const void *property, size_t length, char text[13])
  +{
-@@ -6974,7 +7002,7 @@
+@@ -6974,7 +7006,7 @@
  +#endif
  --- /dev/null
  +++ b/bsd/dev/fuxi_wlan_ios.inc
 -@@ -0,0 +1,1762 @@
-+@@ -0,0 +1,1897 @@
++@@ -0,0 +1,2018 @@
  +#include <sys/fuxi_wifi_ios.h>
  +#include <sys/fuxi_wifi_wpa.h>
  +#include <sys/errno.h>
-@@ -7740,6 +7768,123 @@
+@@ -7009,6 +7041,7 @@
+ +#define WLI_DIAG_LINES 48
+ +
+ +enum { WLI_POWER = 1, WLI_SCAN, WLI_JOIN, WLI_LEAVE };
+++enum { WLI_RESET_NONE, WLI_RESET_OFF_WAIT, WLI_RESET_ON_SEND, WLI_RESET_ON_WAIT, WLI_RESET_DONE };
+ +enum {
+ +	WLJ_NONE, WLJ_AUTH, WLJ_AUTH_WAIT, WLJ_ASSOC, WLJ_ASSOC_WAIT, WLJ_KEYS_WAIT,
+ +	WLJ_PAIRWISE, WLJ_GROUP, WLJ_PORT, WLJ_OPERSTATE, WLJ_UP, WLJ_JOINED, WLJ_REKEY,
+@@ -7048,6 +7081,10 @@
+ +	unsigned cache_enabled, cache_valid, cache_hits, scan_rejections;
+ +	unsigned batch_enabled, scan_count, scan_limit, scan_offset;
+ +	unsigned ux;                            /* fuxi,wifi-ux（FUXI_WIFI_UX_*），發布時讀一次 */
+++	unsigned ap_active;                     /* under wli_lock: SoftAP interface currently active */
+++	unsigned sta_reset_needed;              /* under wli_lock: recycle primary netdev before next STA scan/join */
+++	unsigned reset_stage;                   /* under wli_lock: internal WLI_RESET_* state while busy */
+++	unsigned handshake_timeouts;            /* worker only: consecutive Reason 15 4-way handshake timeouts */
+ +	int result, fatal;
+ +	struct fuxi_wifi_sta_scan scan;
+ +} wli;
+@@ -7065,7 +7102,7 @@
+ +	uint64_t deadline;
+ +	uint32_t group;
+ +	unsigned step, security, joined, leaving, answered, auth_seen, assoc_seen, timed_out;
+-+	unsigned lost, lost_reason, eapol_ready, rekeys;
+++	unsigned lost, lost_reason, eapol_ready, rekeys, eapol_tx_ack, eapol_tx_nack;
+ +	int auth_status, assoc_status, error;
+ +	size_t eapol_length;
+ +	uint8_t eapol[WLI_EAPOL_MOST];
+@@ -7092,6 +7129,7 @@
+ +	wli_state.last_error = error;
+ +	if (wli_state.phase == FUXI_WIFI_STA_SCANNING) { wli_state.phase = FUXI_WIFI_STA_IDLE; }
+ +	wli.busy = wli.submitted = wli.power_waiting = wli.fetching = 0;
+++	wli.reset_stage = WLI_RESET_NONE;
+ +	lck_mtx_unlock(&wli_lock);
+ +	thread_wakeup((event_t)&wli.busy);
+ +}
+@@ -7740,6 +7778,152 @@
  +	wli_input = input;
  +}
  +
@@ -2359,13 +2810,42 @@ index f635b87..cf7584e 100644
 ++	nc.freq_mhz = cfg->freq_mhz;
 ++	nc.extra_ie_len = cfg->extra_ie_len;
 ++	if (cfg->extra_ie_len) { memcpy(nc.extra_ie, cfg->extra_ie, cfg->extra_ie_len); }
-++	return wli_ap_errno(nw_wifi_ap_start(&nc, actual_freq_mhz));
+++	/* Wait for any in-flight STA leave or primary recycle to finish before starting SoftAP
+++	 * so ap1 creation does not race with wlan0 deauthentication or dev_close/dev_open. */
+++	lck_mtx_lock(&wli_lock);
+++	if (wli.busy && (wli.operation == WLI_LEAVE || wli.reset_stage != WLI_RESET_NONE) && !wli.fatal) {
+++		uint64_t wait_deadline;
+++		clock_interval_to_deadline(2000, NSEC_PER_MSEC, &wait_deadline);
+++		while (wli.busy && (wli.operation == WLI_LEAVE || wli.reset_stage != WLI_RESET_NONE) && !wli.fatal) {
+++			if (lck_mtx_sleep_deadline(&wli_lock, LCK_SLEEP_DEFAULT, (event_t)&wli.busy,
+++			    THREAD_UNINT, wait_deadline) == THREAD_TIMED_OUT) {
+++				break;
+++			}
+++		}
+++	}
+++	wli.ap_active = 1;
+++	wli.sta_reset_needed = 1;
+++	wli.cache_valid = 0;
+++	lck_mtx_unlock(&wli_lock);
+++	int error = wli_ap_errno(nw_wifi_ap_start(&nc, actual_freq_mhz));
+++	if (error) {
+++		lck_mtx_lock(&wli_lock);
+++		wli.ap_active = 0;
+++		lck_mtx_unlock(&wli_lock);
+++	}
+++	return error;
 ++}
 ++
 ++static int
 ++wli_ap_stop_op(void)
 ++{
-++	return wli_ap_errno(nw_wifi_ap_stop());
+++	int error = wli_ap_errno(nw_wifi_ap_stop());
+++	lck_mtx_lock(&wli_lock);
+++	wli.ap_active = 0;
+++	wli.sta_reset_needed = 1;
+++	wli.cache_valid = 0;
+++	lck_mtx_unlock(&wli_lock);
+++	return error;
 ++}
 ++
 ++static int
@@ -2402,7 +2882,101 @@ index f635b87..cf7584e 100644
  +/* Elements an iOS scan record cannot do without; the rest is kept while there is room. */
  +static bool
  +wli_essential(const uint8_t *element)
-@@ -8611,10 +8756,28 @@
+@@ -8053,6 +8237,13 @@
+ +		wlj.eapol_length = size;
+ +		wlj.eapol_ready = 1;
+ +		return;
+++	case 0x107:
+++		value = fwc_attribute(bytes, length, 41, &size);
+++		if (value && size == 4) {
+++			if (fwc_read32(value)) { wlj.eapol_tx_ack++; }
+++			else { wlj.eapol_tx_nack++; }
+++		}
+++		return;
+ +	case 0x10c:
+ +	case 0x10d:
+ +		if ((operation == 0x10c && wlj.step == WLJ_AUTH_WAIT) ||
+@@ -8093,14 +8284,36 @@
+ +		bool recover = (wli.ux & (FUXI_WIFI_UX_SCAN_RECOVER | FUXI_WIFI_UX_POWER_OFF_FIRST)) != 0;
+ +		if (operation == 0x10a) {
+ +			value = fwc_attribute(bytes, length, 32, &size);
+++			lck_mtx_lock(&wli_lock);
+++			unsigned reset_stage = wli.reset_stage;
+++			lck_mtx_unlock(&wli_lock);
+++			if (reset_stage == WLI_RESET_OFF_WAIT || reset_stage == WLI_RESET_ON_WAIT) {
+++				unsigned expected = reset_stage == WLI_RESET_ON_WAIT ? 1u : 0u;
+++				if (status || !value || size != 4 || fwc_read32(value) != expected ||
+++				    generation < wli.generation || generation - wli.generation > 1) { goto invalid; }
+++				bool power_changed = generation != wli.generation;
+++				wli.generation = generation;
+++				lck_mtx_lock(&wli_lock);
+++				if (power_changed) { wli.scan_draining = false; }
+++				if (reset_stage == WLI_RESET_OFF_WAIT) {
+++					wli.reset_stage = WLI_RESET_ON_SEND;
+++				} else {
+++					wli.reset_stage = WLI_RESET_DONE;
+++					wli.sta_reset_needed = 0;
+++				}
+++				lck_mtx_unlock(&wli_lock);
+++				return 0;
+++			}
+ +			if (!wli.power_waiting || status || !value || size != 4 ||
+ +			    fwc_read32(value) != wli.power_on || generation < wli.generation ||
+ +			    generation - wli.generation > 1) { goto invalid; }
+ +			bool power_changed = generation != wli.generation;
+ +			wli.generation = generation;
+++			wli.handshake_timeouts = 0;
+ +			wli_forget();
+ +			lck_mtx_lock(&wli_lock);
+ +			if (power_changed) { wli.scan_draining = false; }
+++			if (!wli.power_on) { wli.sta_reset_needed = 0; }
+ +			wli_state.phase = wli.power_on ? FUXI_WIFI_STA_IDLE : FUXI_WIFI_STA_OFF;
+ +			wli_bss_count = 0;
+ +			wli.cache_valid = 0;
+@@ -8113,7 +8326,8 @@
+ +			lck_mtx_lock(&wli_lock);
+ +			bool draining = wli.scan_draining;
+ +			if (draining && operation == 0x102) { wli.scan_draining = false; }
+-+			bool scanning = wli.busy && wli.submitted && wli.operation == WLI_SCAN && !wli.fetching;
+++			bool scanning = wli.busy && wli.submitted && wli.operation == WLI_SCAN &&
+++			    !wli.fetching && wli.reset_stage == WLI_RESET_NONE;
+ +			lck_mtx_unlock(&wli_lock);
+ +			if (draining) { return 0; }
+ +			if (!scanning) { goto invalid; }
+@@ -8203,7 +8417,23 @@
+ +wli_join_stop(int error, const char *why)
+ +{
+ +	if (!wlj.error) { wlj.error = error; }
+-+	printf("FUXI WIFI IOS: join stopped at step %u: %s, error %d\n", wlj.step, why, wlj.error);
+++	if (wlj.answered) {
+++		printf("FUXI WIFI IOS: join stopped at step %u: %s, error %d (eapol_tx ack %u nack %u)\n",
+++		    wlj.step, why, wlj.error, wlj.eapol_tx_ack, wlj.eapol_tx_nack);
+++	} else {
+++		printf("FUXI WIFI IOS: join stopped at step %u: %s, error %d\n", wlj.step, why, wlj.error);
+++	}
+++	if (wlj.step == WLJ_KEYS_WAIT && wlj.lost && wlj.lost_reason == 15 && wlj.answered) {
+++		if (++wli.handshake_timeouts >= 2) {
+++			wli.handshake_timeouts = 0;
+++			lck_mtx_lock(&wli_lock);
+++			wli.sta_reset_needed = 1;
+++			lck_mtx_unlock(&wli_lock);
+++			printf("FUXI WIFI IOS: repeated 4-way handshake timeout; scheduling primary interface recycle\n");
+++		}
+++	} else {
+++		wli.handshake_timeouts = 0;
+++	}
+ +	wlj.step = wlj.lost ? WLJ_FAILED : WLJ_ABORT;
+ +}
+ +
+@@ -8395,6 +8625,7 @@
+ +		if (wlj.lost) { wli_join_stop(ECONNRESET, "lost as the link came up"); return; }
+ +		wlj.step = WLJ_JOINED;
+ +		wlj.joined = 1;
+++		wli.handshake_timeouts = 0;
+ +		memset(wlj.wpa.pmk, 0, sizeof(wlj.wpa.pmk));
+ +		__atomic_store_n(&wli_link, 1, __ATOMIC_RELEASE);
+ +		lck_mtx_lock(&wli_lock);
+@@ -8611,10 +8842,28 @@
  +		wli_backend.station.channels = wli_channel_snapshot;
  +		wli_backend.tx_frame = wli_tx;
  +		wli_backend.start = wli_start;
@@ -2431,6 +3005,83 @@ index f635b87..cf7584e 100644
  +		bool batch_rx = (wli.ux & FUXI_WIFI_UX_RX_BATCH) && wli_input &&
  +		    wli_input->rx_packet && wli_input->rx_flush;
  +		if (batch_rx) { printf("FUXI WIFI IOS: batched ath12k receive enabled\n"); }
+@@ -8628,6 +8877,7 @@
+ +	bool begin = wli.busy && !wli.submitted;
+ +	unsigned operation = wli.operation, power_on = wli.power_on;
+ +	bool leave_now = false;
+++	bool start_reset = false;
+ +	if (begin) {
+ +		wli.submitted = 1;
+ +		wli.deadline = now + 30000;
+@@ -8637,10 +8887,14 @@
+ +		wli.scan_accepted = wli.scan_done = wli.fetching = 0;
+ +		wli.scan_error = 0;
+ +		if (operation == WLI_SCAN) {
+++			start_reset = !wli.ap_active && wli.sta_reset_needed &&
+++			    wli_state.phase != FUXI_WIFI_STA_OFF && wlj.step == WLJ_NONE;
+ +			if (wli_state.phase == FUXI_WIFI_STA_IDLE) { wli_state.phase = FUXI_WIFI_STA_SCANNING; }
+ +			wli_bss_count = 0;
+ +			wli.cache_valid = 0;
+ +		} else if (operation == WLI_JOIN) {
+++			start_reset = !wli.ap_active && wli.sta_reset_needed &&
+++			    wli_state.phase != FUXI_WIFI_STA_OFF;
+ +			memset(&wlj, 0, sizeof(wlj));
+ +			wlj.bss = wli_target.bss;
+ +			memcpy(wlj.wpa.pmk, wli_target.pmk, sizeof(wlj.wpa.pmk));
+@@ -8655,11 +8909,17 @@
+ +			leave_now = wlj.step != WLJ_JOINED && wlj.step != WLJ_REKEY;
+ +			wlj.leaving = 1;
+ +		}
+++		if (start_reset) { wli.reset_stage = WLI_RESET_OFF_WAIT; }
+ +	}
+++	unsigned reset_stage = wli.reset_stage;
+ +	bool busy = wli.busy;
+ +	lck_mtx_unlock(&wli_lock);
+ +	if (begin) {
+-+		if (operation == WLI_POWER) {
+++		if (start_reset) {
+++			printf("FUXI WIFI IOS: recycling primary STA interface before op %u\n", operation);
+++			nw_wifi_power(0);
+++			return now >= wli.deadline ? ETIMEDOUT : 0;
+++		} else if (operation == WLI_POWER) {
+ +			wli.power_waiting = 1;
+ +			nw_wifi_power(power_on);
+ +		} else if (operation == WLI_SCAN) {
+@@ -8672,6 +8932,34 @@
+ +			wli_complete(0);
+ +			busy = false;
+ +		}
+++	} else if (reset_stage != WLI_RESET_NONE) {
+++		if (reset_stage == WLI_RESET_ON_SEND) {
+++			lck_mtx_lock(&wli_lock);
+++			wli.reset_stage = WLI_RESET_ON_WAIT;
+++			lck_mtx_unlock(&wli_lock);
+++			nw_wifi_power(1);
+++			return now >= wli.deadline ? ETIMEDOUT : 0;
+++		}
+++		if (reset_stage == WLI_RESET_DONE) {
+++			lck_mtx_lock(&wli_lock);
+++			wli.reset_stage = WLI_RESET_NONE;
+++			lck_mtx_unlock(&wli_lock);
+++			thread_wakeup((event_t)&wli.busy);
+++			printf("FUXI WIFI IOS: primary STA interface recycled (generation %llu)\n",
+++			    (unsigned long long)wli.generation);
+++			if (operation == WLI_SCAN) {
+++				if (fuxi_wifi_sta_power_off_pending()) {
+++					wli_complete(ECANCELED);
+++					return 0;
+++				}
+++				int error = wli_request(2);
+++				if (error) { return error; }
+++			} else if (operation == WLI_JOIN) {
+++				wli_join_begin(now);
+++			}
+++		} else {
+++			return now >= wli.deadline ? ETIMEDOUT : 0;
+++		}
+ +	}
+ +	if (busy && operation == WLI_SCAN && wli.scan_accepted && !wli.fetching &&
+ +	    (wli.ux & (FUXI_WIFI_UX_SCAN_RECOVER | FUXI_WIFI_UX_POWER_OFF_FIRST))) {
 diff --git a/xnu/patches/0104-fuxi-wifi-ios.patch b/xnu/patches/0104-fuxi-wifi-ios.patch
 index 375b1a9..89f3c95 100644
 --- a/xnu/patches/0104-fuxi-wifi-ios.patch
