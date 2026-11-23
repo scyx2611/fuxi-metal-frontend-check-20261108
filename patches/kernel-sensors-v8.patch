@@ -1,6 +1,6 @@
 diff --git a/tools/sync-fuxi-sensors.py b/tools/sync-fuxi-sensors.py
 new file mode 100644
-index 0000000..e860d14
+index 0000000..5b3f10f
 --- /dev/null
 +++ b/tools/sync-fuxi-sensors.py
 @@ -0,0 +1,139 @@
@@ -52,7 +52,7 @@ index 0000000..e860d14
 +)
 +
 +BSD_BEFORE = (
-+    'bsd/dev/fuxi_modem_fw.c\t\tstandard',
++    'bsd/dev/fuxi_modem_fw.c\t\t\tstandard',
 +    'bsd/dev/fuxi_camera.c\t\t\tstandard',
 +    'bsd/dev/fuxi_camera_dylib.c\t\tstandard',
 +)
@@ -14031,14 +14031,14 @@ index 0000000..789f5fb
 +#endif
 diff --git a/xnu/patches/0130-fuxi-sensors.patch b/xnu/patches/0130-fuxi-sensors.patch
 new file mode 100644
-index 0000000..c9ebfcb
+index 0000000..8d763f1
 --- /dev/null
 +++ b/xnu/patches/0130-fuxi-sensors.patch
 @@ -0,0 +1,10560 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -159,6 +159,17 @@
-+ bsd/dev/fuxi_modem_fw.c		standard
++ bsd/dev/fuxi_modem_fw.c			standard
 + bsd/dev/fuxi_camera.c			standard
 + bsd/dev/fuxi_camera_dylib.c		standard
 ++bsd/dev/SensorsPb.c			standard
