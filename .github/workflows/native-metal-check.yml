@@ -91,6 +91,7 @@ jobs:
           cp harness/patches/metal2vulkan-fuxi-0019-census-passes.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0020-lane-strips.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0021-rotated-two-plane.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0022-fast-rotated-staging.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |
