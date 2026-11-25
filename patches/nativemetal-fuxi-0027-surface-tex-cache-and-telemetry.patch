@@ -1,8 +1,8 @@
 diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
-index aaa3fc9..d8488b3 100644
+index 943798c..5f8fe90 100644
 --- a/NativeBridgeMetalFrontend.mm
 +++ b/NativeBridgeMetalFrontend.mm
-@@ -370,6 +370,8 @@ static void waitForResource(id resource);
+@@ -371,6 +371,8 @@ static void waitForResource(id resource);
  // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
  // unmap or reuse pages the GPU still reads or writes.
  static std::atomic<uint64_t> gNoCopyAll,gNoCopyMade,gNoCopyReleased,gSurfaceImportsMade,gSurfaceImportsReleased;
@@ -11,11 +11,14 @@ index aaa3fc9..d8488b3 100644
  static void releaseBlock(void *context,void *pointer,uint64_t length) {
   gNoCopyReleased++;
   void (^deallocator)(void *,NSUInteger)=(__bridge_transfer void (^)(void *,NSUInteger))context;deallocator(pointer,(NSUInteger)length);
-@@ -410,10 +412,41 @@ struct HeldImport {
+@@ -410,11 +412,44 @@ struct HeldImport {
+  OSType pixelFormat;
   std::list<HeldImportKey>::iterator lruIt;
  };
- static constexpr size_t kMaxHeldImports = 128;
-+static constexpr size_t kMaxHeldSurfaceTextures = 128;
+-static constexpr size_t kMaxHeldImports = 128;
++static constexpr size_t kMaxHeldImports = 32;
++static constexpr size_t kMaxHeldSurfaceTextures = 48;
++static constexpr size_t kMaxHeldImportBytes = 128ULL << 20;
 +struct SurfaceTextureKey {
 + uint64_t surfaceId,address,surfaceBytes,plane,offset,rowBytes;
 + uint64_t type,format,width,height,depth,levels,samples,arrayLength,usage,options,rotation,framebufferOnly,isDrawable;
@@ -48,12 +51,13 @@ index aaa3fc9..d8488b3 100644
  static std::mutex gSurfaceImportLock;
  static auto &gHeldImports=*new std::map<HeldImportKey,HeldImport>;
  static auto &gHeldImportOrder=*new std::list<HeldImportKey>;
++static size_t gHeldImportBytes = 0;
 +static auto &gHeldSurfaceTextures=*new std::map<SurfaceTextureKey,HeldSurfaceTexture>;
 +static auto &gHeldSurfaceTexOrder=*new std::list<SurfaceTextureKey>;
  static NSUInteger gSurfaceImportsPruned=64;
  static bool isSurfacePurgeableOk(IOSurfaceRef surface) {
   if(!surface)return false;
-@@ -428,28 +461,60 @@ static bool isSurfaceShapeValid(const HeldImport &entry,IOSurfaceRef callerSurfa
+@@ -429,28 +464,62 @@ static bool isSurfaceShapeValid(const HeldImport &entry,IOSurfaceRef callerSurfa
          IOSurfaceGetPixelFormat(callerSurface)==entry.pixelFormat &&
          isSurfacePurgeableOk(entry.surface);
  }
@@ -86,6 +90,8 @@ index aaa3fc9..d8488b3 100644
 + }
 +}
 +static void eraseHeldImportLocked(std::map<HeldImportKey,HeldImport>::iterator it,GoneSurfaceCleanup &cleanup) {
++ const size_t heldBytes=std::get<2>(it->first);
++ gHeldImportBytes=gHeldImportBytes>=heldBytes?gHeldImportBytes-heldBytes:0;
 + evictSurfaceTexturesForImportLocked(it->first,it->second.buffer,cleanup);
   if(gSurfaceImports) {
    const SurfaceImportKey k={std::get<0>(it->first),std::get<1>(it->first),std::get<2>(it->first)};
@@ -121,7 +127,7 @@ index aaa3fc9..d8488b3 100644
  }
  extern "C" void native_bridge_metal_trim_surface_imports(void) {trimHeldImports(false);}
  static void watchImportPressure() {
-@@ -465,8 +530,8 @@ static void watchImportPressure() {
+@@ -466,8 +535,8 @@ static void watchImportPressure() {
    dispatch_activate(source);
   });
  }
@@ -132,14 +138,17 @@ index aaa3fc9..d8488b3 100644
   auto existing=gHeldImports.find(k);
   if(existing!=gHeldImports.end()) {
    if(existing->second.buffer==buffer) {
-@@ -477,12 +542,12 @@ static void holdImportLocked(const HeldImportKey &k,NBBuffer *buffer,std::vector
+@@ -478,17 +547,20 @@ static void holdImportLocked(const HeldImportKey &k,NBBuffer *buffer,std::vector
     }
     return;
    }
 -  eraseHeldImportLocked(existing,gone);
 +  eraseHeldImportLocked(existing,cleanup);
   }
-  while(gHeldImports.size()>=kMaxHeldImports && !gHeldImportOrder.empty()) {
+- while(gHeldImports.size()>=kMaxHeldImports && !gHeldImportOrder.empty()) {
++ const size_t entryBytes=std::get<2>(k);
++ if(entryBytes>kMaxHeldImportBytes)return;
++ while((gHeldImports.size()>=kMaxHeldImports || gHeldImportBytes+entryBytes>kMaxHeldImportBytes) && !gHeldImportOrder.empty()) {
    const HeldImportKey lruKey=gHeldImportOrder.back();
    auto victim=gHeldImports.find(lruKey);
 -  if(victim!=gHeldImports.end())eraseHeldImportLocked(victim,gone);
@@ -147,43 +156,80 @@ index aaa3fc9..d8488b3 100644
    else gHeldImportOrder.pop_back();
   }
   gHeldImportOrder.push_front(k);
-@@ -498,7 +563,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  IOSurfaceRef kept=buffer.importedSurface;
+  gHeldImports[k]={buffer,kept,IOSurfaceGetWidth(kept),IOSurfaceGetHeight(kept),IOSurfaceGetPixelFormat(kept),gHeldImportOrder.begin()};
++ gHeldImportBytes+=entryBytes;
+  if(gSurfaceImports) {
+   const SurfaceImportKey sk={std::get<0>(k),std::get<1>(k),std::get<2>(k)};
+   if(NSValue *nsKey=[NSValue valueWithBytes:&sk objCType:@encode(SurfaceImportKey)])[gSurfaceImports setObject:buffer forKey:nsKey];
+@@ -499,34 +571,49 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
   const HeldImportKey heldKey={value.identity,value.address,value.bytes};
   NSValue *key=value.identity?[NSValue valueWithBytes:&value objCType:@encode(SurfaceImportKey)]:nil;
   watchImportPressure();
 - std::vector<NBBuffer *> gone;   // declared before lock: released after unlock
-+ GoneSurfaceCleanup cleanup;   // declared before lock: released outside lock (textures before buffers)
-  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
-  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
-  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
-@@ -507,13 +572,15 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
-   if(existing!=gHeldImports.end() && existing->second.buffer==buffer &&
-      buffer.importedSurface && CFGetRetainCount(buffer.importedSurface)>1 &&
-      isSurfaceShapeValid(existing->second,surface)) {
+- std::lock_guard<std::mutex> lock(gSurfaceImportLock);
+- if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
+- NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
+- if(buffer) {
+-  auto existing=gHeldImports.find(heldKey);
+-  if(existing!=gHeldImports.end() && existing->second.buffer==buffer &&
+-     buffer.importedSurface && CFGetRetainCount(buffer.importedSurface)>1 &&
+-     isSurfaceShapeValid(existing->second,surface)) {
 -   holdImportLocked(heldKey,buffer,gone);
-+   holdImportLocked(heldKey,buffer,cleanup);
-+   gSurfaceImportHits++;
-    return buffer;
+-   return buffer;
++ NBBuffer *hit=nil;
++ {
++  GoneSurfaceCleanup cleanup;   // declared before lock: released outside lock (textures before buffers)
++  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
++  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
++  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
++  if(buffer) {
++   auto existing=gHeldImports.find(heldKey);
++   if(existing!=gHeldImports.end() && existing->second.buffer==buffer &&
++      buffer.importedSurface && CFGetRetainCount(buffer.importedSurface)>1 &&
++      isSurfaceShapeValid(existing->second,surface)) {
++    holdImportLocked(heldKey,buffer,cleanup);
++    gSurfaceImportHits++;
++    hit=buffer;
++   } else {
++    if(existing!=gHeldImports.end())eraseHeldImportLocked(existing,cleanup);
++    else [gSurfaceImports removeObjectForKey:key];
++   }
    }
 -  if(existing!=gHeldImports.end())eraseHeldImportLocked(existing,gone);
-+  if(existing!=gHeldImports.end())eraseHeldImportLocked(existing,cleanup);
-   else [gSurfaceImports removeObjectForKey:key];
-   buffer=nil;
+-  else [gSurfaceImports removeObjectForKey:key];
+-  buffer=nil;
   }
++ if(hit)return hit;
 + gSurfaceImportMisses++;
   // The surface keeps its CPU mapping (the imported pages) until the import is freed.
   NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
-  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
-@@ -525,7 +592,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+- if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
+- gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.importedSurface=surface;
++ if(!handle) {
++  CFRelease(surface);
++  trimHeldImports(true);
++  if(gDevice)(void)nmb_device_release_kept_memory(gDevice);
++  handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
++  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
++ }
++ gSurfaceImportsMade++;NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.importedSurface=surface;
+  if(key) {
++  GoneSurfaceCleanup cleanup;
++  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
++  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
+   if(gSurfaceImports.count>=gSurfaceImportsPruned) {
+    for(NSValue *old in gSurfaceImports.keyEnumerator.allObjects)
+     if(![gSurfaceImports objectForKey:old])[gSurfaceImports removeObjectForKey:old];
     gSurfaceImportsPruned=MAX(gSurfaceImports.count*2,(NSUInteger)64);
    }
    [gSurfaceImports setObject:buffer forKey:key];
 -  holdImportLocked(heldKey,buffer,gone);
-+  holdImportLocked(heldKey,buffer,cleanup);
++  if(bytes<=kMaxHeldImportBytes)holdImportLocked(heldKey,buffer,cleanup);
   }
   return buffer;
  }
-@@ -2127,9 +2194,80 @@ static BOOL supportsFamilyImpl(id self,MTLGPUFamily family,const void *caller);
+@@ -2128,9 +2215,80 @@ static BOOL supportsFamilyImpl(id self,MTLGPUFamily family,const void *caller);
   const size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
   if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){refuseSurface(3,surface,d,plane,start-(uintptr_t)base,row);return nil;}
   const size_t bytes=(allocation+page-1)&~(page-1);
@@ -267,7 +313,7 @@ index aaa3fc9..d8488b3 100644
   gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);texture.surfacePlane=plane;return (id<MTLTexture>)texture;
  } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
  - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error { try { @try {
-@@ -2518,6 +2656,10 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
+@@ -2560,6 +2718,10 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
    (unsigned long long)gNoCopyMade.load(),
    (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
@@ -278,7 +324,7 @@ index aaa3fc9..d8488b3 100644
   // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
   // its shader cache: where the driver's compile time goes.
   uint64_t work[10]={};
-@@ -2529,6 +2671,11 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
+@@ -2571,6 +2733,11 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    char warning[200];size_t n=nmb_last_warning(warning,sizeof warning);
    if(n){row("W %.86s",warning);if(n>86)row("Wb %.86s",warning+86);}
   }
@@ -290,7 +336,7 @@ index aaa3fc9..d8488b3 100644
   {
    std::lock_guard<std::mutex> lock(gProblemLock);
    char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);row("F %.86s",formats);
-@@ -2560,6 +2707,24 @@ extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {
+@@ -2602,6 +2769,24 @@ extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {
  }
  
  extern "C" uint64_t fuxi_native_metal_metric(unsigned index){

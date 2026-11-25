@@ -90,8 +90,8 @@ index 0000000..4f6d9f3
 +//!   `DeviceShared::memory`. Entries to destroy are drained/evicted out of the mutex first and
 +//!   destroyed lock-free via [`destroy_entries`], strictly destroying each `VkImage` before freeing
 +//!   its [`Placement`].
-+//! - **Budgets & TTL.** Bounded by [`IMAGE_POOL_TTL`] (10 s), [`MAX_POOL_BYTES`] (128 MiB),
-+//!   [`MAX_POOL_IMAGES`] (128), and [`MAX_POOL_ENTRY_BYTES`] (64 MiB).
++//! - **Budgets & TTL.** Bounded by [`IMAGE_POOL_TTL`] (10 s), [`MAX_POOL_BYTES`] (64 MiB),
++//!   [`MAX_POOL_IMAGES`] (64), and [`MAX_POOL_ENTRY_BYTES`] (48 MiB).
 +
 +use crate::device::lock;
 +use crate::memory::{Memory, MemoryClass, Placement};
@@ -104,14 +104,14 @@ index 0000000..4f6d9f3
 +/// Time-to-live of an idle pooled `VkImage` before automatic eviction.
 +pub(super) const IMAGE_POOL_TTL: Duration = Duration::from_secs(10);
 +
-+/// Maximum total backing bytes held across all pooled images on one device (128 MiB).
-+pub(super) const MAX_POOL_BYTES: u64 = 128 << 20;
++/// Maximum total backing bytes held across all pooled images on one device (64 MiB).
++pub(super) const MAX_POOL_BYTES: u64 = 64 << 20;
 +
 +/// Maximum number of pooled `VkImage` entries kept on one device.
-+pub(super) const MAX_POOL_IMAGES: usize = 128;
++pub(super) const MAX_POOL_IMAGES: usize = 64;
 +
-+/// Maximum backing byte size of a single poolable `VkImage` (64 MiB).
-+pub(super) const MAX_POOL_ENTRY_BYTES: u64 = MAX_POOL_BYTES / 2;
++/// Maximum backing byte size of a single poolable `VkImage` (48 MiB).
++pub(super) const MAX_POOL_ENTRY_BYTES: u64 = 48 << 20;
 +
 +/// 12-field lookup key covering every `VkImageCreateInfo` parameter, view format list, queue
 +/// sharing mode, and [`MemoryClass`] compatibility property of a runtime-owned `VkImage`.
@@ -173,7 +173,7 @@ index 0000000..4f6d9f3
 +
 +impl ImagePoolInner {
 +    fn evict_expired(&mut self, now: Instant, expired: &mut Vec<PooledImage>) {
-+        // Bounded by MAX_POOL_IMAGES (128), so scanning all entries avoids leaving stale
++        // Bounded by MAX_POOL_IMAGES (64), so scanning all entries avoids leaving stale
 +        // entries behind if timestamps ever arrive non-monotonically.
 +        let mut idx = 0;
 +        while idx < self.entries.len() {
@@ -711,14 +711,14 @@ index 0000000..4ab25b6
 +    let t0 = Instant::now();
 +    let key = base_key();
 +
-+    // Dedicated allocations (> 32 MiB) so Memory::free immediately triggers vkFreeMemory.
-+    let size = 40 << 20;
++    // Entry 201 is a dedicated allocation (> 32 MiB) so Memory::free immediately triggers vkFreeMemory.
++    // Pair with a 16 MiB entry 202 so both remain under MAX_POOL_BYTES (64 MiB).
 +    assert!(pool
-+        .give_back_at(make_entry(&harness, key.clone(), 201, size, t0), t0)
++        .give_back_at(make_entry(&harness, key.clone(), 201, 40 << 20, t0), t0)
 +        .is_empty());
 +    assert!(pool
 +        .give_back_at(
-+            make_entry(&harness, key.clone(), 202, size, t0 + Duration::from_secs(2)),
++            make_entry(&harness, key.clone(), 202, 16 << 20, t0 + Duration::from_secs(2)),
 +            t0 + Duration::from_secs(2)
 +        )
 +        .is_empty());
@@ -749,7 +749,7 @@ index 0000000..4ab25b6
 +    let t0 = Instant::now();
 +    let key = base_key();
 +
-+    // 1. Oversized entry (> 64 MiB) is rejected from pooling and destroyed immediately.
++    // 1. Oversized entry (> MAX_POOL_ENTRY_BYTES = 48 MiB) is rejected from pooling and destroyed immediately.
 +    let oversized = make_entry(&harness, key.clone(), 900, MAX_POOL_ENTRY_BYTES + 4096, t0);
 +    let evicted = pool.give_back_at(oversized, t0);
 +    assert_eq!(evicted.len(), 1);
@@ -758,7 +758,7 @@ index 0000000..4ab25b6
 +    assert_eq!(pool.stats(), (0, 0));
 +    assert_eq!(harness.image_destroy_count(), 1);
 +
-+    // 2. Count cap (MAX_POOL_IMAGES = 128): inserting 135 small entries evicts oldest 7.
++    // 2. Count cap (MAX_POOL_IMAGES = 64): inserting 71 small entries evicts oldest 7.
 +    for i in 0..(MAX_POOL_IMAGES + 7) {
 +        let now = t0 + Duration::from_millis(i as u64);
 +        let evicted = pool.give_back_at(make_entry(&harness, key.clone(), 1000 + i as u64, 4096, now), now);
@@ -769,17 +769,17 @@ index 0000000..4ab25b6
 +    }
 +    assert_eq!(pool.stats().0, MAX_POOL_IMAGES);
 +    assert_eq!(harness.image_destroy_count(), 1 + 7);
-+    // Oldest kept should be 1007 (1000..=1006 evicted); newest is 1134.
++    // Oldest kept should be 1007 (1000..=1006 evicted); newest is 1000 + MAX_POOL_IMAGES + 6 (1070).
 +    let mut popped = Vec::new();
 +    while let (Some(e), _) = pool.take_at(&key, t0 + Duration::from_secs(1)) {
 +        popped.push(e.raw.as_raw());
 +    }
-+    assert_eq!(popped.first().copied(), Some(1134));
++    assert_eq!(popped.first().copied(), Some(1000 + MAX_POOL_IMAGES as u64 + 6));
 +    assert_eq!(popped.last().copied(), Some(1007));
 +
-+    // 3. Bytes cap (MAX_POOL_BYTES = 128 MiB): inserting 3 x 50 MiB (= 150 MiB) evicts oldest first.
++    // 3. Bytes cap (MAX_POOL_BYTES = 64 MiB): inserting 3 x 25 MiB (= 75 MiB) evicts oldest first.
 +    let ops_before = harness.image_destroy_count();
-+    let big = 50 << 20;
++    let big = 25 << 20;
 +    for j in 0..3u64 {
 +        let now = t0 + Duration::from_secs(2) + Duration::from_millis(j);
 +        let evicted = pool.give_back_at(make_entry(&harness, key.clone(), 2000 + j, big, now), now);
@@ -788,7 +788,7 @@ index 0000000..4ab25b6
 +        assert!(count <= MAX_POOL_IMAGES);
 +        assert!(bytes <= MAX_POOL_BYTES);
 +    }
-+    assert_eq!(pool.stats(), (2, 100 << 20));
++    assert_eq!(pool.stats(), (2, 50 << 20));
 +    assert_eq!(harness.image_destroy_count(), ops_before + 1);
 +    let ops = harness.ops();
 +    assert!(ops.contains(&MockOp::Image(2000)));
@@ -801,14 +801,14 @@ index 0000000..4ab25b6
 +    let t0 = Instant::now();
 +    let key = base_key();
 +
-+    // Mix dedicated (40 MiB each -> direct vkFreeMemory) and small pooled (4 KiB -> empty block release).
++    // Mix dedicated (40 MiB -> direct vkFreeMemory) and pooled entries (16 MiB + 4 KiB -> empty block release) within 64 MiB budget.
 +    let e1 = make_entry(&harness, key.clone(), 301, 40 << 20, t0);
-+    let e2 = make_entry(&harness, key.clone(), 302, 40 << 20, t0);
++    let e2 = make_entry(&harness, key.clone(), 302, 16 << 20, t0);
 +    let e3 = make_entry(&harness, key.clone(), 303, 4096, t0);
 +    for e in [e1, e2, e3] {
 +        assert!(pool.give_back_at(e, t0).is_empty());
 +    }
-+    assert_eq!(pool.stats(), (3, (80 << 20) + 4096));
++    assert_eq!(pool.stats(), (3, (56 << 20) + 4096));
 +
 +    // Simulate Device::release_kept_memory()
 +    let drained = pool.drain_all();
@@ -822,8 +822,8 @@ index 0000000..4ab25b6
 +    assert!(freed_empty_blocks >= 1);
 +    assert_eq!(pool.stats(), (0, 0));
 +    assert_eq!(harness.image_destroy_count(), 3);
-+    // 2 dedicated blocks + 1 pooled block freed
-+    assert_eq!(harness.memory_free_count(), 3);
++    // 1 dedicated block + 1 pooled block freed
++    assert_eq!(harness.memory_free_count(), 2);
 +    assert_eq!(harness.double_free_count(), 0);
 +
 +    // Verify every Image destruction preceded its corresponding Memory free in order.

@@ -50,6 +50,8 @@ jobs:
           git -C source apply ../harness/patches/fuxi-bridge-lto-builder.patch
           git -C source apply --check ../harness/patches/fuxi-bridge-lse-builder.patch
           git -C source apply ../harness/patches/fuxi-bridge-lse-builder.patch
+          git -C source apply --check ../harness/patches/fuxi-metal-m9-m11-multiclient-120hz.patch
+          git -C source apply ../harness/patches/fuxi-metal-m9-m11-multiclient-120hz.patch
           cp harness/patches/nativemetal-fuxi-0004-optional-answers.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0005-completion-handlers.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0006-uchar3-constant.patch source/tools/patches/

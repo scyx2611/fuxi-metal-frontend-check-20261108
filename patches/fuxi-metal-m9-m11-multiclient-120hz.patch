@@ -1,0 +1,550 @@
+diff --git a/tools/fuxi-metal/BackboardGate.hpp b/tools/fuxi-metal/BackboardGate.hpp
+index 921e9d0..229cf77 100644
+--- a/tools/fuxi-metal/BackboardGate.hpp
++++ b/tools/fuxi-metal/BackboardGate.hpp
+@@ -6,6 +6,8 @@
+ #include "FrameTrace.hpp"
+ #include "SamplingPolicy.hpp"
+ #include <array>
++#include <cmath>
++#include <cstdint>
+ #include <string>
+ #include <chrono>
+ #include <atomic>
+@@ -22,6 +24,21 @@ class BackboardGate {
+  // unlocking, so a retiring frame never waits for the sorting and printing (reportMutex: one report at a time).
+  std::unique_ptr<FrameTraceWindow> frameTrace=std::make_unique<FrameTraceWindow>(),spareTrace;std::mutex reportMutex;
+  LateFrameLog lateFrames; // FUXI_MTL_LATE_FRAMES: not swapped with the windows, so its rate limit and previous frame span reports
++public:
++ struct NativeTelemetrySnapshot {
++  uint64_t texPoolHits=0,texPoolMisses=0,texPoolEvicts=0,texPoolBytes=0,surfaceImportHits=0,surfaceImportMisses=0;
++ };
++ using TelemetryReader = NativeTelemetrySnapshot(*)();
++ static uint64_t clampWallMsToNs(double wallMS) {
++  if(!std::isfinite(wallMS) || wallMS<=0.0)return 0;
++  const double ns=wallMS*1e6;
++  constexpr double kU64Upper=18446744073709551616.0;
++  if(!(ns<kU64Upper))return UINT64_MAX;
++  return uint64_t(ns);
++ }
++private:
++ bool panel120=false;
++ TelemetryReader telemetryReader=nullptr;
+  uint64_t frames=0,late=0,failures=0,gpu=0,lastFrames=0,lastGPU=0;
+  double began=0,lastReport=0;
+  static double now(){return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+@@ -82,6 +99,7 @@ public:
+   }
+   if(strikes>=strikeLimit){store("denied");return deny("strikes");}
+   if(!store("armed"))return deny("record-write");
++  panel120=systemTranslationPolicy().panel120;
+   active=true;began=lastReport=now();
+   fprintf(stderr,"FUXI MTL: backboardd gate allow armed strikes=%u uid=%lu good_frames=%u\n",strikes,(unsigned long)geteuid(),goodFrames);return true;
+  }
+@@ -96,12 +114,23 @@ public:
+   failed=true;strikes=strikeLimit;bool saved=persistDenied();
+   fprintf(stderr,"FUXI MTL: backboardd gate runtime-failure next-respawn=CPU persisted=%u\n",unsigned(saved));
+  }
++ void setPanel120(bool enabled){std::lock_guard<std::mutex> guard(mutex);panel120=enabled;}
++ void setTelemetryReader(TelemetryReader reader){std::lock_guard<std::mutex> guard(mutex);telemetryReader=reader;}
++ double lateBudgetMs() const{return panel120?(1000.0/120.0):(1000.0/60.0);}
+  void completed(uint64_t gpuNanos,double wallMS,const FrameSample *sample=nullptr) {
+   if(!active.load())return;
+   char lateText[1536];bool lateLine=false;
++  const FrameSample *usedSample=sample;
++  FrameSample fallbackSample{};
++  if(!usedSample && std::isfinite(wallMS) && wallMS>=0.0){
++   fallbackSample.wall=clampWallMsToNs(wallMS);
++   fallbackSample.gpuExec=gpuNanos;
++   fallbackSample.gpuSamples=gpuNanos?1:0;
++   usedSample=&fallbackSample;
++  }
+   {std::lock_guard<std::mutex> guard(mutex);if(!active || failed)return;
+-  if(sample){uint64_t interval=frameTrace->add(*sample);if(systemTranslationPolicy().lateFrames)lateLine=lateFrames.note(*sample,interval,lateText,sizeof lateText);}
+-  ++frames;gpu+=gpuNanos;if(wallMS>1000.0/60.0)++late;
++  if(usedSample){uint64_t interval=frameTrace->add(*usedSample);if(systemTranslationPolicy().lateFrames)lateLine=lateFrames.note(*usedSample,interval,lateText,sizeof lateText);}
++  ++frames;gpu+=gpuNanos;if(std::isfinite(wallMS) && wallMS>lateBudgetMs())++late;
+   if(frames==1)fprintf(stderr,"FUXI MTL: backboardd first_frame_ms=%.3f gpu_ms=%.3f\n",(now()-began)*1000,gpuNanos/1e6);
+   if(!good && frames>=goodFrames) {
+    if(store("good")){good=true;fprintf(stderr,"FUXI MTL: backboardd gate good frames=%llu\n",(unsigned long long)frames);}
+@@ -115,16 +144,29 @@ public:
+  static std::string classCounts(const std::array<std::atomic<uint64_t>,40> &a){std::string r;char b[40];for(size_t i=0;i<a.size();++i)if(auto v=a[i].load()){snprintf(b,sizeof b,"%s%zu:%llu",r.empty()?"":",",i,(unsigned long long)v);r+=b;}return r.empty()?"-":r;}
+  // name:count pairs for non-zero pool-miss causes, or "-".
+  static std::string causeCounts(){std::string r;char b[48];for(unsigned i=0;i<missCauses;++i)if(auto v=texturePoolMissCause[i].load()){snprintf(b,sizeof b,"%s%s:%llu",r.empty()?"":",",missCauseNames[i],(unsigned long long)v);r+=b;}return r.empty()?"-":r;}
+- void report() {
+-  if(!active.load())return;
++ void report() { reportTo(stderr,false); }
++ void reportTo(FILE *out,bool force=false) {
++  if(!active.load() || !out)return;
+   std::lock_guard<std::mutex> serial(reportMutex);
+   const bool trace=systemTranslationPolicy().frameTrace;
+   if(trace && !spareTrace)spareTrace=std::make_unique<FrameTraceWindow>(); // allocated before taking the gate lock
+-  uint64_t count,gpuDelta,frameCount,lateCount,failureCount;double span;
+-  {std::lock_guard<std::mutex> guard(mutex);double t=now();if(!active || t-lastReport<5)return;
+-   count=frames-lastFrames;gpuDelta=gpu-lastGPU;span=t-lastReport;frameCount=frames;lateCount=late;failureCount=failures;
++  uint64_t count,gpuDelta,frameCount,lateCount,failureCount;double span,p95Ms=0,p99Ms=0;
++  TelemetryReader reader=nullptr;bool is120=false;
++  {std::lock_guard<std::mutex> guard(mutex);double t=now();if(!active || (!force && t-lastReport<5))return;
++   span=t-lastReport;if(force && span<1e-6)span=1e-6;
++   count=frames-lastFrames;gpuDelta=gpu-lastGPU;frameCount=frames;lateCount=late;failureCount=failures;
++   reader=telemetryReader;is120=panel120;
+    if(trace){std::swap(frameTrace,spareTrace);frameTrace->continueFrom(*spareTrace);}
++   else{p95Ms=frameTrace->percentile(&FrameSample::wall,95)/1e6;p99Ms=frameTrace->percentile(&FrameSample::wall,99)/1e6;frameTrace->reset();}
+    lastReport=t;lastFrames=frames;lastGPU=gpu;}
++  if(trace){p95Ms=spareTrace->percentile(&FrameSample::wall,95)/1e6;p99Ms=spareTrace->percentile(&FrameSample::wall,99)/1e6;}
++  const NativeTelemetrySnapshot snap=reader?reader():NativeTelemetrySnapshot{};
++  const uint64_t texHits=reader?snap.texPoolHits:texturePoolHits.load();
++  const uint64_t texMisses=reader?snap.texPoolMisses:texturePoolMisses.load();
++  const uint64_t texEvicts=reader?snap.texPoolEvicts:texturePoolTrims.load();
++  const uint64_t texBytes=reader?snap.texPoolBytes:texturePoolBytes.load();
++  const uint64_t surfHits=reader?snap.surfaceImportHits:surfaceImportHits.load();
++  const uint64_t surfMisses=reader?snap.surfaceImportMisses:surfaceImportMisses.load();
+   // Reuse completed-frame GPU timestamps. Completion-window attribution can
+   // straddle report boundaries; overlapping work can exceed one wall interval.
+   // This is compositor timestamp occupancy, not a whole-engine busy counter.
+@@ -137,10 +179,10 @@ public:
+   // skipped/asked per kind
+   if(systemTranslationPolicy().bindSkip && extraLen>=0 && size_t(extraLen)<sizeof extra)snprintf(extra+extraLen,sizeof extra-size_t(extraLen)," bind_skip=push:%llu/%llu,vertex:%llu/%llu,index:%llu/%llu",
+    (unsigned long long)bindPushSkips.load(),(unsigned long long)bindPushCalls.load(),(unsigned long long)bindVertexSkips.load(),(unsigned long long)bindVertexCalls.load(),(unsigned long long)bindIndexSkips.load(),(unsigned long long)bindIndexCalls.load());
+-  fprintf(stderr,"FUXI MTL: backboardd frames=%llu gpu_ms=%.3f late=%llu failures=%llu sampling_skipped=%llu hz=%.2f window_frames=%llu gpu_busy_est_pct=%.1f tex_pool_hits=%llu tex_pool_misses=%llu tex_pool_trims=%llu tex_pool_bytes=%llu tex_pool_wasted=%llu tex_pool_idle_trims=%llu tex_pool_pressure_trims=%llu tex_pool_reject_full=%llu tex_pool_reject_budget=%llu tex_pool_class_hits=%s tex_pool_class_misses=%s tex_pool_miss_causes=%s slab_hits=%llu slab_grows=%llu slab_grow_cold=%llu slab_grow_frag=%llu slab_grow_full=%llu slab_grow_refused=%llu slab_frees=%llu slab_trims=%llu slab_bytes=%llu slab_free_bytes=%llu buf_pool_hits=%llu buf_pool_misses=%llu buf_pool_trims=%llu buf_pool_bytes=%llu surface_import_hits=%llu surface_import_misses=%llu%s\n",
++  fprintf(out,"FUXI MTL: backboardd frames=%llu gpu_ms=%.3f late=%llu failures=%llu sampling_skipped=%llu hz=%.2f window_frames=%llu gpu_busy_est_pct=%.1f tex_pool_hits=%llu tex_pool_misses=%llu tex_pool_trims=%llu tex_pool_bytes=%llu tex_pool_wasted=%llu tex_pool_idle_trims=%llu tex_pool_pressure_trims=%llu tex_pool_reject_full=%llu tex_pool_reject_budget=%llu tex_pool_class_hits=%s tex_pool_class_misses=%s tex_pool_miss_causes=%s slab_hits=%llu slab_grows=%llu slab_grow_cold=%llu slab_grow_frag=%llu slab_grow_full=%llu slab_grow_refused=%llu slab_frees=%llu slab_trims=%llu slab_bytes=%llu slab_free_bytes=%llu buf_pool_hits=%llu buf_pool_misses=%llu buf_pool_trims=%llu buf_pool_bytes=%llu surface_import_hits=%llu surface_import_misses=%llu tex_pool_evicts=%llu p95=%.3f p99=%.3f late_budget_ms=%.3f%s\n",
+    (unsigned long long)frameCount,count?gpuDelta/1e6/double(count):0.0,(unsigned long long)lateCount,
+-   (unsigned long long)failureCount,(unsigned long long)skippedSamplingDraws.load(),double(count)/span,(unsigned long long)count,busy,(unsigned long long)texturePoolHits.load(),(unsigned long long)texturePoolMisses.load(),(unsigned long long)texturePoolTrims.load(),(unsigned long long)texturePoolBytes.load(),(unsigned long long)texturePoolWasted.load(),(unsigned long long)texturePoolIdleTrims.load(),(unsigned long long)texturePoolPressureTrims.load(),(unsigned long long)texturePoolRejectFull.load(),(unsigned long long)texturePoolRejectBudget.load(),classCounts(texturePoolClassHits).c_str(),classCounts(texturePoolClassMisses).c_str(),causeCounts().c_str(),(unsigned long long)slabHits.load(),(unsigned long long)slabGrows.load(),(unsigned long long)slabGrowCold.load(),(unsigned long long)slabGrowFrag.load(),(unsigned long long)slabGrowFull.load(),(unsigned long long)slabGrowRefused.load(),(unsigned long long)slabFrees.load(),(unsigned long long)slabTrims.load(),(unsigned long long)slabBytes.load(),(unsigned long long)slabFreeBytes.load(),(unsigned long long)bufferPoolHits.load(),(unsigned long long)bufferPoolMisses.load(),(unsigned long long)bufferPoolTrims.load(),(unsigned long long)bufferPoolBytes.load(),(unsigned long long)surfaceImportHits.load(),(unsigned long long)surfaceImportMisses.load(),extra);
+-  if(trace)spareTrace->report();
++   (unsigned long long)failureCount,(unsigned long long)skippedSamplingDraws.load(),double(count)/span,(unsigned long long)count,busy,(unsigned long long)texHits,(unsigned long long)texMisses,(unsigned long long)texEvicts,(unsigned long long)texBytes,(unsigned long long)texturePoolWasted.load(),(unsigned long long)texturePoolIdleTrims.load(),(unsigned long long)texturePoolPressureTrims.load(),(unsigned long long)texturePoolRejectFull.load(),(unsigned long long)texturePoolRejectBudget.load(),classCounts(texturePoolClassHits).c_str(),classCounts(texturePoolClassMisses).c_str(),causeCounts().c_str(),(unsigned long long)slabHits.load(),(unsigned long long)slabGrows.load(),(unsigned long long)slabGrowCold.load(),(unsigned long long)slabGrowFrag.load(),(unsigned long long)slabGrowFull.load(),(unsigned long long)slabGrowRefused.load(),(unsigned long long)slabFrees.load(),(unsigned long long)slabTrims.load(),(unsigned long long)slabBytes.load(),(unsigned long long)slabFreeBytes.load(),(unsigned long long)bufferPoolHits.load(),(unsigned long long)bufferPoolMisses.load(),(unsigned long long)bufferPoolTrims.load(),(unsigned long long)bufferPoolBytes.load(),(unsigned long long)surfHits,(unsigned long long)surfMisses,(unsigned long long)texEvicts,p95Ms,p99Ms,is120?(1000.0/120.0):(1000.0/60.0),extra);
++  if(trace)spareTrace->report(out);
+  }
+  BackboardGate()=default;
+  BackboardGate(const BackboardGate&)=delete;BackboardGate& operator=(const BackboardGate&)=delete;
+@@ -149,4 +191,22 @@ public:
+ // The dispatch reporter and lease live until process death, including during
+ // static teardown. Local test instances still close their descriptors normally.
+ inline BackboardGate &backboardGate=*new BackboardGate;
++
++// Process-local gate for Class 1 foreground Apps: failure latches only within
++// the failing process and never touches backboardd's persistent gate.state.
++class ForegroundClientGate {
++ std::atomic<bool> active{false},failed{false};
++ std::atomic<uint64_t> failures{0};
++public:
++ void admit() { active.store(true,std::memory_order_release); }
++ bool isActive() const { return active.load(std::memory_order_acquire); }
++ bool blocked() const { return active.load(std::memory_order_acquire) && failed.load(std::memory_order_acquire); }
++ void fault() {
++  failures.fetch_add(1,std::memory_order_relaxed);
++  if(active.load(std::memory_order_acquire))failed.store(true,std::memory_order_release);
++ }
++ uint64_t failureCount() const { return failures.load(std::memory_order_acquire); }
++ void resetForTest() { active.store(false); failed.store(false); failures.store(0); }
++};
++inline ForegroundClientGate &foregroundClientGate=*new ForegroundClientGate;
+ }
+diff --git a/tools/fuxi-metal/BackboardGateTests.cpp b/tools/fuxi-metal/BackboardGateTests.cpp
+index 21bb44c..f96ee67 100644
+--- a/tools/fuxi-metal/BackboardGateTests.cpp
++++ b/tools/fuxi-metal/BackboardGateTests.cpp
+@@ -60,6 +60,19 @@ int main(){
+   assert(!unlinkat(dir,"gate.tmp",AT_REMOVEDIR));
+  }
+  {auto gate=std::make_unique<fuxi::BackboardGate>();auto &g=*gate;assert(!g.admit(bootB,storage(path)));}
++ // M9 ForegroundClientGate decoupling: fault latches only process-local atomic state and never touches backboardd's gate.state.
++ {
++  auto bg=std::make_unique<fuxi::BackboardGate>();
++  assert(bg->admit(bootA,storage(path)));
++  fuxi::foregroundClientGate.resetForTest();
++  assert(!fuxi::foregroundClientGate.isActive() && !fuxi::foregroundClientGate.blocked());
++  fuxi::foregroundClientGate.admit();
++  assert(fuxi::foregroundClientGate.isActive() && !fuxi::foregroundClientGate.blocked());
++  fuxi::foregroundClientGate.fault();
++  assert(fuxi::foregroundClientGate.blocked() && fuxi::foregroundClientGate.failureCount()==1);
++  assert(!bg->blocked() && record(path).find("0 armed")!=std::string::npos);
++  fuxi::foregroundClientGate.resetForTest();
++ }
+  clear(path);close(dir);assert(!rmdir(path));
+  if(fuxi::systemTranslationPolicy().lateFrames){ // FUXI_MTL_LATE_FRAMES: a late frame's line leaves the gate on stderr, in pieces of at most 200 chars
+   char late[]="/tmp/fuxi-backboard-late-XXXXXX";assert(mkdtemp(late));
+@@ -72,5 +85,5 @@ int main(){
+    fclose(log);assert(first==1 && cont>=2);}
+   clear(late);assert(!rmdir(late));
+  }
+- puts("PASS: backboardd boot reset, crash strike/deny, good/rearm, runtime fault, exclusive lease, private record integrity and write failure");
++ puts("PASS: backboardd boot reset, crash strike/deny, good/rearm, runtime fault, exclusive lease, private record integrity, write failure and ForegroundClientGate decoupling");
+ }
+diff --git a/tools/fuxi-metal/ClientGate.hpp b/tools/fuxi-metal/ClientGate.hpp
+index 42bbf13..1f3af79 100644
+--- a/tools/fuxi-metal/ClientGate.hpp
++++ b/tools/fuxi-metal/ClientGate.hpp
+@@ -1,7 +1,10 @@
+ /* Original fail-closed client policy; no GPU or Objective-C dependencies. */
+ #pragma once
+ #include <cstdio>
++#include <cstdint>
++#include <cerrno>
+ #include <cstring>
++#include <dlfcn.h>
+ #include <fcntl.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+@@ -36,15 +39,107 @@ static inline bool clientName(const char *s) {
+      (s[i]>='0'&&s[i]<='9')||s[i]=='_'||s[i]=='-'||s[i]=='.'))return false;
+  return true;
+ }
++static inline char asciiLower(char c) {
++ return (c>='A' && c<='Z')?char(c+('a'-'A')):c;
++}
++static inline bool equalsIgnoreCase(const char *a,const char *b) {
++ if(!a || !b)return false;
++ while(*a && *b){if(asciiLower(*a)!=asciiLower(*b))return false;++a;++b;}
++ return *a==0 && *b==0;
++}
++static inline bool containsIgnoreCase(const char *haystack,const char *needle) {
++ if(!haystack || !needle || !*needle)return false;
++ size_t nlen=strlen(needle);
++ for(const char *p=haystack;*p;++p) {
++  size_t i=0;
++  while(i<nlen && p[i] && asciiLower(p[i])==asciiLower(needle[i]))++i;
++  if(i==nlen)return true;
++ }
++ return false;
++}
+ // Processes that must never see a Metal device, not even a census one. HackiOS
+ // (hackios-xnu-userland, MIT) observed both aborting on a visible device:
+ // mediaserverd's CMCapture preloads AppleCVAPhoto's shader library (28 aborts
+ // per boot) and SpringBoard's Siri orb prewarms its shaders (abort every
+-// 8.3 s). A denied device init returns nil, which is what both expect here.
++// 8.3 s). U-026 Phase A also permanently blocks all *poster* wallpaper extensions (case-insensitive).
+ static inline bool hiddenClient(const char *s) {
+- return !strcmp(s,"SpringBoard") || !strcmp(s,"mediaserverd");
++ if(!s || !*s)return true;
++ if(equalsIgnoreCase(s,"SpringBoard") || equalsIgnoreCase(s,"mediaserverd"))return true;
++ if(containsIgnoreCase(s,"poster"))return true;
++ return false;
+ }
+-static inline ClientMode parseClients(char *data,size_t length,const char *process,const char *bootargs=nullptr) {
++static inline bool parseAdtClientsData(const uint8_t *bytes,size_t len,char *out,size_t capacity) {
++ if(!out || !capacity)return false;
++ out[0]=0;
++ if(!bytes || !len || len>=capacity)return false;
++ if(bytes[len-1]!=0)return false;
++ if(memchr(bytes,0,len-1)!=nullptr)return false;
++ if(bytes[0]==0)return false;
++ memcpy(out,bytes,len);
++ return true;
++}
++static inline bool matchAllowlistToken(const char *list,const char *process) {
++ if(!list || !*list || !process || hiddenClient(process) || !clientName(process))return false;
++ const size_t plen=strlen(process);
++ for(const char *p=list;*p;) {
++  while(*p==',' || *p==' ' || *p=='\t' || *p=='\r' || *p=='\n')++p;
++  if(!*p)break;
++  const char *end=p;
++  while(*end && *end!=',' && *end!=' ' && *end!='\t' && *end!='\r' && *end!='\n')++end;
++  if(size_t(end-p)==plen && !strncmp(p,process,plen))return true;
++  p=end;
++ }
++ return false;
++}
++static inline bool systemAdtGpuClients(char *out,size_t capacity) {
++ if(!out || !capacity)return false;
++ out[0]=0;
++#ifdef __APPLE__
++ void *io=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW|RTLD_LOCAL);
++ void *cf=dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",RTLD_NOW|RTLD_LOCAL);
++ bool ok=false;
++ if(io && cf) {
++  auto entryFromPath=(uint32_t(*)(uint32_t,const char *))dlsym(io,"IORegistryEntryFromPath");
++  auto copyProp=(const void *(*)(uint32_t,const void *,const void *,uint32_t))dlsym(io,"IORegistryEntryCreateCFProperty");
++  auto objRelease=(int(*)(uint32_t))dlsym(io,"IOObjectRelease");
++  auto cfStrCreate=(const void *(*)(const void *,const char *,uint32_t))dlsym(cf,"CFStringCreateWithCString");
++  auto cfRelease=(void(*)(const void *))dlsym(cf,"CFRelease");
++  auto cfGetTypeID=(unsigned long(*)(const void *))dlsym(cf,"CFGetTypeID");
++  auto cfDataTypeID=(unsigned long(*)())dlsym(cf,"CFDataGetTypeID");
++  auto cfStrTypeID=(unsigned long(*)())dlsym(cf,"CFStringGetTypeID");
++  auto cfDataLen=(long(*)(const void *))dlsym(cf,"CFDataGetLength");
++  auto cfDataPtr=(const uint8_t *(*)(const void *))dlsym(cf,"CFDataGetBytePtr");
++  auto cfStrC=(int(*)(const void *,char *,long,uint32_t))dlsym(cf,"CFStringGetCString");
++  if(entryFromPath && copyProp && objRelease && cfStrCreate && cfRelease && cfGetTypeID) {
++   uint32_t chosen=entryFromPath(0,"IODeviceTree:/chosen");
++   if(chosen) {
++    const void *key=cfStrCreate(nullptr,"fuxi,gpu-clients",0x08000100u);
++    if(key) {
++     const void *val=copyProp(chosen,key,nullptr,0);
++     if(val) {
++      unsigned long tid=cfGetTypeID(val);
++      if(cfDataTypeID && cfDataLen && cfDataPtr && tid==cfDataTypeID()) {
++       long n=cfDataLen(val);
++       if(n>0)ok=parseAdtClientsData(cfDataPtr(val),(size_t)n,out,capacity);
++      } else if(cfStrTypeID && cfStrC && tid==cfStrTypeID()) {
++       ok=cfStrC(val,out,(long)capacity,0x08000100u)!=0 && out[0]!=0 && strlen(out)<capacity-1;
++      }
++      cfRelease(val);
++     }
++     cfRelease(key);
++    }
++    objRelease(chosen);
++   }
++  }
++ }
++ if(io)dlclose(io);
++ if(cf)dlclose(cf);
++ return ok;
++#else
++ return false;
++#endif
++}
++static inline ClientMode parseClients(char *data,size_t length,const char *process,const char *bootargs=nullptr,const char *adtClients=nullptr) {
+  bool backboard=!strcmp(process,"backboardd");
+  if(hiddenClient(process) || (backboard && !backboardArmed(bootargs)))return ClientMode::deny;
+  if(!clientName(process)||memchr(data,0,length))return ClientMode::deny;
+@@ -64,16 +159,28 @@ static inline ClientMode parseClients(char *data,size_t length,const char *proce
+   }
+   line=next;
+  }
++ if(result==ClientMode::deny && !backboard && adtClients && matchAllowlistToken(adtClients,process))
++  result=ClientMode::allow;
+  return backboard && result!=ClientMode::allow?ClientMode::deny:result;
+ }
+-static inline ClientMode readClients(const char *path,const char *process) {
+- int fd=open(path,O_RDONLY|O_NOFOLLOW|O_NONBLOCK);if(fd<0)return ClientMode::deny;
++static inline ClientMode readClients(const char *path,const char *process,const char *adtOverride=nullptr) {
++ if(hiddenClient(process))return ClientMode::deny;
++ char adtBuf[256]={};
++ const char *adt=adtOverride;
++ if(!adt && strcmp(process,"backboardd") && systemAdtGpuClients(adtBuf,sizeof(adtBuf)))adt=adtBuf;
++ int fd=open(path,O_RDONLY|O_NOFOLLOW|O_NONBLOCK);
++ if(fd<0) {
++  if(errno==ENOENT && strcmp(process,"backboardd") && adt && adt[0]) {
++   char empty[1]={0};return parseClients(empty,0,process,nullptr,adt);
++  }
++  return ClientMode::deny;
++ }
+  struct stat st={};char data[8193];size_t used=0;bool ok=false;
+  if(!fstat(fd,&st)&&S_ISREG(st.st_mode)&&st.st_uid==0&&!(st.st_mode&0022)&&st.st_size<=8192) {
+   ssize_t n;while(used<sizeof(data)-1 && (n=read(fd,data+used,sizeof(data)-1-used))>0)used+=(size_t)n;
+   char tail;ok=read(fd,&tail,1)==0 && used==(size_t)st.st_size;
+  }
+  char args[4096]={};if(!strcmp(process,"backboardd"))systemString("kern.bootargs",args,sizeof(args));
+- close(fd);return ok?parseClients(data,used,process,args):ClientMode::deny;
++ close(fd);return ok?parseClients(data,used,process,args,adt):ClientMode::deny;
+ }
+ }
+diff --git a/tools/fuxi-metal/ClientGateTests.cpp b/tools/fuxi-metal/ClientGateTests.cpp
+index 5ede671..a5b6ec3 100644
+--- a/tools/fuxi-metal/ClientGateTests.cpp
++++ b/tools/fuxi-metal/ClientGateTests.cpp
+@@ -1,8 +1,8 @@
+ #include "ClientGate.hpp"
+ #include <cassert>
+ #include <string>
+-static fuxi::ClientMode parse(std::string text,const char *name="fuxi-metal-smoke",const char *args=nullptr) {
+- size_t n=text.size();text.push_back(0);return fuxi::parseClients(text.data(),n,name,args);
++static fuxi::ClientMode parse(std::string text,const char *name="fuxi-metal-smoke",const char *args=nullptr,const char *adt=nullptr) {
++ size_t n=text.size();text.push_back(0);return fuxi::parseClients(text.data(),n,name,args,adt);
+ }
+ int main() {
+  using M=fuxi::ClientMode;
+@@ -49,5 +49,36 @@ int main() {
+  chmod(path,0600);std::string link=std::string(path)+"-link";assert(!symlink(path,link.c_str()));
+  assert(fuxi::readClients(link.c_str(),"fuxi-metal-smoke")==M::deny);unlink(link.c_str());unlink(path);
+  assert(fuxi::readClients(path,"fuxi-metal-smoke")==M::deny);
+- puts("PASS: exact clients, hidden SpringBoard/mediaserverd, census/conflicts, malformed/NUL, missing/untrusted/writable/symlink policy fail closed");
++ // U-026 Phase A: *poster* (case-insensitive) permanently denied; ADT fuxi,gpu-clients allows foreground apps but never blacklists or backboardd.
++ for(const char *poster:{"PosterBoard","CollectionsPoster","WeatherPoster","CustomPosterExt","LockScreenAstronomyWallpaperPosterExt","mywallpaperposterapp","WALLPAPERPOSTER"}) {
++  assert(fuxi::hiddenClient(poster));
++  assert(parse(std::string(poster)+"\n",poster,armed,"Maps,PosterBoard,CollectionsPoster,WeatherPoster,CustomPosterExt")==M::deny);
++  assert(fuxi::readClients("/nonexistent/fuxi-missing",poster,poster)==M::deny);
++ }
++ assert(fuxi::hiddenClient("springboard") && fuxi::hiddenClient("MEDIASERVERD"));
++ // BUG-6: parseAdtClientsData rejects >= capacity (256B truncation) or non-NUL-terminated / embedded-NUL buffers.
++ {
++  char out[256]={};
++  std::string ok("Maps,Weather"); ok.push_back('\0');
++  assert(fuxi::parseAdtClientsData(reinterpret_cast<const uint8_t *>(ok.data()),ok.size(),out,sizeof(out)));
++  assert(!strcmp(out,"Maps,Weather"));
++  std::string noNul("Maps,Weather");
++  assert(!fuxi::parseAdtClientsData(reinterpret_cast<const uint8_t *>(noNul.data()),noNul.size(),out,sizeof(out)));
++  std::string exact256(255,'a'); exact256.push_back('\0');
++  assert(exact256.size()==256);
++  assert(!fuxi::parseAdtClientsData(reinterpret_cast<const uint8_t *>(exact256.data()),exact256.size(),out,sizeof(out)));
++  std::string over260(250,'a'); over260+=",MapsExtra"; over260.push_back('\0');
++  assert(!fuxi::parseAdtClientsData(reinterpret_cast<const uint8_t *>(over260.data()),over260.size(),out,sizeof(out)));
++  std::string embedded("Maps\0Weather\0",13);
++  assert(!fuxi::parseAdtClientsData(reinterpret_cast<const uint8_t *>(embedded.data()),embedded.size(),out,sizeof(out)));
++ }
++ assert(parse("backboardd\n","SpringBoard",armed,"SpringBoard,Maps")==M::deny);
++ assert(parse("backboardd\n","mediaserverd",armed,"mediaserverd,Maps")==M::deny);
++ assert(parse("backboardd\n","Maps",nullptr,"Maps,Weather")==M::allow);
++ assert(parse("backboardd\n","Weather",nullptr,"Maps,Weather")==M::allow);
++ assert(parse("backboardd\n","MapsExtra",nullptr,"Maps,Weather")==M::deny);
++ assert(parse("backboardd\n","backboardd",nullptr,"backboardd,Maps")==M::deny);
++ assert(fuxi::readClients("/nonexistent/fuxi-missing","Maps","Maps,Weather")==M::allow);
++ assert(fuxi::readClients("/nonexistent/fuxi-missing","backboardd","backboardd,Maps")==M::deny);
++ puts("PASS: exact clients, hidden SpringBoard/mediaserverd/*Poster*, ADT allowlist, census/conflicts, malformed/NUL, missing/untrusted/writable/symlink policy fail closed");
+ }
+diff --git a/tools/fuxi-metal/FrameTrace.hpp b/tools/fuxi-metal/FrameTrace.hpp
+index e716e2c..179f233 100644
+--- a/tools/fuxi-metal/FrameTrace.hpp
++++ b/tools/fuxi-metal/FrameTrace.hpp
+@@ -236,7 +236,7 @@ public:
+  uint64_t add(const FrameSample &s) {
+   auto &stored=samples[count%capacity];stored=s;
+   // Gaps over 100 ms are idle pauses, not cadence; they do not enter the histogram.
+-  if(s.createdNs && lastCreated && s.createdNs>lastCreated && s.createdNs-lastCreated<100000000){stored.interval=s.createdNs-lastCreated;uint64_t ticks=(stored.interval+8333333)/16666667;++cadence[ticks<=1?0:ticks==2?1:ticks==3?2:3];}
++  if(s.createdNs && lastCreated && s.createdNs>lastCreated && s.createdNs-lastCreated<100000000){stored.interval=s.createdNs-lastCreated;uint64_t periodNs=systemTranslationPolicy().panel120?8333333ULL:16666667ULL;uint64_t ticks=(stored.interval+periodNs/2)/periodNs;++cadence[ticks<=1?0:ticks==2?1:ticks==3?2:3];}
+   if(s.createdNs)lastCreated=s.createdNs;++count;wallMax=std::max(wallMax,s.wall);
+   draws+=s.draws;passes+=s.passes;counts.pipelines+=s.counts.pipelines;counts.descriptors+=s.counts.descriptors;counts.allocations+=s.counts.allocations;
+   mergedDraws+=s.mergedDraws;for(size_t i=1;i<mergeSplits.size();++i)mergeSplits[i]+=s.mergeSplits[i];
+@@ -294,14 +294,18 @@ public:
+   if(line)wrapLine(out,text?text:"","FUXI MTL: frame trace+");else reportMain(out);
+   if(rest)fputs(phases?phases:"",out);else reportPhases(out);
+   funlockfile(out);free(text);free(phases);
++  reset();
++ }
++ void reset() {
+   count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=mergedDraws=0;mergeSplits.fill(0);counts={};totals={};cpus.fill(0);cadence.fill(0);
+  }
+  void reportMain(FILE *out) {
+   auto p=[&](uint64_t FrameSample::*field,unsigned percent){return percentile(field,percent)/1e6;};
+   double n=count?double(count):1;
+-  fprintf(out,"FUXI MTL: frame trace n=%llu samples=%llu wall=%.3f/%.3f/%.3f ms cpu_before_commit=%.3f/%.3f shadow_copy=%.3f/%.3f lease_lock=%.3f/%.3f backend_submit=%.3f/%.3f gpu_wait=%.3f/%.3f gpu_exec=%.3f/%.3f draws/frame=%.2f render_passes/frame=%.2f pipelines/frame=%.2f descriptors/frame=%.2f allocations/frame=%.2f cpu_hist=",
++  fprintf(out,"FUXI MTL: frame trace n=%llu samples=%llu wall=%.3f/%.3f/%.3f ms wall_p95=%.3f wall_p99=%.3f cpu_before_commit=%.3f/%.3f shadow_copy=%.3f/%.3f lease_lock=%.3f/%.3f backend_submit=%.3f/%.3f gpu_wait=%.3f/%.3f gpu_exec=%.3f/%.3f draws/frame=%.2f render_passes/frame=%.2f pipelines/frame=%.2f descriptors/frame=%.2f allocations/frame=%.2f cpu_hist=",
+    (unsigned long long)count,(unsigned long long)std::min<uint64_t>(count,capacity),
+    p(&FrameSample::wall,50),p(&FrameSample::wall,90),wallMax/1e6,
++   p(&FrameSample::wall,95),p(&FrameSample::wall,99),
+    p(&FrameSample::cpuBeforeCommit,50),p(&FrameSample::cpuBeforeCommit,90),
+    p(&FrameSample::shadowCopy,50),p(&FrameSample::shadowCopy,90),
+    p(&FrameSample::leaseLock,50),p(&FrameSample::leaseLock,90),
+diff --git a/tools/fuxi-metal/Frontend.mm b/tools/fuxi-metal/Frontend.mm
+index 67867b5..1dd6708 100644
+--- a/tools/fuxi-metal/Frontend.mm
++++ b/tools/fuxi-metal/Frontend.mm
+@@ -137,6 +137,8 @@ static void checkClient() {
+     if(timer){dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC),5*NSEC_PER_SEC,NSEC_PER_SEC/10);
+      dispatch_source_set_event_handler(timer,^{fuxi::backboardGate.report();finishSurvey();});dispatch_resume(timer);}
+    }
++  } else if(clientMode==fuxi::ClientMode::allow) {
++   fuxi::foregroundClientGate.admit();
+   }
+   // Constructor-time admission precedes CA framebuffer selection and discovery.
+   // Census/denied clients must not change the process's rendering preferences.
+@@ -238,7 +240,9 @@ static void logThreadPriority(std::atomic<bool> &done,const char *role,bool core
+  fprintf(stderr,"FUXI MTL: thread priority %s name=%.64s policy=%d base=%d cur=%d\n",role,info.pth_name,info.pth_policy,info.pth_priority,info.pth_curpri);
+ }
+ static void failureLog(const char *format,...) {
+- fuxi::backboardGate.fault();uint64_t n=failureCount.fetch_add(1);
++ const bool backboard=!strcmp(clientProcess,"backboardd");
++ if(backboard)fuxi::backboardGate.fault(); else fuxi::foregroundClientGate.fault();
++ uint64_t n=failureCount.fetch_add(1);
+  char message[fuxi::Survey::messageBytes];va_list args;va_start(args,format);vsnprintf(message,sizeof(message),format,args);va_end(args);
+  // Context is captured in the refusal itself, before the normal immediate exit.
+  if(descriptorContext.text || descriptorContext.lazy){size_t len=strlen(message);if(len && message[len-1]=='\n')message[--len]=0;
+@@ -1373,7 +1377,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
+  if(backboardSurvey.active() && fuxi::backboardGate.blocked()){
+   for(const auto &point:_events)if(point.signal)[point.event setSignaledValue:point.value];
+   _scheduled=YES;_status=MTLCommandBufferStatusCompleted;[_error release];_error=nil;finishSurvey();
+- }else try {if(fuxi::backboardGate.blocked())throw std::runtime_error("backboardd failure latched: CPU on next respawn");if(!strcmp(clientProcess,"fuxi-ca-smoke") && failureCount.load())throw std::runtime_error("CA diagnostic failure latched: GPU submission refused");if(_rejected)throw std::runtime_error("unsupported command: GPU submission refused");if(clientMode==fuxi::ClientMode::census)throw std::runtime_error("census: no GPU submission");auto *backend=owner(_queue->_device)->backend;size_t begin=0;
++ }else try {if(fuxi::backboardGate.blocked() || fuxi::foregroundClientGate.blocked())throw std::runtime_error("client failure latched: CPU fallback");if(!strcmp(clientProcess,"fuxi-ca-smoke") && failureCount.load())throw std::runtime_error("CA diagnostic failure latched: GPU submission refused");if(_rejected)throw std::runtime_error("unsupported command: GPU submission refused");if(clientMode==fuxi::ClientMode::census)throw std::runtime_error("census: no GPU submission");auto *backend=owner(_queue->_device)->backend;size_t begin=0;
+  if(gpuScanout)backend->requireLive();
+  auto leaseStart=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
+  fuxi::SurfaceLease lease(gpuScanout,lockScanoutSurface,unlockScanoutSurface,&backend->poisoned);
+@@ -1471,7 +1475,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
+   if(_status==MTLCommandBufferStatusError)throw std::runtime_error("command snapshot failed");
+   if(backboardSurvey.active() && fuxi::backboardGate.blocked()){_scheduled=YES;}
+   else {
+-  if(fuxi::backboardGate.blocked())throw std::runtime_error("backboardd failure latched: CPU on next respawn");
++  if(fuxi::backboardGate.blocked() || fuxi::foregroundClientGate.blocked())throw std::runtime_error("client failure latched: CPU fallback");
+   if(!strcmp(clientProcess,"fuxi-ca-smoke") && failureCount.load())throw std::runtime_error("CA diagnostic failure latched: GPU submission refused");
+   if(_rejected)throw std::runtime_error("unsupported command: GPU submission refused");
+   if(clientMode==fuxi::ClientMode::census)throw std::runtime_error("census: no GPU submission");
+@@ -1704,8 +1708,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
+  checkClient();
+  if(clientMode==fuxi::ClientMode::deny) {[self release];return nil;}
+  CENSUS();
+- if((clientMode!=fuxi::ClientMode::census && geteuid()!=0 && strcmp(clientProcess,"backboardd")) ||
+-    fuxi::backboardGate.blocked() || !port || owner(self)) {[self release];return nil;}
++ if(fuxi::backboardGate.blocked() || fuxi::foregroundClientGate.blocked() || !port || owner(self)) {[self release];return nil;}
+  if(clientMode==fuxi::ClientMode::census) {
+   FuxiOwner *state=[FuxiOwner new];
+   objc_setAssociatedObject(self,&ownerKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[state release];return self;
+@@ -1723,14 +1726,35 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
+   if(!FUXI_MTL_NATIVE_PREFLIGHT(port)){
+    failureLog("FUXI MTL: NativeMetal host-import ABI-2 preflight FAIL\n");[self release];return nil;
+   }
++  if(!strcmp(clientProcess,"backboardd")) {
++   fuxi::backboardGate.setTelemetryReader([](){
++    fuxi::BackboardGate::NativeTelemetrySnapshot snap{};
++    snap.texPoolHits=nativeMetric(2);
++    snap.texPoolMisses=nativeMetric(3);
++    snap.texPoolEvicts=nativeMetric(4);
++    snap.surfaceImportHits=nativeMetric(5);
++    snap.surfaceImportMisses=nativeMetric(6);
++    snap.texPoolBytes=nativeMetric(7);
++    return snap;
++   });
++  }
+   static const FuxiNativeHooks hooks={FUXI_NATIVE_ABI,sizeof(FuxiNativeHooks),
+    [](const char *why){failureLog("FUXI MTL: native refusal %s\n",why?why:"unknown");},
+-   [](){return fuxi::backboardGate.blocked();},
++   [](){return !strcmp(clientProcess,"backboardd") ? fuxi::backboardGate.blocked() : fuxi::foregroundClientGate.blocked();},
+    [](uint64_t gpu,double wall,uint64_t draws,bool storedSurface){
+-    if(fuxi::backboardGate.blocked())return;
++    const bool bb=!strcmp(clientProcess,"backboardd");
++    if(bb ? fuxi::backboardGate.blocked() : fuxi::foregroundClientGate.blocked())return;
+     completedDraws.fetch_add(draws);if(gpu){fuxi::Backend::gpuNanos.fetch_add(gpu);++fuxi::Backend::gpuSamples;}
+-    if(storedSurface)fuxi::backboardGate.completed(gpu,wall);
+-    if(fuxi::backboardGate.blocked())failureLog("FUXI MTL: native completion latch\n");}};
++    if(bb && storedSurface){
++     fuxi::FrameSample sample{};
++     sample.wall=fuxi::BackboardGate::clampWallMsToNs(wall);
++     sample.gpuExec=gpu;
++     sample.draws=draws;
++     sample.gpuSamples=gpu?1:0;
++     sample.createdNs=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(fuxi::FrameClock::now().time_since_epoch()).count());
++     fuxi::backboardGate.completed(gpu,wall,&sample);
++    }
++    if(bb && fuxi::backboardGate.blocked())failureLog("FUXI MTL: native completion latch\n");}};
+   id device=nil;
+   try { @try {device=FUXI_MTL_NATIVE_OPEN(clientProcess,registry,&hooks);}
+   @catch(NSException *e){failureLog("FUXI MTL: native open exception %s\n",e.reason.UTF8String);} }
+diff --git a/tools/fuxi-metal/NativeSelectionTests.cpp b/tools/fuxi-metal/NativeSelectionTests.cpp
+index d5c8254..41525b9 100644
+--- a/tools/fuxi-metal/NativeSelectionTests.cpp
++++ b/tools/fuxi-metal/NativeSelectionTests.cpp
+@@ -21,6 +21,10 @@ int main(){
+  }
+  char noBoot[]="backboardd\n";
+  assert(fuxi::parseClients(noBoot,sizeof(noBoot)-1,"backboardd","fuximetal=native")==fuxi::ClientMode::deny);
++ // U-026 + M9: ADT allowlist permits foreground apps like Maps, while PosterBoard/CollectionsPoster stay denied.
++ assert(fuxi::parseClients(noBoot,sizeof(noBoot)-1,"Maps","fuximetal=native","Maps,Weather,PosterBoard,CollectionsPoster")==fuxi::ClientMode::allow);
++ assert(fuxi::parseClients(noBoot,sizeof(noBoot)-1,"PosterBoard","fuximetal=native","Maps,Weather,PosterBoard,CollectionsPoster")==fuxi::ClientMode::deny);
++ assert(fuxi::parseClients(noBoot,sizeof(noBoot)-1,"CollectionsPoster","fuximetal=native","Maps,Weather,PosterBoard,CollectionsPoster")==fuxi::ClientMode::deny);
+  for(unsigned failure=0;failure<7;++failure){
+   unsigned opens=0,queries=0,closes=0;
+   bool ok=fuxi::nativeImportPreflight(
+diff --git a/tools/fuxi-metal/TranslationPolicy.hpp b/tools/fuxi-metal/TranslationPolicy.hpp
+index 5869dda..832fbc7 100644
+--- a/tools/fuxi-metal/TranslationPolicy.hpp
++++ b/tools/fuxi-metal/TranslationPolicy.hpp
+@@ -24,9 +24,11 @@ inline unsigned translationLevel(const char *args,const char *key,unsigned maxim
+ }
+ inline unsigned translationPerf(const char *args){return translationLevel(args,"fuxigpuperf=",7);}
+ inline unsigned translationFrameTrace(const char *args){return translationLevel(args,"fuxigpuframetrace=",2);}
+-struct TranslationPolicy {bool stages=false,trace=false,async=false,compileBoost=false,frameTrace=false,pipelined=false,skipSampling=false,allowFeedback=false,overlap=false,submitFast=false,gmem=false,merge=false;unsigned perf=0;bool frameCPU=false,noSlab=false,shadowRename=false,shadowHash=true,passTimes=false,renderArea=true,reorder=true,drawTimes=false,linearShadow=false,pipeStats=false,f16=false,robust=false,rtShadow=false,rtReuse=false,rtRename=false,fragRelaxed=false,sampleShadow=false,occlude=false,orderFetchOnly=false,nofetchRp=false;unsigned sampleMinPx=65536,occludeMinPx=4096;bool drawArea=false;unsigned drawAreaMinPx=1u<<20,drawAreaMargin=16,drawAreaBudgetUs=1000;bool earlyRelease=false;unsigned spirvUnroll=0,halfRound=0,halfPipeCount=0;bool halfPipesSet=false;uint32_t halfPipes[16]{};bool submitLean=false,splitSubmit=false;unsigned submitLeanLevel=0,splitSubmitUs=400,splitSubmitMax=3;bool bufferCached=false,fetchSplit=false;unsigned rtShadowMb=48;bool lateFrames=false;unsigned lateFrameUs=12500,lateFrameMax=8;bool descReuse=false,bindSkip=false;};
++struct TranslationPolicy {bool stages=false,trace=false,async=false,compileBoost=false,frameTrace=false,pipelined=false,skipSampling=false,allowFeedback=false,overlap=false,submitFast=false,gmem=false,merge=false;unsigned perf=0;bool frameCPU=false,noSlab=false,shadowRename=false,shadowHash=true,passTimes=false,renderArea=true,reorder=true,drawTimes=false,linearShadow=false,pipeStats=false,f16=false,robust=false,rtShadow=false,rtReuse=false,rtRename=false,fragRelaxed=false,sampleShadow=false,occlude=false,orderFetchOnly=false,nofetchRp=false;unsigned sampleMinPx=65536,occludeMinPx=4096;bool drawArea=false;unsigned drawAreaMinPx=1u<<20,drawAreaMargin=16,drawAreaBudgetUs=1000;bool earlyRelease=false;unsigned spirvUnroll=0,halfRound=0,halfPipeCount=0;bool halfPipesSet=false;uint32_t halfPipes[16]{};bool submitLean=false,splitSubmit=false;unsigned submitLeanLevel=0,splitSubmitUs=400,splitSubmitMax=3;bool bufferCached=false,fetchSplit=false;unsigned rtShadowMb=48;bool lateFrames=false;unsigned lateFrameUs=12500,lateFrameMax=8;bool descReuse=false,bindSkip=false,panel120=false;};
+ inline TranslationPolicy translationPolicy(const char *args) {
+- return {translationOption(args,"fuxigpustages="),translationOption(args,"fuxigputrace="),translationOption(args,"fuxigpuasync="),translationOption(args,"fuxicompileboost="),translationFrameTrace(args)!=0,translationOption(args,"fuxigpupipelined="),translationOption(args,"fuxigpuskip="),translationOption(args,"fuxigpufeedback="),translationOption(args,"fuxigpuoverlap="),translationOption(args,"fuxigpusubmit="),translationOption(args,"fuxigpugmem="),translationOption(args,"fuxigpumerge="),translationPerf(args),translationFrameTrace(args)==2};
++ TranslationPolicy p{translationOption(args,"fuxigpustages="),translationOption(args,"fuxigputrace="),translationOption(args,"fuxigpuasync="),translationOption(args,"fuxicompileboost="),translationFrameTrace(args)!=0,translationOption(args,"fuxigpupipelined="),translationOption(args,"fuxigpuskip="),translationOption(args,"fuxigpufeedback="),translationOption(args,"fuxigpuoverlap="),translationOption(args,"fuxigpusubmit="),translationOption(args,"fuxigpugmem="),translationOption(args,"fuxigpumerge="),translationPerf(args),translationFrameTrace(args)==2};
++ p.panel120=translationOption(args,"fuxipanel120=");
++ return p;
+ }
+ inline bool earlyScheduledWait(const TranslationPolicy &p,bool scanout,bool quiet,const char *process) {return p.overlap && p.submitFast && scanout && quiet && process && !strcmp(process,"backboardd");}
+ // fmtl=<hex> on the boot line sets FUXI_MTL_* switches, so trying one needs no root write. A variable already set wins.
+@@ -60,7 +62,7 @@ inline TranslationPolicy systemTranslationPolicy() {
+ #endif
+   bool stages=false,trace=false,async=false;
+   TranslationPolicy p{translationOption(args,"fuxigpustages=",&stages),translationOption(args,"fuxigputrace=",&trace),translationOption(args,"fuxigpuasync=",&async),translationOption(args,"fuxicompileboost="),translationFrameTrace(args)!=0,translationOption(args,"fuxigpupipelined="),translationOption(args,"fuxigpuskip="),translationOption(args,"fuxigpufeedback="),translationOption(args,"fuxigpuoverlap="),translationOption(args,"fuxigpusubmit="),translationOption(args,"fuxigpugmem="),translationOption(args,"fuxigpumerge="),translationPerf(args),translationFrameTrace(args)==2};
+-  p.noSlab=translationOption(args,"fuxigpunoslab=");bool renameKey=false;p.shadowRename=translationOption(args,"fuxigpurename=",&renameKey);
++  p.noSlab=translationOption(args,"fuxigpunoslab=");p.panel120=translationOption(args,"fuxipanel120=");bool renameKey=false;p.shadowRename=translationOption(args,"fuxigpurename=",&renameKey);
+   // Explicit boot keys, including =0/invalid/duplicates, take precedence.
+   if(!stages){const char *v=getenv("FUXI_MTL_STAGE_CACHE");p.stages=v && !strcmp(v,"1");}
+   if(!trace){const char *v=getenv("FUXI_MTL_TRANSLATION_TRACE");p.trace=v && !strcmp(v,"1");}
