@@ -79,6 +79,7 @@ jobs:
           cp harness/patches/nativemetal-fuxi-0028-vectorkit-render-encoder.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0029-maps-library-and-safe-fallback.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0030-maps-canvas-residency-argbuf-telemetry.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0031-msaa-resolve-present-blit-compute-texview.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0001-copy-span.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0002-fresh-zero.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0004-surface-alias.patch source/tools/patches/
@@ -104,6 +105,7 @@ jobs:
           cp harness/patches/metal2vulkan-fuxi-0024-first-loss-ring.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0025-image-pool-telemetry.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0026-null-pipeline-skip-counter.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0027-view-shadow-iosurface-alias.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |

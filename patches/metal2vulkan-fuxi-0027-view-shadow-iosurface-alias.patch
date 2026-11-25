@@ -1,0 +1,363 @@
+diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+index e4ad010..d17502f 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+@@ -100,6 +100,8 @@ pub(super) struct Texels {
+     /// The texture objects over the texels as a texture buffer's (`Storage::Texels`), and the
+     /// caller's token for a texture buffer's range (`Device::new_texture_with_range_token`).
+     pub(super) objects: ObjectsToken,
++    /// Whether these texels were created over an IOSurface plane (`new_texture_with_iosurface_plane`).
++    pub(super) iosurface: bool,
+ }
+ 
+ /// A texture's texel buffer views, by format, kind (storage or uniform) and range; destroyed
+@@ -630,8 +632,10 @@ impl Buffer {
+                 rotated_rows(&texture),
+                 texel_bytes,
+                 descriptor,
+-            );
+-            let stored = Texels::placed(self.clone(), stored, texel_bytes, descriptor);
++            )
++            .with_iosurface(surface);
++            let stored = Texels::placed(self.clone(), stored, texel_bytes, descriptor)
++                .with_iosurface(surface);
+             let id_use = IdUse::Program(descriptor.placement);
+             if let Some(alpha) = alpha_plane {
+                 return self.device().new_rotated_surface_planes_texture(
+@@ -657,16 +661,18 @@ impl Buffer {
+             return Err(Error::DeviceLost);
+         }
+         if let Some(alpha) = alpha_plane {
+-            let texels =
+-                Texels::placed(self.clone(), placed, texel_bytes, descriptor).with_options(options);
++            let texels = Texels::placed(self.clone(), placed, texel_bytes, descriptor)
++                .with_options(options)
++                .with_iosurface(surface);
+             let id_use = IdUse::Program(descriptor.placement);
+             return self
+                 .device()
+                 .new_surface_planes_texture(call, texels, descriptor, &layout, id_use, alpha);
+         }
+         if let Some((planes, span)) = converted {
+-            let texels =
+-                Texels::placed(self.clone(), placed, texel_bytes, descriptor).with_options(options);
++            let texels = Texels::placed(self.clone(), placed, texel_bytes, descriptor)
++                .with_options(options)
++                .with_iosurface(surface);
+             let id_use = IdUse::Program(descriptor.placement);
+             return self.device().new_converted_texture(
+                 call,
+@@ -681,8 +687,9 @@ impl Buffer {
+             let texels = Texels::texture_buffer(self.clone(), placed.gpu, texel_bytes, descriptor)?;
+             Ok(texels.texture(descriptor, &layout, IdUse::Program(descriptor.placement)))
+         } else {
+-            let texels =
+-                Texels::placed(self.clone(), placed, texel_bytes, descriptor).with_options(options);
++            let texels = Texels::placed(self.clone(), placed, texel_bytes, descriptor)
++                .with_options(options)
++                .with_iosurface(surface);
+             let id_use = IdUse::Program(descriptor.placement);
+             let texture = self
+                 .device()
+@@ -918,6 +925,7 @@ impl Texels {
+         };
+         Texels::new(self.buffer.clone(), layout, self.texel_bytes, &descriptor)
+             .with_options(self.options)
++            .with_iosurface(self.iosurface)
+     }
+ 
+     /// These texels' buffer's bytes `span` as one row of `unit`-byte texels, of these texels'
+@@ -937,7 +945,9 @@ impl Texels {
+             allow_gpu_optimized_contents: self.allow_gpu_optimized_contents,
+             ..TextureDescriptor::default()
+         };
+-        Texels::new(self.buffer.clone(), layout, unit, &descriptor).with_options(self.options)
++        Texels::new(self.buffer.clone(), layout, unit, &descriptor)
++            .with_options(self.options)
++            .with_iosurface(self.iosurface)
+     }
+ 
+     /// The attachment twin of `pixel_format` kept with the texels (a texture buffer's, or a
+@@ -1034,6 +1044,11 @@ impl Texels {
+         Texels { options, ..self }
+     }
+ 
++    /// These texels with whether they originated from an IOSurface plane.
++    fn with_iosurface(self, iosurface: bool) -> Texels {
++        Texels { iosurface, ..self }
++    }
++
+     /// Every byte of the buffer the texels lie in, for the GPU or the CPU: from the first to the
+     /// last of either layout, and of the alpha plane where the texels have one.
+     pub(super) fn span(&self) -> std::ops::Range<u64> {
+@@ -1084,6 +1099,7 @@ impl Texels {
+             twins: Mutex::new(HashMap::new()),
+             alpha: None,
+             objects: ObjectsToken::default(),
++            iosurface: false,
+             buffer,
+         }
+     }
+diff --git a/crates/metal2vulkan-runtime/src/render/shadows.rs b/crates/metal2vulkan-runtime/src/render/shadows.rs
+index 57a3786..60155a0 100644
+--- a/crates/metal2vulkan-runtime/src/render/shadows.rs
++++ b/crates/metal2vulkan-runtime/src/render/shadows.rs
+@@ -516,4 +516,81 @@ mod tests {
+         assert_eq!(ranges.len(), RANGES_PER_BUFFER);
+         assert!(ranges.contains(&(300..340)), "{ranges:?}");
+     }
++
++    #[test]
++    fn view_shadow_copies_in_and_back_and_rejects_two_way_write() {
++        use crate::error::Error;
++        use crate::shadow::{ShadowCopies, ShadowSource, ShadowSync, ShadowUse, Step};
++        use std::sync::Arc;
++
++        let base_key = ResourceKey::new();
++        let shadow_key = ResourceKey::new();
++        let range = UseRange::Image {
++            aspects: vk::ImageAspectFlags::COLOR,
++            levels: 0..1,
++            layers: 0..1,
++        };
++        let copies = Arc::new(ShadowCopies {
++            source: ShadowSource::Image {
++                image: vk::Image::null(),
++                key: base_key,
++                range: range.clone(),
++                shadow: vk::Image::null(),
++                regions: Vec::new(),
++            },
++            shadow_key,
++            shadow_range: range.clone(),
++            tracked: true,
++            drops_writes: false,
++        });
++        let used = ShadowUse {
++            copies: Arc::clone(&copies),
++            writes: true,
++            overwrites: false,
++            kept: false,
++            area: None,
++        };
++        let mut sync = ShadowSync::<()>::default();
++        let before = sync
++            .before(std::slice::from_ref(&used), &[], |_| Ok(()))
++            .expect("single-writer ViewShadow pass succeeds");
++        assert_eq!(before.len(), 1);
++        assert!(matches!(before[0].step, Step::Into));
++        assert_eq!(before[0].copies.shadow_key, shadow_key);
++
++        sync.after(std::slice::from_ref(&used), &[]);
++        let back = sync.finish();
++        assert_eq!(back.len(), 1);
++        assert!(matches!(back[0].step, Step::Back));
++
++        let overwrite = ShadowUse {
++            overwrites: true,
++            ..used
++        };
++        let mut overwrite_sync = ShadowSync::<()>::default();
++        let skipped_into = overwrite_sync
++            .before(std::slice::from_ref(&overwrite), &[], |_| Ok(()))
++            .expect("overwrite ViewShadow pass succeeds");
++        assert!(skipped_into.is_empty());
++        overwrite_sync.after(std::slice::from_ref(&overwrite), &[]);
++        let overwrite_back = overwrite_sync.finish();
++        assert_eq!(overwrite_back.len(), 1);
++        assert!(matches!(overwrite_back[0].step, Step::Back));
++
++        let conflicting_base_write = Use::writes(
++            base_key,
++            true,
++            range,
++            Access::new(
++                vk::PipelineStageFlags2::ALL_COMMANDS,
++                vk::AccessFlags2::MEMORY_WRITE,
++            ),
++        );
++        let mut conflict_sync = ShadowSync::<()>::default();
++        let err = match conflict_sync.before(&[overwrite], &[conflicting_base_write], |_| Ok(())) {
++            Ok(_) => panic!("two-way write of ViewShadow and its truth image must be refused"),
++            Err(err) => err,
++        };
++        assert!(matches!(err, Error::Unsupported(_)));
++    }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index f2a82e8..cb21dc7 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -1436,6 +1436,21 @@ pub(crate) fn fuxi_surface_alias() -> bool {
+     })
+ }
+ 
++/// FUXI: whether `storage_over_buffer` for `call` / `texels` allows aliasing an IOSurface plane's
++/// padded rows (`Holds::Padding`), preserving alias eligibility for views of IOSurface textures.
++pub(crate) fn fuxi_allows_padded_surface_alias_with(
++    call: &str,
++    texels_iosurface: bool,
++    surface_alias: bool,
++) -> bool {
++    (call == "new_texture_with_iosurface_plane" || texels_iosurface) && surface_alias
++}
++
++/// FUXI: runtime wrapper around [`fuxi_allows_padded_surface_alias_with`] reading [`fuxi_surface_alias`].
++pub(crate) fn fuxi_allows_padded_surface_alias(call: &str, texels_iosurface: bool) -> bool {
++    fuxi_allows_padded_surface_alias_with(call, texels_iosurface, fuxi_surface_alias())
++}
++
+ impl Device {
+     /// `newTextureWithDescriptor:`: a texture of `descriptor`, its contents undefined.
+     ///
+@@ -2020,7 +2035,7 @@ impl Device {
+         // every pass that drew into it (three full-screen copies per CoreAnimation pass into the
+         // display surface, measured by the kernel's per-IB profile). `FUXI_M2V_SURFACE_SHADOW` 1
+         // keeps the shadow (the default elsewhere).
+-        if holds.is_err() && call == "new_texture_with_iosurface_plane" && fuxi_surface_alias() {
++        if holds.is_err() && fuxi_allows_padded_surface_alias(call, texels.iosurface) {
+             holds = Ok(Holds::Padding);
+         }
+         // Over bytes detached from their pages (`detach.rs`) no image aliases them: the texture
+diff --git a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+index 3f47dc3..d3f63fe 100644
+--- a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
++++ b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+@@ -47,6 +47,7 @@ use crate::resource::{Identity, ResourceKey};
+ use crate::shadow::{ShadowCopies, ShadowSource};
+ use crate::texture::{copy_units, image_error, texture_aspects};
+ use crate::texture_descriptor::{TextureDescriptor, TextureLayout};
++use crate::values::ResourceOptions;
+ use crate::tracker::UseRange;
+ use crate::view_plan::{keeps_components, reinterpretation_refused, ViewRecord};
+ use crate::Device;
+@@ -121,16 +122,12 @@ impl Texture {
+             Storage::Shadow { .. } if record.presented.rotation != 0 => {
+                 self.rotated_view(call, record)
+             }
+-            Storage::Alias { texels, .. } | Storage::Shadow { texels, .. } => {
+-                let mut descriptor = TextureDescriptor::texture_2d(
+-                    record.pixel_format,
+-                    u64::from(record.image_extent[0]),
+-                    u64::from(record.image_extent[1]),
+-                    false,
++            Storage::Alias { image, texels } | Storage::Shadow { image, texels, .. } => {
++                let descriptor = reinterpreted_buffer_descriptor(
++                    record,
++                    texels.options(),
++                    image.allow_gpu_optimized_contents,
+                 );
+-                descriptor.usage = record.usage;
+-                descriptor.swizzle = record.swizzle;
+-                descriptor.resource_options = texels.options();
+                 let layout = descriptor
+                     .check(self.device().properties().texture_rules())
+                     .map_err(|_| refused(None))?;
+@@ -330,3 +327,107 @@ impl Device {
+         Ok(image)
+     }
+ }
++
++fn reinterpreted_buffer_descriptor(
++    record: &ViewRecord,
++    resource_options: ResourceOptions,
++    allow_gpu_optimized_contents: bool,
++) -> TextureDescriptor {
++    let mut descriptor = TextureDescriptor::texture_2d(
++        record.pixel_format,
++        u64::from(record.image_extent[0]),
++        u64::from(record.image_extent[1]),
++        false,
++    );
++    descriptor.usage = record.usage;
++    descriptor.swizzle = record.swizzle;
++    descriptor.resource_options = resource_options;
++    descriptor.allow_gpu_optimized_contents = allow_gpu_optimized_contents;
++    descriptor.alpha_reads_one = record.alpha_reads_one;
++    descriptor.address_mode_map = record.address_mode_map;
++    descriptor.framebuffer_only = record.presented.framebuffer_only;
++    descriptor.rotation = u64::from(record.presented.rotation);
++    descriptor.is_drawable = record.presented.is_drawable;
++    descriptor
++}
++
++#[cfg(test)]
++mod tests {
++    use super::reinterpreted_buffer_descriptor;
++    use crate::address_map::AddressModeMap;
++    use crate::texture::fuxi_allows_padded_surface_alias_with;
++    use crate::texture_descriptor::TextureSwizzleChannels;
++    use crate::values::ResourceOptions;
++    use crate::view_plan::{Presented, ViewRecord};
++    use metal2vulkan::metal::{
++        PixelFormat, SamplerAddressMode, TextureSwizzle, TextureType, TextureUsage,
++    };
++
++    #[test]
++    fn reinterpreted_buffer_descriptor_inherits_presentation_and_sampling_metadata() {
++        let map = AddressModeMap::IDENTITY
++            .with(SamplerAddressMode::ClampToEdge, SamplerAddressMode::Repeat);
++        let swizzle = TextureSwizzleChannels::new(
++            TextureSwizzle::Blue,
++            TextureSwizzle::Green,
++            TextureSwizzle::Red,
++            TextureSwizzle::One,
++        );
++        let record = ViewRecord {
++            pixel_format: PixelFormat::R32Uint,
++            texture_type: TextureType::Type2D,
++            image_extent: [1125, 2500, 1],
++            base_level: 0,
++            level_count: 1,
++            base_layer: 0,
++            layer_count: 1,
++            samples: 1,
++            swizzle,
++            usage: TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
++            alpha_reads_one: true,
++            address_mode_map: map,
++            presented: Presented {
++                framebuffer_only: true,
++                rotation: 2,
++                is_drawable: true,
++            },
++        };
++        let opts = ResourceOptions::default();
++        let desc = reinterpreted_buffer_descriptor(&record, opts, false);
++        assert_eq!(desc.pixel_format, PixelFormat::R32Uint);
++        assert_eq!(desc.width, 1125);
++        assert_eq!(desc.height, 2500);
++        assert_eq!(desc.usage, record.usage);
++        assert_eq!(desc.swizzle, swizzle);
++        assert!(!desc.allow_gpu_optimized_contents);
++        assert!(desc.alpha_reads_one);
++        assert_eq!(desc.address_mode_map, map);
++        assert!(desc.framebuffer_only);
++        assert_eq!(desc.rotation, 2);
++        assert!(desc.is_drawable);
++    }
++
++    #[test]
++    fn iosurface_view_preserves_padded_surface_alias_eligibility() {
++        assert!(fuxi_allows_padded_surface_alias_with(
++            "new_texture_with_iosurface_plane",
++            false,
++            true
++        ));
++        assert!(fuxi_allows_padded_surface_alias_with(
++            "new_texture_view",
++            true,
++            true
++        ));
++        assert!(!fuxi_allows_padded_surface_alias_with(
++            "new_texture_view",
++            false,
++            true
++        ));
++        assert!(!fuxi_allows_padded_surface_alias_with(
++            "new_texture_view",
++            true,
++            false
++        ));
++    }
++}
