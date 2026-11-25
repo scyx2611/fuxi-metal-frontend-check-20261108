@@ -1,0 +1,1660 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index d2eaf06..2b9beca 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -18,6 +18,7 @@
+ #include <mutex>
+ #include <pthread.h>
+ #include <string>
++#include <string.h>
+ #include <tuple>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -236,6 +237,54 @@ static void fuxiFrameNote(uint64_t committedUs,uint64_t encodeUs,const EncodedWo
+  line("heavy",f.heavy);line("light",f.light);
+  const uint64_t last=f.lastUs;f=FrameStats();f.lastUs=last;
+ }
++static bool fuxiIsTelemetryClient() {
++ static const bool allow=[]{
++  const char *raw=getprogname();
++  if(!raw || !*raw)return false;
++  const char *slash=strrchr(raw,'/');
++  const char *name=slash?slash+1:raw;
++  if(!strcmp(name,"SpringBoard") || !strcmp(name,"backboardd") || !strcmp(name,"mediaserverd"))return false;
++  if(strcasestr(name,"poster")!=nullptr)return false;
++  return strcmp(name,"Maps")==0;
++ }();
++ return allow;
++}
++static std::atomic<uint64_t> gMapsCommits,gMapsSurfPasses;
++static std::atomic<uint64_t> gMapsLoadClear,gMapsLoadLoad,gMapsLoadDontCare;
++static std::atomic<uint64_t> gMapsStoreStore,gMapsStoreDontCare,gMapsStoreOther;
++static std::atomic<uint64_t> gMapsNonZeroClears,gMapsSurfPassDraws,gMapsStoreActionPromoted;
++static std::atomic<uint64_t> gMapsUseResourceCalls,gMapsUseResourceCount;
++static std::atomic<uint64_t> gMapsUseHeapCalls,gMapsUseHeapCount;
++static std::atomic<uint64_t> gMapsBarrierScopeCalls,gMapsBarrierResourceCalls;
++static void fuxiMapsTelemetryNote(NmbDevice *device) {
++ if(!fuxiIsTelemetryClient())return;
++ const uint64_t cb=gMapsCommits.fetch_add(1,std::memory_order_relaxed)+1;
++ if(cb!=1 && cb!=10 && cb!=50 && cb!=100 && (cb%200)!=0)return;
++ uint64_t work[10]={};
++ if(device)(void)nmb_device_work_stats(device,work);
++ const uint64_t nullDraws=device?nmb_device_skipped_null_draws(device):0;
++ fprintf(stderr,
++  "FUXI MAPS DIAG: cb=%llu surf_pass=%llu load(c/l/dc)=%llu/%llu/%llu store(s/dc/o)=%llu/%llu/%llu "
++  "nz_clear=%llu surf_draws=%llu store_promo=%llu use_res=%llu/%llu use_heap=%llu/%llu "
++  "mbar(s/r)=%llu/%llu vkpipe_fail=%llu null_draws=%llu\n",
++  (unsigned long long)cb,(unsigned long long)gMapsSurfPasses.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsLoadClear.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsLoadLoad.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsLoadDontCare.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsStoreStore.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsStoreDontCare.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsStoreOther.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsNonZeroClears.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsSurfPassDraws.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsStoreActionPromoted.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsUseResourceCalls.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsUseResourceCount.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsUseHeapCalls.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsUseHeapCount.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsBarrierScopeCalls.load(std::memory_order_relaxed),
++  (unsigned long long)gMapsBarrierResourceCalls.load(std::memory_order_relaxed),
++  (unsigned long long)work[4],(unsigned long long)nullDraws);
++}
+ struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
+ static CommitRecord gCommitRing[32];
+ static std::mutex gCommitLock;
+@@ -345,13 +394,14 @@ static void journal(const std::string &line) {
+  static const char *const kEv[]={"MTLEvent"};
+  static const char *const kFence[]={"MTLFence"};
+  static const char *const kArch[]={"MTLBinaryArchive"};
++ static const char *const kArgEnc[]={"MTLArgumentEncoder"};
+  static const ProtoEntry kTable[]={
+   {"NBLibrary",kLib,2},{"NBFunction",kFn,2},{"NBBuffer",kBuf,4},{"NBTexture",kTex,4},
+   {"NBRenderEncoder",kRend,3},{"NBComputeEncoder",kComp,3},{"NBBlitEncoder",kBlit,3},
+   {"NBCommandBuffer",kCB,2},{"NBQueue",kQueue,2},{"NBHeap",kHeap,2},
+   {"NBRenderPipeline",kRP,2},{"NBComputePipeline",kCP,2},{"NBSampler",kSamp,1},
+   {"NBDepthStencil",kDS,1},{"NBSharedEvent",kShEv,1},{"NBEvent",kEv,1},
+-  {"NBFence",kFence,1},{"NBBinaryArchive",kArch,1},
++  {"NBFence",kFence,1},{"NBBinaryArchive",kArch,1},{"NBArgumentEncoder",kArgEnc,1},
+  };
+  for(const ProtoEntry &entry : kTable) {
+   Class c=objc_lookUpClass(entry.cls);
+@@ -769,6 +819,7 @@ NB_RESOURCE_SPI
+  (void)swizzle;
+  return [self newTextureViewWithPixelFormat:format textureType:type levels:levels slices:slices];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLResourceID)gpuResourceID { try { @try {return MTLResourceID{nmb_texture_gpu_resource_id(_handle)};} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ // A command can use many independent imports/views of one IOSurface. Their
+ // owners keep the mapping live through this phase. Maintain each exact CPU
+@@ -1011,6 +1062,7 @@ static std::string quartzCoreCallers();
+ @implementation NBSampler
+ - (void)dealloc { try { @try {nmb_sampler_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (NSUInteger)pixelFormat { try { @try {return MTLPixelFormatInvalid;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }   // SPI: a sampler built from a plain descriptor names no format
++- (MTLResourceID)gpuResourceID { try { @try {return MTLResourceID{nmb_sampler_gpu_resource_id(_handle)};} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ @interface NBDepthStencil : NBObject
+ @property(nonatomic) NmbDepthStencil *handle;
+@@ -1019,6 +1071,175 @@ static std::string quartzCoreCallers();
+ - (void)dealloc { try { @try {nmb_depth_stencil_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ 
++@interface NBArgumentEncoder : NBObject
++@property(nonatomic) NmbArgumentEncoder *handle;
++@property(nonatomic,strong) NBBuffer *argumentBuffer;
++@end
++@implementation NBArgumentEncoder
++- (void)dealloc { try { @try {nmb_argument_encoder_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)encodedLength { try { @try {return nmb_argument_encoder_encoded_length(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)alignment { try { @try {return nmb_argument_encoder_alignment(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setArgumentBuffer:(id<MTLBuffer>)argumentBuffer offset:(NSUInteger)offset { try { @try {
++ [self setArgumentBuffer:argumentBuffer startOffset:offset arrayElement:0];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setArgumentBuffer:(id<MTLBuffer>)argumentBuffer startOffset:(NSUInteger)startOffset arrayElement:(NSUInteger)arrayElement { try { @try {
++ if(argumentBuffer && ![(id)argumentBuffer isKindOfClass:[NBBuffer class]]) {
++  _argumentBuffer=nil;
++  (void)nmb_argument_encoder_set_argument_buffer(_handle,nullptr,0,0);
++  noteProblem(@"foreign argument buffer");
++  return;
++ }
++ if(!nmb_argument_encoder_set_argument_buffer(_handle,argumentBuffer?[(NBBuffer *)argumentBuffer handle]:nullptr,startOffset,arrayElement)) {
++  NBLOG(@"native-metal: setArgumentBuffer refused: %@",lastError());
++  return;
++ }
++ _argumentBuffer=(NBBuffer *)argumentBuffer;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index { try { @try {
++ if(index>UINT32_MAX){NBLOG(@"native-metal: setBuffer index out of range");return;}
++ if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){NBLOG(@"native-metal: foreign argument buffer entry");return;}
++ if(!nmb_argument_encoder_set_buffer(_handle,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index))
++  NBLOG(@"native-metal: argument setBuffer refused: %@",lastError());
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])buffers offsets:(const NSUInteger [])offsets withRange:(NSRange)range { try { @try {
++ if(range.location>UINT32_MAX){NBLOG(@"native-metal: setBuffers location out of range");return;}
++ if(range.length && (!buffers || !offsets)){NBLOG(@"native-metal: null setBuffers arguments");return;}
++ std::vector<NmbBuffer *> handles;std::vector<uint64_t> offs;handles.reserve(range.length);offs.reserve(range.length);
++ for(NSUInteger k=0;k<range.length;k++) {
++  id b=buffers[k];
++  if(b && ![b isKindOfClass:[NBBuffer class]]){NBLOG(@"native-metal: foreign argument buffer entry");return;}
++  handles.push_back(b?[(NBBuffer *)b handle]:nullptr);offs.push_back(offsets[k]);
++ }
++ if(!nmb_argument_encoder_set_buffers(_handle,handles.empty()?nullptr:handles.data(),offs.empty()?nullptr:offs.data(),(uint32_t)range.location,(size_t)range.length))
++  NBLOG(@"native-metal: argument setBuffers refused: %@",lastError());
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index { try { @try {
++ if(index>UINT32_MAX){NBLOG(@"native-metal: setTexture index out of range");return;}
++ if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){NBLOG(@"native-metal: foreign argument texture entry");return;}
++ if(!nmb_argument_encoder_set_texture(_handle,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index))
++  NBLOG(@"native-metal: argument setTexture refused: %@",lastError());
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setTextures:(const id<MTLTexture> __unsafe_unretained [])textures withRange:(NSRange)range { try { @try {
++ if(range.location>UINT32_MAX){NBLOG(@"native-metal: setTextures location out of range");return;}
++ if(range.length && !textures){NBLOG(@"native-metal: null setTextures arguments");return;}
++ std::vector<NmbTexture *> handles;handles.reserve(range.length);
++ for(NSUInteger k=0;k<range.length;k++) {
++  id t=textures[k];
++  if(t && ![t isKindOfClass:[NBTexture class]]){NBLOG(@"native-metal: foreign argument texture entry");return;}
++  handles.push_back(t?[(NBTexture *)t handle]:nullptr);
++ }
++ if(!nmb_argument_encoder_set_textures(_handle,handles.empty()?nullptr:handles.data(),(uint32_t)range.location,(size_t)range.length))
++  NBLOG(@"native-metal: argument setTextures refused: %@",lastError());
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index { try { @try {
++ if(index>UINT32_MAX){NBLOG(@"native-metal: setSamplerState index out of range");return;}
++ if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){NBLOG(@"native-metal: foreign argument sampler entry");return;}
++ if(!nmb_argument_encoder_set_sampler(_handle,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index))
++  NBLOG(@"native-metal: argument setSamplerState refused: %@",lastError());
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])samplers withRange:(NSRange)range { try { @try {
++ if(range.location>UINT32_MAX){NBLOG(@"native-metal: setSamplerStates location out of range");return;}
++ if(range.length && !samplers){NBLOG(@"native-metal: null setSamplerStates arguments");return;}
++ std::vector<NmbSampler *> handles;handles.reserve(range.length);
++ for(NSUInteger k=0;k<range.length;k++) {
++  id s=samplers[k];
++  if(s && ![s isKindOfClass:[NBSampler class]]){NBLOG(@"native-metal: foreign argument sampler entry");return;}
++  handles.push_back(s?[(NBSampler *)s handle]:nullptr);
++ }
++ if(!nmb_argument_encoder_set_samplers(_handle,handles.empty()?nullptr:handles.data(),(uint32_t)range.location,(size_t)range.length))
++  NBLOG(@"native-metal: argument setSamplerStates refused: %@",lastError());
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setComputePipelineState:(id<MTLComputePipelineState>)pipeline atIndex:(NSUInteger)index { try { @try {
++ if(index>UINT32_MAX){NBLOG(@"native-metal: setComputePipelineState index out of range");return;}
++ if(pipeline && ![(id)pipeline isKindOfClass:[NBComputePipeline class]]){NBLOG(@"native-metal: foreign argument compute pipeline");return;}
++ if(!nmb_argument_encoder_set_compute_pipeline(_handle,pipeline?[(NBComputePipeline *)pipeline handle]:nullptr,(uint32_t)index))
++  NBLOG(@"native-metal: argument setComputePipelineState refused: %@",lastError());
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setComputePipelineStates:(const id<MTLComputePipelineState> __unsafe_unretained [])pipelines withRange:(NSRange)range { try { @try {
++ if(range.location>UINT32_MAX){NBLOG(@"native-metal: setComputePipelineStates location out of range");return;}
++ if(range.length && !pipelines){NBLOG(@"native-metal: null setComputePipelineStates arguments");return;}
++ std::vector<NmbComputePipeline *> handles;handles.reserve(range.length);
++ for(NSUInteger k=0;k<range.length;k++) {
++  id p=pipelines[k];
++  if(p && ![p isKindOfClass:[NBComputePipeline class]]){NBLOG(@"native-metal: foreign argument compute pipeline");return;}
++  handles.push_back(p?[(NBComputePipeline *)p handle]:nullptr);
++ }
++ if(!nmb_argument_encoder_set_compute_pipelines(_handle,handles.empty()?nullptr:handles.data(),(uint32_t)range.location,(size_t)range.length))
++  NBLOG(@"native-metal: argument setComputePipelineStates refused: %@",lastError());
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)pipeline atIndex:(NSUInteger)index { try { @try {
++ if(index>UINT32_MAX){NBLOG(@"native-metal: setRenderPipelineState index out of range");return;}
++ if(pipeline && ![(id)pipeline isKindOfClass:[NBRenderPipeline class]]){NBLOG(@"native-metal: foreign argument render pipeline");return;}
++ if(!nmb_argument_encoder_set_render_pipeline(_handle,pipeline?[(NBRenderPipeline *)pipeline handle]:nullptr,(uint32_t)index))
++  NBLOG(@"native-metal: argument setRenderPipelineState refused: %@",lastError());
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setRenderPipelineStates:(const id<MTLRenderPipelineState> __unsafe_unretained [])pipelines withRange:(NSRange)range { try { @try {
++ if(range.location>UINT32_MAX){NBLOG(@"native-metal: setRenderPipelineStates location out of range");return;}
++ if(range.length && !pipelines){NBLOG(@"native-metal: null setRenderPipelineStates arguments");return;}
++ std::vector<NmbRenderPipeline *> handles;handles.reserve(range.length);
++ for(NSUInteger k=0;k<range.length;k++) {
++  id p=pipelines[k];
++  if(p && ![p isKindOfClass:[NBRenderPipeline class]]){NBLOG(@"native-metal: foreign argument render pipeline");return;}
++  handles.push_back(p?[(NBRenderPipeline *)p handle]:nullptr);
++ }
++ if(!nmb_argument_encoder_set_render_pipelines(_handle,handles.empty()?nullptr:handles.data(),(uint32_t)range.location,(size_t)range.length))
++  NBLOG(@"native-metal: argument setRenderPipelineStates refused: %@",lastError());
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void *)constantDataAtIndex:(NSUInteger)index { try { @try {
++ if(index>UINT32_MAX){NBLOG(@"native-metal: constantDataAtIndex out of range");return nullptr;}
++ void *ptr=nmb_argument_encoder_constant_data(_handle,(uint32_t)index);
++ if(!ptr)NBLOG(@"native-metal: constantDataAtIndex refused: %@",lastError());
++ return ptr;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLArgumentEncoder>)newArgumentEncoderForBufferAtIndex:(NSUInteger)index { try { @try {
++ if(index>UINT32_MAX){NBLOG(@"native-metal: newArgumentEncoderForBufferAtIndex out of range");return nil;}
++ NmbArgumentEncoder *handle=nmb_argument_encoder_for_buffer_at_index(_handle,(uint32_t)index);
++ if(!handle){noteProblem(lastError());return nil;}
++ NBArgumentEncoder *nested=[NBArgumentEncoder new];nested.handle=handle;return (id<MTLArgumentEncoder>)nested;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)icb atIndex:(NSUInteger)index { try { @try {
++ (void)index;
++ if(icb){noteProblem(@"argument setIndirectCommandBuffer unsupported");if(gMissing)gMissing("NBArgumentEncoder","setIndirectCommandBuffer:atIndex:");}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setIndirectCommandBuffers:(const id<MTLIndirectCommandBuffer> __unsafe_unretained [])icbs withRange:(NSRange)range { try { @try {
++ if(icbs)for(NSUInteger k=0;k<range.length;k++)if(icbs[k]){noteProblem(@"argument setIndirectCommandBuffers unsupported");if(gMissing)gMissing("NBArgumentEncoder","setIndirectCommandBuffers:withRange:");break;}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)table atIndex:(NSUInteger)index { try { @try {
++ (void)index;
++ if(table){noteProblem(@"argument setVisibleFunctionTable unsupported");if(gMissing)gMissing("NBArgumentEncoder","setVisibleFunctionTable:atIndex:");}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __unsafe_unretained [])tables withRange:(NSRange)range { try { @try {
++ if(tables)for(NSUInteger k=0;k<range.length;k++)if(tables[k]){noteProblem(@"argument setVisibleFunctionTables unsupported");if(gMissing)gMissing("NBArgumentEncoder","setVisibleFunctionTables:withRange:");break;}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setAccelerationStructure:(id<MTLAccelerationStructure>)accel atIndex:(NSUInteger)index { try { @try {
++ (void)index;
++ if(accel){noteProblem(@"argument setAccelerationStructure unsupported");if(gMissing)gMissing("NBArgumentEncoder","setAccelerationStructure:atIndex:");}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)table atIndex:(NSUInteger)index { try { @try {
++ (void)index;
++ if(table){noteProblem(@"argument setIntersectionFunctionTable unsupported");if(gMissing)gMissing("NBArgumentEncoder","setIntersectionFunctionTable:atIndex:");}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained [])tables withRange:(NSRange)range { try { @try {
++ if(tables)for(NSUInteger k=0;k<range.length;k++)if(tables[k]){noteProblem(@"argument setIntersectionFunctionTables unsupported");if(gMissing)gMissing("NBArgumentEncoder","setIntersectionFunctionTables:withRange:");break;}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++@end
++
++@implementation NBFunction (ArgumentEncoder)
++- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex { try { @try {
++ if(bufferIndex>UINT32_MAX){NBLOG(@"native-metal: newArgumentEncoderWithBufferIndex out of range");return nil;}
++ NmbArgumentEncoder *handle=nmb_function_new_argument_encoder(_handle,(uint32_t)bufferIndex);
++ if(!handle){noteProblem(lastError());return nil;}
++ NBArgumentEncoder *encoder=[NBArgumentEncoder new];encoder.handle=handle;return (id<MTLArgumentEncoder>)encoder;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex reflection:(MTLAutoreleasedArgument *)reflection { try { @try {
++ if(reflection)*reflection=nil;
++ return [self newArgumentEncoderWithBufferIndex:bufferIndex];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++#pragma clang diagnostic pop
++@end
++
+ // ---- events and fences ----
+ @interface NBEvent : NBObject
+ @property(nonatomic) NmbEvent *handle;
+@@ -1076,6 +1297,7 @@ static void notified(void *context,uint64_t value) {
+  std::vector<IOSurfaceRef> fuxiLeases;   // patch 0020: pending writer leases (retained), under @synchronized(self)
+  bool fuxiOtherWork;                     // patch 0020: a blit or compute encoder was opened
+  uint8_t fuxiOverlapReason;              // patch 0023: 1 scheduled handlers, 2 blit/compute, 0 not queued on the worker
++ uint32_t fuxiStoredSurfaceEncoders;     // encoders currently contributing storedSurface
+ }
+ @property(atomic) BOOL fuxiOverlapPending;   // patch 0020: queued on the worker, not yet taken by the runtime
+ @property(atomic) BOOL fuxiOverlapped;       // patch 0020: commitAndWaitUntilSubmitted returns without the scheduling wait
+@@ -1102,6 +1324,11 @@ static void notified(void *context,uint64_t value) {
+ - (void)fuxiDropLeases;
+ - (void)finish;
+ @end
++@interface NBHeap : NBObject
++@property(nonatomic) NmbHeap *handle;
++@property(nonatomic) MTLResourceOptions options;
++@property(nonatomic) MTLHeapType heapType;
++@end
+ @interface NBEncoder : NBObject
+ @property(nonatomic) NmbEncoder *handle;
+ @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
+@@ -1172,6 +1399,38 @@ static void waitForResource(id resource) {
+ - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage { try { @try {
+  [self check:nmb_encoder_set_buffer_offset(_handle,stage,offset,(uint32_t)index) what:"setBufferOffset"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (bool)collectResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count out:(std::vector<NmbResourceRef> &)out { try { @try {
++ if(count && !resources){[_commandBuffer refuse:@"null resources"];return false;}
++ out.clear();out.reserve(count);
++ for(NSUInteger i=0;i<count;i++) {
++  id r=resources[i];
++  if(!r)continue;
++  if([r isKindOfClass:[NBBuffer class]]) {
++   [_commandBuffer.resourceOwners addObject:r];
++   out.push_back({NMB_RESOURCE_BUFFER,[(NBBuffer *)r handle]});
++  } else if([r isKindOfClass:[NBTexture class]]) {
++   [_commandBuffer.resourceOwners addObject:r];
++   if([(NBTexture *)r surface])[_commandBuffer.surfaces addObject:r];
++   out.push_back({NMB_RESOURCE_TEXTURE,[(NBTexture *)r handle]});
++  } else {
++   [_commandBuffer refuse:@"foreign resource"];
++   return false;
++  }
++ }
++ return true;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (bool)collectHeaps:(const id<MTLHeap> __unsafe_unretained [])heaps count:(NSUInteger)count out:(std::vector<NmbHeap *> &)out { try { @try {
++ if(count && !heaps){[_commandBuffer refuse:@"null heaps"];return false;}
++ out.clear();out.reserve(count);
++ for(NSUInteger i=0;i<count;i++) {
++  id h=heaps[i];
++  if(!h)continue;
++  if(![h isKindOfClass:[NBHeap class]]){[_commandBuffer refuse:@"foreign heap"];return false;}
++  [_commandBuffer.resourceOwners addObject:h];
++  out.push_back([(NBHeap *)h handle]);
++ }
++ return true;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ 
+ @interface NBComputeEncoder : NBEncoder
+@@ -1203,8 +1462,14 @@ static void waitForResource(id resource) {
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g { try { @try {[self dispatch:t group:g threads:true];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g { try { @try {[self dispatch:t group:g threads:false];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { try { @try {(void)r;(void)u;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (void)memoryBarrierWithScope:(MTLBarrierScope)s { try { @try {(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { try { @try {
++ id<MTLResource> __unsafe_unretained one[1]={r};
++ [self useResources:one count:1 usage:u];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)memoryBarrierWithScope:(MTLBarrierScope)s { try { @try {
++ if(fuxiIsTelemetryClient())gMapsBarrierScopeCalls++;
++ [self check:nmb_encoder_memory_barrier_scope(self.handle,(uint64_t)s,0,0) what:"memoryBarrierWithScope"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r { try { @try {
+  for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:0];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1214,16 +1479,55 @@ static void waitForResource(id resource) {
+ - (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float *)lodMins lodMaxClamps:(const float *)lodMaxs withRange:(NSRange)r { try { @try {
+  (void)lodMins;(void)lodMaxs;for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:0];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u { try { @try {(void)r;(void)c;(void)u;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (void)useHeap:(id<MTLHeap>)h { try { @try {(void)h;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+-- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c { try { @try {(void)h;(void)c;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+-- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c { try { @try {(void)r;(void)c;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u { try { @try {
++ std::vector<NmbResourceRef> refs;
++ if(![self collectResources:r count:c out:refs])return;
++ if(fuxiIsTelemetryClient()){gMapsUseResourceCalls++;gMapsUseResourceCount+=refs.size();}
++ [self check:nmb_encoder_use_resources(self.handle,refs.empty()?nullptr:refs.data(),refs.size(),(uint64_t)u,0) what:"useResources"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)useHeap:(id<MTLHeap>)h { try { @try {
++ id<MTLHeap> __unsafe_unretained one[1]={h};
++ [self useHeaps:one count:1];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c { try { @try {
++ std::vector<NmbHeap *> refs;
++ if(![self collectHeaps:h count:c out:refs])return;
++ if(fuxiIsTelemetryClient()){gMapsUseHeapCalls++;gMapsUseHeapCount+=refs.size();}
++ [self check:nmb_encoder_use_heaps(self.handle,refs.empty()?nullptr:refs.data(),refs.size(),0) what:"useHeaps"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c { try { @try {
++ std::vector<NmbResourceRef> refs;
++ if(![self collectResources:r count:c out:refs])return;
++ if(fuxiIsTelemetryClient())gMapsBarrierResourceCalls++;
++ [self check:nmb_encoder_memory_barrier_resources(self.handle,refs.empty()?nullptr:refs.data(),refs.size(),0,0) what:"memoryBarrierWithResources"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ 
+ @interface NBRenderEncoder : NBEncoder
+ @property(nonatomic) BOOL fuxiStoredSurface;
++@property(nonatomic) uint8_t fuxiSurfaceMask;
++@property(nonatomic) uint8_t fuxiStoreSurfaceMask;
++@property(nonatomic) uint8_t fuxiLoadWriteMask;
++@property(nonatomic) BOOL fuxiDrew;
++@property(nonatomic) BOOL fuxiContributedStoredSurface;
++- (BOOL)fuxiCurrentStoredSurface;
++- (void)fuxiSyncStoredSurface;
+ @end
+ @implementation NBRenderEncoder
++- (BOOL)fuxiCurrentStoredSurface {
++ return self.fuxiStoreSurfaceMask!=0 &&
++        (self.fuxiDrew || (self.fuxiStoreSurfaceMask & self.fuxiLoadWriteMask)!=0);
++}
++- (void)fuxiSyncStoredSurface {
++ NBCommandBuffer *cb=self.commandBuffer;
++ if(!cb)return;
++ const BOOL next=[self fuxiCurrentStoredSurface];
++ if(next==self.fuxiContributedStoredSurface)return;
++ self.fuxiContributedStoredSurface=next;
++ if(next)cb->fuxiStoredSurfaceEncoders++;
++ else if(cb->fuxiStoredSurfaceEncoders>0)cb->fuxiStoredSurfaceEncoders--;
++ cb->encodedWork.storedSurface=(cb->fuxiStoredSurfaceEncoders>0);
++}
+ - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state { try { @try {
+  if(!state){if(fuxiBlocked())return;[self.commandBuffer refuse:@"nil render pipeline"];return;}
+  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+@@ -1296,7 +1600,9 @@ static void waitForResource(id resource) {
+  const float c[4]={r,g,b,a};[self check:nmb_render_set_blend_color(self.handle,c) what:"setBlendColor"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b { try { @try {
+- if(self.fuxiStoredSurface)self.commandBuffer->encodedWork.storedSurface=true;
++ self.fuxiDrew=YES;
++ [self fuxiSyncStoredSurface];
++ if(fuxiIsTelemetryClient() && self.fuxiSurfaceMask!=0)gMapsSurfPassDraws++;
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1310,7 +1616,9 @@ static void waitForResource(id resource) {
+                 instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi { try { @try {
+  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
+  [self.commandBuffer.resourceOwners addObject:b];
+- if(self.fuxiStoredSurface)self.commandBuffer->encodedWork.storedSurface=true;
++ self.fuxiDrew=YES;
++ [self fuxiSyncStoredSurface];
++ if(fuxiIsTelemetryClient() && self.fuxiSurfaceMask!=0)gMapsSurfPassDraws++;
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1321,7 +1629,10 @@ static void waitForResource(id resource) {
+ - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o { try { @try {
+  [self drawIndexedPrimitives:t indexCount:n indexType:k indexBuffer:b indexBufferOffset:o instanceCount:1 baseVertex:0 baseInstance:0];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { try { @try {(void)r;(void)u;(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { try { @try {
++ id<MTLResource> __unsafe_unretained one[1]={r};
++ [self useResources:one count:1 usage:u stages:s];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages { try { @try {[self fence:fence stages:stages update:true];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages { try { @try {[self fence:fence stages:stages update:false];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)setVertexTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r { try { @try {
+@@ -1368,7 +1679,18 @@ static void waitForResource(id resource) {
+  [self check:nmb_render_set_depth_clip_mode(self.handle,(uint64_t)mode) what:"setDepthClipMode"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+ - (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index { try { @try {
+- [self check:nmb_render_set_store_action(self.handle,0,(uint32_t)index,(uint64_t)action) what:"setColorStoreAction"];
++ if(index>UINT32_MAX){[self.commandBuffer refuse:@"color store action index out of range"];return;}
++ if(![self check:nmb_render_set_store_action(self.handle,0,(uint32_t)index,(uint64_t)action) what:"setColorStoreAction"])return;
++ if(index<8 && (self.fuxiSurfaceMask & (1u<<index))) {
++  NBCommandBuffer *cb=self.commandBuffer;
++  const bool wasStored=cb && cb->encodedWork.storedSurface;
++  const bool stores=(action==MTLStoreActionStore || action==MTLStoreActionStoreAndMultisampleResolve);
++  if(stores)self.fuxiStoreSurfaceMask|=(uint8_t)(1u<<index);
++  else self.fuxiStoreSurfaceMask&=(uint8_t)~(1u<<index);
++  self.fuxiStoredSurface=(self.fuxiStoreSurfaceMask!=0);
++  [self fuxiSyncStoredSurface];
++  if(!wasStored && cb && cb->encodedWork.storedSurface && fuxiIsTelemetryClient())gMapsStoreActionPromoted++;
++ }
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+ - (void)setDepthStoreAction:(MTLStoreAction)action { try { @try {
+  [self check:nmb_render_set_store_action(self.handle,1,0,(uint64_t)action) what:"setDepthStoreAction"];
+@@ -1377,6 +1699,7 @@ static void waitForResource(id resource) {
+  [self check:nmb_render_set_store_action(self.handle,2,0,(uint64_t)action) what:"setStencilStoreAction"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+ - (void)setColorStoreActionOptions:(MTLStoreActionOptions)options atIndex:(NSUInteger)index { try { @try {
++ if(index>UINT32_MAX){[self.commandBuffer refuse:@"color store action options index out of range"];return;}
+  [self check:nmb_render_set_store_action_options(self.handle,0,(uint32_t)index,(uint64_t)options) what:"setColorStoreActionOptions"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+ - (void)setDepthStoreActionOptions:(MTLStoreActionOptions)options { try { @try {
+@@ -1388,7 +1711,9 @@ static void waitForResource(id resource) {
+ - (void)drawPrimitives:(MTLPrimitiveType)t indirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o { try { @try {
+  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign indirect buffer"];return;}
+  [self.commandBuffer.resourceOwners addObject:b];
+- if(self.fuxiStoredSurface)self.commandBuffer->encodedWork.storedSurface=true;
++ self.fuxiDrew=YES;
++ [self fuxiSyncStoredSurface];
++ if(fuxiIsTelemetryClient() && self.fuxiSurfaceMask!=0)gMapsSurfPassDraws++;
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+  [self check:nmb_render_draw_indirect(self.handle,t,[(NBBuffer *)b handle],o) what:"drawPrimitives:indirectBuffer:"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+@@ -1398,19 +1723,52 @@ static void waitForResource(id resource) {
+  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign indirect buffer"];return;}
+  [self.commandBuffer.resourceOwners addObject:ib];
+  [self.commandBuffer.resourceOwners addObject:b];
+- if(self.fuxiStoredSurface)self.commandBuffer->encodedWork.storedSurface=true;
++ self.fuxiDrew=YES;
++ [self fuxiSyncStoredSurface];
++ if(fuxiIsTelemetryClient() && self.fuxiSurfaceMask!=0)gMapsSurfPassDraws++;
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+  [self check:nmb_render_draw_indexed_indirect(self.handle,t,k,[(NBBuffer *)ib handle],io,[(NBBuffer *)b handle],o) what:"drawIndexedPrimitives:indirectBuffer:"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { try { @try {(void)r;(void)u;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+-- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u { try { @try {(void)r;(void)c;(void)u;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+-- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { try { @try {(void)r;(void)c;(void)u;(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+-- (void)useHeap:(id<MTLHeap>)h { try { @try {(void)h;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+-- (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)s { try { @try {(void)h;(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+-- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c { try { @try {(void)h;(void)c;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+-- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c stages:(MTLRenderStages)s { try { @try {(void)h;(void)c;(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+-- (void)memoryBarrierWithScope:(MTLBarrierScope)s afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b { try { @try {(void)s;(void)a;(void)b;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+-- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b { try { @try {(void)r;(void)c;(void)a;(void)b;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { try { @try {
++ id<MTLResource> __unsafe_unretained one[1]={r};
++ [self useResources:one count:1 usage:u stages:(MTLRenderStageVertex|MTLRenderStageFragment)];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u { try { @try {
++ [self useResources:r count:c usage:u stages:(MTLRenderStageVertex|MTLRenderStageFragment)];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { try { @try {
++ std::vector<NmbResourceRef> refs;
++ if(![self collectResources:r count:c out:refs])return;
++ if(fuxiIsTelemetryClient()){gMapsUseResourceCalls++;gMapsUseResourceCount+=refs.size();}
++ [self check:nmb_encoder_use_resources(self.handle,refs.empty()?nullptr:refs.data(),refs.size(),(uint64_t)u,(uint64_t)s) what:"useResources"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useHeap:(id<MTLHeap>)h { try { @try {
++ id<MTLHeap> __unsafe_unretained one[1]={h};
++ [self useHeaps:one count:1 stages:(MTLRenderStageVertex|MTLRenderStageFragment)];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)s { try { @try {
++ id<MTLHeap> __unsafe_unretained one[1]={h};
++ [self useHeaps:one count:1 stages:s];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c { try { @try {
++ [self useHeaps:h count:c stages:(MTLRenderStageVertex|MTLRenderStageFragment)];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c stages:(MTLRenderStages)s { try { @try {
++ std::vector<NmbHeap *> refs;
++ if(![self collectHeaps:h count:c out:refs])return;
++ if(fuxiIsTelemetryClient()){gMapsUseHeapCalls++;gMapsUseHeapCount+=refs.size();}
++ [self check:nmb_encoder_use_heaps(self.handle,refs.empty()?nullptr:refs.data(),refs.size(),(uint64_t)s) what:"useHeaps"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)memoryBarrierWithScope:(MTLBarrierScope)s afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b { try { @try {
++ if(fuxiIsTelemetryClient())gMapsBarrierScopeCalls++;
++ [self check:nmb_encoder_memory_barrier_scope(self.handle,(uint64_t)s,(uint64_t)a,(uint64_t)b) what:"memoryBarrierWithScope"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b { try { @try {
++ std::vector<NmbResourceRef> refs;
++ if(![self collectResources:r count:c out:refs])return;
++ if(fuxiIsTelemetryClient())gMapsBarrierResourceCalls++;
++ [self check:nmb_encoder_memory_barrier_resources(self.handle,refs.empty()?nullptr:refs.data(),refs.size(),(uint64_t)a,(uint64_t)b) what:"memoryBarrierWithResources"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+ @end
+ 
+ @interface NBBlitEncoder : NBEncoder
+@@ -1610,16 +1968,46 @@ static void overlapCommitted(void *context,const char *why);
+   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
+   return true;
+  };
++ uint8_t surfaceMask=0,storeSurfaceMask=0,loadWriteMask=0;
+  bool storesSurface=false;
+  for(unsigned i=0;i<8;i++) {
+   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
+   if(!attachment(c,pass.colors[i])){[self refuse:@"foreign color attachment"];return nil;}
+-  if(c.texture && [(NBTexture *)c.texture surface] && c.storeAction==MTLStoreActionStore){
+-   storesSurface=true;
+-   if(c.loadAction==MTLLoadActionClear || c.loadAction==MTLLoadActionLoad)encodedWork.storedSurface=true;
++  if(c.texture && [(NBTexture *)c.texture surface]) {
++   surfaceMask|=(uint8_t)(1u<<i);
++   const bool loadWrite=(c.loadAction==MTLLoadActionClear || c.loadAction==MTLLoadActionLoad);
++   const bool stores=(c.storeAction==MTLStoreActionStore || c.storeAction==MTLStoreActionStoreAndMultisampleResolve);
++   if(loadWrite)loadWriteMask|=(uint8_t)(1u<<i);
++   if(stores) {
++    storeSurfaceMask|=(uint8_t)(1u<<i);
++    storesSurface=true;
++   }
+   }
+   pass.colors[i].clear[0]=c.clearColor.red;pass.colors[i].clear[1]=c.clearColor.green;pass.colors[i].clear[2]=c.clearColor.blue;pass.colors[i].clear[3]=c.clearColor.alpha;
+  }
++ const bool telemetrySurf=fuxiIsTelemetryClient() && surfaceMask!=0;
++ if(telemetrySurf) {
++  gMapsSurfPasses.fetch_add(1,std::memory_order_relaxed);
++  for(unsigned i=0;i<8;i++) {
++   if(!(surfaceMask & (1u<<i)))continue;
++   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
++   if(c.loadAction==MTLLoadActionClear) {
++    gMapsLoadClear.fetch_add(1,std::memory_order_relaxed);
++    if(c.clearColor.red!=0.0 || c.clearColor.green!=0.0 || c.clearColor.blue!=0.0 || c.clearColor.alpha!=0.0)
++     gMapsNonZeroClears.fetch_add(1,std::memory_order_relaxed);
++   } else if(c.loadAction==MTLLoadActionLoad) {
++    gMapsLoadLoad.fetch_add(1,std::memory_order_relaxed);
++   } else {
++    gMapsLoadDontCare.fetch_add(1,std::memory_order_relaxed);
++   }
++   if(c.storeAction==MTLStoreActionStore || c.storeAction==MTLStoreActionStoreAndMultisampleResolve)
++    gMapsStoreStore.fetch_add(1,std::memory_order_relaxed);
++   else if(c.storeAction==MTLStoreActionDontCare)
++    gMapsStoreDontCare.fetch_add(1,std::memory_order_relaxed);
++   else
++    gMapsStoreOther.fetch_add(1,std::memory_order_relaxed);
++  }
++ }
+  if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
+  pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
+  pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=d.defaultRasterSampleCount;
+@@ -1628,9 +2016,15 @@ static void overlapCommitted(void *context,const char *why);
+   [_resourceOwners addObject:d.visibilityResultBuffer];
+   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
+  }
+- NBRenderEncoder *encoder=[NBRenderEncoder new];encoder.fuxiStoredSurface=storesSurface;
++ NBRenderEncoder *encoder=[NBRenderEncoder new];
++ encoder.fuxiStoredSurface=storesSurface;
++ encoder.fuxiSurfaceMask=surfaceMask;
++ encoder.fuxiStoreSurfaceMask=storeSurfaceMask;
++ encoder.fuxiLoadWriteMask=loadWriteMask;
+  [self fuxiMaybeSplit];
+- return [self encoder:encoder handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
++ id<MTLRenderCommandEncoder> attached=[self encoder:encoder handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
++ if(attached)[(NBRenderEncoder *)attached fuxiSyncStoredSurface];
++ return attached;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)addScheduledHandler:(MTLCommandBufferHandler)block { try { @try {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)addCompletedHandler:(MTLCommandBufferHandler)block { try { @try {
+@@ -1760,6 +2154,7 @@ static void overlapCommitted(void *context,const char *why);
+  self.committed=YES;
+  self.committedUs=nowUs();
+  if(encodedWork.storedSurface)fuxiFrameNote(self.committedUs,self.committedUs-createdUs,encodedWork);
++ fuxiMapsTelemetryNote(gDevice);
+  {
+   std::lock_guard<std::mutex> lock(gCommitLock);
+   // Assign once under the same lock as publication. A concurrent commit cannot reuse this index.
+@@ -2188,11 +2583,6 @@ static void fuxiPrewarmLibrary(NBLibrary *library) {
+ // ---- heaps ----
+ // Metal heaps over the runtime's: an automatic heap places each resource, a placement heap takes an offset. Resources made from one keep it
+ // alive (their `heap`); a heap's resources share its storage mode, CPU cache mode and (here) hazard tracking mode.
+-@interface NBHeap : NBObject
+-@property(nonatomic) NmbHeap *handle;
+-@property(nonatomic) MTLResourceOptions options;
+-@property(nonatomic) MTLHeapType heapType;
+-@end
+ @implementation NBHeap
+ - (void)dealloc { try { @try {nmb_heap_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (NSUInteger)size { try { @try {return nmb_heap_size(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -2759,6 +3149,23 @@ static BOOL supportsFamilyImpl(id self,MTLGPUFamily family,const void *caller);
+  (void)pl;
+  return [(id<MTLDevice>)self newComputePipelineStateWithDescriptor:d options:options reflection:reflection error:error];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLArgumentEncoder>)newArgumentEncoderWithArguments:(NSArray<MTLArgumentDescriptor *> *)arguments { try { @try {
++ if(!arguments || !arguments.count){noteProblem(@"newArgumentEncoderWithArguments: empty arguments");return nil;}
++ std::vector<NmbArgumentDescriptor> descs;descs.reserve(arguments.count);
++ for(MTLArgumentDescriptor *d in arguments) {
++  if(![d isKindOfClass:[MTLArgumentDescriptor class]]){noteProblem(@"newArgumentEncoderWithArguments: invalid descriptor");return nil;}
++  descs.push_back({(uint64_t)d.dataType,(uint64_t)d.index,(uint64_t)d.arrayLength,(uint64_t)d.access,(uint64_t)d.textureType,(uint64_t)d.constantBlockAlignment});
++ }
++ NmbArgumentEncoder *handle=nmb_argument_encoder_new_with_arguments(gDevice,descs.data(),descs.size());
++ if(!handle){NBLOG(@"native-metal: argumentEncoder refused: %@",lastError());return nil;}
++ NBArgumentEncoder *encoder=[NBArgumentEncoder new];encoder.handle=handle;return (id<MTLArgumentEncoder>)encoder;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferBinding:(id<MTLBufferBinding>)bufferBinding { try { @try {
++ (void)bufferBinding;
++ noteProblem(@"newArgumentEncoderWithBufferBinding: pipeline reflection unavailable");
++ if(gMissing)gMissing("NativeBridgeMetalDevice","newArgumentEncoderWithBufferBinding:");
++ return nil;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ 
+ // The device queries the runtime answers (nmb_device_answer_selector), as methods of the device class. One without an argument is read once
+diff --git a/bridge/FuxiDeferred.rs b/bridge/FuxiDeferred.rs
+index 580e5c0..c001966 100644
+--- a/bridge/FuxiDeferred.rs
++++ b/bridge/FuxiDeferred.rs
+@@ -14,10 +14,10 @@
+ //! to CoreAnimation's swap and its next frame while the worker still records and submits this one. The frontend holds the
+ //! swap's present back with pending IOSurface writer leases until the runtime has submitted the work.
+ 
+-use metal2vulkan::metal::{CullMode, DepthClipMode, IndexType, PrimitiveType, RenderStages, TriangleFillMode, Winding};
++use metal2vulkan::metal::{BarrierScope, CullMode, DepthClipMode, IndexType, PrimitiveType, RenderStages, ResourceUsage, TriangleFillMode, Winding};
+ use metal2vulkan_runtime::{
+-    Buffer, CommandBuffer, DepthStencilState, Fence, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, SamplerState,
+-    ScissorRect, StoreAction, StoreActionOptions, Texture, Viewport, VisibilityResultMode,
++    Buffer, CommandBuffer, DepthStencilState, Fence, Heap, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceRef,
++    SamplerState, ScissorRect, StoreAction, StoreActionOptions, Texture, Viewport, VisibilityResultMode,
+ };
+ use std::cell::Cell;
+ use std::ffi::{c_char, c_int, c_void, CStr};
+@@ -190,6 +190,21 @@ impl Bytes {
+     }
+ }
+ 
++#[derive(Clone)]
++pub(crate) enum DeferredResource {
++    Buffer(Buffer),
++    Texture(Texture),
++}
++
++impl DeferredResource {
++    fn as_ref(&self) -> ResourceRef<'_> {
++        match self {
++            DeferredResource::Buffer(b) => ResourceRef::Buffer(b),
++            DeferredResource::Texture(t) => ResourceRef::Texture(t),
++        }
++    }
++}
++
+ /// A queued call; raw Metal values were checked at the call. `fragment` picks the fragment stage over the vertex stage.
+ pub(crate) enum Op {
+     Open { command_buffer: CommandBuffer, pass: Box<RenderPassDescriptor> },
+@@ -234,6 +249,10 @@ pub(crate) enum Op {
+         base_instance: u32,
+     },
+     Fence { fence: Fence, stages: RenderStages, update: bool },
++    UseResources { resources: Box<[DeferredResource]>, usage: ResourceUsage, stages: RenderStages },
++    UseHeaps { heaps: Box<[Heap]>, stages: RenderStages },
++    BarrierScope { scope: BarrierScope, after: RenderStages, before: RenderStages },
++    BarrierResources { resources: Box<[DeferredResource]>, after: RenderStages, before: RenderStages },
+     End,
+     Discard,
+     /// Patch 0020: a command buffer's commit, queued with no encoder (`task`); it reports its own outcome.
+@@ -291,6 +310,32 @@ pub(crate) fn push(slot: SlotPtr, op: Op) {
+     queue(Entry { slot: Some(slot), op });
+ }
+ 
++#[cfg(test)]
++pub(crate) fn new_test_slot(failure: Failure) -> SlotPtr {
++    SlotPtr(NonNull::from(Box::leak(Box::new(Slot { encoder: None, failure }))))
++}
++
++#[cfg(test)]
++pub(crate) unsafe fn free_test_slot(slot: SlotPtr) {
++    drop(unsafe { Box::from_raw(slot.0.as_ptr()) });
++}
++
++#[cfg(test)]
++pub(crate) fn take_test_ops(slot: SlotPtr) -> Vec<Op> {
++    let mut pending = lock(&QUEUE.pending);
++    let mut taken = Vec::new();
++    let mut kept = Vec::new();
++    for entry in pending.drain(..) {
++        if entry.slot.is_some_and(|s| s.0 == slot.0) {
++            taken.push(entry.op);
++        } else {
++            kept.push(entry);
++        }
++    }
++    *pending = kept;
++    taken
++}
++
+ /// Patch 0020: queues `body` after every call queued before it; this thread's later bridge calls wait for it as for a
+ /// queued render call. The worker runs it with no encoder and counts it as a task.
+ pub(crate) fn task(body: Box<dyn FnOnce() + Send>) {
+@@ -665,6 +710,66 @@ fn apply(r: &mut RenderCommandEncoder, op: Op) -> Result<(), String> {
+         Op::Fence { fence, stages, update } => {
+             if update { r.update_fence(&fence, stages).map_err(e("update fence")) } else { r.wait_for_fence(&fence, stages).map_err(e("wait for fence")) }
+         }
++        Op::UseResources { resources, usage, stages } => {
++            let refs: Vec<ResourceRef<'_>> = resources.iter().map(DeferredResource::as_ref).collect();
++            r.use_resources(&refs, usage, stages).map_err(e("use resources"))
++        }
++        Op::UseHeaps { heaps, stages } => {
++            let refs: Vec<&Heap> = heaps.iter().collect();
++            r.use_heaps(&refs, stages).map_err(e("use heaps"))
++        }
++        Op::BarrierScope { scope, after, before } => {
++            r.memory_barrier_with_scope(scope, after, before);
++            Ok(())
++        }
++        Op::BarrierResources { resources, after, before } => {
++            let refs: Vec<ResourceRef<'_>> = resources.iter().map(DeferredResource::as_ref).collect();
++            r.memory_barrier_with_resources(&refs, after, before).map_err(e("memory barrier resources"))
++        }
+         Op::Open { .. } | Op::End | Op::Discard | Op::Task(_) => unreachable!("run handles the encoder's opening and end, and tasks"),
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn deferred_ops_and_failure_tracking() {
++        let failure: Failure = Arc::default();
++        assert!(!has_failed(&failure));
++        fail(&failure, "bad barrier".into());
++        assert!(has_failed(&failure));
++        assert_eq!(take_failure(&failure).as_deref(), Some("deferred bad barrier"));
++        assert!(!has_failed(&failure));
++
++        let small = Bytes::new(&[1, 2, 3, 4]);
++        assert_eq!(small.get(), &[1, 2, 3, 4]);
++        let large_data = vec![0xABu8; INLINE_BYTES + 16];
++        let large = Bytes::new(&large_data);
++        assert_eq!(large.get(), large_data.as_slice());
++
++        let ops = [
++            Op::UseResources {
++                resources: Box::new([]),
++                usage: ResourceUsage::READ | ResourceUsage::WRITE,
++                stages: RenderStages::VERTEX | RenderStages::FRAGMENT,
++            },
++            Op::UseHeaps {
++                heaps: Box::new([]),
++                stages: RenderStages::FRAGMENT,
++            },
++            Op::BarrierScope {
++                scope: BarrierScope::BUFFERS | BarrierScope::TEXTURES,
++                after: RenderStages::VERTEX,
++                before: RenderStages::FRAGMENT,
++            },
++            Op::BarrierResources {
++                resources: Box::new([]),
++                after: RenderStages::FRAGMENT,
++                before: RenderStages::FRAGMENT,
++            },
++        ];
++        assert_eq!(ops.len(), 4);
++    }
++}
+diff --git a/bridge/FuxiThreadCache.rs b/bridge/FuxiThreadCache.rs
+index 44d8aa4..e4c3cae 100644
+--- a/bridge/FuxiThreadCache.rs
++++ b/bridge/FuxiThreadCache.rs
+@@ -199,6 +199,10 @@ unsafe impl GlobalAlloc for ThreadCache {
+ 
+     #[inline]
+     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        if STATE.load(Ordering::Relaxed) != ON {
++            // SAFETY: forwarded unchanged when the thread cache is off.
++            return unsafe { System.realloc(ptr, layout, new_size) };
++        }
+         // SAFETY: the caller guarantees new_size and layout.align() form a valid layout.
+         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+         match (class_of(&layout), class_of(&new_layout)) {
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index 576ce78..39ca716 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -39,6 +39,7 @@ size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
+ uint64_t nmb_device_max_buffer_length(const NmbDevice *);
+ // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
+ bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
++uint64_t nmb_device_skipped_null_draws(const NmbDevice *);
+ /* Artifact lookups and driver pipeline records are separate cache layers. */
+ struct NmbShaderCacheStats {
+     uint64_t hits, misses, rejected, read_failures, writes, write_failures, evictions;
+@@ -115,6 +116,7 @@ bool nmb_texture_replace(NmbTexture *, const uint64_t region[6], uint64_t level,
+                          uint64_t bytes_per_image, uint64_t length);
+ bool nmb_texture_get_bytes(const NmbTexture *, void *bytes, uint64_t bytes_per_row, uint64_t bytes_per_image, uint64_t length,
+                            const uint64_t region[6], uint64_t level, uint64_t slice);
++uint64_t nmb_texture_gpu_resource_id(const NmbTexture *);
+ 
+ /* A metallib (a universal one gives its AIR64 slice), or with air set bare AIR bitcode. */
+ NmbLibrary *nmb_library_new(NmbDevice *, const void *bytes, size_t length, bool air);
+@@ -172,6 +174,35 @@ struct NmbSamplerDescriptor {
+ };
+ NmbSampler *nmb_sampler_new(NmbDevice *, const struct NmbSamplerDescriptor *);
+ void nmb_sampler_release(NmbSampler *);
++uint64_t nmb_sampler_gpu_resource_id(const NmbSampler *);
++
++typedef struct NmbArgumentEncoder NmbArgumentEncoder;
++struct NmbArgumentDescriptor {
++    uint64_t data_type;
++    uint64_t index;
++    uint64_t array_length;
++    uint64_t access;
++    uint64_t texture_type;
++    uint64_t constant_block_alignment;
++};
++NmbArgumentEncoder *nmb_argument_encoder_new_with_arguments(NmbDevice *, const struct NmbArgumentDescriptor *, size_t count);
++NmbArgumentEncoder *nmb_function_new_argument_encoder(NmbFunction *, uint32_t buffer_index);
++NmbArgumentEncoder *nmb_argument_encoder_for_buffer_at_index(NmbArgumentEncoder *, uint32_t index);
++void nmb_argument_encoder_release(NmbArgumentEncoder *);
++uint64_t nmb_argument_encoder_encoded_length(const NmbArgumentEncoder *);
++uint64_t nmb_argument_encoder_alignment(const NmbArgumentEncoder *);
++bool nmb_argument_encoder_set_argument_buffer(NmbArgumentEncoder *, NmbBuffer *, uint64_t start_offset, uint64_t array_element);
++bool nmb_argument_encoder_set_buffer(NmbArgumentEncoder *, NmbBuffer *, uint64_t offset, uint32_t index);
++bool nmb_argument_encoder_set_buffers(NmbArgumentEncoder *, NmbBuffer *const *buffers, const uint64_t *offsets, uint32_t first, size_t count);
++bool nmb_argument_encoder_set_texture(NmbArgumentEncoder *, NmbTexture *, uint32_t index);
++bool nmb_argument_encoder_set_textures(NmbArgumentEncoder *, NmbTexture *const *textures, uint32_t first, size_t count);
++bool nmb_argument_encoder_set_sampler(NmbArgumentEncoder *, NmbSampler *, uint32_t index);
++bool nmb_argument_encoder_set_samplers(NmbArgumentEncoder *, NmbSampler *const *samplers, uint32_t first, size_t count);
++bool nmb_argument_encoder_set_compute_pipeline(NmbArgumentEncoder *, NmbComputePipeline *, uint32_t index);
++bool nmb_argument_encoder_set_compute_pipelines(NmbArgumentEncoder *, NmbComputePipeline *const *pipelines, uint32_t first, size_t count);
++bool nmb_argument_encoder_set_render_pipeline(NmbArgumentEncoder *, NmbRenderPipeline *, uint32_t index);
++bool nmb_argument_encoder_set_render_pipelines(NmbArgumentEncoder *, NmbRenderPipeline *const *pipelines, uint32_t first, size_t count);
++void *nmb_argument_encoder_constant_data(const NmbArgumentEncoder *, uint32_t index);
+ 
+ struct NmbStencil {uint64_t compare, failure, depth_failure, pass, read_mask, write_mask;};
+ struct NmbDepthStencilDescriptor {uint64_t compare, write; struct NmbStencil front, back;};
+@@ -236,6 +267,17 @@ void nmb_fence_release(NmbFence *);
+ bool nmb_encoder_update_fence(NmbEncoder *, NmbFence *, uint64_t stages);
+ bool nmb_encoder_wait_fence(NmbEncoder *, NmbFence *, uint64_t stages);
+ 
++enum { NMB_RESOURCE_BUFFER = 0, NMB_RESOURCE_TEXTURE = 1 };
++struct NmbResourceRef {
++    uint32_t kind;
++    const void *handle;
++};
++/* stages / after_stages / before_stages: MTLRenderStages bitmask (ignored for compute encoders). */
++bool nmb_encoder_use_resources(NmbEncoder *, const struct NmbResourceRef *resources, size_t count, uint64_t usage, uint64_t stages);
++bool nmb_encoder_use_heaps(NmbEncoder *, NmbHeap *const *heaps, size_t count, uint64_t stages);
++bool nmb_encoder_memory_barrier_scope(NmbEncoder *, uint64_t scope, uint64_t after_stages, uint64_t before_stages);
++bool nmb_encoder_memory_barrier_resources(NmbEncoder *, const struct NmbResourceRef *resources, size_t count, uint64_t after_stages, uint64_t before_stages);
++
+ NmbEncoder *nmb_compute_encoder_new(NmbCommandBuffer *);
+ NmbEncoder *nmb_blit_encoder_new(NmbCommandBuffer *);
+ struct NmbPassAttachment {
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index b1d0681..e459466 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -4,23 +4,26 @@
+ //! checked conversions; a value it does not know fails the call (never a substitute). Failures leave their reason in a per-thread
+ //! string, and no call unwinds into C.
+ 
+-use metal2vulkan::bind::SamplerDescriptor;
++use metal2vulkan::bind::{ArgumentDescriptor, SamplerDescriptor};
+ use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
+ use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
+ use metal2vulkan::metal::{
+-    BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, DepthClipMode, IndexType, PixelFormat, PrimitiveTopologyClass,
+-    PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
+-    TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
++    BarrierScope, BindingAccess, BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, DepthClipMode, IndexType,
++    PixelFormat, PrimitiveTopologyClass, PrimitiveType, RenderStages, ResourceUsage, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter,
++    SamplerMipFilter, StencilOperation, TextureType, TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
+ };
+ use metal2vulkan::pipeline::{
+     ColorAttachmentDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor, VertexBufferLayoutDescriptor,
+     VertexDescriptor,
+ };
+ use metal2vulkan_runtime::{
+-    BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
+-    ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
+-    MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
+-    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, StoreActionOptions, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
++    ArgumentEncoder, BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer,
++    ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder, ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device,
++    DeviceOptions, DeviceProperties, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory,
++    IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction, MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount,
++    PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
++    ResourceRef, SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, StoreActionOptions, Texture, TextureDescriptor,
++    Viewport, VisibilityResultMode,
+ };
+ use std::cell::RefCell;
+ use std::collections::VecDeque;
+@@ -33,7 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+ use std::time::Duration;
+ 
+-use crate::fuxi_deferred::{self, Bytes, Op, SlotPtr};
++use crate::fuxi_deferred::{self, Bytes, DeferredResource, Op, SlotPtr};
+ 
+ thread_local! {
+     static LAST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+@@ -274,6 +277,15 @@ pub extern "C" fn nmb_device_work_stats(device: *const NmbDevice, out: *mut u64)
+     })
+ }
+ 
++/// Number of draws skipped during command recording because their graphics pipeline was `vk::Pipeline::null()` (patch 0006).
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_device_skipped_null_draws(device: *const NmbDevice) -> u64 {
++    guard(0, || {
++        let _ = get(device)?;
++        Ok(metal2vulkan_runtime::skipped_null_pipeline_draws())
++    })
++}
++
+ /// Separate artifact and driver-record counters, mirroring the C ABI.
+ #[repr(C)]
+ pub struct NmbShaderCacheStats {
+@@ -465,15 +477,70 @@ pub extern "C" fn nmb_device_family_waivers(device: *const NmbDevice, out: *mut
+     })
+ }
+ 
++fn fallback_private_count_values(
++    c: PrivateCount,
++    gpu_core_count: Option<u32>,
++    max_vertex_amplification_count: u64,
++    max_threadgroup_memory_length: u64,
++) -> Option<u64> {
++    match c {
++        PrivateCount::GpuCoreCount => Some(gpu_core_count.map_or(8, u64::from)),
++        PrivateCount::MaxVertexAmplificationCount => Some(max_vertex_amplification_count),
++        PrivateCount::MaxComputeThreadgroupMemory => Some(max_threadgroup_memory_length),
++        _ => None,
++    }
++}
++
++fn fallback_private_flag_values(
++    f: PrivateFlag,
++    max_color_attachments: u32,
++    max_fragment_output_attachments: u32,
++) -> Option<bool> {
++    match f {
++        PrivateFlag::IsLargeMrtSupported => {
++            let max_color = (MAX_COLOR_ATTACHMENTS as u64)
++                .min(max_color_attachments.min(max_fragment_output_attachments) as u64);
++            Some(max_color >= 8)
++        }
++        PrivateFlag::SupportsComputeCompressedTextureWrite => Some(false),
++        PrivateFlag::SupportsConditionalLoadStore => Some(false),
++        _ => None,
++    }
++}
++
++fn fallback_private_count(c: PrivateCount, p: &DeviceProperties) -> Option<u64> {
++    let max_amp = (1..=8)
++        .rev()
++        .find(|&n| p.supports_vertex_amplification_count(n) == Ok(true))
++        .unwrap_or(1);
++    fallback_private_count_values(c, p.gpu_core_count, max_amp, p.max_threadgroup_memory_length)
++}
++
++fn fallback_private_flag(f: PrivateFlag, p: &DeviceProperties) -> Option<bool> {
++    let l = &p.description.limits;
++    fallback_private_flag_values(f, l.max_color_attachments, l.max_fragment_output_attachments)
++}
++
+ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, String> {
+     let d = &device.0;
+     let p = d.properties();
+     let none = || format!("the device has no answer for {selector}");
+     if let Some(c) = PrivateCount::ALL.into_iter().find(|c| c.selector() == selector) {
+-        return device.private().count(c).value().ok_or_else(none);
++        return device
++            .private()
++            .count(c)
++            .value()
++            .or_else(|| fallback_private_count(c, p))
++            .ok_or_else(none);
+     }
+     if let Some(f) = PrivateFlag::ALL.into_iter().find(|f| f.selector() == selector) {
+-        return device.private().flag(f).value().map(u64::from).ok_or_else(none);
++        return device
++            .private()
++            .flag(f)
++            .value()
++            .or_else(|| fallback_private_flag(f, p))
++            .map(u64::from)
++            .ok_or_else(none);
+     }
+     let gap = |r: Result<bool, metal2vulkan_runtime::RuntimeGap>| r.map(u64::from).map_err(|g| format!("{selector}: {g:?}"));
+     let format_supported = |f: PixelFormat| d.pixel_format_capabilities(f) != metal2vulkan_runtime::FormatCapabilities::NONE;
+@@ -1214,6 +1281,11 @@ pub unsafe extern "C" fn nmb_texture_get_bytes(texture: *const NmbTexture, bytes
+     })
+ }
+ 
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_texture_gpu_resource_id(texture: *const NmbTexture) -> u64 {
++    guard_free(0, || Ok(get(texture)?.0.gpu_resource_id().0))
++}
++
+ // ---- libraries and functions ----
+ 
+ pub struct NmbLibrary(Library, Vec<String>);
+@@ -1650,6 +1722,290 @@ pub extern "C" fn nmb_sampler_release(sampler: *mut NmbSampler) {
+     release(sampler)
+ }
+ 
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_sampler_gpu_resource_id(sampler: *const NmbSampler) -> u64 {
++    guard_free(0, || Ok(get(sampler)?.0.gpu_resource_id().0))
++}
++
++// ---- argument encoders ----
++
++pub struct NmbArgumentEncoder(ArgumentEncoder);
++
++#[repr(C)]
++#[derive(Clone, Copy)]
++pub struct NmbArgumentDescriptor {
++    pub data_type: u64,
++    pub index: u64,
++    pub array_length: u64,
++    pub access: u64,
++    pub texture_type: u64,
++    pub constant_block_alignment: u64,
++}
++
++unsafe fn slice_from_raw<'a, T>(ptr: *const T, count: usize, what: &str) -> Result<&'a [T], String> {
++    if count == 0 {
++        return Ok(&[]);
++    }
++    if ptr.is_null() || count > isize::MAX as usize / std::mem::size_of::<T>().max(1) {
++        return Err(format!("invalid {what} array"));
++    }
++    Ok(unsafe { std::slice::from_raw_parts(ptr, count) })
++}
++
++fn decode_argument_descriptor(d: &NmbArgumentDescriptor) -> Result<ArgumentDescriptor, String> {
++    let data_type = raw::<DataType>(d.data_type, "argument data type")?;
++    let index = u32::try_from(d.index).map_err(e("argument index"))?;
++    let mut out = ArgumentDescriptor::new(data_type, index);
++    out.array_length = u32::try_from(d.array_length).map_err(e("argument array length"))?;
++    out.access = raw::<BindingAccess>(d.access, "argument access")?;
++    out.texture_type = raw::<TextureType>(d.texture_type, "argument texture type")?;
++    out.constant_block_alignment = u32::try_from(d.constant_block_alignment).map_err(e("constant block alignment"))?;
++    Ok(out)
++}
++
++/// # Safety
++/// `descriptors` is null when `count == 0`, or holds `count` readable `NmbArgumentDescriptor` records.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_argument_encoder_new_with_arguments(
++    device: *mut NmbDevice,
++    descriptors: *const NmbArgumentDescriptor,
++    count: usize,
++) -> *mut NmbArgumentEncoder {
++    guard(std::ptr::null_mut(), || {
++        let raw_descs = unsafe { slice_from_raw(descriptors, count, "argument descriptors")? };
++        let mut descs = Vec::with_capacity(raw_descs.len());
++        for d in raw_descs {
++            descs.push(decode_argument_descriptor(d)?);
++        }
++        let encoder = get(device)?.0.new_argument_encoder_with_arguments(&descs).map_err(e("argument encoder"))?;
++        Ok(boxed(NmbArgumentEncoder(encoder)))
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_function_new_argument_encoder(function: *mut NmbFunction, buffer_index: u32) -> *mut NmbArgumentEncoder {
++    guard(std::ptr::null_mut(), || {
++        let encoder = get(function)?.0.new_argument_encoder_with_buffer_index(buffer_index).map_err(e("function argument encoder"))?;
++        Ok(boxed(NmbArgumentEncoder(encoder)))
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_for_buffer_at_index(encoder: *mut NmbArgumentEncoder, index: u32) -> *mut NmbArgumentEncoder {
++    guard(std::ptr::null_mut(), || {
++        let nested = get(encoder)?.0.new_argument_encoder_for_buffer_at_index(index).map_err(e("nested argument encoder"))?;
++        Ok(boxed(NmbArgumentEncoder(nested)))
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_release(encoder: *mut NmbArgumentEncoder) {
++    release(encoder)
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_encoded_length(encoder: *const NmbArgumentEncoder) -> u64 {
++    guard_free(0, || Ok(get(encoder)?.0.encoded_length()))
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_alignment(encoder: *const NmbArgumentEncoder) -> u64 {
++    guard_free(0, || Ok(get(encoder)?.0.alignment()))
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_set_argument_buffer(
++    encoder: *mut NmbArgumentEncoder,
++    buffer: *mut NmbBuffer,
++    start_offset: u64,
++    array_element: u64,
++) -> bool {
++    guard(false, || {
++        let enc = &mut get_mut(encoder)?.0;
++        let buffer = optional(buffer)?.map(|b| &b.0);
++        enc.set_argument_buffer_start_offset_array_element(buffer, start_offset, array_element)
++            .map_err(e("set argument buffer"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_set_buffer(
++    encoder: *mut NmbArgumentEncoder,
++    buffer: *mut NmbBuffer,
++    offset: u64,
++    index: u32,
++) -> bool {
++    guard(false, || {
++        let enc = &get(encoder)?.0;
++        let buffer = optional(buffer)?.map(|b| &b.0);
++        enc.set_buffer(buffer, offset, index).map_err(e("set argument buffer entry"))?;
++        Ok(true)
++    })
++}
++
++/// # Safety
++/// `buffers` and `offsets` are null when `count == 0`, or hold `count` entries.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_argument_encoder_set_buffers(
++    encoder: *mut NmbArgumentEncoder,
++    buffers: *const *mut NmbBuffer,
++    offsets: *const u64,
++    first: u32,
++    count: usize,
++) -> bool {
++    guard(false, || {
++        let enc = &get(encoder)?.0;
++        let ptrs = unsafe { slice_from_raw(buffers, count, "buffers")? };
++        let offs = unsafe { slice_from_raw(offsets, count, "offsets")? };
++        let mut refs = Vec::with_capacity(ptrs.len());
++        for &p in ptrs {
++            refs.push(optional(p)?.map(|b| &b.0));
++        }
++        enc.set_buffers(&refs, offs, first).map_err(e("set argument buffers"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_set_texture(encoder: *mut NmbArgumentEncoder, texture: *mut NmbTexture, index: u32) -> bool {
++    guard(false, || {
++        let enc = &get(encoder)?.0;
++        let texture = optional(texture)?.map(|t| &t.0);
++        enc.set_texture(texture, index).map_err(e("set argument texture"))?;
++        Ok(true)
++    })
++}
++
++/// # Safety
++/// `textures` is null when `count == 0`, or holds `count` entries.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_argument_encoder_set_textures(
++    encoder: *mut NmbArgumentEncoder,
++    textures: *const *mut NmbTexture,
++    first: u32,
++    count: usize,
++) -> bool {
++    guard(false, || {
++        let enc = &get(encoder)?.0;
++        let ptrs = unsafe { slice_from_raw(textures, count, "textures")? };
++        let mut refs = Vec::with_capacity(ptrs.len());
++        for &p in ptrs {
++            refs.push(optional(p)?.map(|t| &t.0));
++        }
++        enc.set_textures(&refs, first).map_err(e("set argument textures"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_set_sampler(encoder: *mut NmbArgumentEncoder, sampler: *mut NmbSampler, index: u32) -> bool {
++    guard(false, || {
++        let enc = &get(encoder)?.0;
++        let sampler = optional(sampler)?.map(|s| &s.0);
++        enc.set_sampler_state(sampler, index).map_err(e("set argument sampler"))?;
++        Ok(true)
++    })
++}
++
++/// # Safety
++/// `samplers` is null when `count == 0`, or holds `count` entries.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_argument_encoder_set_samplers(
++    encoder: *mut NmbArgumentEncoder,
++    samplers: *const *mut NmbSampler,
++    first: u32,
++    count: usize,
++) -> bool {
++    guard(false, || {
++        let enc = &get(encoder)?.0;
++        let ptrs = unsafe { slice_from_raw(samplers, count, "samplers")? };
++        let mut refs = Vec::with_capacity(ptrs.len());
++        for &p in ptrs {
++            refs.push(optional(p)?.map(|s| &s.0));
++        }
++        enc.set_sampler_states(&refs, first).map_err(e("set argument samplers"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_set_compute_pipeline(
++    encoder: *mut NmbArgumentEncoder,
++    pipeline: *mut NmbComputePipeline,
++    index: u32,
++) -> bool {
++    guard(false, || {
++        let enc = &get(encoder)?.0;
++        let pipeline = optional(pipeline)?.map(|p| &p.0);
++        enc.set_compute_pipeline_state(pipeline, index).map_err(e("set argument compute pipeline"))?;
++        Ok(true)
++    })
++}
++
++/// # Safety
++/// `pipelines` is null when `count == 0`, or holds `count` entries.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_argument_encoder_set_compute_pipelines(
++    encoder: *mut NmbArgumentEncoder,
++    pipelines: *const *mut NmbComputePipeline,
++    first: u32,
++    count: usize,
++) -> bool {
++    guard(false, || {
++        let enc = &get(encoder)?.0;
++        let ptrs = unsafe { slice_from_raw(pipelines, count, "compute pipelines")? };
++        let mut refs = Vec::with_capacity(ptrs.len());
++        for &p in ptrs {
++            refs.push(optional(p)?.map(|c| &c.0));
++        }
++        enc.set_compute_pipeline_states(&refs, first).map_err(e("set argument compute pipelines"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_set_render_pipeline(
++    encoder: *mut NmbArgumentEncoder,
++    pipeline: *mut NmbRenderPipeline,
++    index: u32,
++) -> bool {
++    guard(false, || {
++        let enc = &get(encoder)?.0;
++        let pipeline = optional(pipeline)?.map(|p| &p.0);
++        enc.set_render_pipeline_state(pipeline, index).map_err(e("set argument render pipeline"))?;
++        Ok(true)
++    })
++}
++
++/// # Safety
++/// `pipelines` is null when `count == 0`, or holds `count` entries.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_argument_encoder_set_render_pipelines(
++    encoder: *mut NmbArgumentEncoder,
++    pipelines: *const *mut NmbRenderPipeline,
++    first: u32,
++    count: usize,
++) -> bool {
++    guard(false, || {
++        let enc = &get(encoder)?.0;
++        let ptrs = unsafe { slice_from_raw(pipelines, count, "render pipelines")? };
++        let mut refs = Vec::with_capacity(ptrs.len());
++        for &p in ptrs {
++            refs.push(optional(p)?.map(|r| &r.0));
++        }
++        enc.set_render_pipeline_states(&refs, first).map_err(e("set argument render pipelines"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_constant_data(encoder: *const NmbArgumentEncoder, index: u32) -> *mut c_void {
++    guard_free(std::ptr::null_mut(), || {
++        Ok(get(encoder)?.0.constant_data(index).map_err(e("constant data"))?.as_ptr() as *mut c_void)
++    })
++}
++
+ #[repr(C)]
+ pub struct NmbStencil {
+     pub compare: u64,
+@@ -2207,6 +2563,193 @@ pub extern "C" fn nmb_encoder_wait_fence(encoder: *mut NmbEncoder, fence: *mut N
+     })
+ }
+ 
++const NMB_RESOURCE_BUFFER: u32 = 0;
++const NMB_RESOURCE_TEXTURE: u32 = 1;
++
++#[repr(C)]
++pub struct NmbResourceRef {
++    pub kind: u32,
++    pub handle: *const c_void,
++}
++
++unsafe fn decode_resource_refs<'a>(resources: *const NmbResourceRef, count: usize) -> Result<Vec<ResourceRef<'a>>, String> {
++    let slice = unsafe { slice_from_raw(resources, count, "resources")? };
++    let mut out = Vec::with_capacity(slice.len());
++    for r in slice {
++        match r.kind {
++            NMB_RESOURCE_BUFFER => out.push(ResourceRef::Buffer(&get(r.handle as *const NmbBuffer)?.0)),
++            NMB_RESOURCE_TEXTURE => out.push(ResourceRef::Texture(&get(r.handle as *const NmbTexture)?.0)),
++            kind => return Err(format!("unknown resource kind {kind}")),
++        }
++    }
++    Ok(out)
++}
++
++unsafe fn decode_deferred_resources(resources: *const NmbResourceRef, count: usize) -> Result<Box<[DeferredResource]>, String> {
++    let slice = unsafe { slice_from_raw(resources, count, "resources")? };
++    let mut out = Vec::with_capacity(slice.len());
++    for r in slice {
++        match r.kind {
++            NMB_RESOURCE_BUFFER => out.push(DeferredResource::Buffer(get(r.handle as *const NmbBuffer)?.0.clone())),
++            NMB_RESOURCE_TEXTURE => out.push(DeferredResource::Texture(get(r.handle as *const NmbTexture)?.0.clone())),
++            kind => return Err(format!("unknown resource kind {kind}")),
++        }
++    }
++    Ok(out.into_boxed_slice())
++}
++
++unsafe fn decode_heaps<'a>(heaps: *const *mut NmbHeap, count: usize) -> Result<Vec<&'a Heap>, String> {
++    let slice = unsafe { slice_from_raw(heaps, count, "heaps")? };
++    let mut out = Vec::with_capacity(slice.len());
++    for &h in slice {
++        out.push(&get(h)?.0);
++    }
++    Ok(out)
++}
++
++unsafe fn decode_deferred_heaps(heaps: *const *mut NmbHeap, count: usize) -> Result<Box<[Heap]>, String> {
++    let slice = unsafe { slice_from_raw(heaps, count, "heaps")? };
++    let mut out = Vec::with_capacity(slice.len());
++    for &h in slice {
++        out.push(get(h)?.0.clone());
++    }
++    Ok(out.into_boxed_slice())
++}
++
++/// # Safety
++/// `resources` is null when `count == 0`, or holds `count` valid `NmbResourceRef` entries.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_encoder_use_resources(
++    encoder: *mut NmbEncoder,
++    resources: *const NmbResourceRef,
++    count: usize,
++    usage: u64,
++    stages: u64,
++) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            Ok(Op::UseResources {
++                resources: unsafe { decode_deferred_resources(resources, count)? },
++                usage: raw::<ResourceUsage>(usage, "resource usage")?,
++                stages: raw::<RenderStages>(stages, "render stages")?,
++            })
++        });
++    }
++    guard(false, || {
++        let usage = raw::<ResourceUsage>(usage, "resource usage")?;
++        let refs = unsafe { decode_resource_refs(resources, count)? };
++        match get_mut(encoder)? {
++            NmbEncoder::Compute(c) => c.use_resources(&refs, usage).map_err(e("use resources"))?,
++            NmbEncoder::Render(r) => {
++                let stages = raw::<RenderStages>(stages, "render stages")?;
++                r.use_resources(&refs, usage, stages).map_err(e("use resources"))?;
++            }
++            NmbEncoder::Blit(_) => return Err("not a compute or render encoder".into()),
++            NmbEncoder::Deferred(_) => return Err("deferred encoder".into()),
++        }
++        Ok(true)
++    })
++}
++
++/// # Safety
++/// `heaps` is null when `count == 0`, or holds `count` valid `NmbHeap` pointers.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_encoder_use_heaps(
++    encoder: *mut NmbEncoder,
++    heaps: *const *mut NmbHeap,
++    count: usize,
++    stages: u64,
++) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            Ok(Op::UseHeaps {
++                heaps: unsafe { decode_deferred_heaps(heaps, count)? },
++                stages: raw::<RenderStages>(stages, "render stages")?,
++            })
++        });
++    }
++    guard(false, || {
++        let refs = unsafe { decode_heaps(heaps, count)? };
++        match get_mut(encoder)? {
++            NmbEncoder::Compute(c) => c.use_heaps(&refs).map_err(e("use heaps"))?,
++            NmbEncoder::Render(r) => {
++                let stages = raw::<RenderStages>(stages, "render stages")?;
++                r.use_heaps(&refs, stages).map_err(e("use heaps"))?;
++            }
++            NmbEncoder::Blit(_) => return Err("not a compute or render encoder".into()),
++            NmbEncoder::Deferred(_) => return Err("deferred encoder".into()),
++        }
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_encoder_memory_barrier_scope(
++    encoder: *mut NmbEncoder,
++    scope: u64,
++    after_stages: u64,
++    before_stages: u64,
++) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            Ok(Op::BarrierScope {
++                scope: raw::<BarrierScope>(scope, "barrier scope")?,
++                after: raw::<RenderStages>(after_stages, "after render stages")?,
++                before: raw::<RenderStages>(before_stages, "before render stages")?,
++            })
++        });
++    }
++    guard(false, || {
++        let scope = raw::<BarrierScope>(scope, "barrier scope")?;
++        match get_mut(encoder)? {
++            NmbEncoder::Compute(c) => c.memory_barrier_with_scope(scope),
++            NmbEncoder::Render(r) => {
++                let after = raw::<RenderStages>(after_stages, "after render stages")?;
++                let before = raw::<RenderStages>(before_stages, "before render stages")?;
++                r.memory_barrier_with_scope(scope, after, before);
++            }
++            NmbEncoder::Blit(_) => return Err("not a compute or render encoder".into()),
++            NmbEncoder::Deferred(_) => return Err("deferred encoder".into()),
++        }
++        Ok(true)
++    })
++}
++
++/// # Safety
++/// `resources` is null when `count == 0`, or holds `count` valid `NmbResourceRef` entries.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_encoder_memory_barrier_resources(
++    encoder: *mut NmbEncoder,
++    resources: *const NmbResourceRef,
++    count: usize,
++    after_stages: u64,
++    before_stages: u64,
++) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            Ok(Op::BarrierResources {
++                resources: unsafe { decode_deferred_resources(resources, count)? },
++                after: raw::<RenderStages>(after_stages, "after render stages")?,
++                before: raw::<RenderStages>(before_stages, "before render stages")?,
++            })
++        });
++    }
++    guard(false, || {
++        let refs = unsafe { decode_resource_refs(resources, count)? };
++        match get_mut(encoder)? {
++            NmbEncoder::Compute(c) => c.memory_barrier_with_resources(&refs).map_err(e("memory barrier resources"))?,
++            NmbEncoder::Render(r) => {
++                let after = raw::<RenderStages>(after_stages, "after render stages")?;
++                let before = raw::<RenderStages>(before_stages, "before render stages")?;
++                r.memory_barrier_with_resources(&refs, after, before).map_err(e("memory barrier resources"))?;
++            }
++            NmbEncoder::Blit(_) => return Err("not a compute or render encoder".into()),
++            NmbEncoder::Deferred(_) => return Err("deferred encoder".into()),
++        }
++        Ok(true)
++    })
++}
++
+ // ---- encoders ----
+ 
+ pub enum NmbEncoder {
+@@ -2953,3 +3496,126 @@ pub extern "C" fn nmb_blit_generate_mipmaps(encoder: *mut NmbEncoder, texture: *
+         Ok(true)
+     })
+ }
++
++#[cfg(test)]
++mod m43_tests {
++    use super::*;
++
++    #[test]
++    fn slice_from_raw_handles_empty_and_null() {
++        assert!(unsafe { slice_from_raw::<u64>(std::ptr::null(), 0, "x") }.unwrap().is_empty());
++        assert!(unsafe { slice_from_raw::<u64>(std::ptr::null(), 1, "x") }.is_err());
++        assert!(unsafe { slice_from_raw::<u64>([1u64].as_ptr(), usize::MAX, "x") }.is_err());
++        let data = [10u64, 20];
++        assert_eq!(unsafe { slice_from_raw(data.as_ptr(), 2, "x") }.unwrap(), &[10, 20]);
++    }
++
++    #[test]
++    fn resource_and_stage_bitflags_validate() {
++        assert_eq!(raw::<ResourceUsage>(1 | 2 | 4, "usage").unwrap(), ResourceUsage::READ | ResourceUsage::WRITE | ResourceUsage::SAMPLE);
++        assert!(raw::<ResourceUsage>(0x100, "usage").is_err());
++        assert_eq!(raw::<RenderStages>(0x3, "stages").unwrap(), RenderStages::VERTEX | RenderStages::FRAGMENT);
++        assert!(raw::<RenderStages>(0x1000, "stages").is_err());
++        assert_eq!(raw::<BarrierScope>(1 | 2, "scope").unwrap(), BarrierScope::BUFFERS | BarrierScope::TEXTURES);
++        assert!(raw::<BarrierScope>(0x100, "scope").is_err());
++    }
++
++    #[test]
++    fn encoder_residency_and_barrier_reject_invalid_inputs() {
++        assert!(!unsafe { nmb_encoder_use_resources(std::ptr::null_mut(), std::ptr::null(), 0, 1, 3) });
++        assert!(!unsafe { CStr::from_ptr(nmb_last_error()) }.to_str().unwrap().is_empty());
++
++        let bad_ref = NmbResourceRef { kind: 99, handle: std::ptr::null() };
++        assert!(unsafe { decode_resource_refs(&bad_ref, 1) }.is_err());
++        assert!(unsafe { decode_deferred_resources(&bad_ref, 1) }.is_err());
++        assert!(unsafe { decode_resource_refs(std::ptr::null(), 2) }.is_err());
++
++        assert!(!unsafe { nmb_encoder_use_heaps(std::ptr::null_mut(), std::ptr::null(), 0, 3) });
++        assert!(!nmb_encoder_memory_barrier_scope(std::ptr::null_mut(), 1, 1, 2));
++        assert!(!unsafe { nmb_encoder_memory_barrier_resources(std::ptr::null_mut(), std::ptr::null(), 0, 1, 2) });
++
++        // Exercise actual FFI -> FuxiDeferred queuing path with NmbEncoder::Deferred
++        let slot = fuxi_deferred::new_test_slot(Arc::default());
++        let mut enc = NmbEncoder::Deferred(slot);
++        let enc_ptr: *mut NmbEncoder = &mut enc;
++
++        assert!(unsafe { nmb_encoder_use_resources(enc_ptr, std::ptr::null(), 0, 1, 3) });
++        assert!(unsafe { nmb_encoder_use_heaps(enc_ptr, std::ptr::null(), 0, 2) });
++        assert!(nmb_encoder_memory_barrier_scope(enc_ptr, 3, 1, 2));
++        assert!(unsafe { nmb_encoder_memory_barrier_resources(enc_ptr, std::ptr::null(), 0, 1, 2) });
++        // Invalid render stages/scope on deferred path must fail immediately without queuing
++        assert!(!unsafe { nmb_encoder_use_resources(enc_ptr, std::ptr::null(), 0, 1, 0x8000) });
++        assert!(!nmb_encoder_memory_barrier_scope(enc_ptr, 0x8000, 1, 2));
++
++        let ops = fuxi_deferred::take_test_ops(slot);
++        assert_eq!(ops.len(), 4);
++        assert!(matches!(ops[0], Op::UseResources { usage, stages, .. } if usage == ResourceUsage::READ && stages == (RenderStages::VERTEX | RenderStages::FRAGMENT)));
++        assert!(matches!(ops[1], Op::UseHeaps { stages, .. } if stages == RenderStages::FRAGMENT));
++        assert!(matches!(ops[2], Op::BarrierScope { scope, after, before } if scope == (BarrierScope::BUFFERS | BarrierScope::TEXTURES) && after == RenderStages::VERTEX && before == RenderStages::FRAGMENT));
++        assert!(matches!(ops[3], Op::BarrierResources { after, before, .. } if after == RenderStages::VERTEX && before == RenderStages::FRAGMENT));
++        unsafe { fuxi_deferred::free_test_slot(slot) };
++    }
++
++    #[test]
++    fn argument_descriptor_decode_and_abi_safety() {
++        let valid = NmbArgumentDescriptor {
++            data_type: DataType::Texture.as_raw() as u64,
++            index: 3,
++            array_length: 4,
++            access: BindingAccess::ReadOnly.as_raw() as u64,
++            texture_type: TextureType::Type2D.as_raw() as u64,
++            constant_block_alignment: 16,
++        };
++        let dec = decode_argument_descriptor(&valid).unwrap();
++        assert_eq!(dec.data_type, DataType::Texture);
++        assert_eq!(dec.index, 3);
++        assert_eq!(dec.array_length, 4);
++        assert_eq!(dec.access, BindingAccess::ReadOnly);
++        assert_eq!(dec.texture_type, TextureType::Type2D);
++        assert_eq!(dec.constant_block_alignment, 16);
++
++        let mut bad = valid;
++        bad.index = u64::MAX;
++        assert!(decode_argument_descriptor(&NmbArgumentDescriptor { data_type: 0xDEAD, ..valid }).is_err());
++        assert!(decode_argument_descriptor(&bad).is_err());
++        assert!(decode_argument_descriptor(&NmbArgumentDescriptor { access: 99, ..valid }).is_err());
++        assert!(decode_argument_descriptor(&NmbArgumentDescriptor { texture_type: 999, ..valid }).is_err());
++
++        assert_eq!(std::mem::size_of::<metal2vulkan_runtime::ResourceId>(), std::mem::size_of::<u64>());
++        assert_eq!(std::mem::align_of::<metal2vulkan_runtime::ResourceId>(), std::mem::align_of::<u64>());
++        assert_eq!(nmb_texture_gpu_resource_id(std::ptr::null()), 0);
++        assert_eq!(nmb_sampler_gpu_resource_id(std::ptr::null()), 0);
++        assert_eq!(nmb_argument_encoder_encoded_length(std::ptr::null()), 0);
++        assert_eq!(nmb_argument_encoder_alignment(std::ptr::null()), 0);
++        assert!(nmb_argument_encoder_constant_data(std::ptr::null(), 0).is_null());
++        assert!(!unsafe { nmb_argument_encoder_set_buffers(std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), 0, 0) });
++        assert_eq!(nmb_device_skipped_null_draws(std::ptr::null()), 0);
++    }
++
++    #[test]
++    fn device_answer_covers_six_optional_capabilities() {
++        let all = answer_selectors();
++        let find_kind = |name: &str| {
++            all.iter()
++                .find(|(s, _)| s.to_str().unwrap() == name)
++                .map(|(_, k)| *k)
++        };
++        assert_eq!(find_kind("gpuCoreCount"), Some(0));
++        assert_eq!(find_kind("maxVertexAmplificationCount"), Some(0));
++        assert_eq!(find_kind("maxComputeThreadgroupMemory"), Some(0));
++        assert_eq!(find_kind("isLargeMRTSupported"), Some(1));
++        assert_eq!(find_kind("supportsComputeCompressedTextureWrite"), Some(1));
++        assert_eq!(find_kind("supportsConditionalLoadStore"), Some(1));
++
++        assert_eq!(fallback_private_count_values(PrivateCount::GpuCoreCount, None, 8, 32768), Some(8));
++        assert_eq!(fallback_private_count_values(PrivateCount::GpuCoreCount, Some(16), 8, 32768), Some(16));
++        assert_eq!(fallback_private_count_values(PrivateCount::MaxVertexAmplificationCount, None, 8, 32768), Some(8));
++        assert_eq!(fallback_private_count_values(PrivateCount::MaxVertexAmplificationCount, None, 1, 32768), Some(1));
++        assert_eq!(fallback_private_count_values(PrivateCount::MaxComputeThreadgroupMemory, None, 8, 32768), Some(32768));
++
++        assert_eq!(fallback_private_flag_values(PrivateFlag::IsLargeMrtSupported, 8, 8), Some(true));
++        assert_eq!(fallback_private_flag_values(PrivateFlag::IsLargeMrtSupported, 4, 8), Some(false));
++        assert_eq!(fallback_private_flag_values(PrivateFlag::SupportsComputeCompressedTextureWrite, 8, 8), Some(false));
++        assert_eq!(fallback_private_flag_values(PrivateFlag::SupportsConditionalLoadStore, 8, 8), Some(false));
++    }
++}

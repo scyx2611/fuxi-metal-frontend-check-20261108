@@ -1,0 +1,75 @@
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 0517f18..7bc77bd 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -283,7 +283,7 @@ pub use queue::CommandQueue;
+ pub use rate_map::{RasterizationRateMap, RateMapProblem};
+ pub use rate_mapped_pass::RegionRefusal;
+ pub use rebind::RebindProblem;
+-pub use render::{DrawProblem, RenderCommandEncoder, ResolveTarget};
++pub use render::{skipped_null_pipeline_draws, DrawProblem, RenderCommandEncoder, ResolveTarget};
+ pub use render_pass::{
+     Attachment, RenderPassColorAttachmentDescriptor, RenderPassDepthAttachmentDescriptor,
+     RenderPassDescriptor, RenderPassProblem, RenderPassStencilAttachmentDescriptor,
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index d311ea1..59fad88 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -8037,6 +8037,23 @@ impl RenderCommandEncoder {
+ }
+ 
+ /// Everything one draw records into the secondary command buffer.
++static SKIPPED_NULL_PIPELINE_DRAWS: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++
++/// Number of draws skipped during recording because their pipeline was `vk::Pipeline::null()`
++/// (patch 0006).
++pub fn skipped_null_pipeline_draws() -> u64 {
++    SKIPPED_NULL_PIPELINE_DRAWS.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++fn skip_null_pipeline(pipeline: vk::Pipeline) -> bool {
++    if pipeline == vk::Pipeline::null() {
++        SKIPPED_NULL_PIPELINE_DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        return true;
++    }
++    false
++}
++
+ struct Recording<'a> {
+     raw: &'a ash::Device,
+     command_buffer: vk::CommandBuffer,
+@@ -8098,7 +8115,7 @@ impl Recording<'_> {
+     unsafe fn record(&self, bound: &mut Bound) -> u64 {
+         // A draw whose pipeline could not be created (the compile was refused) has a null pipeline; binding it crashes the driver
+         // (int-170: tu_CmdBindPipeline in the render server). The draw is dropped instead, and nothing is recorded for it.
+-        if self.pipeline == vk::Pipeline::null() {
++        if skip_null_pipeline(self.pipeline) {
+             return 0;
+         }
+         let (raw, cb) = (self.raw, self.command_buffer);
+@@ -8708,7 +8725,8 @@ fn late_store(
+ #[cfg(test)]
+ mod tests {
+     use super::{
+-        check_arguments, draw_problem, late_store, store_problem, DrawProblem, RenderPassProblem,
++        check_arguments, draw_problem, late_store, skip_null_pipeline, skipped_null_pipeline_draws,
++        store_problem, DrawProblem, RenderPassProblem,
+     };
+     use crate::{Attachment, StoreAction};
+ 
+@@ -8848,4 +8866,14 @@ mod tests {
+             );
+         }
+     }
++
++    #[test]
++    fn skipped_null_pipeline_counter_increments_only_on_null() {
++        use ash::vk::{self, Handle as _};
++        let before = skipped_null_pipeline_draws();
++        assert!(!skip_null_pipeline(vk::Pipeline::from_raw(1)));
++        assert_eq!(skipped_null_pipeline_draws(), before);
++        assert!(skip_null_pipeline(vk::Pipeline::null()));
++        assert!(skipped_null_pipeline_draws() >= before + 1);
++    }
+ }
