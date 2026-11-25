@@ -10,7 +10,7 @@ index 340f89b..88c1202 100644
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
-@@ -229,6 +230,42 @@ dw_close_connection(void)
+@@ -229,6 +230,43 @@ dw_close_connection(void)
     }
  }
  
