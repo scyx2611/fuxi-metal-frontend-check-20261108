@@ -1,0 +1,607 @@
+diff --git a/NativeBridgeMetalFrontend.h b/NativeBridgeMetalFrontend.h
+index 5c0c7ca..a4194c1 100644
+--- a/NativeBridgeMetalFrontend.h
++++ b/NativeBridgeMetalFrontend.h
+@@ -16,6 +16,7 @@ size_t native_bridge_metal_status(char *out, size_t size);
+ // The pixel formats of the textures asked for (first eight distinct) and how many texture requests the runtime refused.
+ size_t native_bridge_metal_formats(char *out, size_t size);
+ size_t native_bridge_metal_telemetry(char *out, size_t size);
++void native_bridge_metal_trim_surface_imports(void);
+ // Structured cumulative artifact/driver-cache counters for offline qualification.
+ struct NmbShaderCacheStats;
+ bool native_bridge_metal_shader_cache_stats(struct NmbShaderCacheStats *out);
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 33313ac..aaa3fc9 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -13,9 +13,12 @@
+ #import <objc/runtime.h>
+ #include <algorithm>
+ #include <atomic>
++#include <list>
++#include <map>
+ #include <mutex>
+ #include <pthread.h>
+ #include <string>
++#include <tuple>
+ #include <unordered_map>
+ #include <vector>
+ #include <sys/mman.h>
+@@ -236,7 +239,17 @@ static CommitRecord gCommitRing[32];
+ static std::mutex gCommitLock;
+ static std::mutex gProblemLock;
+ static char gLastProblems[2][200];
++static void noteFirstLostOnce(const char *where) {
++ if(!gDevice)return;
++ static std::atomic<bool> logged{false};
++ if(logged.load(std::memory_order_acquire))return;
++ char report[2048]={};
++ if(nmb_device_first_lost_report(gDevice,report,sizeof report)>0 && !logged.exchange(true,std::memory_order_acq_rel)) {
++  fprintf(stderr,"FUXI MTL FIRST LOST (%s): %.200s\n",where?where:"unknown",report);
++ }
++}
+ static void noteProblem(NSString *what) {
++ noteFirstLostOnce("problem");
+  fuxiFailure(what.UTF8String);
+  gProblems++;
+  std::lock_guard<std::mutex> lock(gProblemLock);
+@@ -338,6 +351,7 @@ static void waitForResource(id resource);
+ @property(nonatomic) NmbBuffer *handle;
+ @property(nonatomic) MTLResourceOptions options;
+ @property(nonatomic) void *wrapped;
++@property(nonatomic) IOSurfaceRef importedSurface;
+ @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
+ @property(nonatomic) NSUInteger heapOffset;
+ @end
+@@ -382,34 +396,136 @@ static void releaseSurface(void *context,void *,uint64_t) {gSurfaceImportsReleas
+ - (IOSurfaceRef)iosurface { try { @try {return nullptr;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }   // a buffer is never the backing of a surface here (surfaces back textures)
+ NB_RESOURCE_SPI
+ @end
+-// Reuse only an import still held by a texture/view or pending command. Weak
+-// values never extend a GPU allocation's lifetime. The strong buffer snapshot
+-// and its retained surface prevent object/address reuse during a hit. A new
+-// mapping, allocation identity or size needs a separate import; ordinary
+-// caller-owned no-copy buffers do not enter this cache.
++// Reuse an import while anything else in this process still retains its surface (plus bounded 128-entry LRU cap and
++// shape/purgeability validation). Never record the caller's temporary IOSurfaceRef: record buffer.importedSurface so
++// releaseSurface's retain keeps the object valid until after NBBuffer deallocates (avoiding PAC/isa UAF).
++using HeldImportKey = std::tuple<uint64_t,uint64_t,uint64_t>;
++struct SurfaceImportKey {uint64_t identity,address,bytes;};
++struct HeldImport {
++ NBBuffer *buffer;
++ IOSurfaceRef surface;
++ size_t width;
++ size_t height;
++ OSType pixelFormat;
++ std::list<HeldImportKey>::iterator lruIt;
++};
++static constexpr size_t kMaxHeldImports = 128;
+ static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
+ static std::mutex gSurfaceImportLock;
++static auto &gHeldImports=*new std::map<HeldImportKey,HeldImport>;
++static auto &gHeldImportOrder=*new std::list<HeldImportKey>;
++static NSUInteger gSurfaceImportsPruned=64;
++static bool isSurfacePurgeableOk(IOSurfaceRef surface) {
++ if(!surface)return false;
++ uint32_t state=0;
++ return IOSurfaceSetPurgeable(surface,kIOSurfacePurgeableKeepCurrent,&state)==KERN_SUCCESS &&
++        state==kIOSurfacePurgeableNonVolatile;
++}
++static bool isSurfaceShapeValid(const HeldImport &entry,IOSurfaceRef callerSurface) {
++ return callerSurface &&
++        IOSurfaceGetWidth(callerSurface)==entry.width &&
++        IOSurfaceGetHeight(callerSurface)==entry.height &&
++        IOSurfaceGetPixelFormat(callerSurface)==entry.pixelFormat &&
++        isSurfacePurgeableOk(entry.surface);
++}
++static void eraseHeldImportLocked(std::map<HeldImportKey,HeldImport>::iterator it,std::vector<NBBuffer *> &gone) {
++ if(gSurfaceImports) {
++  const SurfaceImportKey k={std::get<0>(it->first),std::get<1>(it->first),std::get<2>(it->first)};
++  if(NSValue *nsKey=[NSValue valueWithBytes:&k objCType:@encode(SurfaceImportKey)])[gSurfaceImports removeObjectForKey:nsKey];
++ }
++ gHeldImportOrder.erase(it->second.lruIt);
++ gone.push_back(it->second.buffer);
++ gHeldImports.erase(it);
++}
++static void pruneHeldImports(bool all,std::vector<NBBuffer *> &gone,const HeldImportKey *exempt=nullptr) {
++ for(auto it=gHeldImports.begin();it!=gHeldImports.end();) {
++  auto cur=it++;
++  if(!all && exempt && cur->first==*exempt)continue;
++  if(all || CFGetRetainCount(cur->second.surface)<=1 || !isSurfacePurgeableOk(cur->second.surface)) {
++   eraseHeldImportLocked(cur,gone);
++  }
++ }
++}
++static void trimHeldImports(bool all) {
++ std::vector<NBBuffer *> gone;
++ {std::lock_guard<std::mutex> lock(gSurfaceImportLock);pruneHeldImports(all,gone);}
++ gone.clear();   // release last frontend references outside lock
++}
++extern "C" void native_bridge_metal_trim_surface_imports(void) {trimHeldImports(false);}
++static void watchImportPressure() {
++ static dispatch_once_t once;
++ dispatch_once(&once,^{
++  dispatch_source_t source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
++   DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
++  if(!source)return;
++  dispatch_source_set_event_handler(source,^{
++   trimHeldImports(true);
++   if(gDevice)(void)nmb_device_release_kept_memory(gDevice);
++  });
++  dispatch_activate(source);
++ });
++}
++static void holdImportLocked(const HeldImportKey &k,NBBuffer *buffer,std::vector<NBBuffer *> &gone) {
++ pruneHeldImports(false,gone,&k);
++ auto existing=gHeldImports.find(k);
++ if(existing!=gHeldImports.end()) {
++  if(existing->second.buffer==buffer) {
++   gHeldImportOrder.splice(gHeldImportOrder.begin(),gHeldImportOrder,existing->second.lruIt);
++   if(gSurfaceImports) {
++    const SurfaceImportKey sk={std::get<0>(k),std::get<1>(k),std::get<2>(k)};
++    if(NSValue *nsKey=[NSValue valueWithBytes:&sk objCType:@encode(SurfaceImportKey)])[gSurfaceImports setObject:buffer forKey:nsKey];
++   }
++   return;
++  }
++  eraseHeldImportLocked(existing,gone);
++ }
++ while(gHeldImports.size()>=kMaxHeldImports && !gHeldImportOrder.empty()) {
++  const HeldImportKey lruKey=gHeldImportOrder.back();
++  auto victim=gHeldImports.find(lruKey);
++  if(victim!=gHeldImports.end())eraseHeldImportLocked(victim,gone);
++  else gHeldImportOrder.pop_back();
++ }
++ gHeldImportOrder.push_front(k);
++ IOSurfaceRef kept=buffer.importedSurface;
++ gHeldImports[k]={buffer,kept,IOSurfaceGetWidth(kept),IOSurfaceGetHeight(kept),IOSurfaceGetPixelFormat(kept),gHeldImportOrder.begin()};
++ if(gSurfaceImports) {
++  const SurfaceImportKey sk={std::get<0>(k),std::get<1>(k),std::get<2>(k)};
++  if(NSValue *nsKey=[NSValue valueWithBytes:&sk objCType:@encode(SurfaceImportKey)])[gSurfaceImports setObject:buffer forKey:nsKey];
++ }
++}
+ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+- struct Key {uint64_t identity,address,bytes;};
+- const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
+- NSValue *key=value.identity?[NSValue valueWithBytes:&value objCType:@encode(Key)]:nil;
++ const SurfaceImportKey value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
++ const HeldImportKey heldKey={value.identity,value.address,value.bytes};
++ NSValue *key=value.identity?[NSValue valueWithBytes:&value objCType:@encode(SurfaceImportKey)]:nil;
++ watchImportPressure();
++ std::vector<NBBuffer *> gone;   // declared before lock: released after unlock
+  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
+  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
+  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
+- if(buffer)return buffer;
++ if(buffer) {
++  auto existing=gHeldImports.find(heldKey);
++  if(existing!=gHeldImports.end() && existing->second.buffer==buffer &&
++     buffer.importedSurface && CFGetRetainCount(buffer.importedSurface)>1 &&
++     isSurfaceShapeValid(existing->second,surface)) {
++   holdImportLocked(heldKey,buffer,gone);
++   return buffer;
++  }
++  if(existing!=gHeldImports.end())eraseHeldImportLocked(existing,gone);
++  else [gSurfaceImports removeObjectForKey:key];
++  buffer=nil;
++ }
+  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
+  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
+  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
+- gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
++ gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.importedSurface=surface;
+  if(key) {
+-  // Bound metadata without retaining old frames. Evicting an association is
+-  // harmless: its owners still retain the actual import until their own end.
+-  if(gSurfaceImports.count>=256) {
++  if(gSurfaceImports.count>=gSurfaceImportsPruned) {
+    for(NSValue *old in gSurfaceImports.keyEnumerator.allObjects)
+     if(![gSurfaceImports objectForKey:old])[gSurfaceImports removeObjectForKey:old];
+-   if(gSurfaceImports.count>=256)[gSurfaceImports removeObjectForKey:gSurfaceImports.keyEnumerator.nextObject];
++   gSurfaceImportsPruned=MAX(gSurfaceImports.count*2,(NSUInteger)64);
+   }
+   [gSurfaceImports setObject:buffer forKey:key];
++  holdImportLocked(heldKey,buffer,gone);
+  }
+  return buffer;
+ }
+@@ -1228,6 +1344,7 @@ static void overlapCommitted(void *context,const char *why);
+  // Actual GPU completion (or a local refusal that never submitted) is the
+  // release point. A retained completed command must not pin every old frame.
+  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
++ trimHeldImports(false);
+  @synchronized(gInFlight){[gInFlight removeObject:self];}
+  @synchronized(self){
+   // A frontend refusal or a failed submission never scheduled. Unblock its waiter without inventing a scheduled event.
+@@ -1388,6 +1505,7 @@ static void completed(void *context) {
+  gCompleted++;
+  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
+  if(nmb_command_buffer_status(commandBuffer.handle)==MTLCommandBufferStatusError){
++  noteFirstLostOnce("completed");
+   char text[512]={};nmb_command_buffer_error(commandBuffer.handle,text,sizeof(text));
+   // Patch 0014: only a relayed failure has a description; name the rest instead of reporting an empty reason.
+   if(!text[0])snprintf(text,sizeof(text),"native-metal: command buffer completed with an error and no description (last: %s)",nmb_last_error());
+@@ -1827,6 +1945,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+ 
+ @interface NBDeviceMethods : NSObject
+ @end
++static BOOL supportsFamilyImpl(id self,MTLGPUFamily family,const void *caller);
+ #include "FuxiTextureLayout.inc"
+ 
+ @implementation NBDeviceMethods
+@@ -1860,9 +1979,13 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+ - (BOOL)isRemovable { try { @try {return NO;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (BOOL)isHeadless { try { @try {return NO;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // supportsFamily: and the other queries the runtime answers are installed from it (installAnswers); supportsFamily: also answers the target
+-// hardware's families (the bridge's TARGET_FAMILIES, journaled with their waived rows as F lines). No legacy feature set is claimed: the
+-// base implementation reads Apple tables this device does not have.
+-- (BOOL)supportsFeatureSet:(MTLFeatureSet)set { try { @try {(void)set;return NO;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++// hardware's families (the bridge's TARGET_FAMILIES, journaled with their waived rows as F lines). Legacy iOS feature sets map directly
++// to Apple GPU families (MTLGPUFamilyApple1..5) and invoke supportsFamilyImpl directly with caller's return address (preserving RenderBox guard).
++- (BOOL)supportsFeatureSet:(MTLFeatureSet)set { const void *caller=__builtin_return_address(0); try { @try {
++ static const uint8_t families[]={1,2,1,2,3,1,2,3,1,2,3,4,1,2,3,4,5};
++ if((NSUInteger)set>=sizeof families)return NO;
++ return supportsFamilyImpl(self,(MTLGPUFamily)(MTLGPUFamilyApple1+families[set]-1),caller);
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // The original discovery (_MTLAddDevice) runs these four on every device it registers. The target's own versions fill the base class's limits
+ // and feature tables from a hardware profile (`featureProfile`, `indirectArgumentBufferCapabilities`, a table of Apple GPUs) that this device
+ // has not got: running them would claim an Apple GPU's capabilities. They are empty here, so a limit or feature the runtime measured is answered
+@@ -2149,6 +2272,18 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+ }
+ static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
+ static BOOL flagArgAnswer(id,SEL cmd,NSUInteger arg) {return askAnswer(cmd,arg)!=0;}
++static BOOL (*gFamilyAnswer)(id,SEL,NSInteger);
++static BOOL supportsFamilyImpl(id self,MTLGPUFamily family,const void *caller) {
++ if((NSInteger)family>=1003 && (NSInteger)family<2000 && caller) {   // MTLGPUFamilyApple3 and up
++  Dl_info info{};
++  if(dladdr(caller,&info) && info.dli_fname && strstr(info.dli_fname,"/RenderBox.framework/"))return NO;
++ }
++ return gFamilyAnswer?gFamilyAnswer(self,@selector(supportsFamily:),(NSInteger)family):NO;
++}
++static BOOL familyForCaller(id self,SEL _cmd,NSInteger family) {
++ (void)_cmd;
++ return supportsFamilyImpl(self,(MTLGPUFamily)family,__builtin_return_address(0));
++}
+ static bool unavailableOptionalAnswer(const char *name,const char *reason) {
+  return name && reason && std::string(reason)==std::string("the device has no answer for ")+name;
+ }
+@@ -2184,10 +2319,16 @@ static void installAnswers(Class cls) {
+   case NMB_ANSWER_FLAG_ARG: class_replaceMethod(cls,sel,(IMP)flagArgAnswer,"B24@0:8Q16");break;
+   }
+  }
++ if(Method family=class_getInstanceMethod(cls,@selector(supportsFamily:))) {
++  gFamilyAnswer=(BOOL (*)(id,SEL,NSInteger))method_getImplementation(family);
++  method_setImplementation(family,(IMP)familyForCaller);
++ }
+ }
+ 
+ static void fuxiDeviceInitialize(Class,SEL) {}
+ 
++// Process gate/cache decoupling: foreground apps drive gFuxiHooks via ForegroundClientGate and never read or write
++// /private/var/db/fuxi-metal/gate.state; per-process diagnostics write only to each process's own <cache>/last-lost.log.
+ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
+  if(gDeviceObject)return gDeviceObject;
+ #if TARGET_OS_IPHONE
+@@ -2199,6 +2340,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
+  const std::string turnip=fuxiTurnipLoader(loader);
+  gDevice=nmb_device_open(loader?turnip.c_str():nullptr,cache);
+  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
++ watchImportPressure();
+  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+  // Before this boot's first line (the F lines below): the prewarm reads only what earlier boots wrote.
+  if(!gJournalPath.empty()){struct stat st;if(stat(gJournalPath.c_str(),&st)==0)gJournalOpenSize=(uint64_t)st.st_size;}
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index 70f6eba..07c5daa 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -55,6 +55,8 @@ bool nmb_device_answer(const NmbDevice *, const char *selector, uint64_t arg, ui
+ size_t nmb_device_vendor_name(const NmbDevice *, char *out, size_t size);
+ size_t nmb_device_family_waivers(const NmbDevice *, char *out, size_t size); /* the target families' rows not met, one family per line */
+ uint64_t nmb_device_linear_bytes_per_row(const NmbDevice *, uint64_t format, uint64_t width); /* 0: refused */
++size_t nmb_device_release_kept_memory(const NmbDevice *);
++size_t nmb_device_first_lost_report(const NmbDevice *, char *out, size_t size);
+ 
+ typedef struct NmbBinaryArchive NmbBinaryArchive;
+ NmbBinaryArchive *nmb_binary_archive_new(NmbDevice *, const char *path /* NULL: empty */);
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 799aadc..0827fef 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -23,9 +23,11 @@ use metal2vulkan_runtime::{
+     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
+ };
+ use std::cell::RefCell;
+-use std::ffi::{c_char, c_void, CStr};
++use std::collections::VecDeque;
++use std::ffi::{c_char, c_int, c_void, CStr, CString};
++use std::io::Write as _;
+ use std::panic::Location;
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use std::ptr::NonNull;
+ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+@@ -157,7 +159,7 @@ pub unsafe extern "C" fn nmb_function_constant_air(length: *mut usize) -> *const
+ 
+ // ---- device ----
+ 
+-pub struct NmbDevice(Device, std::sync::OnceLock<PrivateProperties>, std::sync::Mutex<()>);
++pub struct NmbDevice(Device, std::sync::OnceLock<PrivateProperties>, std::sync::Mutex<()>, PathBuf, PathBuf, AtomicBool);
+ 
+ impl NmbDevice {
+     /// The runtime judges the private properties by the family rows once.
+@@ -176,12 +178,21 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
+         }
+         // SAFETY: the caller's contract.
+         let (loader, cache) = unsafe { (CStr::from_ptr(loader), CStr::from_ptr(cache)) };
++        let loader_path = PathBuf::from(loader.to_string_lossy().into_owned());
++        let cache_dir = PathBuf::from(cache.to_string_lossy().into_owned());
+         let mut options = DeviceOptions::default();
+-        options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
++        options.loader = Some(loader_path.clone());
+         options.metal_level = Some(MetalLevel::NEWEST);
+-        options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
++        options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache_dir.clone());
+         options.messages = Some(MessageSink::new(observe_message));
+-        Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
++        Ok(boxed(NmbDevice(
++            Device::system_default_with(&options).map_err(e("device"))?,
++            std::sync::OnceLock::new(),
++            std::sync::Mutex::new(()),
++            loader_path,
++            cache_dir,
++            AtomicBool::new(false),
++        )))
+     })
+ }
+ 
+@@ -191,6 +202,7 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
+ static PIPELINE_MAKINGS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5]; // n, us, max us, waited us, failed
+ static OTHER_MESSAGES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];      // info, warning or worse
+ static LAST_WARNING: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
++static VK_ERROR_RING: std::sync::Mutex<VecDeque<String>> = std::sync::Mutex::new(VecDeque::new());
+ 
+ fn millis_after(text: &str, marker: &str) -> Option<f64> {
+     let at = text.find(marker)? + marker.len();
+@@ -217,9 +229,17 @@ fn observe_message(message: &DebugMessage) {
+         // Lost-device diagnostic (patch 0014): with a messenger registered the driver's errors (Turnip's
+         // vk_device_set_lost reason among them) come only here, never to stderr. Print the first 32.
+         static ERRORS_SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+-        if message.severity >= MessageSeverity::Error && ERRORS_SHOWN.fetch_add(1, Relaxed) < 32 {
++        if message.severity >= MessageSeverity::Error {
+             let text: String = message.text.chars().take(400).collect();
+-            eprintln!("FUXI NMB VK ERROR: [{}] {}", message.id_name, text);
++            if ERRORS_SHOWN.fetch_add(1, Relaxed) < 32 {
++                eprintln!("FUXI NMB VK ERROR: [{}] {}", message.id_name, text);
++            }
++            if let Ok(mut ring) = VK_ERROR_RING.lock() {
++                while ring.len() >= 32 {
++                    ring.pop_front();
++                }
++                ring.push_back(format!("[{}] {}", message.id_name, text));
++            }
+         }
+         OTHER_MESSAGES[1].fetch_add(1, Relaxed);
+         if let Ok(mut last) = LAST_WARNING.lock() {
+@@ -532,6 +552,222 @@ pub extern "C" fn nmb_device_vendor_name(device: *const NmbDevice, out: *mut c_c
+     })
+ }
+ 
++#[cfg(unix)]
++fn query_turnip_lost_reason(loader: &Path) -> Option<String> {
++    #[cfg(target_vendor = "apple")]
++    const RTLD_NOW_NOLOAD: c_int = 0x2 | 0x10;
++    #[cfg(not(target_vendor = "apple"))]
++    const RTLD_NOW_NOLOAD: c_int = 0x2 | 0x4;
++
++    unsafe extern "C" {
++        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
++        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
++        fn dlclose(handle: *mut c_void) -> c_int;
++    }
++
++    let c_loader = CString::new(loader.as_os_str().as_encoded_bytes()).ok()?;
++    // SAFETY: `c_loader` is a valid NUL-terminated path and `RTLD_NOLOAD` only inspects an already loaded image.
++    let handle = unsafe { dlopen(c_loader.as_ptr(), RTLD_NOW_NOLOAD) };
++    if handle.is_null() {
++        return None;
++    }
++    // SAFETY: valid symbol lookup on an open handle; closed before returning.
++    let sym = unsafe { dlsym(handle, c"tu_darwin_last_lost_reason".as_ptr()) };
++    let out = if sym.is_null() {
++        None
++    } else {
++        // SAFETY: `tu_darwin_last_lost_reason` has C ABI `size_t (*)(char *, size_t)`.
++        let query: unsafe extern "C" fn(*mut c_char, usize) -> usize = unsafe { std::mem::transmute(sym) };
++        let mut buf = vec![0u8; 512];
++        // SAFETY: `buf` is writable for `buf.len()` bytes.
++        let n = unsafe { query(buf.as_mut_ptr() as *mut c_char, buf.len()) };
++        if n > 0 {
++            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
++            let s = String::from_utf8_lossy(&buf[..end]).into_owned();
++            if s.is_empty() { None } else { Some(s) }
++        } else {
++            None
++        }
++    };
++    // SAFETY: closes the `dlopen` reference acquired above.
++    unsafe { dlclose(handle) };
++    out
++}
++
++#[cfg(not(unix))]
++fn query_turnip_lost_reason(_loader: &Path) -> Option<String> {
++    None
++}
++
++const FORBIDDEN_LAST_LOST_PREFIXES: &[&str] = &["/private/var/db/fuxi-metal", "/var/db/fuxi-metal"];
++
++fn has_forbidden_prefix(path: &Path, forbidden_prefixes: &[&Path]) -> bool {
++    forbidden_prefixes.iter().any(|prefix| path.starts_with(prefix))
++}
++
++fn is_forbidden_last_lost_cache_dir_against(cache: &Path, forbidden_prefixes: &[&Path]) -> bool {
++    if cache.as_os_str().is_empty() {
++        return true;
++    }
++    if cache.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
++        return true;
++    }
++    let normalized: PathBuf = cache
++        .components()
++        .filter(|c| !matches!(c, std::path::Component::CurDir))
++        .collect();
++    if has_forbidden_prefix(&normalized, forbidden_prefixes) {
++        return true;
++    }
++    if let Ok(canon) = std::fs::canonicalize(&normalized) {
++        if has_forbidden_prefix(&canon, forbidden_prefixes) {
++            return true;
++        }
++    } else {
++        let mut cur = normalized.as_path();
++        while let Some(parent) = cur.parent() {
++            if parent.as_os_str().is_empty() {
++                break;
++            }
++            if let Ok(canon_parent) = std::fs::canonicalize(parent) {
++                if let Ok(tail) = normalized.strip_prefix(parent) {
++                    let resolved = canon_parent.join(tail);
++                    if has_forbidden_prefix(&resolved, forbidden_prefixes) {
++                        return true;
++                    }
++                }
++                break;
++            }
++            cur = parent;
++        }
++    }
++    false
++}
++
++fn is_forbidden_last_lost_cache_dir(cache: &Path) -> bool {
++    let prefixes = [
++        Path::new(FORBIDDEN_LAST_LOST_PREFIXES[0]),
++        Path::new(FORBIDDEN_LAST_LOST_PREFIXES[1]),
++    ];
++    is_forbidden_last_lost_cache_dir_against(cache, &prefixes)
++}
++
++fn write_last_lost_log_to_cache(cache: &Path, report: &str) {
++    if is_forbidden_last_lost_cache_dir(cache) {
++        return;
++    }
++    let tmp_path = cache.join("last-lost.log.tmp");
++    let final_path = cache.join("last-lost.log");
++    let result = (|| -> std::io::Result<()> {
++        let mut file = std::fs::OpenOptions::new()
++            .create(true)
++            .write(true)
++            .truncate(true)
++            .open(&tmp_path)?;
++        file.write_all(report.as_bytes())?;
++        file.sync_all()?;
++        drop(file);
++        std::fs::rename(&tmp_path, &final_path)?;
++        Ok(())
++    })();
++    if let Err(err) = result {
++        eprintln!("FUXI NMB: failed to write {}: {err}", final_path.display());
++    }
++}
++
++fn write_last_lost_log_once(dev: &NmbDevice, report: &str) {
++    if dev.5.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
++        return;
++    }
++    eprintln!("FUXI NMB FIRST LOST:\n{report}");
++    write_last_lost_log_to_cache(&dev.4, report);
++}
++
++#[cfg(test)]
++mod last_lost_tests {
++    use super::*;
++
++    #[test]
++    fn rejects_var_and_private_var_and_parent_traversal() {
++        assert!(is_forbidden_last_lost_cache_dir(Path::new("")));
++        assert!(is_forbidden_last_lost_cache_dir(Path::new("/private/var/db/fuxi-metal")));
++        assert!(is_forbidden_last_lost_cache_dir(Path::new("/private/var/db/fuxi-metal/app")));
++        assert!(is_forbidden_last_lost_cache_dir(Path::new("/var/db/fuxi-metal")));
++        assert!(is_forbidden_last_lost_cache_dir(Path::new("/var/db/fuxi-metal/app")));
++        assert!(is_forbidden_last_lost_cache_dir(Path::new("/var/./db//fuxi-metal/")));
++        assert!(is_forbidden_last_lost_cache_dir(Path::new("/tmp/safe/../var/db/fuxi-metal")));
++        assert!(!is_forbidden_last_lost_cache_dir(Path::new("/var/db/fuxi-metal-other")));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn canonicalize_blocks_symlink_and_writes_safe_dir() {
++        let base = std::env::temp_dir().join(format!("fuxi_last_lost_test_{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&base);
++        let forbidden_real = base.join("private/var/db/fuxi-metal");
++        let safe_dir = base.join("app_cache");
++        let symlink_var = base.join("var_link");
++        std::fs::create_dir_all(&forbidden_real).unwrap();
++        std::fs::create_dir_all(&safe_dir).unwrap();
++        std::os::unix::fs::symlink(base.join("private/var"), &symlink_var).unwrap();
++
++        let canon_forbidden = std::fs::canonicalize(&forbidden_real).unwrap();
++        let prefixes = [canon_forbidden.as_path()];
++
++        let via_symlink = symlink_var.join("db/fuxi-metal");
++        assert!(is_forbidden_last_lost_cache_dir_against(&via_symlink, &prefixes));
++        let via_symlink_sub = symlink_var.join("db/fuxi-metal/app_not_created_yet");
++        assert!(is_forbidden_last_lost_cache_dir_against(&via_symlink_sub, &prefixes));
++        assert!(!is_forbidden_last_lost_cache_dir_against(&safe_dir, &prefixes));
++
++        // Actual atomic write in safe_dir + no-op on /var/db/fuxi-metal
++        write_last_lost_log_to_cache(&safe_dir, "first_loss stage=test\n");
++        let written = std::fs::read_to_string(safe_dir.join("last-lost.log")).unwrap();
++        assert_eq!(written, "first_loss stage=test\n");
++        assert!(!safe_dir.join("last-lost.log.tmp").exists());
++
++        write_last_lost_log_to_cache(Path::new("/var/db/fuxi-metal"), "should_not_write");
++        write_last_lost_log_to_cache(Path::new("/var/db/fuxi-metal/app"), "should_not_write");
++        write_last_lost_log_to_cache(Path::new("/private/var/db/fuxi-metal"), "should_not_write");
++
++        let _ = std::fs::remove_dir_all(&base);
++    }
++}
++
++/// Releases all idle pooled `VkImage` entries and empty kept memory blocks back to Vulkan.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_device_release_kept_memory(device: *const NmbDevice) -> usize {
++    guard(0, || Ok(get(device)?.0.release_kept_memory()))
++}
++
++/// Returns the first-loss diagnostics report (with optional Turnip `tu_darwin_last_lost_reason` and recent VK errors)
++/// and atomically writes `<cache>/last-lost.log` once per device.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_device_first_lost_report(device: *const NmbDevice, out: *mut c_char, size: usize) -> usize {
++    guard(0, || {
++        let dev = get(device)?;
++        let runtime_report = dev.0.first_loss_report_text();
++        let turnip_reason = query_turnip_lost_reason(&dev.3);
++        if runtime_report.is_none() && turnip_reason.is_none() {
++            return Ok(0);
++        }
++        let mut report = runtime_report.unwrap_or_else(|| "first_loss stage=turnip_or_external\n".to_string());
++        if let Some(reason) = turnip_reason {
++            report.push_str(&format!("turnip_last_lost_reason={reason}\n"));
++        }
++        if let Ok(ring) = VK_ERROR_RING.lock() {
++            if !ring.is_empty() {
++                report.push_str(&format!("vk_error_ring({}):\n", ring.len()));
++                for (idx, line) in ring.iter().enumerate() {
++                    report.push_str(&format!("  [{idx}] {line}\n"));
++                }
++            }
++        }
++        write_last_lost_log_once(dev, &report);
++        Ok(copy_out(&report, out, size))
++    })
++}
++
+ // ---- buffers ----
+ 
+ pub struct NmbBuffer(Buffer);

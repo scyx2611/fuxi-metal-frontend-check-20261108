@@ -1,0 +1,265 @@
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 1d41abc..8476ad2 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -720,6 +720,13 @@ impl Device {
+         freed_images + freed_blocks
+     }
+ 
++    /// Return cumulative `ImagePool` telemetry `(hits, misses, evicts, entries, bytes)` for
++    /// bridge and `BackboardGate` observability.
++    pub fn image_pool_stats(&self) -> (u64, u64, u64, usize, u64) {
++        let stats = self.shared().image_pool.telemetry_stats();
++        (stats.hits, stats.misses, stats.evicts, stats.entries, stats.bytes)
++    }
++
+     /// Evict idle pooled `VkImage` entries whose 10-second TTL has expired, returning the number
+     /// of images destroyed.
+     pub fn age_kept_memory(&self) -> usize {
+diff --git a/crates/metal2vulkan-runtime/src/image_pool.rs b/crates/metal2vulkan-runtime/src/image_pool.rs
+index 4f6d9f3..08d8ee4 100644
+--- a/crates/metal2vulkan-runtime/src/image_pool.rs
++++ b/crates/metal2vulkan-runtime/src/image_pool.rs
+@@ -17,6 +17,7 @@ use crate::memory::{Memory, MemoryClass, Placement};
+ use crate::release;
+ use ash::vk;
+ use std::collections::VecDeque;
++use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::Mutex;
+ use std::time::{Duration, Instant};
+ 
+@@ -108,10 +109,23 @@ impl ImagePoolInner {
+     }
+ }
+ 
++/// Snapshot of [`ImagePool`] atomic telemetry counters and current pool occupancy.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(super) struct ImagePoolStats {
++    pub(super) hits: u64,
++    pub(super) misses: u64,
++    pub(super) evicts: u64,
++    pub(super) entries: usize,
++    pub(super) bytes: u64,
++}
++
+ /// Per-device pool of idle runtime-owned `VkImage` objects and their bound placements.
+ #[derive(Default)]
+ pub(super) struct ImagePool {
+     inner: Mutex<ImagePoolInner>,
++    hits: AtomicU64,
++    misses: AtomicU64,
++    evicts: AtomicU64,
+ }
+ 
+ impl ImagePool {
+@@ -135,6 +149,15 @@ impl ImagePool {
+         if let Some(ref image) = hit {
+             inner.total_bytes = inner.total_bytes.saturating_sub(image.placement.size());
+         }
++        drop(inner);
++        if !expired.is_empty() {
++            self.evicts.fetch_add(expired.len() as u64, Ordering::Relaxed);
++        }
++        if hit.is_some() {
++            self.hits.fetch_add(1, Ordering::Relaxed);
++        } else {
++            self.misses.fetch_add(1, Ordering::Relaxed);
++        }
+         (hit, expired)
+     }
+ 
+@@ -148,6 +171,7 @@ impl ImagePool {
+         let size = image.placement.size();
+         if size > MAX_POOL_ENTRY_BYTES {
+             evicted.push(image);
++            self.evicts.fetch_add(1, Ordering::Relaxed);
+             return evicted;
+         }
+         let mut inner = lock(&self.inner);
+@@ -169,6 +193,10 @@ impl ImagePool {
+             image,
+             returned_at: now,
+         });
++        drop(inner);
++        if !evicted.is_empty() {
++            self.evicts.fetch_add(evicted.len() as u64, Ordering::Relaxed);
++        }
+         evicted
+     }
+ 
+@@ -189,6 +217,9 @@ impl ImagePool {
+     pub(super) fn drain_expired_at(&self, now: Instant) -> Vec<PooledImage> {
+         let mut expired = Vec::new();
+         lock(&self.inner).evict_expired(now, &mut expired);
++        if !expired.is_empty() {
++            self.evicts.fetch_add(expired.len() as u64, Ordering::Relaxed);
++        }
+         expired
+     }
+ 
+@@ -196,7 +227,12 @@ impl ImagePool {
+     pub(super) fn drain_all(&self) -> Vec<PooledImage> {
+         let mut inner = lock(&self.inner);
+         inner.total_bytes = 0;
+-        inner.entries.drain(..).map(|entry| entry.image).collect()
++        let drained: Vec<PooledImage> = inner.entries.drain(..).map(|entry| entry.image).collect();
++        drop(inner);
++        if !drained.is_empty() {
++            self.evicts.fetch_add(drained.len() as u64, Ordering::Relaxed);
++        }
++        drained
+     }
+ 
+     /// Current `(image_count, total_bytes)` held in the pool.
+@@ -205,6 +241,18 @@ impl ImagePool {
+         let inner = lock(&self.inner);
+         (inner.entries.len(), inner.total_bytes)
+     }
++
++    /// Cumulative atomic hit/miss/evict counts plus current `(entries, bytes)` in the pool.
++    pub(super) fn telemetry_stats(&self) -> ImagePoolStats {
++        let inner = lock(&self.inner);
++        ImagePoolStats {
++            hits: self.hits.load(Ordering::Relaxed),
++            misses: self.misses.load(Ordering::Relaxed),
++            evicts: self.evicts.load(Ordering::Relaxed),
++            entries: inner.entries.len(),
++            bytes: inner.total_bytes,
++        }
++    }
+ }
+ 
+ /// Destroy `entries` without holding the pool mutex: destroys each `VkImage` through
+diff --git a/crates/metal2vulkan-runtime/src/tests/image_pool.rs b/crates/metal2vulkan-runtime/src/tests/image_pool.rs
+index 4ab25b6..36b43e6 100644
+--- a/crates/metal2vulkan-runtime/src/tests/image_pool.rs
++++ b/crates/metal2vulkan-runtime/src/tests/image_pool.rs
+@@ -532,3 +532,59 @@ fn non_monotonic_timestamp_ttl_eviction() {
+     destroy_entries(&harness.vk, &harness.memory, expired2);
+     assert_eq!(harness.double_free_count(), 0);
+ }
++
++#[test]
++fn telemetry_counts_hits_misses_and_evictions() {
++    let harness = MockHarness::new();
++    let pool = ImagePool::default();
++    let t0 = Instant::now();
++    let key = base_key();
++
++    // Cold miss.
++    let (hit0, exp0) = pool.take_at(&key, t0);
++    assert!(hit0.is_none() && exp0.is_empty());
++    let st = pool.telemetry_stats();
++    assert_eq!((st.hits, st.misses, st.evicts, st.entries, st.bytes), (0, 1, 0, 0, 0));
++
++    // Return two entries -> hit one, let the other expire on a later lookup.
++    assert!(pool.give_back_at(make_entry(&harness, key.clone(), 601, 4096, t0), t0).is_empty());
++    assert!(pool
++        .give_back_at(
++            make_entry(&harness, key.clone(), 602, 4096, t0 + Duration::from_secs(5)),
++            t0 + Duration::from_secs(5)
++        )
++        .is_empty());
++
++    let (hit1, exp1) = pool.take_at(&key, t0 + Duration::from_secs(6));
++    assert_eq!(hit1.unwrap().raw.as_raw(), 602);
++    assert!(exp1.is_empty());
++    let st = pool.telemetry_stats();
++    assert_eq!((st.hits, st.misses, st.evicts, st.entries, st.bytes), (1, 1, 0, 1, 4096));
++
++    // At t0 + 11s, 601 expires during take_at -> 1 evict + 1 miss.
++    let (hit2, exp2) = pool.take_at(&key, t0 + Duration::from_secs(11));
++    assert!(hit2.is_none());
++    assert_eq!(exp2.len(), 1);
++    destroy_entries(&harness.vk, &harness.memory, exp2);
++    let st = pool.telemetry_stats();
++    assert_eq!((st.hits, st.misses, st.evicts, st.entries, st.bytes), (1, 2, 1, 0, 0));
++
++    // Oversized rejection increments evicts immediately.
++    let oversized = pool.give_back_at(
++        make_entry(&harness, key.clone(), 603, MAX_POOL_ENTRY_BYTES + 4096, t0),
++        t0,
++    );
++    assert_eq!(oversized.len(), 1);
++    destroy_entries(&harness.vk, &harness.memory, oversized);
++    assert_eq!(pool.telemetry_stats().evicts, 2);
++
++    // Budget drain_all increments evicts for all drained entries.
++    assert!(pool.give_back_at(make_entry(&harness, key.clone(), 604, 4096, t0), t0).is_empty());
++    assert!(pool.give_back_at(make_entry(&harness, key, 605, 4096, t0), t0).is_empty());
++    let drained = pool.drain_all();
++    assert_eq!(drained.len(), 2);
++    destroy_entries(&harness.vk, &harness.memory, drained);
++    let st = pool.telemetry_stats();
++    assert_eq!((st.hits, st.misses, st.evicts, st.entries, st.bytes), (1, 2, 4, 0, 0));
++    assert_eq!(harness.double_free_count(), 0);
++}
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index b567ff3..f2a82e8 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2284,7 +2284,10 @@ impl Device {
+     /// their `MTLBuffer`s it is instead made of a Metal texture over the import's `MTLBuffer`
+     /// ([`Device::metal_alias_image`]), which renders where the driver's linear images do not.
+     /// Pages the runtime imported as dma-buf memory take [`Device::dma_buf_alias_image`]'s image
+-    /// instead. The image's hazard tracking is the buffer's. `holds`: what the image may hold
++    /// instead. Neither `alias_image` nor `dma_buf_alias_image` (`Owner::Buffer`) can enter
++    /// `ImagePool`, because each `VkImage` is bound to a dedicated `DmaBufImport` / `HostPages`
++    /// allocation and tracked via `AliasWatch`; reusing `IOSurface`-backed `Texture` wrappers is
++    /// handled via `Texture::clone` (`Arc<TextureShared>`) in `gHeldSurfaceTextures`. The image's hazard tracking is the buffer's. `holds`: what the image may hold
+     /// beside the texels (`linear_plan::holding`), or why no image may hold them.
+     fn alias_image(
+         &self,
+@@ -2377,6 +2380,13 @@ impl Device {
+         // texture holding it, in a type the image takes, at an offset `aliases` checked against
+         // the image's alignment and size. An image bound to imported host memory was made for
+         // host allocations.
++        //
++        // Note on `ImagePool` exclusion: `Owner::Buffer` images are permanently bound via
++        // `vkBindImageMemory` to the caller's `HostPages` import (`VUID-vkBindImageMemory-image-07460`)
++        // and carry `MemoryHold` + `AliasWatch`. Pooling them in `ImagePool` across different
++        // buffers/surfaces is invalid and would pin caller `IOSurface` memory past release; instead,
++        // `IOSurface` texture wrapper reuse is performed in `NativeBridgeMetalFrontend.mm`
++        // (`gHeldSurfaceTextures`) via `Texture::clone` (`Arc<TextureShared>`), pruned with `gHeldImports`.
+         if let Err(error) = unsafe { raw_device.bind_image_memory(raw, memory, memory_offset) } {
+             // SAFETY: the image is live and unbound, and no command uses it.
+             unsafe { release::object(raw_device, raw) };
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index 7fda01b..63a976e 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -976,6 +976,15 @@ pub struct WorkCounts {
+     /// Dispatches that handed the making of a region's `VkPipeline` to the device's pool and
+     /// went on, rather than make it at the dispatch: each counted once per region it handed.
+     pub dispatch_pipelines_pooled: u64,
++    /// Owned `ImagePool` borrow hits (`image_pool.rs`).
++    pub tex_pool_hits: u64,
++    /// Owned `ImagePool` borrow misses (`image_pool.rs`).
++    pub tex_pool_misses: u64,
++    /// Owned `ImagePool` evictions (TTL expiration, budget/count cap, oversized rejection, or
++    /// pressure/teardown drains).
++    pub tex_pool_evicts: u64,
++    /// Current backing bytes held idle inside `ImagePool`.
++    pub tex_pool_bytes: u64,
+ }
+ 
+ impl Device {
+@@ -988,6 +997,7 @@ impl Device {
+             let memory = lock(&self.shared().memory);
+             (memory.allocated(), memory.census())
+         };
++        let pool_stats = self.shared().image_pool.telemetry_stats();
+         WorkCounts {
+             command_pools_made: counters.command_pools_made.load(Ordering::Relaxed),
+             live_tables_uploaded: counters.live_tables_uploaded.load(Ordering::Relaxed),
+@@ -1117,6 +1127,10 @@ impl Device {
+                 .load(Ordering::Relaxed),
+             pipelines_linked: counters.pipelines_linked.load(Ordering::Relaxed),
+             dispatch_pipelines_pooled: counters.dispatch_pipelines_pooled.load(Ordering::Relaxed),
++            tex_pool_hits: pool_stats.hits,
++            tex_pool_misses: pool_stats.misses,
++            tex_pool_evicts: pool_stats.evicts,
++            tex_pool_bytes: pool_stats.bytes,
+         }
+     }
+ }

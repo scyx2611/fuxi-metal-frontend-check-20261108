@@ -1,0 +1,189 @@
+diff --git a/FuxiTilePipelineGuard.h b/FuxiTilePipelineGuard.h
+new file mode 100644
+index 0000000..911345a
+--- /dev/null
++++ b/FuxiTilePipelineGuard.h
+@@ -0,0 +1,123 @@
++// SPDX-License-Identifier: MIT
++// Structural validation and non-fatal NSError guard for Metal tile render pipeline descriptors
++// (VectorKit / WeatherUI probe newRenderPipelineStateWithTileDescriptor:options:reflection:error:).
++// Because NativeMetalObjects/metal2vulkan-runtime withholds supportsTileShaders=NO, exposing an
++// explicit optional refusal prevents _objc_msgForward / NSInvalidArgumentException and avoids
++// tripping ForegroundClientGate::fault() on normal vertex/fragment/compute GPU work.
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++
++enum class FuxiTileGuardCode : int32_t {
++    NilDescriptor = 1,
++    MissingTileFunction = 2,
++    ForeignTileFunction = 3,
++    InvalidSampleCount = 4,
++    ForeignBinaryArchive = 5,
++    TileShadersUnsupported = 6,
++};
++
++struct FuxiTilePipelineDescInfo {
++    bool hasDescriptor = false;
++    bool hasTileFunction = false;
++    bool tileFunctionIsNative = false;
++    bool hasForeignArchive = false;
++    bool threadgroupSizeMatchesTileSize = false;
++    uint64_t rasterSampleCount = 0;
++    uint64_t maxTotalThreadsPerThreadgroup = 0;
++    uint64_t tileFunctionType = 0;
++    uint64_t options = 0;
++    uint32_t colorAttachmentMask = 0;
++    uint64_t colorFormats[8] = {};
++    const char *label = nullptr;
++    const char *tileFunctionName = nullptr;
++};
++
++struct FuxiTilePipelineGuardResult {
++    bool supported = false;
++    bool triggersGlobalFault = false;
++    bool shouldLog = false;
++    FuxiTileGuardCode code = FuxiTileGuardCode::TileShadersUnsupported;
++    const char *errorDomain = "org.fuxi.native-metal.optional";
++    int32_t errorCode = -1;
++    char reason[256] = {};
++};
++
++inline bool fuxiValidTileSampleCount(uint64_t samples) {
++    return samples >= 1 && samples <= 16 && (samples & (samples - 1)) == 0;
++}
++
++inline FuxiTilePipelineGuardResult fuxiEvaluateTilePipelineDescriptor(
++    const FuxiTilePipelineDescInfo &info,
++    std::atomic<uint64_t> *logCounter = nullptr,
++    uint64_t maxLogs = 8) {
++    FuxiTilePipelineGuardResult out{};
++    out.supported = false;
++    out.triggersGlobalFault = false;
++    out.errorDomain = "org.fuxi.native-metal.optional";
++    out.errorCode = -1;
++
++    if (logCounter) {
++        const uint64_t idx = logCounter->fetch_add(1, std::memory_order_relaxed);
++        out.shouldLog = idx < maxLogs;
++    }
++
++    const char *safeLabel = (info.label && info.label[0]) ? info.label : "-";
++    const char *safeFn = (info.tileFunctionName && info.tileFunctionName[0]) ? info.tileFunctionName : "-";
++
++    if (!info.hasDescriptor) {
++        out.code = FuxiTileGuardCode::NilDescriptor;
++        std::snprintf(out.reason, sizeof(out.reason),
++                      "tile pipeline descriptor is nil (supportsTileShaders=NO)");
++        return out;
++    }
++    if (!info.hasTileFunction) {
++        out.code = FuxiTileGuardCode::MissingTileFunction;
++        std::snprintf(out.reason, sizeof(out.reason),
++                      "tile pipeline missing tileFunction (label=%.48s supportsTileShaders=NO)",
++                      safeLabel);
++        return out;
++    }
++    if (!info.tileFunctionIsNative) {
++        out.code = FuxiTileGuardCode::ForeignTileFunction;
++        std::snprintf(out.reason, sizeof(out.reason),
++                      "tile pipeline foreign tileFunction (label=%.48s fn=%.48s)",
++                      safeLabel, safeFn);
++        return out;
++    }
++    if (!fuxiValidTileSampleCount(info.rasterSampleCount)) {
++        out.code = FuxiTileGuardCode::InvalidSampleCount;
++        std::snprintf(out.reason, sizeof(out.reason),
++                      "tile pipeline invalid rasterSampleCount=%llu (label=%.48s fn=%.48s)",
++                      static_cast<unsigned long long>(info.rasterSampleCount), safeLabel, safeFn);
++        return out;
++    }
++    if (info.hasForeignArchive) {
++        out.code = FuxiTileGuardCode::ForeignBinaryArchive;
++        std::snprintf(out.reason, sizeof(out.reason),
++                      "tile pipeline foreign binary archive (label=%.48s fn=%.48s)",
++                      safeLabel, safeFn);
++        return out;
++    }
++
++    uint32_t mask = info.colorAttachmentMask & 0xffu;
++    for (uint32_t i = 0; i < 8; ++i) {
++        if (info.colorFormats[i] != 0) {
++            mask |= (1u << i);
++        }
++    }
++
++    out.code = FuxiTileGuardCode::TileShadersUnsupported;
++    std::snprintf(
++        out.reason, sizeof(out.reason),
++        "tile pipelines are not supported on this GPU (supportsTileShaders=NO label=%.40s fn=%.40s ftype=%llu samples=%llu colors=0x%x tgMatch=%u maxThreads=%llu)",
++        safeLabel, safeFn,
++        static_cast<unsigned long long>(info.tileFunctionType),
++        static_cast<unsigned long long>(info.rasterSampleCount),
++        static_cast<unsigned>(mask),
++        info.threadgroupSizeMatchesTileSize ? 1u : 0u,
++        static_cast<unsigned long long>(info.maxTotalThreadsPerThreadgroup));
++    return out;
++}
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 1bb64f6..0febc11 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -29,6 +29,7 @@
+ #include <dlfcn.h>
+ #include <execinfo.h>
+ #include "FuxiNocopyObservation.h"
++#include "FuxiTilePipelineGuard.h"
+ #include <mach/mach.h>
+ #include "bridge/NativeMetalObjects.h"
+ #include "NativeBridgeMetalFrontend.h"
+@@ -2230,6 +2231,47 @@ static BOOL supportsFamilyImpl(id self,MTLGPUFamily family,const void *caller);
+  if(error)*error=[NSError errorWithDomain:@"org.fuxi.native-metal.optional" code:-1 userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"no pipeline library on this GPU: %@",path.lastPathComponent]}];
+  return nil;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++// Tile render pipelines (VectorKit / WeatherUI): supportsTileShaders is NO on this runtime, so implement both MTLDevice tile
++// selectors explicitly to validate the descriptor, log bounded diagnostics, and return nil + optional NSError instead of
++// falling into _objc_msgForward / NSInvalidArgumentException or tripping ForegroundClientGate::fault().
++- (id<MTLRenderPipelineState>)newRenderPipelineStateWithTileDescriptor:(MTLTileRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
++                                                            reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error { try { @try {
++ if(reflection)*reflection=nil;
++ static std::atomic<uint64_t> gTileGuardLogs{0};
++ FuxiTilePipelineDescInfo info{};
++ info.options=(uint64_t)options;
++ if(d) {
++  info.hasDescriptor=true;
++  info.label=d.label?d.label.UTF8String:nullptr;
++  info.rasterSampleCount=(uint64_t)d.rasterSampleCount;
++  info.maxTotalThreadsPerThreadgroup=(uint64_t)d.maxTotalThreadsPerThreadgroup;
++  info.threadgroupSizeMatchesTileSize=(bool)d.threadgroupSizeMatchesTileSize;
++  id<MTLFunction> tf=d.tileFunction;
++  if(tf) {
++   info.hasTileFunction=true;
++   info.tileFunctionIsNative=[(id)tf isKindOfClass:[NBFunction class]];
++   info.tileFunctionType=(uint64_t)tf.functionType;
++   info.tileFunctionName=tf.name?tf.name.UTF8String:nullptr;
++  }
++  for(unsigned i=0;i<8;i++) {
++   MTLTileRenderPipelineColorAttachmentDescriptor *ca=d.colorAttachments[i];
++   if(ca)info.colorFormats[i]=(uint64_t)ca.pixelFormat;
++  }
++  for(id archive in d.binaryArchives) {
++   if(![archive isKindOfClass:[NBBinaryArchive class]]){info.hasForeignArchive=true;break;}
++  }
++ }
++ const FuxiTilePipelineGuardResult guard=fuxiEvaluateTilePipelineDescriptor(info,&gTileGuardLogs,8);
++ if(guard.shouldLog)NSLog(@"FUXI MTL: %s",guard.reason);
++ if(error)*error=[NSError errorWithDomain:@(guard.errorDomain) code:guard.errorCode userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:guard.reason]?:@"tile pipelines unsupported"}];
++ return nil;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)newRenderPipelineStateWithTileDescriptor:(MTLTileRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
++                               completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler { try { @try {
++ NSError *error=nil;
++ id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithTileDescriptor:d options:options reflection:nil error:&error];
++ if(handler)handler(state,nil,error);
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)d error:(NSError **)error { try { @try {
+  if(d.url && !d.url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
+  NmbBinaryArchive *handle=nmb_binary_archive_new(gDevice,d.url?d.url.fileSystemRepresentation:nullptr);

@@ -1,0 +1,162 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 340f89b..88c1202 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <errno.h>
+ #include <pthread.h>
++#include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -229,6 +230,41 @@ dw_close_connection(void)
+    }
+ }
+ 
++static pthread_mutex_t g_last_lost_lock = PTHREAD_MUTEX_INITIALIZER;
++static char g_last_lost_reason[512];
++static bool g_last_lost_set = false;
++
++static VkResult __attribute__((format(printf, 2, 3)))
++tu_darwin_set_lost(struct tu_device *dev, const char *fmt, ...)
++{
++   char msg[sizeof(g_last_lost_reason)];
++   va_list ap;
++   va_start(ap, fmt);
++   vsnprintf(msg, sizeof(msg), fmt, ap);
++   va_end(ap);
++
++   pthread_mutex_lock(&g_last_lost_lock);
++   if (!g_last_lost_set) {
++      snprintf(g_last_lost_reason, sizeof(g_last_lost_reason), "%s", msg);
++      g_last_lost_set = true;
++   }
++   pthread_mutex_unlock(&g_last_lost_lock);
++
++   mesa_loge("FUXI TURNIP LOST: %s", msg);
++   return vk_device_set_lost(&dev->vk, "%s", msg);
++}
++
++extern "C" __attribute__((visibility("default"))) size_t
++tu_darwin_last_lost_reason(char *out, size_t size)
++{
++   pthread_mutex_lock(&g_last_lost_lock);
++   size_t len = g_last_lost_set ? strlen(g_last_lost_reason) : 0;
++   if (len > 0 && out && size > 0)
++      snprintf(out, size, "%s", g_last_lost_reason);
++   pthread_mutex_unlock(&g_last_lost_lock);
++   return len;
++}
++
+ static VkResult
+ dw_status_to_vk(struct tu_device *dev, kern_return_t kr, const char *what)
+ {
+@@ -236,7 +272,7 @@ dw_status_to_vk(struct tu_device *dev, kern_return_t kr, const char *what)
+       return VK_SUCCESS;
+    if (kr == kIOReturnTimeout)
+       return VK_TIMEOUT;
+-   return vk_device_set_lost(&dev->vk, "%s failed: 0x%x", what, kr);
++   return tu_darwin_set_lost(dev, "%s failed: 0x%x", what, kr);
+ }
+ 
+ /* Waits for a fence in short kernel waits so the connection lock is never held for long. */
+@@ -501,13 +537,13 @@ darwin_release_native(struct tu_device *dev, struct darwin_retire_state *retire,
+       if (*mapping) {
+          kern_return_t kr = IOConnectUnmapMemory64(dw.conn, *token, mach_task_self(), (mach_vm_address_t)(uintptr_t)*mapping);
+          if (kr != KERN_SUCCESS)
+-            return retire->failure = vk_device_set_lost(&dev->vk, "deferred CPU unmap failed: 0x%x", kr);
++            return retire->failure = tu_darwin_set_lost(dev, "deferred CPU unmap failed: 0x%x", kr);
+          *mapping = NULL;
+       }
+       NativeAdrenoAbiBoCpuUnmap undo = {.handle = handle, .token = *token};
+       kern_return_t kr = dw_call(NativeAdrenoMethodBoCpuUnmap, &undo, sizeof(undo), NULL, 0);
+       if (kr != KERN_SUCCESS)
+-         return retire->failure = vk_device_set_lost(&dev->vk, "deferred CPU lease release failed: 0x%x", kr);
++         return retire->failure = tu_darwin_set_lost(dev, "deferred CPU lease release failed: 0x%x", kr);
+       *token = 0;
+    }
+    NativeAdrenoAbiBoFree release = {.handle = handle};
+@@ -515,7 +551,7 @@ darwin_release_native(struct tu_device *dev, struct darwin_retire_state *retire,
+    if (kr == kIOReturnBusy)
+       return VK_NOT_READY;
+    if (kr != KERN_SUCCESS)
+-      return retire->failure = vk_device_set_lost(&dev->vk, "deferred BoFree failed: 0x%x", kr);
++      return retire->failure = tu_darwin_set_lost(dev, "deferred BoFree failed: 0x%x", kr);
+    darwin_free_iova(dev, iova, size);
+    return VK_SUCCESS;
+ }
+@@ -736,7 +772,7 @@ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+     * reusing its IOVA, even though no tu_bo could be published to the caller. */
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    pthread_mutex_lock(&retire->lock);
+-   retire->failure = vk_device_set_lost(&dev->vk, "BoMap cleanup failed: 0x%x; retaining native allocation and IOVA", cleanup);
++   retire->failure = tu_darwin_set_lost(dev, "BoMap cleanup failed: 0x%x; retaining native allocation and IOVA", cleanup);
+    VkResult result = retire->failure;
+    pthread_mutex_unlock(&retire->lock);
+    return result;
+@@ -1092,7 +1128,7 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+    } else if (retire->failure == VK_SUCCESS) {
+       /* No reusable range is reported on error. The kernel still owns the handle
+        * and view; connection teardown must drain them, even if this record cannot fit. */
+-      retire->failure = vk_device_set_lost(&dev->vk, "deferred BO queue cannot grow; retaining native allocation");
++      retire->failure = tu_darwin_set_lost(dev, "deferred BO queue cannot grow; retaining native allocation");
+    }
+    pthread_mutex_unlock(&retire->lock);
+ 
+@@ -1339,7 +1375,7 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
+          return VK_SUCCESS;
+       }
+       if (kr != kIOReturnBusy)
+-         return vk_device_set_lost(&dev->vk, "submit failed: 0x%x", kr);
++         return tu_darwin_set_lost(dev, "submit failed: 0x%x", kr);
+ 
+       pthread_mutex_lock(&dw.lock);
+       uint32_t oldest = dw.inflight_count ? dw.inflight[0] : 0;
+@@ -1347,9 +1383,9 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
+       if (!oldest)
+          usleep(100);
+       else if (dw_wait_fence_locked_free(dev, oldest, os_time_get_nano() + 5000000000ull) != VK_SUCCESS)
+-         return vk_device_set_lost(&dev->vk, "submit: GPU did not retire a job");
++         return tu_darwin_set_lost(dev, "submit: GPU did not retire a job");
+    }
+-   return vk_device_set_lost(&dev->vk, "submit: no free job slot");
++   return tu_darwin_set_lost(dev, "submit: no free job slot");
+ }
+ 
+ static VkResult
+@@ -1366,7 +1402,7 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
+       VkResult result = darwin_sync_wait(dev, s, UINT64_MAX);
+       if (result != VK_SUCCESS)
+-         return vk_device_set_lost(&dev->vk, "wait before submit failed");
++         return tu_darwin_set_lost(dev, "wait before submit failed");
+    }
+ 
+    uint32_t fence = 0;
+@@ -1375,9 +1411,9 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+     * command list would discard state between chunks, after partial execution.
+     * Reject before the first doorbell; a future ABI needs an atomic IB chain. */
+    if (total > NativeAdrenoAbiMaxBuffers)
+-      return vk_device_set_lost(&dev->vk,
+-                               "Fuxi IB list %u exceeds atomic submit limit %u",
+-                               total, (unsigned)NativeAdrenoAbiMaxBuffers);
++      return tu_darwin_set_lost(dev,
++                                "Fuxi IB list %u exceeds atomic submit limit %u",
++                                total, (unsigned)NativeAdrenoAbiMaxBuffers);
+    if (total) {
+       const NativeAdrenoAbiSubmitBuffer *all =
+          util_dynarray_element(&submit->commands, NativeAdrenoAbiSubmitBuffer, 0);
+@@ -1494,10 +1530,10 @@ darwin_device_check_status(struct tu_device *device)
+    if (kr == kIOReturnUnsupported)
+       return VK_SUCCESS; /* counters not attached in this kernel */
+    if (kr != KERN_SUCCESS)
+-      return vk_device_set_lost(&device->vk, "error getting GPU status: 0x%x", kr);
++      return tu_darwin_set_lost(device, "error getting GPU status: 0x%x", kr);
+    if (reply.faults != device->fault_count) {
+       device->fault_count = reply.faults;
+-      return vk_device_set_lost(&device->vk, "GPU faulted or hung");
++      return tu_darwin_set_lost(device, "GPU faulted or hung");
+    }
+    return VK_SUCCESS;
+ }

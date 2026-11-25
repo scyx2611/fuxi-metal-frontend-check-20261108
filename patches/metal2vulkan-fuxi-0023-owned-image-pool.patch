@@ -1,0 +1,1343 @@
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index db82e5a..dc98cd6 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -57,6 +57,7 @@ use super::gpu_pools::GpuPools;
+ use super::gpu_time::{self, FromHost, Timing};
+ use super::heap_sets::{DeviceHeaps, NanResidue};
+ use super::host_memory::Importer;
++use super::image_pool::{self, ImagePool};
+ use super::interop::Interop;
+ use super::loader_word::LoaderWord;
+ use super::memory::Memory;
+@@ -242,6 +243,8 @@ pub(super) struct DeviceShared {
+     /// records a loss it hears of.
+     lost: Arc<AtomicBool>,
+     pub(super) textures: super::texture::TextureState,
++    /// Pool of idle runtime-owned `VkImage` objects and their bound placements (`image_pool.rs`).
++    pub(super) image_pool: ImagePool,
+     /// The translated-shader cache on disk and the driver's pipeline cache.
+     pub(super) shader_cache: ShaderCache,
+     /// How no-copy buffers import host memory, or why they are refused.
+@@ -534,6 +537,8 @@ impl Drop for DeviceShared {
+         // Every other pipeline was destroyed with its state (each holds this device); the cache
+         // thread stops.
+         self.shader_cache.close();
++        let pooled = self.image_pool.drain_all();
++        image_pool::destroy_entries(self.vk(), &self.memory, pooled);
+         lock(&self.memory).destroy(self.vk());
+         // The device's record of pipeline makings goes, before `vkDestroyDevice`: in builds with
+         // debug assertions, no making is in progress (`compiles.rs`).
+@@ -669,6 +674,36 @@ impl Device {
+         self.0.lost.store(true, Ordering::Release);
+     }
+ 
++    /// Release all idle pooled `VkImage` entries and empty kept memory blocks back to the
++    /// Vulkan driver, returning the number of images and blocks freed.
++    pub fn release_kept_memory(&self) -> usize {
++        if self.is_lost() {
++            return 0;
++        }
++        let Some(_busy) = exit_guard::enter() else {
++            return 0;
++        };
++        let shared = self.shared();
++        let pooled = shared.image_pool.drain_all();
++        let freed_images = image_pool::destroy_entries(shared.vk(), &shared.memory, pooled);
++        let freed_blocks = lock(&shared.memory).release_empty_blocks(shared.vk());
++        freed_images + freed_blocks
++    }
++
++    /// Evict idle pooled `VkImage` entries whose 10-second TTL has expired, returning the number
++    /// of images destroyed.
++    pub fn age_kept_memory(&self) -> usize {
++        if self.is_lost() {
++            return 0;
++        }
++        let Some(_busy) = exit_guard::enter() else {
++            return 0;
++        };
++        let shared = self.shared();
++        let expired = shared.image_pool.drain_expired_at(Instant::now());
++        image_pool::destroy_entries(shared.vk(), &shared.memory, expired)
++    }
++
+     /// Wait for the work submitted to each of the device's queues to end, each queue under its
+     /// lock, the waits one section of the exit guard: what the completion thread does after a
+     /// failed wait, before that wait's command buffers let go of what they used
+@@ -1261,6 +1296,7 @@ impl Device {
+             owned,
+             lost,
+             textures,
++            image_pool: ImagePool::default(),
+             shader_cache,
+             host_import,
+             extended_dynamic_state,
+diff --git a/crates/metal2vulkan-runtime/src/image_pool.rs b/crates/metal2vulkan-runtime/src/image_pool.rs
+new file mode 100644
+index 0000000..4f6d9f3
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/image_pool.rs
+@@ -0,0 +1,225 @@
++//! Owned `VkImage` backing pool (`ImagePool`): reuses runtime-owned `VkImage` objects and their
++//! bound `Placement`s across short-lived textures of the same creation shape and memory class.
++//!
++//! - **Ownership & retirement safety.** An image enters the pool only from [`Image::drop`], after
++//!   [`TextureShared::drop`] has retired the texture ID through `heap_sets::gone` (all prior
++//!   command buffers referencing the texture have completed) and all `VkImageView`s have been
++//!   destroyed. Every pooled image has zero views and zero in-flight GPU accesses.
++//! - **Lock ordering.** The pool's mutex is never held while calling `release::object` or locking
++//!   `DeviceShared::memory`. Entries to destroy are drained/evicted out of the mutex first and
++//!   destroyed lock-free via [`destroy_entries`], strictly destroying each `VkImage` before freeing
++//!   its [`Placement`].
++//! - **Budgets & TTL.** Bounded by [`IMAGE_POOL_TTL`] (10 s), [`MAX_POOL_BYTES`] (128 MiB),
++//!   [`MAX_POOL_IMAGES`] (128), and [`MAX_POOL_ENTRY_BYTES`] (64 MiB).
++
++use crate::device::lock;
++use crate::memory::{Memory, MemoryClass, Placement};
++use crate::release;
++use ash::vk;
++use std::collections::VecDeque;
++use std::sync::Mutex;
++use std::time::{Duration, Instant};
++
++/// Time-to-live of an idle pooled `VkImage` before automatic eviction.
++pub(super) const IMAGE_POOL_TTL: Duration = Duration::from_secs(10);
++
++/// Maximum total backing bytes held across all pooled images on one device (128 MiB).
++pub(super) const MAX_POOL_BYTES: u64 = 128 << 20;
++
++/// Maximum number of pooled `VkImage` entries kept on one device.
++pub(super) const MAX_POOL_IMAGES: usize = 128;
++
++/// Maximum backing byte size of a single poolable `VkImage` (64 MiB).
++pub(super) const MAX_POOL_ENTRY_BYTES: u64 = MAX_POOL_BYTES / 2;
++
++/// 12-field lookup key covering every `VkImageCreateInfo` parameter, view format list, queue
++/// sharing mode, and [`MemoryClass`] compatibility property of a runtime-owned `VkImage`.
++#[derive(Clone, PartialEq, Eq, Hash)]
++pub(super) struct ImagePoolKey {
++    /// Vulkan image dimensionality (`VkImageCreateInfo::imageType`).
++    pub(super) image_type: metal2vulkan::vk::ImageType,
++    /// Vulkan texel format (`VkImageCreateInfo::format`).
++    pub(super) format: metal2vulkan::vk::Format,
++    /// Base level extent `[width, height, depth]`.
++    pub(super) extent: [u32; 3],
++    /// Mipmap level count (`VkImageCreateInfo::mipLevels`).
++    pub(super) mip_levels: u32,
++    /// Array layer count (`VkImageCreateInfo::arrayLayers`).
++    pub(super) array_layers: u32,
++    /// Multisample sample count (`VkImageCreateInfo::samples`).
++    pub(super) samples: metal2vulkan::vk::SampleCountFlags,
++    /// Vulkan image tiling (`VkImageCreateInfo::tiling`).
++    pub(super) tiling: vk::ImageTiling,
++    /// Vulkan image usage flags (`VkImageCreateInfo::usage`, including `HOST_TRANSFER` if any).
++    pub(super) usage: metal2vulkan::vk::ImageUsageFlags,
++    /// Vulkan image creation flags (`VkImageCreateInfo::flags`).
++    pub(super) flags: metal2vulkan::vk::ImageCreateFlags,
++    /// Mutable view formats chained via `VkImageFormatListCreateInfo`.
++    pub(super) view_formats: Vec<metal2vulkan::vk::Format>,
++    /// Whether the image is shared concurrently with the dedicated staging queue family.
++    pub(super) sharing_staging: bool,
++    /// Logical memory class requested for placement.
++    pub(super) memory_class: MemoryClass,
++}
++
++/// A pooled `VkImage` together with its bound [`Placement`] and layout state.
++pub(super) struct PooledImage {
++    /// Creation compatibility key.
++    pub(super) key: ImagePoolKey,
++    /// Bound `VkImage` handle (zero live views, zero in-flight command buffers).
++    pub(super) raw: vk::Image,
++    /// Backing memory placement owned with `raw`.
++    pub(super) placement: Placement,
++    /// Whether the image was created with host-transfer usage for host CPU copies.
++    pub(super) host_copies: bool,
++    /// `true` if a prior `FirstMove` or host/staging transition moved the image into `GENERAL`;
++    /// `false` if it still resides in `UNDEFINED`.
++    pub(super) in_general: bool,
++}
++
++struct PoolEntry {
++    image: PooledImage,
++    /// Timestamp sampled under the pool mutex when the entry was returned to the pool.
++    returned_at: Instant,
++}
++
++#[derive(Default)]
++struct ImagePoolInner {
++    /// Oldest entries at the front (FIFO/LRU eviction), newest at the back (LIFO reuse).
++    entries: VecDeque<PoolEntry>,
++    total_bytes: u64,
++}
++
++impl ImagePoolInner {
++    fn evict_expired(&mut self, now: Instant, expired: &mut Vec<PooledImage>) {
++        // Bounded by MAX_POOL_IMAGES (128), so scanning all entries avoids leaving stale
++        // entries behind if timestamps ever arrive non-monotonically.
++        let mut idx = 0;
++        while idx < self.entries.len() {
++            if now.saturating_duration_since(self.entries[idx].returned_at) >= IMAGE_POOL_TTL {
++                if let Some(entry) = self.entries.remove(idx) {
++                    self.total_bytes = self.total_bytes.saturating_sub(entry.image.placement.size());
++                    expired.push(entry.image);
++                }
++            } else {
++                idx += 1;
++            }
++        }
++    }
++}
++
++/// Per-device pool of idle runtime-owned `VkImage` objects and their bound placements.
++#[derive(Default)]
++pub(super) struct ImagePool {
++    inner: Mutex<ImagePoolInner>,
++}
++
++impl ImagePool {
++    /// Borrow the newest pooled image matching `key` at time `now` (LIFO), evicting any expired
++    /// entries first. The caller must destroy any returned expired entries outside locks via
++    /// [`destroy_entries`].
++    pub(super) fn take_at(
++        &self,
++        key: &ImagePoolKey,
++        now: Instant,
++    ) -> (Option<PooledImage>, Vec<PooledImage>) {
++        let mut expired = Vec::new();
++        let mut inner = lock(&self.inner);
++        inner.evict_expired(now, &mut expired);
++        let hit = inner
++            .entries
++            .iter()
++            .rposition(|entry| entry.image.key == *key)
++            .and_then(|idx| inner.entries.remove(idx))
++            .map(|entry| entry.image);
++        if let Some(ref image) = hit {
++            inner.total_bytes = inner.total_bytes.saturating_sub(image.placement.size());
++        }
++        (hit, expired)
++    }
++
++    /// Borrow a pooled image matching `key` at `Instant::now()`.
++    pub(super) fn take(&self, key: &ImagePoolKey) -> (Option<PooledImage>, Vec<PooledImage>) {
++        self.take_at(key, Instant::now())
++    }
++
++    fn give_back_inner(&self, image: PooledImage, explicit_now: Option<Instant>) -> Vec<PooledImage> {
++        let mut evicted = Vec::new();
++        let size = image.placement.size();
++        if size > MAX_POOL_ENTRY_BYTES {
++            evicted.push(image);
++            return evicted;
++        }
++        let mut inner = lock(&self.inner);
++        // Sample `Instant::now()` strictly after acquiring the pool mutex so real insertions
++        // record monotonic timestamps under lock.
++        let now = explicit_now.unwrap_or_else(Instant::now);
++        inner.evict_expired(now, &mut evicted);
++        while inner.entries.len() >= MAX_POOL_IMAGES
++            || inner.total_bytes.saturating_add(size) > MAX_POOL_BYTES
++        {
++            let Some(oldest) = inner.entries.pop_front() else {
++                break;
++            };
++            inner.total_bytes = inner.total_bytes.saturating_sub(oldest.image.placement.size());
++            evicted.push(oldest.image);
++        }
++        inner.total_bytes = inner.total_bytes.saturating_add(size);
++        inner.entries.push_back(PoolEntry {
++            image,
++            returned_at: now,
++        });
++        evicted
++    }
++
++    /// Return `entry` to the pool at time `now`, returning all expired or budget-evicted entries
++    /// (plus `entry` itself if it exceeds [`MAX_POOL_ENTRY_BYTES`]) for lock-free destruction via
++    /// [`destroy_entries`].
++    #[cfg(test)]
++    pub(super) fn give_back_at(&self, entry: PooledImage, now: Instant) -> Vec<PooledImage> {
++        self.give_back_inner(entry, Some(now))
++    }
++
++    /// Return `entry` to the pool, sampling `Instant::now()` under the pool mutex.
++    pub(super) fn give_back(&self, entry: PooledImage) -> Vec<PooledImage> {
++        self.give_back_inner(entry, None)
++    }
++
++    /// Drain all entries whose TTL has expired by `now` for lock-free destruction.
++    pub(super) fn drain_expired_at(&self, now: Instant) -> Vec<PooledImage> {
++        let mut expired = Vec::new();
++        lock(&self.inner).evict_expired(now, &mut expired);
++        expired
++    }
++
++    /// Drain every pooled entry (for memory pressure trimming or device teardown).
++    pub(super) fn drain_all(&self) -> Vec<PooledImage> {
++        let mut inner = lock(&self.inner);
++        inner.total_bytes = 0;
++        inner.entries.drain(..).map(|entry| entry.image).collect()
++    }
++
++    /// Current `(image_count, total_bytes)` held in the pool.
++    #[cfg(test)]
++    pub(super) fn stats(&self) -> (usize, u64) {
++        let inner = lock(&self.inner);
++        (inner.entries.len(), inner.total_bytes)
++    }
++}
++
++/// Destroy `entries` without holding the pool mutex: destroys each `VkImage` through
++/// [`release::object`] before freeing its [`Placement`] from `memory`.
++pub(super) fn destroy_entries(
++    vk: &ash::Device,
++    memory: &Mutex<Memory>,
++    entries: Vec<PooledImage>,
++) -> usize {
++    let count = entries.len();
++    for entry in entries {
++        // SAFETY: the image has zero live views and zero pending command buffer uses; destroy the
++        // image handle before freeing the memory placement bound to it.
++        unsafe { release::object(vk, entry.raw) };
++        lock(memory).free(vk, &entry.placement);
++    }
++    count
++}
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index a7305f9..b924ffe 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -107,6 +107,7 @@ mod heap;
+ mod heap_sets;
+ mod host_aliases;
+ mod host_memory;
++mod image_pool;
+ mod image_plan;
+ mod index_bounds;
+ mod index_rewrite;
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index de3df1e..6d2a4b8 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -52,7 +52,7 @@ use std::sync::Mutex;
+ pub(super) const BLOCK_BYTES: u64 = 64 << 20;
+ 
+ /// What memory a resource needs.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+ pub(super) enum MemoryClass {
+     /// Host-visible and coherent memory the host reads as well as writes (`Shared` storage of
+     /// the default CPU cache mode, staging for the host's reads and writes): host-cached where the
+@@ -375,6 +375,22 @@ impl<T> Pool<T> {
+         self.blocks.drain(..).flatten().map(|block| block.payload)
+     }
+ 
++    /// Remove and return every empty non-dedicated block kept for reuse.
++    pub(super) fn drain_empty(&mut self) -> Vec<T> {
++        let mut empty = Vec::new();
++        for slot in &mut self.blocks {
++            let is_empty = slot
++                .as_ref()
++                .is_some_and(|block| !block.dedicated && block.ranges.is_empty());
++            if is_empty {
++                if let Some(block) = slot.take() {
++                    empty.push(block.payload);
++                }
++            }
++        }
++        empty
++    }
++
+     /// The number of live blocks.
+     #[cfg(test)]
+     pub(super) fn blocks(&self) -> usize {
+@@ -1102,6 +1118,19 @@ impl Memory {
+         );
+     }
+ 
++    /// Free every empty pooled block kept across all memory types and holds.
++    pub(super) fn release_empty_blocks(&mut self, device: &ash::Device) -> usize {
++        let mut freed = 0;
++        for pool in &mut self.pools {
++            for block in pool.drain_empty() {
++                // SAFETY: the block has no live placements.
++                unsafe { block.release(device) };
++                freed += 1;
++            }
++        }
++        freed
++    }
++
+     /// Free every block: the device is being destroyed and no resource is left.
+     pub(super) fn destroy(&mut self, device: &ash::Device) {
+         for pool in &mut self.pools {
+diff --git a/crates/metal2vulkan-runtime/src/tests/image_pool.rs b/crates/metal2vulkan-runtime/src/tests/image_pool.rs
+new file mode 100644
+index 0000000..4ab25b6
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/tests/image_pool.rs
+@@ -0,0 +1,534 @@
++//! Unit and mock `ash::Device` lifecycle tests for the owned `VkImage` backing pool (`image_pool.rs`).
++
++use crate::image_pool::{
++    destroy_entries, ImagePool, ImagePoolKey, PooledImage, IMAGE_POOL_TTL, MAX_POOL_BYTES,
++    MAX_POOL_ENTRY_BYTES, MAX_POOL_IMAGES,
++};
++use crate::memory::{Holds, Memory, MemoryClass, Placement};
++use ash::vk::{self, Handle};
++use std::collections::{HashMap, HashSet};
++use std::ffi::{c_void, CStr};
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock};
++use std::time::{Duration, Instant};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum MockOp {
++    Image(u64),
++    Memory(u64),
++}
++
++#[derive(Default)]
++struct MockState {
++    next_memory: u64,
++    ops: Vec<MockOp>,
++    destroyed_images: HashSet<u64>,
++    freed_memories: HashSet<u64>,
++    double_frees: usize,
++}
++
++fn mock_states() -> &'static Mutex<HashMap<u64, MockState>> {
++    static STATES: OnceLock<Mutex<HashMap<u64, MockState>>> = OnceLock::new();
++    STATES.get_or_init(|| Mutex::new(HashMap::new()))
++}
++
++unsafe extern "system" fn stub_alloc_memory(
++    device: vk::Device,
++    _info: *const vk::MemoryAllocateInfo<'_>,
++    _allocator: *const vk::AllocationCallbacks<'_>,
++    memory: *mut vk::DeviceMemory,
++) -> vk::Result {
++    let mut map = mock_states().lock().unwrap();
++    let st = map.entry(device.as_raw()).or_default();
++    st.next_memory += 1;
++    let handle = st.next_memory;
++    unsafe { *memory = vk::DeviceMemory::from_raw(handle) };
++    vk::Result::SUCCESS
++}
++
++unsafe extern "system" fn stub_discard_memory(
++    device: vk::Device,
++    memory: vk::DeviceMemory,
++    _allocator: *const vk::AllocationCallbacks<'_>,
++) {
++    let raw = memory.as_raw();
++    let mut map = mock_states().lock().unwrap();
++    let st = map.entry(device.as_raw()).or_default();
++    if !st.freed_memories.insert(raw) {
++        st.double_frees += 1;
++    }
++    st.ops.push(MockOp::Memory(raw));
++}
++
++unsafe extern "system" fn stub_discard_image(
++    device: vk::Device,
++    image: vk::Image,
++    _allocator: *const vk::AllocationCallbacks<'_>,
++) {
++    let raw = image.as_raw();
++    let mut map = mock_states().lock().unwrap();
++    let st = map.entry(device.as_raw()).or_default();
++    if !st.destroyed_images.insert(raw) {
++        st.double_frees += 1;
++    }
++    st.ops.push(MockOp::Image(raw));
++}
++
++struct MockHarness {
++    id: u64,
++    vk: ash::Device,
++    memory: Mutex<Memory>,
++}
++
++impl MockHarness {
++    fn new() -> Self {
++        static NEXT_DEV: AtomicU64 = AtomicU64::new(0x1000);
++        let id = NEXT_DEV.fetch_add(1, Ordering::Relaxed);
++        {
++            let mut map = mock_states().lock().unwrap();
++            map.insert(id, MockState::default());
++        }
++        let load = |name: &CStr| -> *const c_void {
++            match name.to_bytes() {
++                b"vkAllocateMemory" => stub_alloc_memory as *const c_void,
++                b"vkFreeMemory" => stub_discard_memory as *const c_void,
++                b"vkDestroyImage" => stub_discard_image as *const c_void,
++                _ => std::ptr::null(),
++            }
++        };
++        // SAFETY: stub entry points have exact Vulkan C ABI signatures.
++        let vk = unsafe { ash::Device::load_with(load, vk::Device::from_raw(id)) };
++        let mem_props = vk::PhysicalDeviceMemoryProperties {
++            memory_type_count: 2,
++            memory_types: {
++                let mut arr = [vk::MemoryType::default(); vk::MAX_MEMORY_TYPES];
++                arr[0] = vk::MemoryType {
++                    property_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
++                    heap_index: 0,
++                };
++                arr[1] = vk::MemoryType {
++                    property_flags: vk::MemoryPropertyFlags::HOST_VISIBLE
++                        | vk::MemoryPropertyFlags::HOST_COHERENT
++                        | vk::MemoryPropertyFlags::HOST_CACHED,
++                    heap_index: 0,
++                };
++                arr
++            },
++            memory_heap_count: 1,
++            memory_heaps: {
++                let mut arr = [vk::MemoryHeap::default(); vk::MAX_MEMORY_HEAPS];
++                arr[0] = vk::MemoryHeap {
++                    size: 4 << 30,
++                    flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
++                };
++                arr
++            },
++        };
++        let memory = Mutex::new(Memory::new(&mem_props, u64::MAX, false, true, vec![0]));
++        Self { id, vk, memory }
++    }
++
++    fn alloc_image_placement(&self, size: u64) -> Placement {
++        let reqs = vk::MemoryRequirements {
++            size,
++            alignment: 4096,
++            memory_type_bits: 0b01,
++        };
++        crate::memory::allocate_image(&self.memory, &self.vk, &reqs, MemoryClass::Private)
++            .expect("mock allocate_image")
++    }
++
++    fn ops(&self) -> Vec<MockOp> {
++        mock_states().lock().unwrap().get(&self.id).unwrap().ops.clone()
++    }
++
++    fn image_destroy_count(&self) -> usize {
++        self.ops()
++            .iter()
++            .filter(|op| matches!(op, MockOp::Image(_)))
++            .count()
++    }
++
++    fn memory_free_count(&self) -> usize {
++        self.ops()
++            .iter()
++            .filter(|op| matches!(op, MockOp::Memory(_)))
++            .count()
++    }
++
++    fn double_free_count(&self) -> usize {
++        mock_states()
++            .lock()
++            .unwrap()
++            .get(&self.id)
++            .unwrap()
++            .double_frees
++    }
++}
++
++impl Drop for MockHarness {
++    fn drop(&mut self) {
++        mock_states().lock().unwrap().remove(&self.id);
++    }
++}
++
++fn base_key() -> ImagePoolKey {
++    ImagePoolKey {
++        image_type: metal2vulkan::vk::ImageType::TYPE_2D,
++        format: metal2vulkan::vk::Format::B8G8R8A8_UNORM,
++        extent: [1920, 1080, 1],
++        mip_levels: 1,
++        array_layers: 1,
++        samples: metal2vulkan::vk::SampleCountFlags::from_raw(1),
++        tiling: vk::ImageTiling::OPTIMAL,
++        usage: metal2vulkan::vk::ImageUsageFlags::SAMPLED
++            | metal2vulkan::vk::ImageUsageFlags::COLOR_ATTACHMENT,
++        flags: metal2vulkan::vk::ImageCreateFlags::empty(),
++        view_formats: vec![],
++        sharing_staging: false,
++        memory_class: MemoryClass::Private,
++    }
++}
++
++fn make_entry(
++    harness: &MockHarness,
++    key: ImagePoolKey,
++    raw_id: u64,
++    size: u64,
++    _returned_at: Instant,
++) -> PooledImage {
++    let placement = harness.alloc_image_placement(size);
++    PooledImage {
++        key,
++        raw: vk::Image::from_raw(raw_id),
++        placement,
++        host_copies: false,
++        in_general: true,
++    }
++}
++
++#[test]
++fn key_distinguishes_all_image_create_fields() {
++    let harness = MockHarness::new();
++    let pool = ImagePool::default();
++    let now = Instant::now();
++    let base = base_key();
++    assert!(pool
++        .give_back_at(make_entry(&harness, base.clone(), 1, 4096, now), now)
++        .is_empty());
++
++    let mut variants = Vec::new();
++    {
++        let mut k = base.clone();
++        k.image_type = metal2vulkan::vk::ImageType::TYPE_3D;
++        variants.push(("image_type", k));
++    }
++    {
++        let mut k = base.clone();
++        k.format = metal2vulkan::vk::Format::R8G8B8A8_UNORM;
++        variants.push(("format", k));
++    }
++    {
++        let mut k = base.clone();
++        k.extent = [1280, 720, 1];
++        variants.push(("extent", k));
++    }
++    {
++        let mut k = base.clone();
++        k.mip_levels = 4;
++        variants.push(("mip_levels", k));
++    }
++    {
++        let mut k = base.clone();
++        k.array_layers = 2;
++        variants.push(("array_layers", k));
++    }
++    {
++        let mut k = base.clone();
++        k.samples = metal2vulkan::vk::SampleCountFlags::from_raw(4);
++        variants.push(("samples", k));
++    }
++    {
++        let mut k = base.clone();
++        k.tiling = vk::ImageTiling::LINEAR;
++        variants.push(("tiling", k));
++    }
++    {
++        let mut k = base.clone();
++        k.usage |= metal2vulkan::vk::ImageUsageFlags::HOST_TRANSFER;
++        variants.push(("usage", k));
++    }
++    {
++        let mut k = base.clone();
++        k.flags = metal2vulkan::vk::ImageCreateFlags::MUTABLE_FORMAT;
++        variants.push(("flags", k));
++    }
++    {
++        let mut k = base.clone();
++        k.view_formats = vec![metal2vulkan::vk::Format::B8G8R8A8_SRGB];
++        variants.push(("view_formats", k));
++    }
++    {
++        let mut k = base.clone();
++        k.sharing_staging = true;
++        variants.push(("sharing_staging", k));
++    }
++    {
++        let mut k = base.clone();
++        k.memory_class = MemoryClass::Memoryless;
++        variants.push(("memory_class", k));
++    }
++
++    for (field, variant) in variants {
++        let (hit, expired) = pool.take_at(&variant, now + Duration::from_secs(1));
++        assert!(expired.is_empty());
++        assert!(hit.is_none(), "key variant {field} must not alias base key");
++    }
++
++    let (hit, _) = pool.take_at(&base, now + Duration::from_secs(1));
++    assert_eq!(hit.expect("exact key must hit").raw.as_raw(), 1);
++    let _ = Holds::Images;
++}
++
++#[test]
++fn pool_reuse_hit_and_lifo_order() {
++    let harness = MockHarness::new();
++    let pool = ImagePool::default();
++    let now = Instant::now();
++    let key = base_key();
++
++    assert!(pool
++        .give_back_at(make_entry(&harness, key.clone(), 101, 4096, now), now)
++        .is_empty());
++    assert!(pool
++        .give_back_at(
++            make_entry(&harness, key.clone(), 102, 4096, now + Duration::from_millis(5)),
++            now + Duration::from_millis(5)
++        )
++        .is_empty());
++    assert_eq!(pool.stats(), (2, 8192));
++
++    let t = now + Duration::from_millis(10);
++    let (first, exp1) = pool.take_at(&key, t);
++    assert!(exp1.is_empty());
++    assert_eq!(first.expect("LIFO first").raw.as_raw(), 102);
++
++    let (second, exp2) = pool.take_at(&key, t);
++    assert!(exp2.is_empty());
++    assert_eq!(second.expect("LIFO second").raw.as_raw(), 101);
++
++    let (third, _) = pool.take_at(&key, t);
++    assert!(third.is_none());
++    assert_eq!(pool.stats(), (0, 0));
++    assert_eq!(harness.image_destroy_count(), 0);
++    assert_eq!(harness.memory_free_count(), 0);
++}
++
++#[test]
++fn ttl_10s_eviction() {
++    let harness = MockHarness::new();
++    let pool = ImagePool::default();
++    let t0 = Instant::now();
++    let key = base_key();
++
++    // Dedicated allocations (> 32 MiB) so Memory::free immediately triggers vkFreeMemory.
++    let size = 40 << 20;
++    assert!(pool
++        .give_back_at(make_entry(&harness, key.clone(), 201, size, t0), t0)
++        .is_empty());
++    assert!(pool
++        .give_back_at(
++            make_entry(&harness, key.clone(), 202, size, t0 + Duration::from_secs(2)),
++            t0 + Duration::from_secs(2)
++        )
++        .is_empty());
++
++    // At 9.999s after t0, entry 201 is not yet expired and LIFO returns 202.
++    let (hit, expired) = pool.take_at(&key, t0 + IMAGE_POOL_TTL - Duration::from_millis(1));
++    assert!(expired.is_empty());
++    assert_eq!(hit.expect("entry 202").raw.as_raw(), 202);
++
++    // At exactly 10.000s after t0, entry 201 expires and is evicted before matching.
++    let (miss, expired) = pool.take_at(&key, t0 + IMAGE_POOL_TTL);
++    assert!(miss.is_none());
++    assert_eq!(expired.len(), 1);
++    assert_eq!(expired[0].raw.as_raw(), 201);
++
++    destroy_entries(&harness.vk, &harness.memory, expired);
++    let ops = harness.ops();
++    assert_eq!(ops.len(), 2);
++    assert_eq!(ops[0], MockOp::Image(201));
++    assert!(matches!(ops[1], MockOp::Memory(_)));
++    assert_eq!(harness.double_free_count(), 0);
++}
++
++#[test]
++fn budget_bytes_and_count_cap_lru_eviction() {
++    let harness = MockHarness::new();
++    let pool = ImagePool::default();
++    let t0 = Instant::now();
++    let key = base_key();
++
++    // 1. Oversized entry (> 64 MiB) is rejected from pooling and destroyed immediately.
++    let oversized = make_entry(&harness, key.clone(), 900, MAX_POOL_ENTRY_BYTES + 4096, t0);
++    let evicted = pool.give_back_at(oversized, t0);
++    assert_eq!(evicted.len(), 1);
++    assert_eq!(evicted[0].raw.as_raw(), 900);
++    destroy_entries(&harness.vk, &harness.memory, evicted);
++    assert_eq!(pool.stats(), (0, 0));
++    assert_eq!(harness.image_destroy_count(), 1);
++
++    // 2. Count cap (MAX_POOL_IMAGES = 128): inserting 135 small entries evicts oldest 7.
++    for i in 0..(MAX_POOL_IMAGES + 7) {
++        let now = t0 + Duration::from_millis(i as u64);
++        let evicted = pool.give_back_at(make_entry(&harness, key.clone(), 1000 + i as u64, 4096, now), now);
++        destroy_entries(&harness.vk, &harness.memory, evicted);
++        let (count, bytes) = pool.stats();
++        assert!(count <= MAX_POOL_IMAGES);
++        assert!(bytes <= MAX_POOL_BYTES);
++    }
++    assert_eq!(pool.stats().0, MAX_POOL_IMAGES);
++    assert_eq!(harness.image_destroy_count(), 1 + 7);
++    // Oldest kept should be 1007 (1000..=1006 evicted); newest is 1134.
++    let mut popped = Vec::new();
++    while let (Some(e), _) = pool.take_at(&key, t0 + Duration::from_secs(1)) {
++        popped.push(e.raw.as_raw());
++    }
++    assert_eq!(popped.first().copied(), Some(1134));
++    assert_eq!(popped.last().copied(), Some(1007));
++
++    // 3. Bytes cap (MAX_POOL_BYTES = 128 MiB): inserting 3 x 50 MiB (= 150 MiB) evicts oldest first.
++    let ops_before = harness.image_destroy_count();
++    let big = 50 << 20;
++    for j in 0..3u64 {
++        let now = t0 + Duration::from_secs(2) + Duration::from_millis(j);
++        let evicted = pool.give_back_at(make_entry(&harness, key.clone(), 2000 + j, big, now), now);
++        destroy_entries(&harness.vk, &harness.memory, evicted);
++        let (count, bytes) = pool.stats();
++        assert!(count <= MAX_POOL_IMAGES);
++        assert!(bytes <= MAX_POOL_BYTES);
++    }
++    assert_eq!(pool.stats(), (2, 100 << 20));
++    assert_eq!(harness.image_destroy_count(), ops_before + 1);
++    let ops = harness.ops();
++    assert!(ops.contains(&MockOp::Image(2000)));
++}
++
++#[test]
++fn memory_pressure_release_kept_memory_drains_all() {
++    let harness = MockHarness::new();
++    let pool = ImagePool::default();
++    let t0 = Instant::now();
++    let key = base_key();
++
++    // Mix dedicated (40 MiB each -> direct vkFreeMemory) and small pooled (4 KiB -> empty block release).
++    let e1 = make_entry(&harness, key.clone(), 301, 40 << 20, t0);
++    let e2 = make_entry(&harness, key.clone(), 302, 40 << 20, t0);
++    let e3 = make_entry(&harness, key.clone(), 303, 4096, t0);
++    for e in [e1, e2, e3] {
++        assert!(pool.give_back_at(e, t0).is_empty());
++    }
++    assert_eq!(pool.stats(), (3, (80 << 20) + 4096));
++
++    // Simulate Device::release_kept_memory()
++    let drained = pool.drain_all();
++    let freed_images = destroy_entries(&harness.vk, &harness.memory, drained);
++    let freed_empty_blocks = harness
++        .memory
++        .lock()
++        .unwrap()
++        .release_empty_blocks(&harness.vk);
++    assert_eq!(freed_images, 3);
++    assert!(freed_empty_blocks >= 1);
++    assert_eq!(pool.stats(), (0, 0));
++    assert_eq!(harness.image_destroy_count(), 3);
++    // 2 dedicated blocks + 1 pooled block freed
++    assert_eq!(harness.memory_free_count(), 3);
++    assert_eq!(harness.double_free_count(), 0);
++
++    // Verify every Image destruction preceded its corresponding Memory free in order.
++    let ops = harness.ops();
++    let first_img = ops.iter().position(|op| matches!(op, MockOp::Image(301))).unwrap();
++    let first_mem = ops.iter().position(|op| matches!(op, MockOp::Memory(_))).unwrap();
++    assert!(first_img < first_mem, "VkImage must be destroyed before VkDeviceMemory is freed");
++}
++
++#[test]
++fn device_lost_refuses_reuse_and_teardown_no_double_free() {
++    let harness = MockHarness::new();
++    let pool = ImagePool::default();
++    let lost = AtomicBool::new(false);
++    let t0 = Instant::now();
++    let key = base_key();
++
++    let e1 = make_entry(&harness, key.clone(), 401, 40 << 20, t0);
++    assert!(pool.give_back_at(e1, t0).is_empty());
++
++    // Simulate DeviceLost: refuses borrow and refuses return (direct destroy).
++    lost.store(true, Ordering::Release);
++    let borrowed = if lost.load(Ordering::Acquire) {
++        None
++    } else {
++        pool.take_at(&key, t0).0
++    };
++    assert!(borrowed.is_none());
++
++    let e2 = make_entry(&harness, key.clone(), 402, 40 << 20, t0);
++    if lost.load(Ordering::Acquire) {
++        destroy_entries(&harness.vk, &harness.memory, vec![e2]);
++    } else {
++        let _ = pool.give_back_at(e2, t0);
++    }
++    assert_eq!(pool.stats(), (1, 40 << 20));
++    assert_eq!(harness.image_destroy_count(), 1);
++    assert_eq!(harness.memory_free_count(), 1);
++
++    // Simulate DeviceShared::drop teardown: drain image_pool then destroy memory.
++    let leftover = pool.drain_all();
++    let n = destroy_entries(&harness.vk, &harness.memory, leftover);
++    assert_eq!(n, 1);
++    harness.memory.lock().unwrap().destroy(&harness.vk);
++
++    assert_eq!(pool.stats(), (0, 0));
++    assert_eq!(harness.image_destroy_count(), 2);
++    assert_eq!(harness.memory_free_count(), 2);
++    assert_eq!(harness.double_free_count(), 0);
++}
++
++#[test]
++fn non_monotonic_timestamp_ttl_eviction() {
++    let harness = MockHarness::new();
++    let pool = ImagePool::default();
++    let t0 = Instant::now();
++    let key = base_key();
++
++    // Insert newer timestamp first, then older timestamp (Challenger 1 out-of-order scenario).
++    assert!(pool
++        .give_back_at(
++            make_entry(&harness, key.clone(), 501, 4096, t0),
++            t0 + Duration::from_secs(8)
++        )
++        .is_empty());
++    assert!(pool
++        .give_back_at(
++            make_entry(&harness, key.clone(), 502, 4096, t0),
++            t0 + Duration::from_secs(1)
++        )
++        .is_empty());
++    assert_eq!(pool.stats(), (2, 8192));
++
++    // At t0 + 12s, entry 502 (t0 + 1s, age 11s >= 10s) must be evicted even though 501 (age 4s) is at front.
++    let expired = pool.drain_expired_at(t0 + Duration::from_secs(12));
++    assert_eq!(expired.len(), 1);
++    assert_eq!(expired[0].raw.as_raw(), 502);
++    assert_eq!(pool.stats(), (1, 4096));
++    destroy_entries(&harness.vk, &harness.memory, expired);
++
++    // At t0 + 18s, entry 501 (t0 + 8s, age 10s) expires as well.
++    let expired2 = pool.drain_expired_at(t0 + Duration::from_secs(18));
++    assert_eq!(expired2.len(), 1);
++    assert_eq!(expired2[0].raw.as_raw(), 501);
++    assert_eq!(pool.stats(), (0, 0));
++    destroy_entries(&harness.vk, &harness.memory, expired2);
++    assert_eq!(harness.double_free_count(), 0);
++}
+diff --git a/crates/metal2vulkan-runtime/src/tests/mod.rs b/crates/metal2vulkan-runtime/src/tests/mod.rs
+index f579adc..f869867 100644
+--- a/crates/metal2vulkan-runtime/src/tests/mod.rs
++++ b/crates/metal2vulkan-runtime/src/tests/mod.rs
+@@ -64,6 +64,7 @@ mod host_memory;
+ #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+ mod host_step_neutrals;
+ mod image_plan;
++mod image_pool;
+ mod inbox;
+ mod indirect_command_buffer;
+ mod interop;
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 27564bc..818de8d 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -78,6 +78,7 @@ use super::framebuffer_fetch::UsageAnswers;
+ use super::fresh_unwritten::{FreshKind, Notice};
+ use super::heap::{Heap, HeapProblem, HeapType};
+ use super::heap_sets;
++use super::image_pool::{self, ImagePoolKey, PooledImage};
+ use super::image_plan::{
+     check_image_limits, plan_image, plan_images, plan_texture_images, DepthImageFacts, ImageFacts,
+     ImagePlan, ImageRefusal,
+@@ -1103,24 +1104,59 @@ impl Drop for Image {
+             return;
+         };
+         let shared = self.device.shared();
+-        let (image, memory) = self.owner.releases();
+-        // An image that took its storage form is in the form's memory: the memory it was made in
+-        // goes with its first `VkImage`, which the switch's command buffer holds until it
+-        // completes (`texture/storage_form.rs`).
+-        let memory = self.form.placement().or(memory);
+         // SAFETY: no pending command buffer uses the image or a view of it: a committed command
+         // buffer holds every texture it uses until it completes. The views are the runtime's
+         // own; the image only where it made it.
+         // An image presenting a stand-in destroys its own `VkImage` where it kept one, and
+         // never the stand-in's.
++        unsafe {
++            for &view in lock(&self.views).values() {
++                release::object(shared.vk(), view);
++            }
++        }
++        let can_pool = self.twin.is_none()
++            && self.decoded.is_none()
++            && self.form.plan().is_none()
++            && lock(&self.detached).is_none()
++            && !self.device.is_lost()
++            && matches!(
++                self.owner,
++                Owner::Runtime {
++                    shareable: false,
++                    pool_key: Some(_),
++                    ..
++                }
++            );
++        if can_pool {
++            let in_general = lock(&self.first_move).is_none();
++            if let Owner::Runtime {
++                placement,
++                pool_key: Some(key),
++                ..
++            } = std::mem::replace(&mut self.owner, Owner::Pooled)
++            {
++                let evicted = shared.image_pool.give_back(PooledImage {
++                    key,
++                    raw: self.raw.get(),
++                    placement,
++                    host_copies: self.host_copies,
++                    in_general,
++                });
++                image_pool::destroy_entries(shared.vk(), &shared.memory, evicted);
++                shared.fresh.forget(self.identity.key);
++                return;
++            }
++        }
++        let (image, memory) = self.owner.releases();
++        // An image that took its storage form is in the form's memory: the memory it was made in
++        // goes with its first `VkImage`, which the switch's command buffer holds until it
++        // completes (`texture/storage_form.rs`).
++        let memory = self.form.placement().or(memory);
+         let raw = match &*lock(&self.detached) {
+             Some(detached) => detached.own,
+             None => Some(self.raw.get()),
+         };
+         unsafe {
+-            for &view in lock(&self.views).values() {
+-                release::object(shared.vk(), view);
+-            }
+             if let Some(raw) = raw.filter(|_| image) {
+                 release::object(shared.vk(), raw);
+             }
+@@ -1193,7 +1229,10 @@ pub(super) enum Owner {
+         placement: Placement,
+         shareable: bool,
+         purgeable: Mutex<PurgeableState>,
++        pool_key: Option<ImagePoolKey>,
+     },
++    /// The image's `VkImage` and `Placement` were transferred to [`ImagePool`] at [`Image::drop`].
++    Pooled,
+     /// The runtime made a linear image (or a Metal texture) in a buffer's memory: the image goes
+     /// with it, the memory stays the buffer's. The image holds the memory, so it outlives every
+     /// command that reaches the image, a batch that took its first move and holds only the image
+@@ -1267,7 +1306,7 @@ impl Owner {
+             Owner::Buffer { .. } | Owner::Sparse(_) | Owner::Heap(_) | Owner::HeapTwin => {
+                 (true, None)
+             }
+-            Owner::Caller(_) => (false, None),
++            Owner::Caller(_) | Owner::Pooled => (false, None),
+         }
+     }
+ }
+@@ -3177,13 +3216,14 @@ impl Device {
+     ) -> Result<Image, Error> {
+         let identity = Identity::new(hazard, false);
+         let held = descriptor.resource_options.storage_mode()? == StorageMode::Memoryless;
+-        self.new_image_starting(
++        self.new_image_starting_impl(
+             plan,
+             layout,
+             descriptor,
+             identity,
+             Start::held_or_zero(held),
+             Device::runtime_owner,
++            true,
+         )
+     }
+ 
+@@ -3193,6 +3233,25 @@ impl Device {
+             placement,
+             shareable: false,
+             purgeable: Mutex::new(PurgeableState::NonVolatile),
++            pool_key: None,
++        }
++    }
++
++    /// Construct the 12-field [`ImagePoolKey`] for a runtime-owned image of `plan`.
++    fn image_pool_key(plan: &ImagePlan, sharing_staging: bool, memory_class: MemoryClass) -> ImagePoolKey {
++        ImagePoolKey {
++            image_type: plan.image_type,
++            format: plan.format,
++            extent: plan.extent,
++            mip_levels: plan.levels,
++            array_layers: plan.layers,
++            samples: plan.samples,
++            tiling: vk::ImageTiling::OPTIMAL,
++            usage: plan.usage,
++            flags: plan.flags,
++            view_formats: plan.view_formats.clone(),
++            sharing_staging,
++            memory_class,
+         }
+     }
+ 
+@@ -3343,6 +3402,19 @@ impl Device {
+         identity: Identity,
+         start: Start,
+         owner: impl FnOnce(Placement, vk::Image) -> Owner,
++    ) -> Result<Image, Error> {
++        self.new_image_starting_impl(plan, layout, descriptor, identity, start, owner, false)
++    }
++
++    fn new_image_starting_impl(
++        &self,
++        plan: ImagePlan,
++        layout: &TextureLayout,
++        descriptor: &TextureDescriptor,
++        identity: Identity,
++        start: Start,
++        owner: impl FnOnce(Placement, vk::Image) -> Owner,
++        poolable: bool,
+     ) -> Result<Image, Error> {
+         let held = start == Start::Held;
+         let moved = start == Start::Moved;
+@@ -3363,21 +3435,69 @@ impl Device {
+         // multisample texture: such an image takes neither path, and a clear writes its zeros.
+         let one_sample = layout.samples == 1;
+         let staged = !held && !private && one_sample && self.stages(&plan, layout.pixel_format);
+-        let hosted = match held || private || !one_sample || is_pvrtc(descriptor.pixel_format) {
+-            true => None,
+-            false => self.host_placed_image(&plan, layout.texture_type, class, staged),
+-        };
+-        let (plan, raw, placement, host_copies) = match hosted {
+-            Some((plan, raw, placement)) => (plan, raw, placement, true),
++        let shared = self.shared();
++        let can_host = !(held || private || !one_sample || is_pvrtc(descriptor.pixel_format))
++            && shared.host_copies.is_some()
++            && !(staged && !lock(&shared.memory).has_host_cached(class))
++            && shared
++                .textures
++                .facts(self.compile_device().profile())
++                .optimal(plan.format)
++                .contains(FormatFeatureFlags2::HOST_IMAGE_TRANSFER);
++        let mut pooled_hit = None;
++        if poolable && !self.is_lost() && can_host {
++            let mut hosted_plan = plan.clone();
++            hosted_plan.usage |= ImageUsageFlags::HOST_TRANSFER;
++            let key = Self::image_pool_key(&hosted_plan, false, class);
++            let (hit, expired) = shared.image_pool.take(&key);
++            image_pool::destroy_entries(shared.vk(), &shared.memory, expired);
++            if let Some(entry) = hit {
++                pooled_hit = Some((hosted_plan, entry.raw, entry.placement, true, entry.in_general, key));
++            }
++        }
++        let (plan, raw, placement, host_copies, in_general, used_pool_key) = match pooled_hit {
++            Some(hit) => hit,
+             None => {
+-                let sharing = match staged {
+-                    true => self.staging_sharing(),
++                let hosted = match can_host {
++                    true => self.host_placed_image(&plan, layout.texture_type, class, staged),
+                     false => None,
+                 };
+-                let sharing = sharing.unwrap_or_else(|| self.shared().sharing());
+-                let (raw, placement) =
+-                    self.placed_image(&plan, layout.texture_type, class, sharing)?;
+-                (plan, raw, placement, false)
++                match hosted {
++                    Some((hosted_plan, raw, placement)) => {
++                        let key = Self::image_pool_key(&hosted_plan, false, class);
++                        (hosted_plan, raw, placement, true, false, key)
++                    }
++                    None => {
++                        let key = Self::image_pool_key(&plan, staged, class);
++                        let pooled = if poolable && !self.is_lost() {
++                            let (hit, expired) = shared.image_pool.take(&key);
++                            image_pool::destroy_entries(shared.vk(), &shared.memory, expired);
++                            hit
++                        } else {
++                            None
++                        };
++                        match pooled {
++                            Some(entry) => (
++                                plan,
++                                entry.raw,
++                                entry.placement,
++                                entry.host_copies,
++                                entry.in_general,
++                                key,
++                            ),
++                            None => {
++                                let sharing = match staged {
++                                    true => self.staging_sharing(),
++                                    false => None,
++                                };
++                                let sharing = sharing.unwrap_or_else(|| shared.sharing());
++                                let (raw, placement) =
++                                    self.placed_image(&plan, layout.texture_type, class, sharing)?;
++                                (plan, raw, placement, false, false, key)
++                            }
++                        }
++                    }
++                }
+             }
+         };
+         let staging_copies = staged && !host_copies;
+@@ -3402,9 +3522,14 @@ impl Device {
+         } else {
+             None
+         };
+-        let first = FirstMove::new(raw, plan.format, vk::ImageLayout::UNDEFINED, false);
++        let old_layout = if in_general {
++            vk::ImageLayout::GENERAL
++        } else {
++            vk::ImageLayout::UNDEFINED
++        };
++        let first = FirstMove::new(raw, plan.format, old_layout, false);
+         let aspects: vk::ImageAspectFlags = image_aspects(plan.format).into();
+-        let image = Image {
++        let mut image = Image {
+             device: self.clone(),
+             raw: Raw::new(raw),
+             owner: owner(placement, raw),
+@@ -3438,16 +3563,25 @@ impl Device {
+             // SAFETY: the image is live, made with host-transfer usage and bound to memory of its
+             // own, which nothing used yet; every copy lies within it and reads within `zeros`.
+             unsafe {
+-                host_copy::start(
+-                    functions,
+-                    self.shared().vk().handle(),
+-                    raw,
+-                    aspects,
+-                    &zeros,
+-                    &copies,
+-                )
++                if in_general {
++                    host_copy::write(functions, self.shared().vk().handle(), raw, &zeros, &copies)
++                } else {
++                    host_copy::start(
++                        functions,
++                        self.shared().vk().handle(),
++                        raw,
++                        aspects,
++                        &zeros,
++                        &copies,
++                    )
++                }
+             }?;
+             self.shared().counts.image_started_on_the_host();
++            if poolable {
++                if let Owner::Runtime { pool_key, .. } = &mut image.owner {
++                    *pool_key = Some(used_pool_key);
++                }
++            }
+             return Ok(image);
+         }
+         // Its texels are written after (`Start::Moved`). Dropping `image` on failure releases
+@@ -3455,18 +3589,34 @@ impl Device {
+         if let (true, true, Some(functions)) =
+             (moved, host_copies, self.shared().host_copies.as_ref())
+         {
+-            // SAFETY: the image is live, made with host-transfer usage and bound to memory of its
+-            // own, which nothing used yet.
+-            unsafe { host_copy::transition(functions, self.shared().vk().handle(), raw, aspects) }?;
++            if !in_general {
++                // SAFETY: the image is live, made with host-transfer usage and bound to memory of its
++                // own, which nothing used yet.
++                unsafe {
++                    host_copy::transition(functions, self.shared().vk().handle(), raw, aspects)
++                }?;
++            }
+             self.shared().counts.image_started_on_the_host();
++            if poolable {
++                if let Owner::Runtime { pool_key, .. } = &mut image.owner {
++                    *pool_key = Some(used_pool_key);
++                }
++            }
+             return Ok(image);
+         }
+         if moved && staging_copies {
+-            // SAFETY: the staging command buffer is recording; the image is live, bound to
+-            // memory of its own, which nothing used yet, in `UNDEFINED`, which the move leaves.
+-            self.submit_staging(|raw, command_buffer| unsafe {
+-                first.record_alone(raw, command_buffer)
+-            })?;
++            if !in_general {
++                // SAFETY: the staging command buffer is recording; the image is live, bound to
++                // memory of its own, which nothing used yet, in `UNDEFINED`, which the move leaves.
++                self.submit_staging(|raw, command_buffer| unsafe {
++                    first.record_alone(raw, command_buffer)
++                })?;
++            }
++            if poolable {
++                if let Owner::Runtime { pool_key, .. } = &mut image.owner {
++                    *pool_key = Some(used_pool_key);
++                }
++            }
+             return Ok(image);
+         }
+         // Its zeros are a staging buffer's, which nothing else uses: the device's own zeros are
+@@ -3481,6 +3631,11 @@ impl Device {
+             self.submit_staging(|raw, command_buffer| unsafe {
+                 first.record_alone(raw, command_buffer)
+             })?;
++            if poolable {
++                if let Owner::Runtime { pool_key, .. } = &mut image.owner {
++                    *pool_key = Some(used_pool_key);
++                }
++            }
+             return Ok(image);
+         }
+         // A `Private` texture of the program's (the runtime's own images are held). Dropping
+@@ -3505,7 +3660,14 @@ impl Device {
+             None if clear => first.cleared(),
+             None => first,
+         };
+-        *lock(&image.first_move) = Some(first);
++        if !(held && in_general) {
++            *lock(&image.first_move) = Some(first);
++        }
++        if poolable {
++            if let Owner::Runtime { pool_key, .. } = &mut image.owner {
++                *pool_key = Some(used_pool_key);
++            }
++        }
+         Ok(image)
+     }
+ 
+@@ -4601,7 +4763,8 @@ impl Texture {
+             | Owner::Heap(_)
+             | Owner::HeapTwin
+             | Owner::HeapShadow(_)
+-            | Owner::HeapUnaliased(_) => None,
++            | Owner::HeapUnaliased(_)
++            | Owner::Pooled => None,
+         }
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/texture/host_copy.rs b/crates/metal2vulkan-runtime/src/texture/host_copy.rs
+index d5bc381..b1dfe46 100644
+--- a/crates/metal2vulkan-runtime/src/texture/host_copy.rs
++++ b/crates/metal2vulkan-runtime/src/texture/host_copy.rs
+@@ -146,7 +146,7 @@ pub(super) unsafe fn transition(
+ ///
+ /// `functions` are `device`'s, `image` is a live image of it with host-transfer usage, in
+ /// `GENERAL`; every copy lies within the image and reads within `bytes`.
+-unsafe fn write(
++pub(super) unsafe fn write(
+     functions: &DeviceFn,
+     device: vk::Device,
+     image: vk::Image,
+diff --git a/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs b/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs
+index f2e253b..777b11a 100644
+--- a/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs
++++ b/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs
+@@ -199,7 +199,8 @@ impl Texture {
+                     | Owner::Sparse(_)
+                     | Owner::Heap(_)
+                     | Owner::HeapTwin
+-                    | Owner::HeapShadow(_) => return Err(refused()),
++                    | Owner::HeapShadow(_)
++                    | Owner::Pooled => return Err(refused()),
+                 };
+                 let image =
+                     device.image_shadow(call, base, &self.root().0.record, &wider, refused)?;
+diff --git a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+index 88ea209..3f47dc3 100644
+--- a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
++++ b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+@@ -106,7 +106,8 @@ impl Texture {
+                     | Owner::Sparse(_)
+                     | Owner::Heap(_)
+                     | Owner::HeapTwin
+-                    | Owner::HeapShadow(_) => return Err(refused(Some(image.as_ref()))),
++                    | Owner::HeapShadow(_)
++                    | Owner::Pooled => return Err(refused(Some(image.as_ref()))),
+                 };
+                 if self.device().image_takes_view(base, record.pixel_format) {
+                     return Ok(Storage::Image(Arc::clone(base)));

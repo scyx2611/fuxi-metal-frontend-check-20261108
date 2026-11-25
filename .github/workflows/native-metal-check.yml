@@ -71,6 +71,9 @@ jobs:
           cp harness/patches/nativemetal-fuxi-0022-pipeline-prewarm.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0023-overlap-handlers.patch source/tools/patches/
           cp harness/patches/nativemetal-fuxi-0024-texture-rotation.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0025-held-imports-feature-set-and-last-lost.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0026-tile-pipeline-guard.patch source/tools/patches/
+          cp harness/patches/nativemetal-fuxi-0027-surface-tex-cache-and-telemetry.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0001-copy-span.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0002-fresh-zero.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0004-surface-alias.patch source/tools/patches/
@@ -92,6 +95,9 @@ jobs:
           cp harness/patches/metal2vulkan-fuxi-0020-lane-strips.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0021-rotated-two-plane.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0022-fast-rotated-staging.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0023-owned-image-pool.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0024-first-loss-ring.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0025-image-pool-telemetry.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |

@@ -1,0 +1,750 @@
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+index af866a3..2e7ab8e 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+@@ -421,7 +421,7 @@ fn settle(device: &Device, fences: &[(usize, vk::Fence)]) -> Settled {
+             Err(vk::Result::TIMEOUT) => continue,
+             Err(error) => error,
+         };
+-        let failed = failure(device, error);
++        let failed = failure(device, error, "completion_wait_all_fences");
+         for &(queue, fence) in fences {
+             let_go(device, queue, fence);
+         }
+@@ -572,7 +572,7 @@ fn poll(device: &Device, queue: usize, front: Front) -> Result<u64, CommandBuffe
+             match waited {
+                 Ok(()) => true,
+                 Err(vk::Result::TIMEOUT) => false,
+-                Err(error) => return Err(failure(device, error)),
++                Err(error) => return Err(failure(device, error, "completion_wait_for_fences")),
+             }
+         }
+         None => {
+@@ -588,14 +588,14 @@ fn poll(device: &Device, queue: usize, front: Front) -> Result<u64, CommandBuffe
+             shared.counts.timeline_wait();
+             match waited {
+                 Ok(()) | Err(vk::Result::TIMEOUT) => false,
+-                Err(error) => return Err(failure(device, error)),
++                Err(error) => return Err(failure(device, error, "completion_wait_semaphores")),
+             }
+         }
+     };
+     // SAFETY: the semaphore is the device's timeline, live while the device is (held here).
+     let value = unsafe { raw.get_semaphore_counter_value(slot.timeline) };
+     exit_guard::called(Call::GetSemaphoreCounterValue);
+-    let value = value.map_err(|error| failure(device, error))?;
++    let value = value.map_err(|error| failure(device, error, "completion_counter_value"))?;
+     let value = match signaled {
+         true => value.max(front.value),
+         false => value,
+@@ -605,17 +605,22 @@ fn poll(device: &Device, queue: usize, front: Front) -> Result<u64, CommandBuffe
+ }
+ 
+ /// The command-buffer error of a failed wait, recording a lost device.
+-fn failure(device: &Device, error: vk::Result) -> CommandBufferError {
++fn failure(device: &Device, error: vk::Result, stage: &'static str) -> CommandBufferError {
+     match error {
+         vk::Result::ERROR_DEVICE_LOST => {
++            device.latch_first_loss(error, stage, format!("timeline wait err={error:?}"));
+             device.mark_lost();
+             // A batch held for an event may now be refused.
+             device.shared().scheduler.wake();
+             CommandBufferError::DeviceLost
+         }
+         vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
++            device.record_event(format!("vk_oom stage={stage} vk={error:?}"));
+             CommandBufferError::OutOfMemory
+         }
+-        other => CommandBufferError::Internal(VkResultCode(other.as_raw())),
++        other => {
++            device.record_event(format!("vk_error stage={stage} vk={other:?}"));
++            CommandBufferError::Internal(VkResultCode(other.as_raw()))
++        }
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 7f1db8e..09ee06b 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -1928,7 +1928,13 @@ impl CommandBuffer {
+                 });
+                 return Err(untimed());
+             }
+-            Stamped::Failed(error) => return Err(device.failed(error)),
++            Stamped::Failed(error) => {
++                return Err(device.failed_at(
++                    error,
++                    "command_buffer_timestamp",
++                    format!("timestamp read err={error:?}"),
++                ))
++            }
+         };
+         // Read timestamps came from the device's clock.
+         let clock = clock.ok_or_else(untimed)?;
+@@ -2575,7 +2581,11 @@ impl CommandBufferShared {
+             Err(error) => {
+                 // SAFETY: as for a failed batch's fence (`submit.rs`).
+                 unsafe { release::object(raw, fence) };
+-                let _ = self.device.failed(error);
++                let _ = self.device.failed_at(
++                    error,
++                    "command_buffer_fence_submit",
++                    format!("empty fence submit err={error:?}"),
++                );
+                 None
+             }
+         }
+@@ -2896,7 +2906,11 @@ fn step_error(device: &Device, error: Error, refusal: &mut Option<Error>) -> Com
+ 
+ /// The command-buffer error of a failed submission, recording a lost device.
+ fn submission_error(device: &Device, error: vk::Result) -> CommandBufferError {
+-    match device.failed(error) {
++    match device.failed_at(
++        error,
++        "command_buffer_submission",
++        format!("queue submission err={error:?}"),
++    ) {
+         Error::DeviceLost => CommandBufferError::DeviceLost,
+         Error::OutOfMemory(_) => CommandBufferError::OutOfMemory,
+         _ => CommandBufferError::Internal(super::error::VkResultCode(error.as_raw())),
+diff --git a/crates/metal2vulkan-runtime/src/creation.rs b/crates/metal2vulkan-runtime/src/creation.rs
+index 91827bf..9863503 100644
+--- a/crates/metal2vulkan-runtime/src/creation.rs
++++ b/crates/metal2vulkan-runtime/src/creation.rs
+@@ -60,6 +60,79 @@ pub(crate) unsafe fn image_or_refusal(
+     }
+ }
+ 
++/// [`image`](Self::image) on `device`, latching first-loss diagnostics before marking `device`
++/// lost if image creation reports `VK_ERROR_DEVICE_LOST`.
++///
++/// # Safety
++///
++/// As [`image`](Self::image)'s: `device` is live, and `info` and its chain are valid for it.
++pub(crate) unsafe fn device_image(
++    device: &crate::Device,
++    info: &vk::ImageCreateInfo<'_>,
++    stage: &'static str,
++) -> Result<vk::Image, Error> {
++    // SAFETY: the caller's.
++    match unsafe { image(device.shared().vk(), info) } {
++        Ok(raw) => Ok(raw),
++        Err(Error::DeviceLost) => {
++            device.latch_first_loss(
++                vk::Result::ERROR_DEVICE_LOST,
++                stage,
++                format!(
++                    "create_image format={} extent={}x{}x{}",
++                    info.format.as_raw(),
++                    info.extent.width,
++                    info.extent.height,
++                    info.extent.depth
++                ),
++            );
++            device.mark_lost();
++            Err(Error::DeviceLost)
++        }
++        Err(other) => {
++            device.record_event(format!("create_image stage={stage} err={other}"));
++            Err(other)
++        }
++    }
++}
++
++/// [`image_or_refusal`](Self::image_or_refusal) on `device`, latching first-loss diagnostics
++/// before marking `device` lost on `VK_ERROR_DEVICE_LOST`.
++///
++/// # Safety
++///
++/// As [`image_or_refusal`](Self::image_or_refusal)'s: `device` is live, and `info` and its chain
++/// are valid for it.
++pub(crate) unsafe fn device_image_or_refusal(
++    device: &crate::Device,
++    info: &vk::ImageCreateInfo<'_>,
++    stage: &'static str,
++) -> Result<Result<vk::Image, vk::Result>, Error> {
++    // SAFETY: the caller's.
++    match unsafe { image_or_refusal(device.shared().vk(), info) } {
++        Ok(res) => Ok(res),
++        Err(Error::DeviceLost) => {
++            device.latch_first_loss(
++                vk::Result::ERROR_DEVICE_LOST,
++                stage,
++                format!(
++                    "create_image_or_refusal format={} extent={}x{}x{}",
++                    info.format.as_raw(),
++                    info.extent.width,
++                    info.extent.height,
++                    info.extent.depth
++                ),
++            );
++            device.mark_lost();
++            Err(Error::DeviceLost)
++        }
++        Err(other) => {
++            device.record_event(format!("create_image_or_refusal stage={stage} err={other}"));
++            Err(other)
++        }
++    }
++}
++
+ /// A `VkRenderPass` of `info`, made by `device`; refused in a host step.
+ ///
+ /// # Safety
+diff --git a/crates/metal2vulkan-runtime/src/device/first_loss.rs b/crates/metal2vulkan-runtime/src/device/first_loss.rs
+new file mode 100644
+index 0000000..92e454c
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/device/first_loss.rs
+@@ -0,0 +1,116 @@
++//! First device-loss latch and bounded 32-entry diagnostic event ring (`device/first_loss.rs`).
++
++use super::lock;
++use ash::vk;
++use std::collections::VecDeque;
++use std::fmt::Write as _;
++use std::sync::{Mutex, OnceLock};
++use std::time::Instant;
++
++/// Maximum number of recent diagnostic events retained per device in the ring buffer.
++pub const MAX_EVENT_RING: usize = 32;
++
++/// Latched details of the very first `VK_ERROR_DEVICE_LOST` or fatal runtime loss observed on a
++/// device.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct FirstLossInfo {
++    /// Raw Vulkan `VkResult` integer code (for example `-4` for `VK_ERROR_DEVICE_LOST`).
++    pub vk_result: i32,
++    /// Runtime stage where the first loss was observed.
++    pub stage: &'static str,
++    /// Contextual diagnostic message describing the failing operation.
++    pub detail: String,
++    /// Milliseconds elapsed from device creation until the first loss was latched.
++    pub elapsed_ms: u64,
++    /// Snapshot of up to [`MAX_EVENT_RING`] recent events ending at the latched loss.
++    pub recent_events: Vec<String>,
++}
++
++/// Per-device diagnostic ring buffer and atomic first-loss latch.
++pub(crate) struct FirstLossState {
++    created_at: Instant,
++    first_loss: OnceLock<FirstLossInfo>,
++    event_ring: Mutex<VecDeque<String>>,
++}
++
++impl Default for FirstLossState {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl FirstLossState {
++    /// Create a fresh diagnostic state anchored at the current monotonic instant.
++    pub(crate) fn new() -> Self {
++        Self {
++            created_at: Instant::now(),
++            first_loss: OnceLock::new(),
++            event_ring: Mutex::new(VecDeque::with_capacity(MAX_EVENT_RING)),
++        }
++    }
++
++    fn elapsed_ms(&self) -> u64 {
++        self.created_at.elapsed().as_millis() as u64
++    }
++
++    /// Push a bounded diagnostic event into the 32-entry FIFO ring buffer.
++    pub(crate) fn record_event(&self, event: impl AsRef<str>) {
++        let elapsed_ms = self.elapsed_ms();
++        let entry = format!("+{elapsed_ms}ms {}", event.as_ref());
++        let mut ring = lock(&self.event_ring);
++        while ring.len() >= MAX_EVENT_RING {
++            ring.pop_front();
++        }
++        ring.push_back(entry);
++    }
++
++    /// Atomically latch the first device loss. Subsequent calls preserve the original latch.
++    pub(crate) fn latch(
++        &self,
++        vk_result: vk::Result,
++        stage: &'static str,
++        detail: impl Into<String>,
++    ) -> &FirstLossInfo {
++        let detail = detail.into();
++        self.first_loss.get_or_init(|| {
++            let elapsed_ms = self.elapsed_ms();
++            let loss_entry = format!("+{elapsed_ms}ms LOSS stage={stage} vk={vk_result:?} {detail}");
++            let recent_events = {
++                let mut ring = lock(&self.event_ring);
++                while ring.len() >= MAX_EVENT_RING {
++                    ring.pop_front();
++                }
++                ring.push_back(loss_entry);
++                ring.iter().cloned().collect()
++            };
++            FirstLossInfo {
++                vk_result: vk_result.as_raw(),
++                stage,
++                detail,
++                elapsed_ms,
++                recent_events,
++            }
++        })
++    }
++
++    /// Return the latched first-loss info, if any loss has occurred.
++    pub(crate) fn get(&self) -> Option<&FirstLossInfo> {
++        self.first_loss.get()
++    }
++
++    /// Format the latched first-loss report and its captured event ring for diagnostics/logging.
++    pub(crate) fn format_report(&self) -> Option<String> {
++        let info = self.get()?;
++        let mut out = String::new();
++        let _ = writeln!(
++            out,
++            "first_loss stage={} vk_result={} elapsed_ms={} detail={}",
++            info.stage, info.vk_result, info.elapsed_ms, info.detail
++        );
++        let _ = writeln!(out, "recent_events({}):", info.recent_events.len());
++        for (idx, ev) in info.recent_events.iter().enumerate() {
++            let _ = writeln!(out, "  [{idx}] {ev}");
++        }
++        Some(out)
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index dc98cd6..1d41abc 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -19,6 +19,7 @@ mod adopt;
+ pub(super) mod argument_buffers;
+ mod compiles;
+ pub(super) mod create;
++pub(super) mod first_loss;
+ pub(super) mod functions;
+ mod handles;
+ pub(super) mod instance_requirements;
+@@ -34,6 +35,7 @@ pub use create::{
+     DebugMessage, DeviceOptions, LayerSetting, LayerSettingValue, MessageKind, MessageSeverity,
+     MessageSink,
+ };
++pub use first_loss::FirstLossInfo;
+ pub use handles::DeviceHandles;
+ pub use properties::DeviceKind;
+ 
+@@ -58,6 +60,7 @@ use super::gpu_time::{self, FromHost, Timing};
+ use super::heap_sets::{DeviceHeaps, NanResidue};
+ use super::host_memory::Importer;
+ use super::image_pool::{self, ImagePool};
++use first_loss::FirstLossState;
+ use super::interop::Interop;
+ use super::loader_word::LoaderWord;
+ use super::memory::Memory;
+@@ -242,6 +245,8 @@ pub(super) struct DeviceShared {
+     /// The device was lost: no further submission. Shared with the relay (`relay.rs`), which
+     /// records a loss it hears of.
+     lost: Arc<AtomicBool>,
++    /// Atomic first-loss latch and bounded 32-entry diagnostic event ring (`device/first_loss.rs`).
++    pub(crate) first_loss: Arc<FirstLossState>,
+     pub(super) textures: super::texture::TextureState,
+     /// Pool of idle runtime-owned `VkImage` objects and their bound placements (`image_pool.rs`).
+     pub(super) image_pool: ImagePool,
+@@ -674,6 +679,31 @@ impl Device {
+         self.0.lost.store(true, Ordering::Release);
+     }
+ 
++    /// Push a bounded diagnostic event into the per-device 32-entry ring buffer.
++    pub(crate) fn record_event(&self, event: impl AsRef<str>) {
++        self.0.first_loss.record_event(event);
++    }
++
++    /// Atomically latch the first device loss details before calling [`mark_lost`](Self::mark_lost).
++    pub(crate) fn latch_first_loss(
++        &self,
++        vk_result: vk::Result,
++        stage: &'static str,
++        detail: impl Into<String>,
++    ) {
++        let _ = self.0.first_loss.latch(vk_result, stage, detail);
++    }
++
++    /// Return the latched first device-loss diagnostics, if any loss has occurred.
++    pub fn first_loss_report(&self) -> Option<&FirstLossInfo> {
++        self.0.first_loss.get()
++    }
++
++    /// Format the latched first device-loss report and its recent 32-entry event ring as text.
++    pub fn first_loss_report_text(&self) -> Option<String> {
++        self.0.first_loss.format_report()
++    }
++
+     /// Release all idle pooled `VkImage` entries and empty kept memory blocks back to the
+     /// Vulkan driver, returning the number of images and blocks freed.
+     pub fn release_kept_memory(&self) -> usize {
+@@ -1239,13 +1269,20 @@ impl Device {
+         // A device on MoltenVK whose instance has the relay has its queues' failures relayed
+         // to the command buffers that failed (`relay.rs`), from its first batch on.
+         let lost = Arc::new(AtomicBool::new(false));
++        let first_loss = Arc::new(FirstLossState::new());
+         let moltenvk = properties.description.driver_id == Some(DriverId::MOLTENVK);
+         if let (Some(relay), true) = (instance.relay(), moltenvk) {
+             for slot in &queues {
+                 let queue = slot.with(|queue| queue);
+                 // SAFETY: the queue is the device's, live, and its word was put back just now.
+-                let flights =
+-                    Arc::new(unsafe { Flights::new(queue, functions.clone(), lost.clone()) });
++                let flights = Arc::new(unsafe {
++                    Flights::new(
++                        queue,
++                        functions.clone(),
++                        lost.clone(),
++                        first_loss.clone(),
++                    )
++                });
+                 if slot.flights.set(Arc::clone(&flights)).is_ok() {
+                     relay.watch(flights);
+                 }
+@@ -1295,6 +1332,7 @@ impl Device {
+             loader_word,
+             owned,
+             lost,
++            first_loss,
+             textures,
+             image_pool: ImagePool::default(),
+             shader_cache,
+diff --git a/crates/metal2vulkan-runtime/src/device/relay.rs b/crates/metal2vulkan-runtime/src/device/relay.rs
+index 4eba9ea..fab49a4 100644
+--- a/crates/metal2vulkan-runtime/src/device/relay.rs
++++ b/crates/metal2vulkan-runtime/src/device/relay.rs
+@@ -48,6 +48,7 @@
+ //! **Not relayed.** An adopted device (its instance is the consumer's, with MoltenVK's default:
+ //! the device is lost), and a device whose instance lacks `VK_EXT_debug_utils` (the same).
+ 
++use super::first_loss::FirstLossState;
+ use super::functions::Functions;
+ use super::lock;
+ use crate::exit_guard::{self, Call};
+@@ -159,10 +160,18 @@ impl Relay {
+         let Some(_busy) = exit_guard::enter() else {
+             return;
+         };
++        flights
++            .first_loss
++            .record_event(format!("relay_failure code={code} desc={description}"));
+         match flights.first_pending() {
+             Some(By::Batch(failed)) => failed.fail(code, Some(description)),
+             Some(By::Program) => {}
+             Some(By::Runtime) | None => {
++                let _ = flights.first_loss.latch(
++                    vk::Result::ERROR_DEVICE_LOST,
++                    "relay_runtime",
++                    format!("code={code} desc={description}"),
++                );
+                 flights.lost.store(true, Ordering::Release);
+                 for each in queues
+                     .iter()
+@@ -233,6 +242,8 @@ pub(crate) struct Flights {
+     functions: Functions,
+     /// The device's loss, shared with it.
+     lost: Arc<AtomicBool>,
++    /// Shared first-loss latch and diagnostic event ring.
++    first_loss: Arc<FirstLossState>,
+     log: Mutex<VecDeque<Flight>>,
+ }
+ 
+@@ -246,6 +257,7 @@ impl Flights {
+         queue: vk::Queue,
+         functions: Functions,
+         lost: Arc<AtomicBool>,
++        first_loss: Arc<FirstLossState>,
+     ) -> Flights {
+         Flights {
+             queue,
+@@ -253,6 +265,7 @@ impl Flights {
+             word: unsafe { LoaderWord::of_handle(queue.as_raw()) },
+             functions,
+             lost,
++            first_loss,
+             log: Mutex::default(),
+         }
+     }
+diff --git a/crates/metal2vulkan-runtime/src/device/staging.rs b/crates/metal2vulkan-runtime/src/device/staging.rs
+index cda67d6..5f39167 100644
+--- a/crates/metal2vulkan-runtime/src/device/staging.rs
++++ b/crates/metal2vulkan-runtime/src/device/staging.rs
+@@ -195,7 +195,13 @@ impl Device {
+             raw.queue_submit(queue, &[submit], made.fence)
+         };
+         exit_guard::called(Call::QueueSubmit);
+-        submitted.map_err(|error| self.failed(error))?;
++        submitted.map_err(|error| {
++            self.failed_at(
++                error,
++                "staging_submit",
++                format!("staging queue_submit err={error:?}"),
++            )
++        })?;
+         shared.counts.staging_submission();
+         loop {
+             // SAFETY: the fence was submitted just now.
+@@ -203,7 +209,13 @@ impl Device {
+             {
+                 Ok(()) => return Ok(()),
+                 Err(vk::Result::TIMEOUT) => continue,
+-                Err(error) => return Err(self.failed(error)),
++                Err(error) => {
++                    return Err(self.failed_at(
++                        error,
++                        "staging_wait",
++                        format!("staging wait_for_fences err={error:?}"),
++                    ))
++                }
+             }
+         }
+     }
+diff --git a/crates/metal2vulkan-runtime/src/device/submit.rs b/crates/metal2vulkan-runtime/src/device/submit.rs
+index 218b7ad..779e4dc 100644
+--- a/crates/metal2vulkan-runtime/src/device/submit.rs
++++ b/crates/metal2vulkan-runtime/src/device/submit.rs
+@@ -221,7 +221,11 @@ impl Device {
+         // A `vkQueueSubmit` that fails leaves what its submissions reference as it was, or loses
+         // the device: the work goes back as `taken` drops.
+         if let Err(error) = made {
+-            return Err(self.failed(error));
++            return Err(self.failed_at(
++                error,
++                "internal_submit",
++                format!("queue_submit internal err={error:?}"),
++            ));
+         }
+         objects.signalled = value;
+         shared.counts.internal_submission();
+@@ -237,7 +241,13 @@ impl Device {
+                     return Ok(());
+                 }
+                 Err(vk::Result::TIMEOUT) => continue,
+-                Err(error) => return Err(self.failed(error)),
++                Err(error) => {
++                    return Err(self.failed_at(
++                        error,
++                        "internal_wait",
++                        format!("wait_for_fences internal err={error:?}"),
++                    ))
++                }
+             }
+         }
+     }
+@@ -285,7 +295,13 @@ impl Device {
+             raw.queue_bind_sparse(queue, &[info], vk::Fence::null())
+         });
+         exit_guard::called(Call::QueueBindSparse);
+-        bound.map_err(|error| self.failed(error))?;
++        bound.map_err(|error| {
++            self.failed_at(
++                error,
++                "bind_sparse_buffer",
++                format!("queue_bind_sparse binds={} err={error:?}", binds.len()),
++            )
++        })?;
+         objects.signalled = value;
+         *lock(&shared.bound_at) = Some((objects.timeline, value));
+         Ok((objects.timeline, value))
+@@ -307,10 +323,20 @@ impl Device {
+         Some((timeline, value))
+     }
+ 
+-    /// The error of a failed submission or wait, recording a lost device.
+-    pub(crate) fn failed(&self, error: vk::Result) -> Error {
++    /// The error of a failed submission or wait at `stage`, latching first-loss diagnostics before
++    /// recording the lost device.
++    pub(crate) fn failed_at(
++        &self,
++        error: vk::Result,
++        stage: &'static str,
++        detail: impl Into<String>,
++    ) -> Error {
++        let detail = detail.into();
+         if error == vk::Result::ERROR_DEVICE_LOST {
++            self.latch_first_loss(error, stage, detail);
+             self.mark_lost();
++        } else {
++            self.record_event(format!("vk_error stage={stage} vk={error:?} {detail}"));
+         }
+         vulkan(error)
+     }
+diff --git a/crates/metal2vulkan-runtime/src/dma_buf.rs b/crates/metal2vulkan-runtime/src/dma_buf.rs
+index 8781adf..29fe7f0 100644
+--- a/crates/metal2vulkan-runtime/src/dma_buf.rs
++++ b/crates/metal2vulkan-runtime/src/dma_buf.rs
+@@ -882,6 +882,17 @@ impl Device {
+                 ))
+             }
+             Err(ImportFailure::Vulkan(vk::Result::ERROR_DEVICE_LOST)) => {
++                self.latch_first_loss(
++                    vk::Result::ERROR_DEVICE_LOST,
++                    "dma_buf_import",
++                    format!(
++                        "import type_index={} size={} request_len={}",
++                        texels.type_index,
++                        requirements.size,
++                        request.length
++                    ),
++                );
++                self.mark_lost();
+                 // SAFETY: the image is live and unbound, and no command uses it.
+                 unsafe { release::object(raw_device, raw) };
+                 return Err(Error::DeviceLost);
+@@ -1068,7 +1079,7 @@ impl Device {
+         // SAFETY: the device is live and enables the extension; `info` and its chain are valid
+         // and within the device's limits for such an image (`modifier_image_limits`), its one
+         // plane the modifier's one (`modifier_features`), made `UNDEFINED` for external memory.
+-        unsafe { crate::creation::image_or_refusal(shared.vk(), &info) }
++        unsafe { crate::creation::device_image_or_refusal(self, &info, "dma_buf_modifier_image") }
+     }
+ 
+     /// The features of `format`'s `DRM_FORMAT_MOD_LINEAR` tiling where the device lists that
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index b924ffe..0517f18 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -219,7 +219,7 @@ pub use degradation::{Degradation, DegradationCategory, DegradeNotice};
+ pub use degradation::{MisplacedNotice, NoticePlace};
+ pub use depth_stencil::DepthStencilState;
+ pub use device::{
+-    DebugMessage, Device, DeviceHandles, DeviceKind, DeviceOptions, LayerSetting,
++    DebugMessage, Device, DeviceHandles, DeviceKind, DeviceOptions, FirstLossInfo, LayerSetting,
+     LayerSettingValue, MessageKind, MessageSeverity, MessageSink, RawDevice,
+ };
+ #[cfg(unix)]
+diff --git a/crates/metal2vulkan-runtime/src/tests/first_loss.rs b/crates/metal2vulkan-runtime/src/tests/first_loss.rs
+new file mode 100644
+index 0000000..d489c26
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/tests/first_loss.rs
+@@ -0,0 +1,73 @@
++//! Unit tests for the first device-loss latch and 32-entry event ring (`device/first_loss.rs`).
++
++use crate::device::first_loss::{FirstLossState, MAX_EVENT_RING};
++use ash::vk;
++
++#[test]
++fn event_ring_keeps_latest_32_entries_fifo() {
++    let state = FirstLossState::new();
++    assert!(state.get().is_none());
++    assert!(state.format_report().is_none());
++
++    for i in 0..45 {
++        state.record_event(format!("event-{i}"));
++    }
++
++    let latched = state.latch(vk::Result::ERROR_DEVICE_LOST, "unit_ring", "overflow_check");
++    assert_eq!(latched.recent_events.len(), MAX_EVENT_RING);
++    assert!(latched.recent_events[0].contains("event-14"));
++    assert!(latched.recent_events[MAX_EVENT_RING - 2].contains("event-44"));
++    assert!(latched.recent_events[MAX_EVENT_RING - 1].contains("LOSS stage=unit_ring"));
++}
++
++#[test]
++fn first_loss_latch_is_single_shot_and_never_overwritten() {
++    let state = FirstLossState::new();
++    state.record_event("submit_1");
++    state.record_event("bind_sparse_2");
++
++    let first = state
++        .latch(
++            vk::Result::ERROR_DEVICE_LOST,
++            "bind_sparse_buffer",
++            "initial hang",
++        )
++        .clone();
++    assert_eq!(first.stage, "bind_sparse_buffer");
++    assert_eq!(first.vk_result, vk::Result::ERROR_DEVICE_LOST.as_raw());
++    assert_eq!(first.detail, "initial hang");
++    assert_eq!(first.recent_events.len(), 3);
++
++    // Later events and subsequent loss calls must never overwrite the first latched snapshot.
++    state.record_event("late_event_after_loss");
++    let second = state.latch(
++        vk::Result::ERROR_SURFACE_LOST_KHR,
++        "completion_wait_semaphores",
++        "secondary ripple",
++    );
++    assert_eq!(second, &first);
++    assert_eq!(state.get(), Some(&first));
++    assert_eq!(state.get().unwrap().recent_events.len(), 3);
++}
++
++#[test]
++fn format_report_contains_stage_result_and_ring() {
++    let state = FirstLossState::new();
++    state.record_event("alloc_dma_buf");
++    state.record_event("create_image_linear");
++
++    let _ = state.latch(
++        vk::Result::ERROR_DEVICE_LOST,
++        "dma_buf_import",
++        "type_index=2 format=B8G8R8A8_UNORM",
++    );
++
++    let report = state.format_report().expect("latched report must exist");
++    assert!(report.contains("first_loss stage=dma_buf_import"));
++    assert!(report.contains("vk_result=-4"));
++    assert!(report.contains("detail=type_index=2 format=B8G8R8A8_UNORM"));
++    assert!(report.contains("recent_events(3):"));
++    assert!(report.contains("alloc_dma_buf"));
++    assert!(report.contains("create_image_linear"));
++    assert!(report.contains("LOSS stage=dma_buf_import"));
++}
+diff --git a/crates/metal2vulkan-runtime/src/tests/mod.rs b/crates/metal2vulkan-runtime/src/tests/mod.rs
+index f869867..ce804cc 100644
+--- a/crates/metal2vulkan-runtime/src/tests/mod.rs
++++ b/crates/metal2vulkan-runtime/src/tests/mod.rs
+@@ -48,6 +48,7 @@ mod exit_guard;
+ mod families;
+ mod fences;
+ mod fill_value;
++mod first_loss;
+ mod first_moves;
+ mod framebuffer_fetch;
+ mod fresh_unwritten;
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 818de8d..b567ff3 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -1746,7 +1746,7 @@ impl Device {
+         check_image_limits(&plan, shape.texture_type, &limits).map_err(Error::Unsupported)?;
+         // SAFETY: the device is live and `info` (with its format list) valid and within the
+         // device's limits for it.
+-        let raw = unsafe { crate::creation::image(raw_device, &info) }?;
++        let raw = unsafe { crate::creation::device_image(self, &info, "placed_image") }?;
+         // SAFETY: `raw` is a live image of this device.
+         let requirements = unsafe { raw_device.get_image_memory_requirements(raw) };
+         let requirements = shared.textures.placement().place(requirements);
+@@ -2168,7 +2168,7 @@ impl Device {
+         }
+         // SAFETY: the device is live and `info` (with its format list) valid and within the
+         // device's limits for it.
+-        let raw = unsafe { crate::creation::image(raw_device, &info) }?;
++        let raw = unsafe { crate::creation::device_image(self, &info, "placed_image") }?;
+         // SAFETY: `raw` is a live image of this device, which nothing else uses: it is destroyed
+         // right after the query, with no memory bound.
+         let requirements = unsafe {
+@@ -2731,7 +2731,7 @@ impl Device {
+         }
+         // SAFETY: the device is live and `info` (with its format list) valid and within the
+         // device's limits for it.
+-        let raw = unsafe { crate::creation::image(raw_device, &info) }?;
++        let raw = unsafe { crate::creation::device_image(self, &info, "placed_image") }?;
+         // SAFETY: `raw` is a live linear image of this device, and its first subresource has
+         // the color aspect (every format a buffer backs is a color format).
+         let (requirements, report) = unsafe {
+@@ -3274,7 +3274,7 @@ impl Device {
+         check_image_limits(plan, texture_type, &limits).map_err(Error::Unsupported)?;
+         // SAFETY: the device is live and `info` (with its format list) valid and within the
+         // device's limits for it.
+-        let raw = unsafe { crate::creation::image(raw_device, &info) }?;
++        let raw = unsafe { crate::creation::device_image(self, &info, "placed_image") }?;
+         // SAFETY: `raw` is a live image of this device.
+         let requirements = unsafe { raw_device.get_image_memory_requirements(raw) };
+         let mut requirements = shared.textures.placement().place(requirements);
