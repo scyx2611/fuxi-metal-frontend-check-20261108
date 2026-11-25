@@ -1,0 +1,431 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 5f8fe90..7d59480 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1079,6 +1079,19 @@ static void waitForResource(id resource) {
+ - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g { try { @try {[self dispatch:t group:g threads:false];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { try { @try {(void)r;(void)u;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)memoryBarrierWithScope:(MTLBarrierScope)s { try { @try {(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r { try { @try {
++ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:0];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lodMin lodMaxClamp:(float)lodMax atIndex:(NSUInteger)i { try { @try {
++ (void)lodMin;(void)lodMax;[self sampler:s index:i stage:0];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float *)lodMins lodMaxClamps:(const float *)lodMaxs withRange:(NSRange)r { try { @try {
++ (void)lodMins;(void)lodMaxs;for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:0];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u { try { @try {(void)r;(void)c;(void)u;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)useHeap:(id<MTLHeap>)h { try { @try {(void)h;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c { try { @try {(void)h;(void)c;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c { try { @try {(void)r;(void)c;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+ @end
+ 
+ @interface NBRenderEncoder : NBEncoder
+@@ -1086,8 +1099,11 @@ static void waitForResource(id resource) {
+ @end
+ @implementation NBRenderEncoder
+ - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state { try { @try {
++ if(!state){if(fuxiBlocked())return;[self.commandBuffer refuse:@"nil render pipeline"];return;}
+  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+- [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
++ NmbRenderPipeline *pipelineHandle=[(NBRenderPipeline *)state handle];
++ if(!pipelineHandle && fuxiBlocked())return;
++ [self check:nmb_render_set_pipeline(self.handle,pipelineHandle) what:"setRenderPipelineState"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { try { @try {[self buffer:b offset:o index:i stage:1];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { try { @try {[self buffer:b offset:o index:i stage:2];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1182,6 +1198,93 @@ static void waitForResource(id resource) {
+ - (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { try { @try {(void)r;(void)u;(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages { try { @try {[self fence:fence stages:stages update:true];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages { try { @try {[self fence:fence stages:stages update:false];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setVertexTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r { try { @try {
++ for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:1];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r { try { @try {
++ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:1];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r { try { @try {
++ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:2];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setVertexSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lodMin lodMaxClamp:(float)lodMax atIndex:(NSUInteger)i { try { @try {
++ (void)lodMin;(void)lodMax;[self sampler:s index:i stage:1];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setFragmentSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lodMin lodMaxClamp:(float)lodMax atIndex:(NSUInteger)i { try { @try {
++ (void)lodMin;(void)lodMax;[self sampler:s index:i stage:2];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float *)lodMins lodMaxClamps:(const float *)lodMaxs withRange:(NSRange)r { try { @try {
++ (void)lodMins;(void)lodMaxs;for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:1];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float *)lodMins lodMaxClamps:(const float *)lodMaxs withRange:(NSRange)r { try { @try {
++ (void)lodMins;(void)lodMaxs;for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:2];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setViewports:(const MTLViewport *)viewports count:(NSUInteger)count { try { @try {
++ if(count && !viewports){[self.commandBuffer refuse:@"null viewports"];return;}
++ std::vector<double> values((size_t)count*6);
++ for(NSUInteger k=0;k<count;k++) {
++  const MTLViewport &v=viewports[k];
++  values[k*6+0]=v.originX;values[k*6+1]=v.originY;values[k*6+2]=v.width;
++  values[k*6+3]=v.height;values[k*6+4]=v.znear;values[k*6+5]=v.zfar;
++ }
++ [self check:nmb_render_set_viewports(self.handle,values.empty()?nullptr:values.data(),(size_t)count) what:"setViewports"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setScissorRects:(const MTLScissorRect *)rects count:(NSUInteger)count { try { @try {
++ if(count && !rects){[self.commandBuffer refuse:@"null scissor rects"];return;}
++ std::vector<uint64_t> values((size_t)count*4);
++ for(NSUInteger k=0;k<count;k++) {
++  const MTLScissorRect &r=rects[k];
++  values[k*4+0]=r.x;values[k*4+1]=r.y;values[k*4+2]=r.width;values[k*4+3]=r.height;
++ }
++ [self check:nmb_render_set_scissor_rects(self.handle,values.empty()?nullptr:values.data(),(size_t)count) what:"setScissorRects"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setDepthClipMode:(MTLDepthClipMode)mode { try { @try {
++ [self check:nmb_render_set_depth_clip_mode(self.handle,(uint64_t)mode) what:"setDepthClipMode"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index { try { @try {
++ [self check:nmb_render_set_store_action(self.handle,0,(uint32_t)index,(uint64_t)action) what:"setColorStoreAction"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setDepthStoreAction:(MTLStoreAction)action { try { @try {
++ [self check:nmb_render_set_store_action(self.handle,1,0,(uint64_t)action) what:"setDepthStoreAction"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setStencilStoreAction:(MTLStoreAction)action { try { @try {
++ [self check:nmb_render_set_store_action(self.handle,2,0,(uint64_t)action) what:"setStencilStoreAction"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setColorStoreActionOptions:(MTLStoreActionOptions)options atIndex:(NSUInteger)index { try { @try {
++ [self check:nmb_render_set_store_action_options(self.handle,0,(uint32_t)index,(uint64_t)options) what:"setColorStoreActionOptions"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setDepthStoreActionOptions:(MTLStoreActionOptions)options { try { @try {
++ [self check:nmb_render_set_store_action_options(self.handle,1,0,(uint64_t)options) what:"setDepthStoreActionOptions"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)setStencilStoreActionOptions:(MTLStoreActionOptions)options { try { @try {
++ [self check:nmb_render_set_store_action_options(self.handle,2,0,(uint64_t)options) what:"setStencilStoreActionOptions"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)drawPrimitives:(MTLPrimitiveType)t indirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o { try { @try {
++ if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign indirect buffer"];return;}
++ [self.commandBuffer.resourceOwners addObject:b];
++ if(self.fuxiStoredSurface)self.commandBuffer->encodedWork.storedSurface=true;
++ gDraws++;self.commandBuffer->encodedWork.draws++;
++ [self check:nmb_render_draw_indirect(self.handle,t,[(NBBuffer *)b handle],o) what:"drawPrimitives:indirectBuffer:"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)ib indexBufferOffset:(NSUInteger)io
++                indirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o { try { @try {
++ if(![(id)ib isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
++ if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign indirect buffer"];return;}
++ [self.commandBuffer.resourceOwners addObject:ib];
++ [self.commandBuffer.resourceOwners addObject:b];
++ if(self.fuxiStoredSurface)self.commandBuffer->encodedWork.storedSurface=true;
++ gDraws++;self.commandBuffer->encodedWork.draws++;
++ [self check:nmb_render_draw_indexed_indirect(self.handle,t,k,[(NBBuffer *)ib handle],io,[(NBBuffer *)b handle],o) what:"drawIndexedPrimitives:indirectBuffer:"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { try { @try {(void)r;(void)u;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u { try { @try {(void)r;(void)c;(void)u;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { try { @try {(void)r;(void)c;(void)u;(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useHeap:(id<MTLHeap>)h { try { @try {(void)h;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)s { try { @try {(void)h;(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c { try { @try {(void)h;(void)c;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c stages:(MTLRenderStages)s { try { @try {(void)h;(void)c;(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)memoryBarrierWithScope:(MTLBarrierScope)s afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b { try { @try {(void)s;(void)a;(void)b;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
++- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b { try { @try {(void)r;(void)c;(void)a;(void)b;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+ @end
+ 
+ @interface NBBlitEncoder : NBEncoder
+diff --git a/bridge/FuxiDeferred.rs b/bridge/FuxiDeferred.rs
+index 293270e..580e5c0 100644
+--- a/bridge/FuxiDeferred.rs
++++ b/bridge/FuxiDeferred.rs
+@@ -14,10 +14,10 @@
+ //! to CoreAnimation's swap and its next frame while the worker still records and submits this one. The frontend holds the
+ //! swap's present back with pending IOSurface writer leases until the runtime has submitted the work.
+ 
+-use metal2vulkan::metal::{CullMode, IndexType, PrimitiveType, RenderStages, TriangleFillMode, Winding};
++use metal2vulkan::metal::{CullMode, DepthClipMode, IndexType, PrimitiveType, RenderStages, TriangleFillMode, Winding};
+ use metal2vulkan_runtime::{
+     Buffer, CommandBuffer, DepthStencilState, Fence, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, SamplerState,
+-    ScissorRect, Texture, Viewport, VisibilityResultMode,
++    ScissorRect, StoreAction, StoreActionOptions, Texture, Viewport, VisibilityResultMode,
+ };
+ use std::cell::Cell;
+ use std::ffi::{c_char, c_int, c_void, CStr};
+@@ -207,7 +207,21 @@ pub(crate) enum Op {
+     DepthBias { bias: f32, slope_scale: f32, clamp: f32 },
+     LineWidth(f32),
+     Visibility { mode: VisibilityResultMode, offset: u64 },
++    DepthClipMode(DepthClipMode),
++    Viewports(Box<[Viewport]>),
++    Scissors(Box<[ScissorRect]>),
++    StoreAction { target: u32, index: u32, action: StoreAction },
++    StoreActionOptions { target: u32, index: u32, options: StoreActionOptions },
+     BlendColor([f32; 4]),
++    DrawIndirect { primitive: PrimitiveType, indirect: Buffer, offset: u64 },
++    DrawIndexedIndirect {
++        primitive: PrimitiveType,
++        index_type: IndexType,
++        indices: Buffer,
++        index_offset: u64,
++        indirect: Buffer,
++        indirect_offset: u64,
++    },
+     Draw { primitive: PrimitiveType, start: u32, count: u32, instances: u32, base_instance: u32 },
+     DrawIndexed {
+         primitive: PrimitiveType,
+@@ -465,7 +479,7 @@ fn work() -> ! {
+             stats.ops += 1;
+             match op {
+                 Op::Open { .. } => stats.opens += 1,
+-                Op::Draw { .. } | Op::DrawIndexed { .. } => stats.draws += 1,
++                Op::Draw { .. } | Op::DrawIndexed { .. } | Op::DrawIndirect { .. } | Op::DrawIndexedIndirect { .. } => stats.draws += 1,
+                 Op::End => stats.ends += 1,
+                 Op::Task(_) => stats.tasks += 1,
+                 _ => {}
+@@ -615,6 +629,29 @@ fn apply(r: &mut RenderCommandEncoder, op: Op) -> Result<(), String> {
+         Op::DepthBias { bias, slope_scale, clamp } => r.set_depth_bias(bias, slope_scale, clamp).map_err(e("depth bias")),
+         Op::LineWidth(width) => r.set_line_width(width).map_err(e("line width")),
+         Op::Visibility { mode, offset } => r.set_visibility_result_mode(mode, offset).map_err(e("visibility result mode")),
++        Op::DepthClipMode(mode) => r.set_depth_clip_mode(mode).map_err(e("depth clip mode")),
++        Op::Viewports(viewports) => r.set_viewports(&viewports).map_err(e("viewports")),
++        Op::Scissors(rects) => r.set_scissor_rects(&rects).map_err(e("scissors")),
++        Op::StoreAction { target, index, action } => match target {
++            0 => r.set_color_store_action(action, index),
++            1 => r.set_depth_store_action(action),
++            2 => r.set_stencil_store_action(action),
++            _ => return Err(format!("invalid store action target {target}")),
++        }
++        .map_err(e("store action")),
++        Op::StoreActionOptions { target, index, options } => match target {
++            0 => r.set_color_store_action_options(options, index),
++            1 => r.set_depth_store_action_options(options),
++            2 => r.set_stencil_store_action_options(options),
++            _ => return Err(format!("invalid store action options target {target}")),
++        }
++        .map_err(e("store action options")),
++        Op::DrawIndirect { primitive, indirect, offset } => r
++            .draw_primitives_indirect(primitive, &indirect, offset)
++            .map_err(e("indirect draw")),
++        Op::DrawIndexedIndirect { primitive, index_type, indices, index_offset, indirect, indirect_offset } => r
++            .draw_indexed_primitives_indirect(primitive, index_type, &indices, index_offset, &indirect, indirect_offset)
++            .map_err(e("indexed indirect draw")),
+         Op::BlendColor(c) => {
+             r.set_blend_color(c[0], c[1], c[2], c[3]);
+             Ok(())
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index 4fb0378..576ce78 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -271,11 +271,20 @@ bool nmb_render_set_raster(NmbEncoder *, uint64_t cull_mode, uint64_t winding, u
+ bool nmb_render_set_stencil_reference(NmbEncoder *, uint32_t front, uint32_t back);
+ bool nmb_render_set_blend_color(NmbEncoder *, const float color[4]);
+ bool nmb_render_set_depth_bias(NmbEncoder *, float bias, float slope_scale, float clamp);
++bool nmb_render_set_depth_clip_mode(NmbEncoder *, uint64_t mode);
++bool nmb_render_set_viewports(NmbEncoder *, const double *viewports, size_t count);
++bool nmb_render_set_scissor_rects(NmbEncoder *, const uint64_t *rects, size_t count);
++/* target: 0 color, 1 depth, 2 stencil */
++bool nmb_render_set_store_action(NmbEncoder *, uint32_t target, uint32_t index, uint64_t action);
++bool nmb_render_set_store_action_options(NmbEncoder *, uint32_t target, uint32_t index, uint64_t options);
+ bool nmb_render_set_line_width(NmbEncoder *, float width);
+ bool nmb_render_set_visibility_mode(NmbEncoder *, uint64_t mode, uint64_t offset);
+ bool nmb_render_draw(NmbEncoder *, uint64_t primitive, uint32_t start, uint32_t count, uint32_t instances, uint32_t base_instance);
+ bool nmb_render_draw_indexed(NmbEncoder *, uint64_t primitive, uint32_t count, uint64_t index_type, NmbBuffer *indices, uint64_t offset,
+                              uint32_t instances, int32_t base_vertex, uint32_t base_instance);
++bool nmb_render_draw_indirect(NmbEncoder *, uint64_t primitive, NmbBuffer *indirect, uint64_t offset);
++bool nmb_render_draw_indexed_indirect(NmbEncoder *, uint64_t primitive, uint64_t index_type, NmbBuffer *indices, uint64_t index_offset,
++                                      NmbBuffer *indirect, uint64_t indirect_offset);
+ 
+ bool nmb_blit_copy_buffer(NmbEncoder *, NmbBuffer *source, uint64_t source_offset, NmbBuffer *destination, uint64_t destination_offset,
+                           uint64_t size);
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 76d4ad9..b1d0681 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -8,7 +8,7 @@ use metal2vulkan::bind::SamplerDescriptor;
+ use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
+ use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
+ use metal2vulkan::metal::{
+-    BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType, PixelFormat, PrimitiveTopologyClass,
++    BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, DepthClipMode, IndexType, PixelFormat, PrimitiveTopologyClass,
+     PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
+     TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
+ };
+@@ -20,7 +20,7 @@ use metal2vulkan_runtime::{
+     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
+     ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
+     MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
+-    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
++    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, StoreActionOptions, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
+ };
+ use std::cell::RefCell;
+ use std::collections::VecDeque;
+@@ -2622,6 +2622,117 @@ pub extern "C" fn nmb_render_set_stencil_reference(encoder: *mut NmbEncoder, fro
+     })
+ }
+ 
++fn depth_clip_mode(value: u64) -> Result<DepthClipMode, String> {
++    match value {
++        0 => Ok(DepthClipMode::Clip),
++        1 => Ok(DepthClipMode::Clamp),
++        _ => Err(format!("depth clip mode {value} is not a Metal value")),
++    }
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_set_depth_clip_mode(encoder: *mut NmbEncoder, mode: u64) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || Ok(Op::DepthClipMode(depth_clip_mode(mode)?)));
++    }
++    guard(false, || {
++        render(encoder)?.set_depth_clip_mode(depth_clip_mode(mode)?).map_err(e("depth clip mode"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_set_viewports(encoder: *mut NmbEncoder, viewports: *const f64, count: usize) -> bool {
++    guard_free(false, || {
++        let list: Vec<Viewport> = if count == 0 {
++            Vec::new()
++        } else {
++            if viewports.is_null() {
++                return Err("null viewports".into());
++            }
++            // SAFETY: caller passes count * 6 f64 values per NativeMetalObjects.h.
++            let raw_vals = unsafe { std::slice::from_raw_parts(viewports, count * 6) };
++            raw_vals.chunks_exact(6).map(|v| Viewport::new(v[0], v[1], v[2], v[3], v[4], v[5])).collect()
++        };
++        if let Some(slot) = deferred(encoder) {
++            fuxi_deferred::push(slot, Op::Viewports(list.into_boxed_slice()));
++            return Ok(true);
++        }
++        fuxi_deferred::drain(Location::caller());
++        render(encoder)?.set_viewports(&list).map_err(e("viewports"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_set_scissor_rects(encoder: *mut NmbEncoder, rects: *const u64, count: usize) -> bool {
++    guard_free(false, || {
++        let list: Vec<ScissorRect> = if count == 0 {
++            Vec::new()
++        } else {
++            if rects.is_null() {
++                return Err("null scissor rects".into());
++            }
++            // SAFETY: caller passes count * 4 u64 values per NativeMetalObjects.h.
++            let raw_vals = unsafe { std::slice::from_raw_parts(rects, count * 4) };
++            raw_vals.chunks_exact(4).map(|r| ScissorRect::new(r[0], r[1], r[2], r[3])).collect()
++        };
++        if let Some(slot) = deferred(encoder) {
++            fuxi_deferred::push(slot, Op::Scissors(list.into_boxed_slice()));
++            return Ok(true);
++        }
++        fuxi_deferred::drain(Location::caller());
++        render(encoder)?.set_scissor_rects(&list).map_err(e("scissors"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_set_store_action(encoder: *mut NmbEncoder, target: u32, index: u32, action: u64) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            Ok(Op::StoreAction { target, index, action: StoreAction::from_raw(action).map_err(e("store action"))? })
++        });
++    }
++    guard(false, || {
++        let a = StoreAction::from_raw(action).map_err(e("store action"))?;
++        let r = render(encoder)?;
++        match target {
++            0 => r.set_color_store_action(a, index),
++            1 => r.set_depth_store_action(a),
++            2 => r.set_stencil_store_action(a),
++            _ => return Err(format!("invalid store action target {target}")),
++        }
++        .map_err(e("store action"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_set_store_action_options(encoder: *mut NmbEncoder, target: u32, index: u32, options: u64) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            Ok(Op::StoreActionOptions {
++                target,
++                index,
++                options: StoreActionOptions::from_raw(options).map_err(e("store action options"))?,
++            })
++        });
++    }
++    guard(false, || {
++        let opts = StoreActionOptions::from_raw(options).map_err(e("store action options"))?;
++        let r = render(encoder)?;
++        match target {
++            0 => r.set_color_store_action_options(opts, index),
++            1 => r.set_depth_store_action_options(opts),
++            2 => r.set_stencil_store_action_options(opts),
++            _ => return Err(format!("invalid store action options target {target}")),
++        }
++        .map_err(e("store action options"))?;
++        Ok(true)
++    })
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_depth_bias(encoder: *mut NmbEncoder, bias: f32, slope_scale: f32, clamp: f32) -> bool {
+     if let Some(slot) = deferred(encoder) {
+@@ -2718,6 +2829,56 @@ pub extern "C" fn nmb_render_draw_indexed(encoder: *mut NmbEncoder, primitive: u
+     })
+ }
+ 
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_draw_indirect(encoder: *mut NmbEncoder, primitive: u64, indirect: *mut NmbBuffer, offset: u64) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            Ok(Op::DrawIndirect {
++                primitive: raw::<PrimitiveType>(primitive, "primitive")?,
++                indirect: get(indirect)?.0.clone(),
++                offset,
++            })
++        });
++    }
++    guard(false, || {
++        render(encoder)?
++            .draw_primitives_indirect(raw::<PrimitiveType>(primitive, "primitive")?, &get(indirect)?.0, offset)
++            .map_err(e("indirect draw"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++#[allow(clippy::too_many_arguments)]
++pub extern "C" fn nmb_render_draw_indexed_indirect(encoder: *mut NmbEncoder, primitive: u64, index_type: u64, indices: *mut NmbBuffer,
++                                                   index_offset: u64, indirect: *mut NmbBuffer, indirect_offset: u64) -> bool {
++    if let Some(slot) = deferred(encoder) {
++        return queue(slot, || {
++            Ok(Op::DrawIndexedIndirect {
++                primitive: raw::<PrimitiveType>(primitive, "primitive")?,
++                index_type: raw::<IndexType>(index_type, "index type")?,
++                indices: get(indices)?.0.clone(),
++                index_offset,
++                indirect: get(indirect)?.0.clone(),
++                indirect_offset,
++            })
++        });
++    }
++    guard(false, || {
++        render(encoder)?
++            .draw_indexed_primitives_indirect(
++                raw::<PrimitiveType>(primitive, "primitive")?,
++                raw::<IndexType>(index_type, "index type")?,
++                &get(indices)?.0,
++                index_offset,
++                &get(indirect)?.0,
++                indirect_offset,
++            )
++            .map_err(e("indexed indirect draw"))?;
++        Ok(true)
++    })
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_blit_copy_buffer(encoder: *mut NmbEncoder, source: *mut NmbBuffer, source_offset: u64, destination: *mut NmbBuffer,
+                                        destination_offset: u64, size: u64) -> bool {
