@@ -1,0 +1,199 @@
+name: Probe Phase B A740 IR3 Shaders
+on:
+  push:
+    branches:
+      - codex/hybrid-lane
+    paths:
+      - .github/workflows/phaseb-ir3-probe.yml
+      - tools/phaseb-probe/**
+      - patches/mesa-hyb-*.patch
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ir3-probe:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
+      SOURCE_COMMIT: f44bf5693da18ac11abfa510c5ad711fc316254b
+      UNIXNU_SHA: fb6aad6ab1f50199a4d99d2da1d0ca403b067633
+    steps:
+      - name: Check out public test harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Fetch pinned public ios-fuxi and Mesa sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source remote add origin https://github.com/zgl97/ios-fuxi.git
+          git -C source fetch --no-tags --depth=1 origin "$SOURCE_COMMIT"
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          source source/tools/ci/pins.env
+          mkdir -p deps/downloads deps/work/patches
+          git init deps/mesa
+          git -C deps/mesa remote add origin https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa
+          git -C deps/mesa fetch --no-tags --depth=1 origin "$MESA_SHA"
+          git -C deps/mesa checkout --detach FETCH_HEAD
+          for name in freedreno-tools-nir.patch ir3-darwin-build-id.patch \
+              ir3-portable-asm-roundtrip.patch offline-adreno-compiler-probe.patch \
+              turnip-darwin-kmd.patch turnip-graphics-cache-feedback.patch \
+              turnip-empty-scissor.patch turnip-builtin-shader-pack.patch \
+              turnip-host-import-images.patch; do
+            curl --fail --location --retry 3 \
+              "https://raw.githubusercontent.com/UniXNU/UniXNU/$UNIXNU_SHA/patches/mesa/$name" \
+              -o "deps/work/patches/$name"
+          done
+          PYTHONDONTWRITEBYTECODE=1 python3 -X utf8 -B - <<'PY'
+          import subprocess
+          from pathlib import Path
+          mesa = Path('deps/mesa')
+          for name in [
+              'freedreno-tools-nir.patch', 'ir3-darwin-build-id.patch',
+              'ir3-portable-asm-roundtrip.patch', 'offline-adreno-compiler-probe.patch',
+              'turnip-darwin-kmd.patch', 'turnip-graphics-cache-feedback.patch',
+              'turnip-empty-scissor.patch', 'turnip-builtin-shader-pack.patch',
+              'turnip-host-import-images.patch']:
+              subprocess.run(['git', '-C', str(mesa), 'apply', str(Path('deps/work/patches') / name)], check=True)
+          src_patches_dir = Path('source/tools/patches')
+          harness_patches_dir = Path('harness/patches')
+          fuxi_order = [
+              'mesa-fuxi-smoke.patch',
+              'mesa-fuxi-hostimport.patch',
+              'mesa-fuxi-ir3-round-default.patch',
+              'mesa-fuxi-fence-wait-100ms.patch',
+              'mesa-fuxi-cached-coherent.patch',
+              'mesa-fuxi-bo-cache.patch',
+          ]
+          fuxi_required = set(fuxi_order[:-1])
+          ordered_patches = []
+          seen_names = set()
+          for name in fuxi_order:
+              p = src_patches_dir / name
+              if p.is_file():
+                  ordered_patches.append(p)
+                  seen_names.add(name)
+              elif name in fuxi_required:
+                  raise FileNotFoundError(f'Missing required patch: {p}')
+          for p in sorted(src_patches_dir.glob('mesa-fuxi-*.patch')):
+              if p.name not in seen_names:
+                  ordered_patches.append(p)
+                  seen_names.add(p.name)
+          hyb_order = [
+              'mesa-hyb-drm-linear-hostimport.patch',
+              'mesa-hyb-hostimport-reclaim.patch',
+              'mesa-hyb-lost-reason.patch',
+              'mesa-hyb-program-pointer.patch',
+          ]
+          for name in hyb_order:
+              p = harness_patches_dir / name
+              if p.is_file():
+                  if p.name in seen_names:
+                      raise RuntimeError(f'Duplicate patch across source and harness: {p.name}')
+                  ordered_patches.append(p)
+                  seen_names.add(p.name)
+          for p in sorted(harness_patches_dir.glob('mesa-hyb-*.patch')):
+              if p.name not in seen_names:
+                  ordered_patches.append(p)
+                  seen_names.add(p.name)
+          for p in ordered_patches:
+              print(f'Applying {p}')
+              subprocess.run(['git', '-C', str(mesa), 'apply', '--check', str(p.resolve())], check=True)
+              subprocess.run(['git', '-C', str(mesa), 'apply', str(p.resolve())], check=True)
+          PY
+
+      - name: Install pinned glslangValidator, Bison 3.8.2 and Meson venv
+        shell: bash
+        run: |
+          set -euo pipefail
+          source source/tools/ci/pins.env
+          mkdir -p deps/native/bin deps/downloads deps/build-tools
+          curl --fail --location --retry 3 \
+            "https://github.com/KhronosGroup/glslang/archive/refs/tags/$GLSLANG_VERSION.tar.gz" \
+            -o "deps/downloads/glslang.tar.gz"
+          echo "$GLSLANG_SHA256  deps/downloads/glslang.tar.gz" | shasum -a 256 -c -
+          tar -xzf deps/downloads/glslang.tar.gz -C deps/build-tools
+          cmake -S "deps/build-tools/glslang-$GLSLANG_VERSION" -B deps/build-tools/glslang-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/deps/native" \
+            -DENABLE_OPT=OFF -DGLSLANG_TESTS=OFF -DBUILD_EXTERNAL=OFF
+          ninja -C deps/build-tools/glslang-build install
+          curl --fail --location --retry 3 \
+            "https://ftp.gnu.org/gnu/bison/bison-$BISON_VERSION.tar.xz" \
+            -o "deps/downloads/bison.tar.xz"
+          echo "$BISON_SHA256  deps/downloads/bison.tar.xz" | shasum -a 256 -c -
+          tar -xf deps/downloads/bison.tar.xz -C deps/build-tools
+          (cd "deps/build-tools/bison-$BISON_VERSION" && ./configure --prefix="$PWD/../../native" && make -j6 && make install)
+          python3 -m venv deps/venv
+          deps/venv/bin/pip install meson==1.12.1 mako==1.4.3 MarkupSafe==3.0.4 pyyaml==6.0.3 packaging==26.3
+
+      - name: Build host adreno_compiler_probe against libfreedreno_ir3
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/deps/native/bin:$PWD/deps/venv/bin:$PATH"
+          unset IR3_SHADER_DEBUG FD_MESA_DEBUG NIR_DEBUG MESA_SHADER_CACHE_DISABLE
+          meson setup deps/mesa-host-build deps/mesa --wrap-mode=nodownload \
+            -Dgallium-drivers= -Dvulkan-drivers= -Dplatforms= \
+            -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false \
+            -Dgles1=disabled -Dgles2=disabled -Dllvm=disabled -Dshared-glapi=disabled \
+            -Dxmlconfig=disabled -Dshader-cache=disabled -Dtools=freedreno \
+            -Dbuild-tests=true -Dvideo-codecs= -Dbuildtype=release \
+            -Doffline-adreno-probe="$PWD/harness/tools/phaseb-probe/adreno_compiler_probe.c"
+          ninja -C deps/mesa-host-build -j6 \
+            src/freedreno/ir3/ir3_disasm \
+            src/freedreno/ir3/ir3_delay_test \
+            src/freedreno/ir3/adreno_compiler_probe
+          deps/mesa-host-build/src/freedreno/ir3/ir3_disasm | tail -n 5
+          deps/mesa-host-build/src/freedreno/ir3/ir3_delay_test | tail -n 5
+
+      - name: Compile 2-texture quad GLSL and export fuxi_gpu_composite_isa.h
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/deps/native/bin:$PATH"
+          mkdir -p out/phaseb-isa
+          glslangValidator -V --target-env vulkan1.1 \
+            harness/tools/phaseb-probe/phaseb_quad.vert -o out/phaseb-isa/phaseb_quad.vert.spv
+          glslangValidator -V --target-env vulkan1.1 \
+            harness/tools/phaseb-probe/phaseb_dual.frag -o out/phaseb-isa/phaseb_dual.frag.spv
+          # 負向檢核：未設定 IR3_SHADER_DEBUG=asmroundtrip 時必須拒絕編譯
+          if deps/mesa-host-build/src/freedreno/ir3/adreno_compiler_probe \
+              out/phaseb-isa/phaseb_quad.vert.spv \
+              out/phaseb-isa/phaseb_dual.frag.spv \
+              out/phaseb-isa; then
+            echo "ERROR: probe unexpectedly succeeded without asmroundtrip"
+            exit 1
+          fi
+          IR3_SHADER_DEBUG=asmroundtrip \
+            deps/mesa-host-build/src/freedreno/ir3/adreno_compiler_probe \
+              out/phaseb-isa/phaseb_quad.vert.spv \
+              out/phaseb-isa/phaseb_dual.frag.spv \
+              out/phaseb-isa
+          IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -isysroot "$IOS_SDK" \
+            -std=c11 -mgeneral-regs-only -Wall -Wextra -Werror \
+            -include out/phaseb-isa/fuxi_gpu_composite_isa.h \
+            -x c -c - -o out/phaseb-isa/header_check.o <<'EOF'
+          #include <stdint.h>
+          uint32_t fuxi_probe_ios_hdr_abi_check(void) {
+              return FUXI_PB_VS_INSTRLEN + FUXI_PB_FS_INSTRLEN +
+                     fuxi_pb_vs_dwords[0] + fuxi_pb_fs_dwords[0];
+          }
+          EOF
+          rm -f out/phaseb-isa/header_check.o
+          (cd out/phaseb-isa && shasum -a 256 * > SHA256SUMS)
+          cat out/phaseb-isa/probe_report.json
+
+      - name: Upload fuxi_gpu_composite_isa.h and IR3 probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuxi-phaseb-ir3-probe
+          path: out/phaseb-isa/
+          if-no-files-found: fail
+          retention-days: 14
