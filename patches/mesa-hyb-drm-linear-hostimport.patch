@@ -1,0 +1,65 @@
+diff --git a/src/freedreno/fdl/fd6_layout.c b/src/freedreno/fdl/fd6_layout.c
+index 67491ab..3e21e2c 100644
+--- a/src/freedreno/fdl/fd6_layout.c
++++ b/src/freedreno/fdl/fd6_layout.c
+@@ -284,7 +284,14 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
+        * The pitch is already sufficiently aligned, but height
+        * may not be. note this only matters if last level is linear
+        */
+-      if (level == params->mip_levels - 1)
++      /* Fuxi: explicit single-level 2D DRM_FORMAT_MOD_LINEAR surfaces cannot
++       * take 4-row tail padding past the caller's backing; tu_image_view_init
++       * forces need_y2_align so unaligned GMEM stores use store_cp_blit.
++       */
++      if (level == params->mip_levels - 1 &&
++          !(explicit_layout && tile_mode == TILE6_LINEAR &&
++            params->mip_levels == 1 && params->array_size == 1 &&
++            !params->is_3d))
+          nblocksy = align(nblocksy, 4);
+ 
+       slice->offset = offset + layout->size;
+diff --git a/src/freedreno/vulkan/tu_formats.cc b/src/freedreno/vulkan/tu_formats.cc
+index 2dead45..ed35fd7 100644
+--- a/src/freedreno/vulkan/tu_formats.cc
++++ b/src/freedreno/vulkan/tu_formats.cc
+@@ -744,14 +744,22 @@ tu_get_external_image_format_properties(
+                           handleType, pImageFormatInfo->type);
+       }
+       break;
+-   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
++   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT: {
++      bool allow_tiling = pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR;
++      if (pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
++         const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *drm_info =
++            vk_find_struct_const(pImageFormatInfo->pNext,
++                                 PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
++         allow_tiling = drm_info && drm_info->drmFormatModifier == DRM_FORMAT_MOD_LINEAR;
++      }
+       if (!physical_device->has_host_import ||
+-          pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR ||
++          !allow_tiling ||
+           pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
+          return vk_error(physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED);
+       flags = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+       compat_flags = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+       break;
++   }
+    default:
+       return vk_errorf(physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED,
+                        "VkExternalMemoryTypeFlagBits(0x%x) unsupported",
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index 8b0aef1..e38d9d6 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -281,6 +281,11 @@ tu_image_view_init(struct tu_device *device,
+ 
+    TU_CALLX(device, fdl6_view_init)(&iview->view, layouts, &args, device->use_z24uint_s8uint);
+ 
++   if (image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
++       layouts[0]->tile_mode == TILE6_LINEAR &&
++       layouts[0]->mip_levels == 1 && image->vk.array_layers == 1)
++      iview->view.need_y2_align = true;
++
+    if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+       struct fdl_layout *layout = &image->layout[0];
+       iview->depth_base_addr = image->iova +

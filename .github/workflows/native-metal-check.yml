@@ -109,6 +109,7 @@ jobs:
           cp harness/patches/metal2vulkan-fuxi-0027-view-shadow-iosurface-alias.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0028-turnip-native-color-resolve.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0029-bound-spares-command-pools.patch source/tools/patches/
+          cp harness/patches/metal2vulkan-fuxi-0030-dont-care-preserve-and-diag.patch source/tools/patches/
       - name: Build and audit NativeMetal
         shell: bash
         run: |

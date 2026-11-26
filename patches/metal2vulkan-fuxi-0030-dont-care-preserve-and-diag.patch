@@ -1,0 +1,505 @@
+diff --git a/crates/metal2vulkan-runtime/src/clear_reach.rs b/crates/metal2vulkan-runtime/src/clear_reach.rs
+index cf4675e..3638eee 100644
+--- a/crates/metal2vulkan-runtime/src/clear_reach.rs
++++ b/crates/metal2vulkan-runtime/src/clear_reach.rs
+@@ -133,38 +133,107 @@ pub(super) enum PassReach {
+     Draws,
+ }
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) struct AttachmentAccess {
++    pub(super) load: LoadAction,
++    pub(super) store: StoreAction,
++    pub(super) memoryless: bool,
++}
++
++impl AttachmentAccess {
++    fn is_cleared_and_stored(self) -> bool {
++        self.load == LoadAction::Clear && self.store == StoreAction::Store && !self.memoryless
++    }
++
++    fn is_stored_dont_care(self) -> bool {
++        self.load == LoadAction::DontCare && !self.memoryless && stores(self.store)
++    }
++}
++
++pub(super) fn pass_reach_from_access(
++    colors: &[AttachmentAccess],
++    depth_stencil: Option<[Option<AttachmentAccess>; 2]>,
++    ds_combined_visible: bool,
++    layers: u32,
++    called: bool,
++    drew: bool,
++) -> PassReach {
++    let colors_cleared = colors.iter().any(|c| c.is_cleared_and_stored());
++    let depth_stencil_cleared = ds_combined_visible
++        && depth_stencil.is_some_and(|aspects| {
++            aspects
++                .into_iter()
++                .flatten()
++                .any(|a| a.is_cleared_and_stored())
++        });
++    let has_stored_dont_care = colors.iter().any(|c| c.is_stored_dont_care())
++        || depth_stencil.is_some_and(|aspects| {
++            aspects
++                .into_iter()
++                .flatten()
++                .any(|a| a.is_stored_dont_care())
++        });
++    if !called {
++        PassReach::Nothing
++    } else if layers == 1 && (colors_cleared || depth_stencil_cleared) {
++        // FUXI: when a pass actually draws and also carries a non-memoryless stored `DontCare`
++        // attachment, keep `PassReach::Draws` so `DrawnArea::tiles` bounds any `DontCare` clear
++        // instead of clearing untouched tiles of that attachment across the whole render area.
++        // Zero-draw passes (`!drew`, EV RRS3-reach3) and passes with no stored `DontCare` still
++        // take `PassReach::Every`.
++        if drew && has_stored_dont_care {
++            PassReach::Draws
++        } else {
++            PassReach::Every
++        }
++    } else if drew {
++        PassReach::Draws
++    } else {
++        PassReach::Nothing
++    }
++}
++
+ impl PassReach {
+     /// The reach of `layout`'s pass, whose store actions are settled and whose `DontCare` loads
+     /// are not yet given their answers, with a draw call where `called` and one that draws where
+     /// `drew`.
+     pub(super) fn of(layout: &PassLayout, called: bool, drew: bool) -> PassReach {
+-        let cleared = |load: LoadAction, store: StoreAction, memoryless: bool| {
+-            load == LoadAction::Clear && store == StoreAction::Store && !memoryless
+-        };
+-        let colors = layout
++        let colors: Vec<AttachmentAccess> = layout
+             .colors
+             .iter()
+             .flatten()
+-            .any(|c| cleared(c.load, c.store, c.memoryless));
+-        let depth_stencil = layout
+-            .depth_stencil
+-            .as_ref()
+-            .filter(|ds| ds.separate.is_none() && !ds.hidden)
+-            .is_some_and(|ds| {
+-                [ds.depth, ds.stencil]
+-                    .into_iter()
+-                    .flatten()
+-                    .any(|a| cleared(a.load, a.store, a.memoryless))
+-            });
+-        if !called {
+-            PassReach::Nothing
+-        } else if layout.layers == 1 && (colors || depth_stencil) {
+-            PassReach::Every
+-        } else if drew {
+-            PassReach::Draws
+-        } else {
+-            PassReach::Nothing
+-        }
++            .map(|c| AttachmentAccess {
++                load: c.load,
++                store: c.store,
++                memoryless: c.memoryless,
++            })
++            .collect();
++        let (ds_combined_visible, depth_stencil) = match layout.depth_stencil.as_ref() {
++            Some(ds) if ds.separate.is_none() => (
++                !ds.hidden,
++                Some([
++                    ds.depth.as_ref().map(|a| AttachmentAccess {
++                        load: a.load,
++                        store: a.store,
++                        memoryless: a.memoryless,
++                    }),
++                    ds.stencil.as_ref().map(|a| AttachmentAccess {
++                        load: a.load,
++                        store: a.store,
++                        memoryless: a.memoryless,
++                    }),
++                ]),
++            ),
++            _ => (false, None),
++        };
++        pass_reach_from_access(
++            &colors,
++            depth_stencil,
++            ds_combined_visible,
++            layout.layers,
++            called,
++            drew,
++        )
+     }
+ }
+ 
+@@ -189,11 +258,97 @@ pub(super) fn dont_care_clear(pf: PixelFormat) -> vk::ClearColorValue {
+ /// attachment ([`dont_care_clear`]) and to its clear value for depth and stencil. Which attachments took it, and whether the pass took
+ /// the near-equivalent (its draws reach the tiles their primitives touch): the attachment it
+ /// names, for the notice.
++static DONT_CARE_CLEARED_ATTACHMENTS: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++static DONT_CARE_PRESERVED_ATTACHMENTS: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++
++/// Number of non-memoryless stored `DontCare` attachments converted to `LoadAction::Clear`.
++pub fn dont_care_cleared_attachments() -> u64 {
++    DONT_CARE_CLEARED_ATTACHMENTS.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++/// Number of non-memoryless stored `DontCare` attachments preserved as `LoadAction::Load`.
++pub fn dont_care_preserved_attachments() -> u64 {
++    DONT_CARE_PRESERVED_ATTACHMENTS.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++/// FUXI: `FUXI_M2V_DONT_CARE_PRESERVE=1` preserves all non-memoryless stored `DontCare`
++/// attachments as `LoadAction::Load` instead of clearing them to zero.
++fn fuxi_dont_care_preserve() -> bool {
++    static PRESERVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *PRESERVE.get_or_init(|| match std::env::var_os("FUXI_M2V_DONT_CARE_PRESERVE") {
++        Some(value) => value != "0",
++        None => false,
++    })
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum DontCareStep {
++    Unchanged,
++    MemorylessCleared,
++    Cleared,
++    Preserved,
++}
++
++pub(super) fn step_dont_care_color(
++    access: &mut AttachmentAccess,
++    reach: PassReach,
++    preserve: bool,
++) -> DontCareStep {
++    // A memoryless color reads zero in every tile a draw touches, the only tiles where a
++    // fragment reads it (an Apple M4, EV ZIN-zp1-m4: a framebuffer fetch of one read 0 in
++    // 52 runs of 52, also after a pass that cleared other bytes into the tiles), and it is
++    // never stored: a clear to zero is Metal's answer exactly, in a pass that draws.
++    if access.load == LoadAction::DontCare && access.memoryless {
++        if reach != PassReach::Nothing {
++            access.load = LoadAction::Clear;
++            return DontCareStep::MemorylessCleared;
++        }
++        return DontCareStep::Unchanged;
++    }
++    if access.load != LoadAction::DontCare || access.memoryless || !stores(access.store) {
++        return DontCareStep::Unchanged;
++    }
++    if reach == PassReach::Nothing || preserve {
++        access.load = LoadAction::Load;
++        DONT_CARE_PRESERVED_ATTACHMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        DontCareStep::Preserved
++    } else {
++        access.load = LoadAction::Clear;
++        DONT_CARE_CLEARED_ATTACHMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        DontCareStep::Cleared
++    }
++}
++
++pub(super) fn step_dont_care_aspect(
++    access: &mut AttachmentAccess,
++    reach: PassReach,
++    preserve: bool,
++) -> DontCareStep {
++    if access.load != LoadAction::DontCare || access.memoryless || !stores(access.store) {
++        return DontCareStep::Unchanged;
++    }
++    if reach == PassReach::Nothing || preserve {
++        access.load = LoadAction::Load;
++        DONT_CARE_PRESERVED_ATTACHMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        DontCareStep::Preserved
++    } else {
++        access.load = LoadAction::Clear;
++        DONT_CARE_CLEARED_ATTACHMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        DontCareStep::Cleared
++    }
++}
++
+ pub(super) fn dont_care_loads(layout: &mut PassLayout, reach: PassReach) -> DontCareLoads {
+-    let load = match reach {
+-        PassReach::Nothing => LoadAction::Load,
+-        PassReach::Every | PassReach::Draws => LoadAction::Clear,
+-    };
++    dont_care_loads_with(layout, reach, fuxi_dont_care_preserve())
++}
++
++pub(super) fn dont_care_loads_with(
++    layout: &mut PassLayout,
++    reach: PassReach,
++    preserve: bool,
++) -> DontCareLoads {
+     let drew = reach == PassReach::Draws;
+     let mut loads = DontCareLoads {
+         named: None,
+@@ -205,27 +360,30 @@ pub(super) fn dont_care_loads(layout: &mut PassLayout, reach: PassReach) -> Dont
+         let Some(color) = color.as_mut() else {
+             continue;
+         };
+-        // A memoryless color reads zero in every tile a draw touches, the only tiles where a
+-        // fragment reads it (an Apple M4, EV ZIN-zp1-m4: a framebuffer fetch of one read 0 in
+-        // 52 runs of 52, also after a pass that cleared other bytes into the tiles), and it is
+-        // never stored: a clear to zero is Metal's answer exactly, in a pass that draws.
+-        if color.load == LoadAction::DontCare && color.memoryless {
+-            if reach != PassReach::Nothing {
+-                color.load = LoadAction::Clear;
++        let mut access = AttachmentAccess {
++            load: color.load,
++            store: color.store,
++            memoryless: color.memoryless,
++        };
++        match step_dont_care_color(&mut access, reach, preserve) {
++            DontCareStep::Unchanged => continue,
++            DontCareStep::MemorylessCleared => {
++                color.load = access.load;
+                 color.clear = dont_care_clear(color.target.texture.pixel_format());
+             }
+-            continue;
+-        }
+-        if color.load != LoadAction::DontCare || color.memoryless || !stores(color.store) {
+-            continue;
+-        }
+-        color.load = load;
+-        color.clear = dont_care_clear(color.target.texture.pixel_format());
+-        loads.colors.push(index);
+-        if drew {
+-            loads
+-                .named
+-                .get_or_insert_with(|| format!("color attachment {index}"));
++            DontCareStep::Preserved => {
++                color.load = access.load;
++            }
++            DontCareStep::Cleared => {
++                color.load = access.load;
++                color.clear = dont_care_clear(color.target.texture.pixel_format());
++                loads.colors.push(index);
++                if drew {
++                    loads
++                        .named
++                        .get_or_insert_with(|| format!("color attachment {index}"));
++                }
++            }
+         }
+     }
+     if let Some(ds) = layout
+@@ -240,15 +398,25 @@ pub(super) fn dont_care_loads(layout: &mut PassLayout, reach: PassReach) -> Dont
+             let Some(aspect) = aspect else {
+                 continue;
+             };
+-            if aspect.load != LoadAction::DontCare || aspect.memoryless || !stores(aspect.store) {
+-                continue;
+-            }
+-            aspect.load = load;
+-            *taken = true;
+-            if drew {
+-                loads
+-                    .named
+-                    .get_or_insert_with(|| format!("the {name} attachment"));
++            let mut access = AttachmentAccess {
++                load: aspect.load,
++                store: aspect.store,
++                memoryless: aspect.memoryless,
++            };
++            match step_dont_care_aspect(&mut access, reach, preserve) {
++                DontCareStep::Unchanged | DontCareStep::MemorylessCleared => continue,
++                DontCareStep::Preserved => {
++                    aspect.load = access.load;
++                }
++                DontCareStep::Cleared => {
++                    aspect.load = access.load;
++                    *taken = true;
++                    if drew {
++                        loads
++                            .named
++                            .get_or_insert_with(|| format!("the {name} attachment"));
++                    }
++                }
+             }
+         }
+     }
+@@ -789,7 +957,12 @@ fn rect([width, height]: [u32; 2]) -> vk::Rect2D {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{dont_care_clear, DrawnArea};
++    use super::{
++        dont_care_clear, dont_care_cleared_attachments, dont_care_preserved_attachments,
++        pass_reach_from_access, step_dont_care_aspect, step_dont_care_color, AttachmentAccess,
++        DontCareStep, DrawnArea, PassReach,
++    };
++    use crate::render_values::{LoadAction, StoreAction};
+     use ash::vk;
+     use metal2vulkan::metal::format::{ClearRoute, ExtendedRange};
+     use metal2vulkan::metal::PixelFormat;
+@@ -886,4 +1059,155 @@ mod tests {
+             }
+         }
+     }
++
++    /// Mixed `Attachment A (DontCare, Store)` + `Attachment B (Clear, Store)` in a single-layer
++    /// pass that draws (`drew == true`) must keep `PassReach::Draws` so `DrawnArea::tiles_of`
++    /// bounds any `DontCare` clear to touched tiles instead of wiping untouched tiles across the
++    /// render area. Zero-draw passes (`!drew`) and passes without stored `DontCare` attachments
++    /// retain `PassReach::Every`.
++    #[test]
++    fn mixed_clear_and_dont_care_with_draw_keeps_pass_reach_draws_to_preserve_untouched_tiles() {
++        let dont_care_color = AttachmentAccess {
++            load: LoadAction::DontCare,
++            store: StoreAction::Store,
++            memoryless: false,
++        };
++        let cleared_color = AttachmentAccess {
++            load: LoadAction::Clear,
++            store: StoreAction::Store,
++            memoryless: false,
++        };
++        let cleared_depth = AttachmentAccess {
++            load: LoadAction::Clear,
++            store: StoreAction::Store,
++            memoryless: false,
++        };
++
++        // Drawing pass with mixed DontCare+Store color and Clear+Store color/depth -> PassReach::Draws
++        assert_eq!(
++            pass_reach_from_access(&[dont_care_color, cleared_color], None, false, 1, true, true),
++            PassReach::Draws
++        );
++        assert_eq!(
++            pass_reach_from_access(
++                &[dont_care_color],
++                Some([Some(cleared_depth), None]),
++                true,
++                1,
++                true,
++                true
++            ),
++            PassReach::Draws
++        );
++
++        // Partial scissor [0,0..32,32) inside 128x128 produces bounded DrawnTiles (only tile 0,0)
++        let mut area = DrawnArea::default();
++        area.add(&[vk::Rect2D {
++            offset: vk::Offset2D { x: 0, y: 0 },
++            extent: vk::Extent2D {
++                width: 32,
++                height: 32,
++            },
++        }]);
++        let tiles = area
++            .tiles_of([32, 32], [128, 128])
++            .expect("partial scissor must preserve untouched tiles");
++        assert!(tiles.contains(0, 0));
++        assert!(!tiles.contains(1, 0));
++        assert!(!tiles.contains(0, 1));
++        assert_eq!(tiles.count(), 1);
++
++        // Zero-draw pass (`!drew`, EV RRS3-reach3) still yields PassReach::Every
++        assert_eq!(
++            pass_reach_from_access(
++                &[dont_care_color, cleared_color],
++                None,
++                false,
++                1,
++                true,
++                false
++            ),
++            PassReach::Every
++        );
++        // Pass with no stored DontCare attachment still yields PassReach::Every when drew == true
++        assert_eq!(
++            pass_reach_from_access(&[cleared_color], None, false, 1, true, true),
++            PassReach::Every
++        );
++        // Pass without any draw call (`!called`) yields PassReach::Nothing
++        assert_eq!(
++            pass_reach_from_access(&[dont_care_color, cleared_color], None, false, 1, false, false),
++            PassReach::Nothing
++        );
++    }
++
++    /// `preserve == true` (`FUXI_M2V_DONT_CARE_PRESERVE=1`) keeps non-memoryless stored `DontCare`
++    /// color and depth/stencil attachments as `LoadAction::Load`, while memoryless `DontCare`
++    /// attachments still clear to zero when the pass reaches tiles.
++    #[test]
++    fn dont_care_preserve_mode_loads_non_memoryless_and_clears_memoryless() {
++        let cleared_before = dont_care_cleared_attachments();
++        let preserved_before = dont_care_preserved_attachments();
++
++        let mut stored_color = AttachmentAccess {
++            load: LoadAction::DontCare,
++            store: StoreAction::Store,
++            memoryless: false,
++        };
++        assert_eq!(
++            step_dont_care_color(&mut stored_color, PassReach::Draws, true),
++            DontCareStep::Preserved
++        );
++        assert_eq!(stored_color.load, LoadAction::Load);
++
++        let mut stored_depth = AttachmentAccess {
++            load: LoadAction::DontCare,
++            store: StoreAction::Store,
++            memoryless: false,
++        };
++        assert_eq!(
++            step_dont_care_aspect(&mut stored_depth, PassReach::Every, true),
++            DontCareStep::Preserved
++        );
++        assert_eq!(stored_depth.load, LoadAction::Load);
++
++        // Memoryless color cannot LoadAction::Load; it still clears when reach != Nothing.
++        let mut memoryless_color = AttachmentAccess {
++            load: LoadAction::DontCare,
++            store: StoreAction::DontCare,
++            memoryless: true,
++        };
++        assert_eq!(
++            step_dont_care_color(&mut memoryless_color, PassReach::Draws, true),
++            DontCareStep::MemorylessCleared
++        );
++        assert_eq!(memoryless_color.load, LoadAction::Clear);
++
++        // Default (preserve == false) with PassReach::Draws clears non-memoryless stored color.
++        let mut default_color = AttachmentAccess {
++            load: LoadAction::DontCare,
++            store: StoreAction::Store,
++            memoryless: false,
++        };
++        assert_eq!(
++            step_dont_care_color(&mut default_color, PassReach::Draws, false),
++            DontCareStep::Cleared
++        );
++        assert_eq!(default_color.load, LoadAction::Clear);
++
++        // PassReach::Nothing always preserves stored attachments even with preserve == false.
++        let mut untouched_color = AttachmentAccess {
++            load: LoadAction::DontCare,
++            store: StoreAction::Store,
++            memoryless: false,
++        };
++        assert_eq!(
++            step_dont_care_color(&mut untouched_color, PassReach::Nothing, false),
++            DontCareStep::Preserved
++        );
++        assert_eq!(untouched_color.load, LoadAction::Load);
++
++        assert!(dont_care_preserved_attachments() >= preserved_before + 3);
++        assert!(dont_care_cleared_attachments() >= cleared_before + 1);
++    }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index f2f3e62..4fdc1df 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -284,6 +284,7 @@ pub use queue::CommandQueue;
+ pub use rate_map::{RasterizationRateMap, RateMapProblem};
+ pub use rate_mapped_pass::RegionRefusal;
+ pub use rebind::RebindProblem;
++pub use clear_reach::{dont_care_cleared_attachments, dont_care_preserved_attachments};
+ pub use render::{skipped_null_pipeline_draws, DrawProblem, RenderCommandEncoder, ResolveTarget};
+ pub use render_pass::{
+     Attachment, RenderPassColorAttachmentDescriptor, RenderPassDepthAttachmentDescriptor,
