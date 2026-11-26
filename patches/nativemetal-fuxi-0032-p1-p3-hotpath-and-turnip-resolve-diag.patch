@@ -1,0 +1,401 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 83ba851..c51ad77 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -273,6 +273,9 @@ static void fuxiMapsTelemetryNote(NmbDevice *device) {
+  uint64_t work[10]={};
+  if(device)(void)nmb_device_work_stats(device,work);
+  const uint64_t nullDraws=device?nmb_device_skipped_null_draws(device):0;
++ const uint64_t turnipNativeRes=device?nmb_device_turnip_native_resolve_passes(device):0;
++ const uint64_t shaderRes=device?nmb_device_shader_resolve_passes(device):0;
++ const uint64_t turnipResDontCare=device?nmb_device_turnip_resolve_dont_care_stores(device):0;
+  const uint64_t p0=gMapsPresent0.load(std::memory_order_relaxed);
+  const uint64_t pt=gMapsPresentAtTime.load(std::memory_order_relaxed);
+  const uint64_t pd=gMapsPresentMinDur.load(std::memory_order_relaxed);
+@@ -285,7 +288,7 @@ static void fuxiMapsTelemetryNote(NmbDevice *device) {
+   "present(tot/0/t/d)=%llu/%llu/%llu/%llu msaa(p/max)=%llu/%llu "
+   "texview(ok/surf/ref)=%llu/%llu/%llu sz1125(mk/c/r/b/p)=%llu/%llu/%llu/%llu/%llu "
+   "use_res=%llu/%llu use_heap=%llu/%llu mbar(s/r)=%llu/%llu "
+-  "vkpipe_fail=%llu m2v_warn=%llu null_draws=%llu\n",
++  "vkpipe_fail=%llu m2v_warn=%llu null_draws=%llu turnip_res(nat/sh/dc)=%llu/%llu/%llu\n",
+   (unsigned long long)cb,(unsigned long long)gMapsEmptyCbs.load(std::memory_order_relaxed),
+   (unsigned long long)gMapsRenderPasses.load(std::memory_order_relaxed),
+   (unsigned long long)gMapsDraws.load(std::memory_order_relaxed),
+@@ -324,7 +327,8 @@ static void fuxiMapsTelemetryNote(NmbDevice *device) {
+   (unsigned long long)gMapsUseHeapCount.load(std::memory_order_relaxed),
+   (unsigned long long)gMapsBarrierScopeCalls.load(std::memory_order_relaxed),
+   (unsigned long long)gMapsBarrierResourceCalls.load(std::memory_order_relaxed),
+-  (unsigned long long)work[4],(unsigned long long)work[6],(unsigned long long)nullDraws);
++  (unsigned long long)work[4],(unsigned long long)work[6],(unsigned long long)nullDraws,
++  (unsigned long long)turnipNativeRes,(unsigned long long)shaderRes,(unsigned long long)turnipResDontCare);
+ }
+ struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
+ static CommitRecord gCommitRing[32];
+@@ -1512,19 +1516,23 @@ static void waitForResource(id resource) {
+ 
+ @interface NBComputeEncoder : NBEncoder {
+ @public
+- std::unordered_set<NSUInteger> fuxiWritableSurfaceSlots;
++ uint64_t fuxiWritableSurfaceMask[2];
++ bool fuxiWritableSurfaceHighSlot;
+  bool fuxiUsedWritableSurface;
+ }
+ @end
+ @implementation NBComputeEncoder
+ - (MTLDispatchType)dispatchType { try { @try {return MTLDispatchTypeSerial;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)fuxiTrackComputeTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
+- if(t && [(id)t isKindOfClass:[NBTexture class]]) {
+-  NBTexture *nb=(NBTexture *)t;
+-  if(nb.surface && (nb.usage & MTLTextureUsageShaderWrite)!=0)fuxiWritableSurfaceSlots.insert(i);
+-  else fuxiWritableSurfaceSlots.erase(i);
+- } else {
+-  fuxiWritableSurfaceSlots.erase(i);
++ const bool writable=(t && [(id)t isKindOfClass:[NBTexture class]] &&
++                      [(NBTexture *)t surface]!=nullptr &&
++                      ([(NBTexture *)t usage] & MTLTextureUsageShaderWrite)!=0);
++ if(i<128) {
++  const uint64_t bit=1ULL<<(i & 63);
++  if(writable)fuxiWritableSurfaceMask[i>>6]|=bit;
++  else fuxiWritableSurfaceMask[i>>6]&=~bit;
++ } else if(writable) {
++  fuxiWritableSurfaceHighSlot=true;
+  }
+ }
+ - (void)setComputePipelineState:(id<MTLComputePipelineState>)state { try { @try {
+@@ -1556,7 +1564,7 @@ static void waitForResource(id resource) {
+  if(fuxiIsTelemetryClient())gMapsComputeDisp.fetch_add(1,std::memory_order_relaxed);
+  const uint64_t s[3]={size.width,size.height,size.depth},g[3]={group.width,group.height,group.depth};
+  if([self check:nmb_compute_dispatch(self.handle,s,g,threads) what:"dispatch"]) {
+-  if(!fuxiWritableSurfaceSlots.empty() || fuxiUsedWritableSurface) {
++  if(fuxiWritableSurfaceMask[0]!=0 || fuxiWritableSurfaceMask[1]!=0 || fuxiWritableSurfaceHighSlot || fuxiUsedWritableSurface) {
+    [self.commandBuffer fuxiMarkStoredSurface];
+    if(fuxiIsTelemetryClient())gMapsComputeToSurf.fetch_add(1,std::memory_order_relaxed);
+   }
+@@ -1615,29 +1623,31 @@ static void waitForResource(id resource) {
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ 
+-@interface NBRenderEncoder : NBEncoder
+-@property(nonatomic) BOOL fuxiStoredSurface;
+-@property(nonatomic) uint8_t fuxiColorSurfaceMask;
+-@property(nonatomic) uint8_t fuxiResolveSurfaceMask;
+-@property(nonatomic) uint8_t fuxiSurfaceMask;
+-@property(nonatomic) uint8_t fuxiStoreSurfaceMask;
+-@property(nonatomic) uint8_t fuxiLoadWriteMask;
+-@property(nonatomic) BOOL fuxiDrew;
+-@property(nonatomic) BOOL fuxiContributedStoredSurface;
++@interface NBRenderEncoder : NBEncoder {
++@public
++ BOOL fuxiStoredSurface;
++ uint8_t fuxiColorSurfaceMask;
++ uint8_t fuxiResolveSurfaceMask;
++ uint8_t fuxiSurfaceMask;
++ uint8_t fuxiStoreSurfaceMask;
++ uint8_t fuxiLoadWriteMask;
++ BOOL fuxiDrew;
++ BOOL fuxiContributedStoredSurface;
++}
+ - (BOOL)fuxiCurrentStoredSurface;
+ - (void)fuxiSyncStoredSurface;
+ @end
+ @implementation NBRenderEncoder
+ - (BOOL)fuxiCurrentStoredSurface {
+- return self.fuxiStoreSurfaceMask!=0 &&
+-        (self.fuxiDrew || (self.fuxiStoreSurfaceMask & self.fuxiLoadWriteMask)!=0);
++ return self->fuxiStoreSurfaceMask!=0 &&
++        (self->fuxiDrew || (self->fuxiStoreSurfaceMask & self->fuxiLoadWriteMask)!=0);
+ }
+ - (void)fuxiSyncStoredSurface {
+  NBCommandBuffer *cb=self.commandBuffer;
+  if(!cb)return;
+  const BOOL next=[self fuxiCurrentStoredSurface];
+- if(next==self.fuxiContributedStoredSurface)return;
+- self.fuxiContributedStoredSurface=next;
++ if(next==self->fuxiContributedStoredSurface)return;
++ self->fuxiContributedStoredSurface=next;
+  if(next)cb->fuxiStoredSurfaceEncoders++;
+  else if(cb->fuxiStoredSurfaceEncoders>0)cb->fuxiStoredSurfaceEncoders--;
+  [cb fuxiUpdateStoredSurface];
+@@ -1714,9 +1724,8 @@ static void waitForResource(id resource) {
+  const float c[4]={r,g,b,a};[self check:nmb_render_set_blend_color(self.handle,c) what:"setBlendColor"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b { try { @try {
+- self.fuxiDrew=YES;
+- [self fuxiSyncStoredSurface];
+- if(fuxiIsTelemetryClient()){gMapsDraws.fetch_add(1,std::memory_order_relaxed);if(self.fuxiSurfaceMask!=0)gMapsSurfPassDraws++;}
++ if(!self->fuxiDrew){self->fuxiDrew=YES;[self fuxiSyncStoredSurface];}
++ if(fuxiIsTelemetryClient()){gMapsDraws.fetch_add(1,std::memory_order_relaxed);if(self->fuxiSurfaceMask!=0)gMapsSurfPassDraws++;}
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1730,9 +1739,8 @@ static void waitForResource(id resource) {
+                 instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi { try { @try {
+  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
+  [self.commandBuffer.resourceOwners addObject:b];
+- self.fuxiDrew=YES;
+- [self fuxiSyncStoredSurface];
+- if(fuxiIsTelemetryClient()){gMapsDraws.fetch_add(1,std::memory_order_relaxed);if(self.fuxiSurfaceMask!=0)gMapsSurfPassDraws++;}
++ if(!self->fuxiDrew){self->fuxiDrew=YES;[self fuxiSyncStoredSurface];}
++ if(fuxiIsTelemetryClient()){gMapsDraws.fetch_add(1,std::memory_order_relaxed);if(self->fuxiSurfaceMask!=0)gMapsSurfPassDraws++;}
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -1795,21 +1803,21 @@ static void waitForResource(id resource) {
+ - (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index { try { @try {
+  if(index>UINT32_MAX){[self.commandBuffer refuse:@"color store action index out of range"];return;}
+  if(![self check:nmb_render_set_store_action(self.handle,0,(uint32_t)index,(uint64_t)action) what:"setColorStoreAction"])return;
+- if(index<8 && (self.fuxiSurfaceMask & (1u<<index))) {
++ if(index<8 && (self->fuxiSurfaceMask & (1u<<index))) {
+   NBCommandBuffer *cb=self.commandBuffer;
+   const bool wasStored=cb && cb->encodedWork.storedSurface;
+   const uint8_t bit=(uint8_t)(1u<<index);
+-  const bool hadStoreMask=(self.fuxiStoreSurfaceMask & bit)!=0;
++  const bool hadStoreMask=(self->fuxiStoreSurfaceMask & bit)!=0;
+   const bool colorStores=(action==MTLStoreActionStore || action==MTLStoreActionStoreAndMultisampleResolve);
+   const bool resolves=(action==MTLStoreActionMultisampleResolve || action==MTLStoreActionStoreAndMultisampleResolve);
+-  const bool stores=((self.fuxiColorSurfaceMask & bit)!=0 && colorStores) ||
+-                    ((self.fuxiResolveSurfaceMask & bit)!=0 && resolves);
+-  if(stores)self.fuxiStoreSurfaceMask|=bit;
+-  else self.fuxiStoreSurfaceMask&=(uint8_t)~bit;
+-  self.fuxiStoredSurface=(self.fuxiStoreSurfaceMask!=0);
++  const bool stores=((self->fuxiColorSurfaceMask & bit)!=0 && colorStores) ||
++                    ((self->fuxiResolveSurfaceMask & bit)!=0 && resolves);
++  if(stores)self->fuxiStoreSurfaceMask|=bit;
++  else self->fuxiStoreSurfaceMask&=(uint8_t)~bit;
++  self->fuxiStoredSurface=(self->fuxiStoreSurfaceMask!=0);
+   [self fuxiSyncStoredSurface];
+   if(!wasStored && cb && cb->encodedWork.storedSurface && fuxiIsTelemetryClient())gMapsStoreActionPromoted++;
+-  if(!hadStoreMask && stores && (self.fuxiResolveSurfaceMask & bit)!=0 && resolves && fuxiIsTelemetryClient())
++  if(!hadStoreMask && stores && (self->fuxiResolveSurfaceMask & bit)!=0 && resolves && fuxiIsTelemetryClient())
+    gMapsResolveStorePromo.fetch_add(1,std::memory_order_relaxed);
+  }
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+@@ -1832,9 +1840,8 @@ static void waitForResource(id resource) {
+ - (void)drawPrimitives:(MTLPrimitiveType)t indirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o { try { @try {
+  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign indirect buffer"];return;}
+  [self.commandBuffer.resourceOwners addObject:b];
+- self.fuxiDrew=YES;
+- [self fuxiSyncStoredSurface];
+- if(fuxiIsTelemetryClient()){gMapsDraws.fetch_add(1,std::memory_order_relaxed);if(self.fuxiSurfaceMask!=0)gMapsSurfPassDraws++;}
++ if(!self->fuxiDrew){self->fuxiDrew=YES;[self fuxiSyncStoredSurface];}
++ if(fuxiIsTelemetryClient()){gMapsDraws.fetch_add(1,std::memory_order_relaxed);if(self->fuxiSurfaceMask!=0)gMapsSurfPassDraws++;}
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+  [self check:nmb_render_draw_indirect(self.handle,t,[(NBBuffer *)b handle],o) what:"drawPrimitives:indirectBuffer:"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+@@ -1844,9 +1851,8 @@ static void waitForResource(id resource) {
+  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign indirect buffer"];return;}
+  [self.commandBuffer.resourceOwners addObject:ib];
+  [self.commandBuffer.resourceOwners addObject:b];
+- self.fuxiDrew=YES;
+- [self fuxiSyncStoredSurface];
+- if(fuxiIsTelemetryClient()){gMapsDraws.fetch_add(1,std::memory_order_relaxed);if(self.fuxiSurfaceMask!=0)gMapsSurfPassDraws++;}
++ if(!self->fuxiDrew){self->fuxiDrew=YES;[self fuxiSyncStoredSurface];}
++ if(fuxiIsTelemetryClient()){gMapsDraws.fetch_add(1,std::memory_order_relaxed);if(self->fuxiSurfaceMask!=0)gMapsSurfPassDraws++;}
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+  [self check:nmb_render_draw_indexed_indirect(self.handle,t,k,[(NBBuffer *)ib handle],io,[(NBBuffer *)b handle],o) what:"drawIndexedPrimitives:indirectBuffer:"];
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} }
+@@ -2130,38 +2136,36 @@ static void overlapCommitted(void *context,const char *why);
+    if(pixels>=2000000)gFullScreenPasses++;
+   }
+  }
+- auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
++ auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out,NBTexture * __strong &outTex,NBTexture * __strong &outRes)->bool {
++  outTex=nil;outRes=nil;
+   if(a.texture) {
+    if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
+-   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
++   NBTexture *texture=(NBTexture *)a.texture;outTex=texture;if(texture.surface)[_surfaces addObject:texture];
+    [_resourceOwners addObject:texture];
+    out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;
+   }
+   out.load=a.loadAction;out.store=a.storeAction;
+   if(a.resolveTexture) {
+    if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
+-   NBTexture *resolve=(NBTexture *)a.resolveTexture;if(resolve.surface)[_surfaces addObject:resolve];
++   NBTexture *resolve=(NBTexture *)a.resolveTexture;outRes=resolve;if(resolve.surface)[_surfaces addObject:resolve];
+    [_resourceOwners addObject:resolve];
+    out.resolve_texture=resolve.handle;out.resolve_level=a.resolveLevel;out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
+   }
+   return true;
+  };
++ const bool telemetry=fuxiIsTelemetryClient();
+  uint8_t colorSurfaceMask=0,resolveSurfaceMask=0,surfaceMask=0,storeSurfaceMask=0,loadWriteMask=0;
+- bool storesSurface=false,hasResolveSurf=false,hasViewSurf=false;
+- uint64_t maxPassSamples=d.defaultRasterSampleCount;
++ bool storesSurface=false,hasViewSurf=false;
++ uint64_t maxPassSamples=telemetry?(uint64_t)d.defaultRasterSampleCount:0;
+  for(unsigned i=0;i<8;i++) {
+   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
+-  if(!attachment(c,pass.colors[i])){[self refuse:@"foreign color attachment"];return nil;}
++  NBTexture *ct=nil,*rt=nil;
++  if(!attachment(c,pass.colors[i],ct,rt)){[self refuse:@"foreign color attachment"];return nil;}
+   const uint8_t bit=(uint8_t)(1u<<i);
+-  NBTexture *ct=(c.texture && [(id)c.texture isKindOfClass:[NBTexture class]])?(NBTexture *)c.texture:nil;
+-  NBTexture *rt=(c.resolveTexture && [(id)c.resolveTexture isKindOfClass:[NBTexture class]])?(NBTexture *)c.resolveTexture:nil;
+-  if(ct)maxPassSamples=MAX(maxPassSamples,(uint64_t)ct.sampleCount);
+-  if(rt)maxPassSamples=MAX(maxPassSamples,(uint64_t)rt.sampleCount);
+   const bool hasColorSurf=(ct && ct.surface!=nullptr);
+   const bool hasResSurf=(rt && rt.surface!=nullptr);
+   if(hasColorSurf)colorSurfaceMask|=bit;
+-  if(hasResSurf){resolveSurfaceMask|=bit;hasResolveSurf=true;}
+-  if((ct && ct.parent && ct.surface) || (rt && rt.parent && rt.surface))hasViewSurf=true;
++  if(hasResSurf)resolveSurfaceMask|=bit;
+   if(hasColorSurf || hasResSurf) {
+    surfaceMask|=bit;
+    const bool loadWrite=(c.loadAction==MTLLoadActionClear || c.loadAction==MTLLoadActionLoad);
+@@ -2174,7 +2178,10 @@ static void overlapCommitted(void *context,const char *why);
+     storesSurface=true;
+    }
+   }
+-  if(fuxiIsTelemetryClient()) {
++  if(telemetry) {
++   if(ct)maxPassSamples=MAX(maxPassSamples,(uint64_t)ct.sampleCount);
++   if(rt)maxPassSamples=MAX(maxPassSamples,(uint64_t)rt.sampleCount);
++   if((ct && ct.parent && ct.surface) || (rt && rt.parent && rt.surface))hasViewSurf=true;
+    if(hasColorSurf && fuxiIs1125x2500((id<MTLTexture>)ct))gMapsSz1125Color.fetch_add(1,std::memory_order_relaxed);
+    if(hasResSurf && fuxiIs1125x2500((id<MTLTexture>)rt))gMapsSz1125Resolve.fetch_add(1,std::memory_order_relaxed);
+   }
+@@ -2182,21 +2189,17 @@ static void overlapCommitted(void *context,const char *why);
+  }
+  MTLRenderPassDepthAttachmentDescriptor *depthDesc=d.depthAttachment;
+  MTLRenderPassStencilAttachmentDescriptor *stencilDesc=d.stencilAttachment;
+- if(!attachment(depthDesc,pass.depth) || !attachment(stencilDesc,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
+- for(MTLRenderPassAttachmentDescriptor *ds in @[depthDesc?:(id)[NSNull null],stencilDesc?:(id)[NSNull null]]) {
+-  if(![ds isKindOfClass:[MTLRenderPassAttachmentDescriptor class]])continue;
+-  if(ds.texture && [(id)ds.texture isKindOfClass:[NBTexture class]]) {
+-   NBTexture *t=(NBTexture *)ds.texture;maxPassSamples=MAX(maxPassSamples,(uint64_t)t.sampleCount);
++ NBTexture *dt=nil,*drt=nil,*st=nil,*srt=nil;
++ if(!attachment(depthDesc,pass.depth,dt,drt) || !attachment(stencilDesc,pass.stencil,st,srt)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
++ if(telemetry) {
++  NBTexture * __unsafe_unretained const dsTex[4]={dt,drt,st,srt};
++  for(NBTexture *t : dsTex) {
++   if(!t)continue;
++   maxPassSamples=MAX(maxPassSamples,(uint64_t)t.sampleCount);
+    if(t.parent && t.surface)hasViewSurf=true;
+   }
+-  if(ds.resolveTexture && [(id)ds.resolveTexture isKindOfClass:[NBTexture class]]) {
+-   NBTexture *r=(NBTexture *)ds.resolveTexture;maxPassSamples=MAX(maxPassSamples,(uint64_t)r.sampleCount);
+-   if(r.parent && r.surface)hasViewSurf=true;
+-  }
+- }
+- if(fuxiIsTelemetryClient()) {
+   gMapsRenderPasses.fetch_add(1,std::memory_order_relaxed);
+-  if(hasResolveSurf)gMapsResolveSurfPasses.fetch_add(1,std::memory_order_relaxed);
++  if(resolveSurfaceMask!=0)gMapsResolveSurfPasses.fetch_add(1,std::memory_order_relaxed);
+   if(hasViewSurf)gMapsViewSurfPasses.fetch_add(1,std::memory_order_relaxed);
+   if(maxPassSamples>1) {
+    gMapsMsaaPasses.fetch_add(1,std::memory_order_relaxed);
+@@ -2204,8 +2207,7 @@ static void overlapCommitted(void *context,const char *why);
+    while(maxPassSamples>seenSamples && !gMapsMsaaMaxSamples.compare_exchange_weak(seenSamples,maxPassSamples)){}
+   }
+  }
+- const bool telemetrySurf=fuxiIsTelemetryClient() && surfaceMask!=0;
+- if(telemetrySurf) {
++ if(telemetry && surfaceMask!=0) {
+   gMapsSurfPasses.fetch_add(1,std::memory_order_relaxed);
+   for(unsigned i=0;i<8;i++) {
+    if(!(surfaceMask & (1u<<i)))continue;
+@@ -2237,12 +2239,12 @@ static void overlapCommitted(void *context,const char *why);
+   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
+  }
+  NBRenderEncoder *encoder=[NBRenderEncoder new];
+- encoder.fuxiStoredSurface=storesSurface;
+- encoder.fuxiColorSurfaceMask=colorSurfaceMask;
+- encoder.fuxiResolveSurfaceMask=resolveSurfaceMask;
+- encoder.fuxiSurfaceMask=surfaceMask;
+- encoder.fuxiStoreSurfaceMask=storeSurfaceMask;
+- encoder.fuxiLoadWriteMask=loadWriteMask;
++ encoder->fuxiStoredSurface=storesSurface;
++ encoder->fuxiColorSurfaceMask=colorSurfaceMask;
++ encoder->fuxiResolveSurfaceMask=resolveSurfaceMask;
++ encoder->fuxiSurfaceMask=surfaceMask;
++ encoder->fuxiStoreSurfaceMask=storeSurfaceMask;
++ encoder->fuxiLoadWriteMask=loadWriteMask;
+  [self fuxiMaybeSplit];
+  id<MTLRenderCommandEncoder> attached=[self encoder:encoder handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+  if(attached)[(NBRenderEncoder *)attached fuxiSyncStoredSurface];
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index ecefcdb..3d7d6c0 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -40,6 +40,9 @@ uint64_t nmb_device_max_buffer_length(const NmbDevice *);
+ // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
+ bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
+ uint64_t nmb_device_skipped_null_draws(const NmbDevice *);
++uint64_t nmb_device_turnip_native_resolve_passes(const NmbDevice *);
++uint64_t nmb_device_shader_resolve_passes(const NmbDevice *);
++uint64_t nmb_device_turnip_resolve_dont_care_stores(const NmbDevice *);
+ /* Artifact lookups and driver pipeline records are separate cache layers. */
+ struct NmbShaderCacheStats {
+     uint64_t hits, misses, rejected, read_failures, writes, write_failures, evictions;
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index cf34f67..17bccbd 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -286,6 +286,33 @@ pub extern "C" fn nmb_device_skipped_null_draws(device: *const NmbDevice) -> u64
+     })
+ }
+ 
++/// Number of color resolve attachments routed to Turnip's native `pResolveAttachments` path (m2v patch 0028).
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_device_turnip_native_resolve_passes(device: *const NmbDevice) -> u64 {
++    guard(0, || {
++        let _ = get(device)?;
++        Ok(metal2vulkan_runtime::turnip_native_resolve_passes())
++    })
++}
++
++/// Number of passes planned with `ShaderResolves` instead of subpass `pResolveAttachments` (m2v patch 0028).
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_device_shader_resolve_passes(device: *const NmbDevice) -> u64 {
++    guard(0, || {
++        let _ = get(device)?;
++        Ok(metal2vulkan_runtime::shader_resolve_passes())
++    })
++}
++
++/// Number of color `StoreAction::MultisampleResolve` attachments emitted as `VK_ATTACHMENT_STORE_OP_DONT_CARE` on Turnip (m2v patch 0028).
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_device_turnip_resolve_dont_care_stores(device: *const NmbDevice) -> u64 {
++    guard(0, || {
++        let _ = get(device)?;
++        Ok(metal2vulkan_runtime::turnip_resolve_dont_care_stores())
++    })
++}
++
+ /// Separate artifact and driver-record counters, mirroring the C ABI.
+ #[repr(C)]
+ pub struct NmbShaderCacheStats {
+@@ -3747,7 +3774,31 @@ mod m43_tests {
+         }
+         assert!(raw::<TextureSwizzle>(6, "texture swizzle").is_err());
+ 
+-        assert_eq!(std::mem::size_of::<NmbPassAttachment>(), 15 * std::mem::size_of::<u64>());
++        assert_eq!(std::mem::size_of::<NmbPassAttachment>(), 120);
++        assert_eq!(std::mem::offset_of!(NmbPassAttachment, texture), 0);
++        assert_eq!(std::mem::offset_of!(NmbPassAttachment, level), 8);
++        assert_eq!(std::mem::offset_of!(NmbPassAttachment, slice), 16);
++        assert_eq!(std::mem::offset_of!(NmbPassAttachment, depth_plane), 24);
++        assert_eq!(std::mem::offset_of!(NmbPassAttachment, load), 32);
++        assert_eq!(std::mem::offset_of!(NmbPassAttachment, store), 40);
++        assert_eq!(std::mem::offset_of!(NmbPassAttachment, resolve_texture), 48);
++        assert_eq!(std::mem::offset_of!(NmbPassAttachment, resolve_level), 56);
++        assert_eq!(std::mem::offset_of!(NmbPassAttachment, resolve_slice), 64);
++        assert_eq!(std::mem::offset_of!(NmbPassAttachment, resolve_depth_plane), 72);
++        assert_eq!(std::mem::offset_of!(NmbPassAttachment, resolve_filter), 80);
++        assert_eq!(std::mem::offset_of!(NmbPassAttachment, clear), 88);
++        assert_eq!(std::mem::size_of::<NmbRenderPassDescriptor>(), 1240);
++        assert_eq!(std::mem::offset_of!(NmbRenderPassDescriptor, colors), 0);
++        assert_eq!(std::mem::offset_of!(NmbRenderPassDescriptor, depth), 960);
++        assert_eq!(std::mem::offset_of!(NmbRenderPassDescriptor, stencil), 1080);
++        assert_eq!(std::mem::offset_of!(NmbRenderPassDescriptor, width), 1200);
++        assert_eq!(std::mem::offset_of!(NmbRenderPassDescriptor, height), 1208);
++        assert_eq!(std::mem::offset_of!(NmbRenderPassDescriptor, array_length), 1216);
++        assert_eq!(std::mem::offset_of!(NmbRenderPassDescriptor, samples), 1224);
++        assert_eq!(std::mem::offset_of!(NmbRenderPassDescriptor, visibility), 1232);
++        assert_eq!(nmb_device_turnip_native_resolve_passes(std::ptr::null()), 0);
++        assert_eq!(nmb_device_shader_resolve_passes(std::ptr::null()), 0);
++        assert_eq!(nmb_device_turnip_resolve_dont_care_stores(std::ptr::null()), 0);
+         assert!(nmb_texture_new_view_ex(std::ptr::null_mut(), 70, 2, std::ptr::null(), std::ptr::null(), true, std::ptr::null(), true, 1, true).is_null());
+         nmb_texture_view_info(std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+     }

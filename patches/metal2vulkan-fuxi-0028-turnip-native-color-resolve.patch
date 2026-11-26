@@ -1,0 +1,560 @@
+diff --git a/crates/metal2vulkan-runtime/src/color_resolve.rs b/crates/metal2vulkan-runtime/src/color_resolve.rs
+index 86c998d..ffde0d6 100644
+--- a/crates/metal2vulkan-runtime/src/color_resolve.rs
++++ b/crates/metal2vulkan-runtime/src/color_resolve.rs
+@@ -56,6 +56,7 @@ use super::image_plan::ImagePlan;
+ use super::release;
+ use super::render_pass::{PassLayout, Target};
+ use super::render_target::{takes_input, ATTACHMENT_STAGES};
++use super::render_values::StoreAction;
+ use super::resource::ResourceKey;
+ use super::sample_planes::{pipeline_layout, set_layout, shader_module};
+ use super::tracker::{Access, Barrier, Use};
+@@ -66,12 +67,45 @@ use metal2vulkan::bind::{color_resolve_modules, ColorResolveFormat, PlanesCopy,
+ use metal2vulkan::device::DriverFact;
+ use metal2vulkan::error::Feature;
+ use metal2vulkan::vk::{
+-    ComponentMapping, Format, ImageAspectFlags, ImageUsageFlags, ImageViewType,
++    ComponentMapping, DriverId, Format, ImageAspectFlags, ImageUsageFlags, ImageViewType,
+ };
+ 
+ /// The most samples of a texture on Apple's GPUs, so the most whose resolve Metal measures.
+ pub(super) const METAL_SAMPLES: u32 = 4;
+ 
++static TURNIP_NATIVE_RESOLVE_PASSES: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++static SHADER_RESOLVE_PASSES: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++
++/// Number of color resolve attachments routed to Turnip's native `pResolveAttachments` path.
++pub fn turnip_native_resolve_passes() -> u64 {
++    TURNIP_NATIVE_RESOLVE_PASSES.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++/// Number of passes planned with `ShaderResolves` instead of subpass `pResolveAttachments`.
++pub fn shader_resolve_passes() -> u64 {
++    SHADER_RESOLVE_PASSES.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++pub(super) fn turnip_exact_color_resolve_override() -> bool {
++    static EXACT_OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *EXACT_OVERRIDE.get_or_init(|| {
++        std::env::var_os("FUXI_TURNIP_EXACT_COLOR_RESOLVE").is_some_and(|v| v == "1")
++    })
++}
++
++pub(super) fn turnip_native_resolve_enabled(
++    driver_id: Option<DriverId>,
++    samples: u32,
++    exact_override: bool,
++) -> bool {
++    samples > 1
++        && samples <= METAL_SAMPLES
++        && driver_id == Some(DriverId::MESA_TURNIP)
++        && !exact_override
++}
++
+ /// The exact resolve of a color attachment of `format` at `samples` samples on `device`: its
+ /// format's rules where the format has them and the device's average is not measured to be
+ /// Metal's at that count (the module docs). `None` where the device resolves it in the pass.
+@@ -85,6 +119,13 @@ pub(super) fn exact(device: &Device, format: Format, samples: u32) -> Option<Col
+ /// Metal's resolve, whatever its format: `DriverFact::ColorResolveAverageIsMetals`, at a count
+ /// Apple's GPUs make (MoltenVK's resolve is Metal's multisample resolve store action).
+ pub(super) fn average_is_metals(device: &Device, samples: u32) -> bool {
++    if turnip_native_resolve_enabled(
++        device.properties().description.driver_id,
++        samples,
++        turnip_exact_color_resolve_override(),
++    ) {
++        return true;
++    }
+     samples <= METAL_SAMPLES
+         && device
+             .properties()
+@@ -101,7 +142,16 @@ pub(super) fn of_attachment(
+ ) -> Result<Option<ColorResolveFormat>, Error> {
+     match exact(device, source.format, source.samples) {
+         Some(rules) if takes_input(source)? => Ok(Some(rules)),
+-        _ => Ok(None),
++        _ => {
++            if turnip_native_resolve_enabled(
++                device.properties().description.driver_id,
++                source.samples,
++                turnip_exact_color_resolve_override(),
++            ) {
++                TURNIP_NATIVE_RESOLVE_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            }
++            Ok(None)
++        }
+     }
+ }
+ 
+@@ -223,7 +273,7 @@ impl ResolvePipeline {
+ /// closed rules, the sample counts and the planes' copy formats.
+ #[derive(Default)]
+ pub(super) struct ColorResolveObjects {
+-    pipelines: Vec<((ColorResolveFormat, u32, Source), ResolvePipeline)>,
++    pipelines: Vec<((ColorResolveFormat, u32, Source, bool), ResolvePipeline)>,
+ }
+ 
+ impl ColorResolveObjects {
+@@ -243,8 +293,9 @@ impl Device {
+         format: ColorResolveFormat,
+         samples: u32,
+         source: Source,
++        discard_samples: bool,
+     ) -> Result<ResolvePipeline, Error> {
+-        let key = (format, samples, source);
++        let key = (format, samples, source, discard_samples);
+         // A making's turn before the lock (`budget::helper_turn`): none where it is made.
+         let _turn =
+             crate::pipeline::budget::helper_turn(&self.shared().color_resolves, |objects| {
+@@ -270,7 +321,8 @@ impl Device {
+             made.set_layout =
+                 set_layout(raw, &[source.descriptor()], vk::ShaderStageFlags::FRAGMENT)?;
+             made.layout = pipeline_layout(raw, made.set_layout)?;
+-            made.render_pass = resolve_pass(raw, format.format(), samples, source)?;
++            made.render_pass =
++                resolve_pass(raw, format.format(), samples, source, discard_samples)?;
+             let making = Making::new("color resolve")
+                 .words(&modules.vertex)
+                 .words(&modules.fragment)
+@@ -292,22 +344,50 @@ impl Device {
+     }
+ }
+ 
++fn samples_attachment_store_op(discard_samples: bool) -> vk::AttachmentStoreOp {
++    if discard_samples {
++        vk::AttachmentStoreOp::DONT_CARE
++    } else {
++        vk::AttachmentStoreOp::STORE
++    }
++}
++
++fn resolve_pass_dependency(source: Source) -> vk::SubpassDependency {
++    let dst_access = match source {
++        Source::Attachment => {
++            vk::AccessFlags::INPUT_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
++        }
++        Source::Planes(_) => vk::AccessFlags::SHADER_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
++    };
++    vk::SubpassDependency::default()
++        .src_subpass(vk::SUBPASS_EXTERNAL)
++        .dst_subpass(0)
++        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
++        .dst_stage_mask(
++            vk::PipelineStageFlags::FRAGMENT_SHADER
++                | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
++        )
++        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
++        .dst_access_mask(dst_access)
++}
++
+ /// The resolve's render pass for `format` at `samples` from `source`: the multisampled
+-/// attachment as input attachment 0 (loaded and stored, `GENERAL`) where it reads it, then the
+-/// single-sampled resolve attachment, written whole over the render area (`DONT_CARE`, then
+-/// `STORE`).
++/// attachment as input attachment 0 (loaded and stored unless pure `MultisampleResolve` discards
++/// its samples, `GENERAL`) where it reads it, then the single-sampled resolve attachment, written
++/// whole over the render area (`DONT_CARE`, then `STORE`).
+ fn resolve_pass(
+     raw: &ash::Device,
+     format: Format,
+     samples: u32,
+     source: Source,
++    discard_samples: bool,
+ ) -> Result<vk::RenderPass, Error> {
+     let general = vk::ImageLayout::GENERAL;
+     let samples_attachment = vk::AttachmentDescription::default()
+         .format(format.into())
+         .samples(vk::SampleCountFlags::from_raw(samples))
+         .load_op(vk::AttachmentLoadOp::LOAD)
+-        .store_op(vk::AttachmentStoreOp::STORE)
++        .store_op(samples_attachment_store_op(discard_samples))
+         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+         .initial_layout(general)
+@@ -338,9 +418,11 @@ fn resolve_pass(
+         subpass = subpass.input_attachments(&inputs);
+     }
+     let subpasses = [subpass];
++    let dependencies = [resolve_pass_dependency(source)];
+     let info = vk::RenderPassCreateInfo::default()
+         .attachments(&attachments)
+-        .subpasses(&subpasses);
++        .subpasses(&subpasses)
++        .dependencies(&dependencies);
+     // SAFETY: `info` and its arrays are live for the call.
+     unsafe { crate::creation::render_pass(raw, &info) }
+ }
+@@ -547,7 +629,12 @@ impl ShaderResolves {
+             if samples.layers != layers || into.layers != layers {
+                 return Err(internal("an exact resolve of other layers than its pass"));
+             }
+-            let pipeline = device.color_resolve_pipeline(format, samples.samples, source)?;
++            let pipeline = device.color_resolve_pipeline(
++                format,
++                samples.samples,
++                source,
++                source == Source::Attachment && color.store == StoreAction::MultisampleResolve,
++            )?;
+             let all = |t: &Target| (t.level..t.level + 1, t.layer..t.layer + layers);
+             match (source, planes) {
+                 (Source::Planes(_), Some(planes)) => uses.push(planes.image_use(
+@@ -655,6 +742,7 @@ impl ShaderResolves {
+                 });
+             }
+         }
++        SHADER_RESOLVE_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         Ok(Some(ShaderResolves {
+             resolves,
+             extent: layout.extent,
+@@ -723,3 +811,70 @@ impl ShaderResolves {
+         core.retain(objects);
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{
++        resolve_pass_dependency, samples_attachment_store_op, turnip_native_resolve_enabled, Source,
++    };
++    use ash::vk;
++    use metal2vulkan::vk::DriverId;
++
++    #[test]
++    fn turnip_native_resolve_applies_to_2_and_4_samples_only() {
++        assert!(turnip_native_resolve_enabled(
++            Some(DriverId::MESA_TURNIP),
++            2,
++            false
++        ));
++        assert!(turnip_native_resolve_enabled(
++            Some(DriverId::MESA_TURNIP),
++            4,
++            false
++        ));
++        assert!(!turnip_native_resolve_enabled(
++            Some(DriverId::MESA_TURNIP),
++            1,
++            false
++        ));
++        assert!(!turnip_native_resolve_enabled(
++            Some(DriverId::MESA_TURNIP),
++            8,
++            false
++        ));
++        assert!(!turnip_native_resolve_enabled(
++            Some(DriverId::MESA_TURNIP),
++            4,
++            true
++        ));
++        assert!(!turnip_native_resolve_enabled(
++            Some(DriverId::MESA_LLVMPIPE),
++            4,
++            false
++        ));
++        assert!(!turnip_native_resolve_enabled(
++            Some(DriverId::MOLTENVK),
++            4,
++            false
++        ));
++        assert!(!turnip_native_resolve_enabled(None, 4, false));
++    }
++
++    #[test]
++    fn resolve_pass_defense_store_op_and_dependency() {
++        assert_eq!(
++            samples_attachment_store_op(true).as_raw(),
++            vk::AttachmentStoreOp::DONT_CARE.as_raw()
++        );
++        assert_eq!(
++            samples_attachment_store_op(false).as_raw(),
++            vk::AttachmentStoreOp::STORE.as_raw()
++        );
++        let dep = resolve_pass_dependency(Source::Attachment);
++        assert_eq!(dep.src_subpass, vk::SUBPASS_EXTERNAL);
++        assert_eq!(dep.dst_subpass, 0);
++        assert!(dep
++            .dst_access_mask
++            .contains(vk::AccessFlags::INPUT_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE));
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 7bc77bd..f2f3e62 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -211,6 +211,7 @@ pub use buffer::Buffer;
+ pub use buffer_descriptor::{BufferContents, BufferDescriptor};
+ pub use buffer_texture::IoSurfacePlane;
+ pub use capabilities::{DeviceProperties, Query};
++pub use color_resolve::{shader_resolve_passes, turnip_native_resolve_passes};
+ pub use command_buffer::checks::{Submission, SubmissionCheck};
+ pub use command_buffer::{CommandBuffer, CommitFailure, FailedEncoders, Handler};
+ pub use compute::ComputeCommandEncoder;
+@@ -290,6 +291,7 @@ pub use render_pass::{
+     MAX_COLOR_ATTACHMENTS,
+ };
+ pub use render_state::RenderStateProblem;
++pub use render_target::turnip_resolve_dont_care_stores;
+ pub use render_values::{
+     ClearColor, LoadAction, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter,
+     SamplePosition, ScissorRect, StoreAction, StoreActionOptions, Viewport,
+diff --git a/crates/metal2vulkan-runtime/src/render_target.rs b/crates/metal2vulkan-runtime/src/render_target.rs
+index e7f7391..6339525 100644
+--- a/crates/metal2vulkan-runtime/src/render_target.rs
++++ b/crates/metal2vulkan-runtime/src/render_target.rs
+@@ -333,6 +333,51 @@ fn store_op(store: StoreAction, dont_care: DontCare) -> vk::AttachmentStoreOp {
+     }
+ }
+ 
++fn store_op_for(
++    store: StoreAction,
++    dont_care: DontCare,
++    discard_resolve: bool,
++) -> vk::AttachmentStoreOp {
++    match store {
++        StoreAction::MultisampleResolve if discard_resolve => vk::AttachmentStoreOp::DONT_CARE,
++        _ => store_op(store, dont_care),
++    }
++}
++
++static TURNIP_RESOLVE_DONT_CARE_STORES: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++
++/// Number of color `StoreAction::MultisampleResolve` attachments emitted as
++/// `VK_ATTACHMENT_STORE_OP_DONT_CARE` via the Turnip native resolve fast-path.
++pub fn turnip_resolve_dont_care_stores() -> u64 {
++    TURNIP_RESOLVE_DONT_CARE_STORES.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++fn turnip_keep_resolved_samples_override() -> bool {
++    static KEEP_OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *KEEP_OVERRIDE.get_or_init(|| {
++        std::env::var_os("FUXI_TURNIP_KEEP_RESOLVED_SAMPLES").is_some_and(|v| v == "1")
++    })
++}
++
++fn discard_multisample_resolve_for(
++    driver_id: Option<metal2vulkan::vk::DriverId>,
++    exact_override: bool,
++    keep_override: bool,
++) -> bool {
++    driver_id == Some(metal2vulkan::vk::DriverId::MESA_TURNIP)
++        && !exact_override
++        && !keep_override
++}
++
++fn discard_multisample_resolve(device: &Device) -> bool {
++    discard_multisample_resolve_for(
++        device.properties().description.driver_id,
++        super::color_resolve::turnip_exact_color_resolve_override(),
++        turnip_keep_resolved_samples_override(),
++    )
++}
++
+ /// How a device stores an attachment Metal stores `DontCare` or `MultisampleResolve` (the module
+ /// docs).
+ #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+@@ -416,8 +461,17 @@ fn load_at(load: LoadAction, at: Position) -> vk::AttachmentLoadOp {
+ /// The store operation of Metal's known `store` in an instance at `at`: Metal's in the last
+ /// (its `DontCare` `dont_care`'s), `STORE` in every other.
+ fn store_at(store: StoreAction, at: Position, dont_care: DontCare) -> vk::AttachmentStoreOp {
++    store_at_for(store, at, dont_care, false)
++}
++
++fn store_at_for(
++    store: StoreAction,
++    at: Position,
++    dont_care: DontCare,
++    discard_resolve: bool,
++) -> vk::AttachmentStoreOp {
+     if at.last {
+-        store_op(store, dont_care)
++        store_op_for(store, dont_care, discard_resolve)
+     } else {
+         vk::AttachmentStoreOp::STORE
+     }
+@@ -723,12 +777,33 @@ pub(super) fn final_pass(
+     }
+     let anchor = shape.anchor(device.compile_device().profile());
+     let dont_care = DontCare::of(device);
++    let discard_resolve = discard_multisample_resolve(device);
+     let colors: Vec<Ops> = layout
+         .colors
+         .iter()
+         .enumerate()
+         .filter_map(|(index, color)| Some((index, color.as_ref()?)))
+-        .map(|(index, color)| color_ops(color, anchor == Some(index as u32), at, dont_care))
++        .map(|(index, color)| {
++            let is_anchor = anchor == Some(index as u32);
++            let ops = color_ops(color, is_anchor, at, dont_care, discard_resolve);
++            if discard_resolve
++                && !is_anchor
++                && at.last
++                && color.store == StoreAction::MultisampleResolve
++                && color.resolve.as_ref().is_some_and(|r| r.shader.is_none())
++                && color.copied_resolve.is_none()
++                && ops.store == vk::AttachmentStoreOp::DONT_CARE
++                && dont_care == DontCare::Stored
++                && !color.memoryless
++                && !color
++                    .stand_in
++                    .as_ref()
++                    .is_some_and(|s| s.cause == Cause::KeptBytes)
++            {
++                TURNIP_RESOLVE_DONT_CARE_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            }
++            ops
++        })
+         .collect();
+     let depth_stencil = layout
+         .depth_stencil
+@@ -822,7 +897,13 @@ fn kept_final_pass(device: &Device, makings: FinalMakings) -> Result<RenderPassO
+ /// a pass that does not store it, which nothing reads after the pass (`kept_bytes.rs`). An
+ /// attachment the exact resolve reads after the pass keeps its samples for it, and one whose
+ /// texels are copied as its resolve its texels.
+-fn color_ops(color: &ColorTarget, anchor: bool, at: Position, dont_care: DontCare) -> Ops {
++fn color_ops(
++    color: &ColorTarget,
++    anchor: bool,
++    at: Position,
++    dont_care: DontCare,
++    discard_resolve: bool,
++) -> Ops {
+     let exact = color.resolve.as_ref().is_some_and(|r| r.shader.is_some())
+         || color.copied_resolve.is_some();
+     let unheld = color.memoryless
+@@ -837,7 +918,12 @@ fn color_ops(color: &ColorTarget, anchor: bool, at: Position, dont_care: DontCar
+             load: load_at(color.load, at),
+             store: match exact {
+                 true => vk::AttachmentStoreOp::STORE,
+-                false => store_at(color.store, at, dont_care.unless(unheld)),
++                false => store_at_for(
++                    color.store,
++                    at,
++                    dont_care.unless(unheld),
++                    discard_resolve && color.resolve.is_some(),
++                ),
+             },
+             stencil_load: vk::AttachmentLoadOp::DONT_CARE,
+             stencil_store: vk::AttachmentStoreOp::DONT_CARE,
+@@ -898,6 +984,7 @@ pub(super) fn handed_dont_care(
+     };
+     let anchor = shape.anchor(device.compile_device().profile());
+     let dont_care = DontCare::of(device);
++    let discard_resolve = discard_multisample_resolve(device);
+     let colors = layout
+         .colors
+         .iter()
+@@ -906,7 +993,8 @@ pub(super) fn handed_dont_care(
+             let index = index as u32;
+             color.as_ref().is_some_and(|color| {
+                 !shape.storage.contains(&index)
+-                    && color_ops(color, anchor == Some(index), only, dont_care).store
++                    && color_ops(color, anchor == Some(index), only, dont_care, discard_resolve)
++                        .store
+                         == vk::AttachmentStoreOp::DONT_CARE
+             })
+         })
+@@ -1642,3 +1730,100 @@ fn add_uses(
+ /// The stages of every attachment use of a pass.
+ pub(super) const ATTACHMENT_STAGES: vk::PipelineStageFlags2 =
+     vk::PipelineStageFlags2::from_raw(COLOR_STAGES.as_raw() | DEPTH_STAGES.as_raw());
++
++#[cfg(test)]
++mod tests {
++    use super::{
++        discard_multisample_resolve_for, store_at_for, store_op_for, DontCare, Position,
++    };
++    use crate::render_values::StoreAction;
++    use ash::vk;
++    use metal2vulkan::vk::DriverId;
++
++    #[test]
++    fn turnip_multisample_resolve_store_op_is_dont_care_without_weakening_dont_care() {
++        assert_eq!(
++            store_op_for(StoreAction::MultisampleResolve, DontCare::Stored, true).as_raw(),
++            vk::AttachmentStoreOp::DONT_CARE.as_raw()
++        );
++        assert_eq!(
++            store_op_for(
++                StoreAction::StoreAndMultisampleResolve,
++                DontCare::Stored,
++                true
++            )
++            .as_raw(),
++            vk::AttachmentStoreOp::STORE.as_raw()
++        );
++        assert_eq!(
++            store_op_for(StoreAction::DontCare, DontCare::Stored, true).as_raw(),
++            vk::AttachmentStoreOp::STORE.as_raw()
++        );
++        assert_eq!(
++            store_op_for(StoreAction::Store, DontCare::Stored, true).as_raw(),
++            vk::AttachmentStoreOp::STORE.as_raw()
++        );
++
++        assert_eq!(
++            store_op_for(StoreAction::MultisampleResolve, DontCare::Stored, false).as_raw(),
++            vk::AttachmentStoreOp::STORE.as_raw()
++        );
++        assert_eq!(
++            store_op_for(
++                StoreAction::StoreAndMultisampleResolve,
++                DontCare::Stored,
++                false
++            )
++            .as_raw(),
++            vk::AttachmentStoreOp::STORE.as_raw()
++        );
++        assert_eq!(
++            store_op_for(StoreAction::DontCare, DontCare::Stored, false).as_raw(),
++            vk::AttachmentStoreOp::STORE.as_raw()
++        );
++
++        assert_eq!(
++            store_op_for(StoreAction::DontCare, DontCare::Discarded, false).as_raw(),
++            vk::AttachmentStoreOp::DONT_CARE.as_raw()
++        );
++
++        let mid = Position {
++            first: true,
++            last: false,
++        };
++        let last = Position {
++            first: false,
++            last: true,
++        };
++        assert_eq!(
++            store_at_for(StoreAction::MultisampleResolve, mid, DontCare::Stored, true).as_raw(),
++            vk::AttachmentStoreOp::STORE.as_raw()
++        );
++        assert_eq!(
++            store_at_for(StoreAction::MultisampleResolve, last, DontCare::Stored, true).as_raw(),
++            vk::AttachmentStoreOp::DONT_CARE.as_raw()
++        );
++
++        assert!(discard_multisample_resolve_for(
++            Some(DriverId::MESA_TURNIP),
++            false,
++            false
++        ));
++        assert!(!discard_multisample_resolve_for(
++            Some(DriverId::MESA_TURNIP),
++            true,
++            false
++        ));
++        assert!(!discard_multisample_resolve_for(
++            Some(DriverId::MESA_TURNIP),
++            false,
++            true
++        ));
++        assert!(!discard_multisample_resolve_for(
++            Some(DriverId::MESA_LLVMPIPE),
++            false,
++            false
++        ));
++        assert!(!discard_multisample_resolve_for(None, false, false));
++    }
++}
