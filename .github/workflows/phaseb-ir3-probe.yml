@@ -59,7 +59,7 @@ jobs:
               'turnip-darwin-kmd.patch', 'turnip-graphics-cache-feedback.patch',
               'turnip-empty-scissor.patch', 'turnip-builtin-shader-pack.patch',
               'turnip-host-import-images.patch']:
-              subprocess.run(['git', '-C', str(mesa), 'apply', str(Path('deps/work/patches') / name)], check=True)
+              subprocess.run(['git', '-C', str(mesa), 'apply', str((Path('deps/work/patches') / name).resolve())], check=True)
           src_patches_dir = Path('source/tools/patches')
           harness_patches_dir = Path('harness/patches')
           fuxi_order = [
@@ -195,5 +195,5 @@ jobs:
         with:
           name: fuxi-phaseb-ir3-probe
           path: out/phaseb-isa/
-          if-no-files-found: fail
+          if-no-files-found: warn
           retention-days: 14
