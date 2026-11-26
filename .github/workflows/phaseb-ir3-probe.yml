@@ -60,6 +60,22 @@ jobs:
               'turnip-empty-scissor.patch', 'turnip-builtin-shader-pack.patch',
               'turnip-host-import-images.patch']:
               subprocess.run(['git', '-C', str(mesa), 'apply', str((Path('deps/work/patches') / name).resolve())], check=True)
+          ir3_meson = mesa / 'src/freedreno/ir3/meson.build'
+          ir3_text = ir3_meson.read_text(encoding='utf-8')
+          old_block = (
+              "    'adreno_compiler_probe',\n"
+              "    get_option('offline-adreno-probe'),\n"
+              "    link_with : libfreedreno_ir3,\n"
+              "    dependencies : [idep_libir3decode, idep_mesautil, idep_nir],"
+          )
+          new_block = (
+              "    'adreno_compiler_probe',\n"
+              "    get_option('offline-adreno-probe'),\n"
+              "    link_with : libfreedreno_ir3,\n"
+              "    dependencies : [idep_libir3decode, idep_mesautil, idep_nir, idep_vtn],"
+          )
+          assert ir3_text.count(old_block) == 1, 'Expected exact adreno_compiler_probe dependency block'
+          ir3_meson.write_text(ir3_text.replace(old_block, new_block, 1), encoding='utf-8')
           src_patches_dir = Path('source/tools/patches')
           harness_patches_dir = Path('harness/patches')
           fuxi_order = [
