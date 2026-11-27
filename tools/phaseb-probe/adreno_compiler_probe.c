@@ -53,6 +53,68 @@
 #define FUXI_PROBE_SPIRV_MAGIC        0x07230203u
 #define FUXI_PROBE_IR3_NOP_DWORD      0x00000000u
 #define FUXI_PROBE_MAX_PROG_INSNS     128u
+#define FUXI_PROBE_MAX_CONST_REGIONS  16u
+
+enum fuxi_probe_const_region_kind {
+	FUXI_CONST_REGION_PUSH_CONSTS = 0,
+	FUXI_CONST_REGION_DYN_DESCRIPTOR_OFFSET = 1,
+	FUXI_CONST_REGION_INLINE_UNIFORM_ADDRS = 2,
+	FUXI_CONST_REGION_DRIVER_PARAMS = 3,
+	FUXI_CONST_REGION_UBO_RANGES = 4,
+	FUXI_CONST_REGION_PREAMBLE = 5,
+	FUXI_CONST_REGION_GLOBAL = 6,
+	FUXI_CONST_REGION_UBO_PTRS = 7,
+	FUXI_CONST_REGION_IMAGE_DIMS = 8,
+	FUXI_CONST_REGION_TFBO = 9,
+	FUXI_CONST_REGION_PRIMITIVE_PARAM = 10,
+	FUXI_CONST_REGION_PRIMITIVE_MAP = 11,
+	FUXI_CONST_REGION_BINDLESS_BASE_ADDRS = 12,
+	FUXI_CONST_REGION_MAX = 13
+};
+
+struct fuxi_probe_const_region {
+	uint32_t type;
+	char name[32];
+	uint32_t offset_vec4;
+	uint32_t size_vec4;
+};
+
+struct fuxi_probe_stage_const_layout {
+	uint32_t push_consts_base_vec4;
+	uint32_t push_consts_size_vec4;
+	uint32_t push_consts_dwords;
+	uint32_t preamble_base_vec4;
+	uint32_t preamble_size_vec4;
+	uint32_t region_count;
+	struct fuxi_probe_const_region regions[FUXI_PROBE_MAX_CONST_REGIONS];
+	uint32_t max_const_offset_vec4;
+	uint32_t load_consts_via_preamble;
+	uint32_t imm_base_vec4;
+	uint32_t imm_raw_dword_count;
+	uint32_t imm_count_vec4;
+	uint32_t imm_dword_count;
+	uint32_t *imm_dwords;
+};
+
+static const char *fuxi_probe_const_region_name(uint32_t type)
+{
+	switch (type) {
+	case FUXI_CONST_REGION_PUSH_CONSTS: return "push_consts";
+	case FUXI_CONST_REGION_DYN_DESCRIPTOR_OFFSET: return "dyn_descriptor_offset";
+	case FUXI_CONST_REGION_INLINE_UNIFORM_ADDRS: return "inline_uniform_addrs";
+	case FUXI_CONST_REGION_DRIVER_PARAMS: return "driver_params";
+	case FUXI_CONST_REGION_UBO_RANGES: return "ubo_ranges";
+	case FUXI_CONST_REGION_PREAMBLE: return "preamble";
+	case FUXI_CONST_REGION_GLOBAL: return "global";
+	case FUXI_CONST_REGION_UBO_PTRS: return "ubo_ptrs";
+	case FUXI_CONST_REGION_IMAGE_DIMS: return "image_dims";
+	case FUXI_CONST_REGION_TFBO: return "tfbo";
+	case FUXI_CONST_REGION_PRIMITIVE_PARAM: return "primitive_param";
+	case FUXI_CONST_REGION_PRIMITIVE_MAP: return "primitive_map";
+	case FUXI_CONST_REGION_BINDLESS_BASE_ADDRS: return "bindless_base_addrs";
+	default: return "unknown";
+	}
+}
 
 struct fuxi_probe_vs_data {
 	uint32_t insn_count;
@@ -73,6 +135,7 @@ struct fuxi_probe_vs_data {
 	uint32_t sp_vpc_dest_reg0;
 	uint32_t vpc_vs_cntl;
 	uint32_t pc_vs_cntl;
+	struct fuxi_probe_stage_const_layout const_layout;
 	uint32_t *dwords;
 	char *asm_text;
 	char sha256_hex[65];
@@ -105,6 +168,7 @@ struct fuxi_probe_fs_data {
 	uint32_t vpc_ps_cntl;
 	uint32_t lm_disable0;
 	uint32_t bindless_tex;
+	struct fuxi_probe_stage_const_layout const_layout;
 	uint32_t *dwords;
 	char *asm_text;
 	char sha256_hex[65];
@@ -127,8 +191,10 @@ static void fuxi_probe_result_free(struct fuxi_probe_result *res)
 {
 	if (!res)
 		return;
+	free(res->vs.const_layout.imm_dwords);
 	free(res->vs.dwords);
 	free(res->vs.asm_text);
+	free(res->fs.const_layout.imm_dwords);
 	free(res->fs.dwords);
 	free(res->fs.asm_text);
 	memset(res, 0, sizeof(*res));
@@ -394,6 +460,255 @@ static bool fuxi_write_binary_file(const char *path, const void *data, size_t le
 /* =========================================================================
  * 不變量驗證、fuxi_gpu_composite_isa.h 匯出與報告輸出
  * ========================================================================= */
+static bool fuxi_probe_parse_u32_span(const char *start, const char *end, uint32_t *out)
+{
+	while (start < end && (*start == ' ' || *start == '\t'))
+		start++;
+	while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r'))
+		end--;
+	if (start >= end)
+		return false;
+	uint64_t val = 0u;
+	for (const char *p = start; p < end; p++) {
+		if (*p < '0' || *p > '9')
+			return false;
+		val = val * 10u + (uint64_t)(*p - '0');
+		if (val > UINT32_MAX)
+			return false;
+	}
+	*out = (uint32_t)val;
+	return true;
+}
+
+static bool fuxi_probe_asm_check_stc_no_push_overlap(const char *stage_name,
+						     const char *asm_text,
+						     uint32_t push_base_dw,
+						     uint32_t push_dwords,
+						     char *err_buf,
+						     size_t err_cap)
+{
+	if (!asm_text) {
+		if (err_buf && err_cap)
+			snprintf(err_buf, err_cap, "%s: missing assembly text for stc guard", stage_name);
+		return false;
+	}
+	if (push_dwords == 0u)
+		return true;
+
+	uint64_t push_end_dw = (uint64_t)push_base_dw + (uint64_t)push_dwords;
+	const char *cur = asm_text;
+	uint32_t line_no = 0u;
+
+	while (*cur != '\0') {
+		line_no++;
+		const char *eol = strchr(cur, '\n');
+		size_t line_len = eol ? (size_t)(eol - cur) : strlen(cur);
+		const char *p = cur;
+		const char *line_end = cur + line_len;
+		cur = eol ? (eol + 1) : line_end;
+
+		while (p < line_end && (*p == ' ' || *p == '\t' || *p == '\r'))
+			p++;
+		if (p >= line_end || *p == ';' || *p == '@')
+			continue;
+
+		while (p < line_end && *p == '(') {
+			const char *close = (const char *)memchr(p, ')', (size_t)(line_end - p));
+			if (!close)
+				break;
+			p = close + 1;
+			while (p < line_end && (*p == ' ' || *p == '\t'))
+				p++;
+		}
+		if (p >= line_end)
+			continue;
+
+		if ((size_t)(line_end - p) >= 4u &&
+		    strncmp(p, "stc", 3) == 0 &&
+		    (p[3] == '.' || p[3] == ' ' || p[3] == '\t')) {
+			while (p < line_end && *p != ' ' && *p != '\t')
+				p++;
+			while (p < line_end && (*p == ' ' || *p == '\t'))
+				p++;
+			if ((size_t)(line_end - p) < 4u || p[0] != 'c' || p[1] != '[') {
+				if (err_buf && err_cap)
+					snprintf(err_buf, err_cap,
+						 "%s line %u: unparseable stc destination (fail-closed)",
+						 stage_name, line_no);
+				return false;
+			}
+			const char *idx_start = p + 2;
+			const char *idx_end = (const char *)memchr(idx_start, ']', (size_t)(line_end - idx_start));
+			if (!idx_end) {
+				if (err_buf && err_cap)
+					snprintf(err_buf, err_cap,
+						 "%s line %u: malformed stc c[...] operand",
+						 stage_name, line_no);
+				return false;
+			}
+			uint32_t dst_dw = 0u;
+			if (!fuxi_probe_parse_u32_span(idx_start, idx_end, &dst_dw)) {
+				if (err_buf && err_cap)
+					snprintf(err_buf, err_cap,
+						 "%s line %u: stc uses indirect or non-constant c[...] operand",
+						 stage_name, line_no);
+				return false;
+			}
+			const char *scan_end = line_end;
+			const char *semi = (const char *)memchr(idx_end + 1, ';', (size_t)(line_end - (idx_end + 1)));
+			if (semi)
+				scan_end = semi;
+			const char *last_comma = NULL;
+			for (const char *q = idx_end + 1; q < scan_end; q++) {
+				if (*q == ',')
+					last_comma = q;
+			}
+			uint32_t count = 0u;
+			if (!last_comma || !fuxi_probe_parse_u32_span(last_comma + 1, scan_end, &count) ||
+			    count == 0u || count > 1024u) {
+				if (err_buf && err_cap)
+					snprintf(err_buf, err_cap,
+						 "%s line %u: invalid or missing stc dword count",
+						 stage_name, line_no);
+				return false;
+			}
+			uint64_t dst_end_dw = (uint64_t)dst_dw + (uint64_t)count;
+			if ((uint64_t)dst_dw < push_end_dw && dst_end_dw > (uint64_t)push_base_dw) {
+				if (err_buf && err_cap)
+					snprintf(err_buf, err_cap,
+						 "%s stc writes c[%u..%" PRIu64 "], overlapping push_consts c[%u..%" PRIu64 "]",
+						 stage_name, dst_dw, dst_end_dw - 1u,
+						 push_base_dw, push_end_dw - 1u);
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+static bool fuxi_probe_verify_const_layout_and_asm(
+	const char *stage_name,
+	const struct fuxi_probe_stage_const_layout *layout,
+	uint32_t constlen,
+	const char *asm_text,
+	char *err_buf,
+	size_t err_cap)
+{
+	if (!stage_name || !layout) {
+		if (err_buf && err_cap)
+			snprintf(err_buf, err_cap, "NULL stage/const_layout");
+		return false;
+	}
+	if (layout->region_count > FUXI_PROBE_MAX_CONST_REGIONS) {
+		if (err_buf && err_cap)
+			snprintf(err_buf, err_cap, "%s: region_count=%u exceeds limit",
+				 stage_name, layout->region_count);
+		return false;
+	}
+	if (layout->push_consts_dwords > 0u) {
+		uint32_t min_vec4 = (layout->push_consts_dwords + 3u) / 4u;
+		if (layout->push_consts_size_vec4 < min_vec4 ||
+		    layout->push_consts_base_vec4 != 0u) {
+			if (err_buf && err_cap)
+				snprintf(err_buf, err_cap,
+					 "%s: push_consts invalid (base=%u size=%u dwords=%u)",
+					 stage_name, layout->push_consts_base_vec4,
+					 layout->push_consts_size_vec4, layout->push_consts_dwords);
+			return false;
+		}
+		bool found_push_region = false;
+		for (uint32_t i = 0u; i < layout->region_count; i++) {
+			if (layout->regions[i].type == FUXI_CONST_REGION_PUSH_CONSTS &&
+			    layout->regions[i].offset_vec4 == layout->push_consts_base_vec4 &&
+			    layout->regions[i].size_vec4 == layout->push_consts_size_vec4) {
+				found_push_region = true;
+				break;
+			}
+		}
+		if (!found_push_region) {
+			if (err_buf && err_cap)
+				snprintf(err_buf, err_cap,
+					 "%s: IR3_CONST_ALLOC_PUSH_CONSTS missing from regions[]",
+					 stage_name);
+			return false;
+		}
+	}
+
+	struct {
+		const char *name;
+		uint32_t base;
+		uint32_t end;
+	} intervals[FUXI_PROBE_MAX_CONST_REGIONS + 1u];
+	uint32_t n_intervals = 0u;
+
+	for (uint32_t i = 0u; i < layout->region_count; i++) {
+		const struct fuxi_probe_const_region *r = &layout->regions[i];
+		if (r->size_vec4 == 0u ||
+		    r->offset_vec4 > layout->max_const_offset_vec4 ||
+		    r->size_vec4 > layout->max_const_offset_vec4 - r->offset_vec4 ||
+		    layout->max_const_offset_vec4 > constlen) {
+			if (err_buf && err_cap)
+				snprintf(err_buf, err_cap,
+					 "%s: region %s [%u..%u) exceeds max_const_offset=%u/constlen=%u",
+					 stage_name, r->name, r->offset_vec4,
+					 r->offset_vec4 + r->size_vec4,
+					 layout->max_const_offset_vec4, constlen);
+			return false;
+		}
+		intervals[n_intervals].name = r->name[0] ? r->name : "region";
+		intervals[n_intervals].base = r->offset_vec4;
+		intervals[n_intervals].end = r->offset_vec4 + r->size_vec4;
+		n_intervals++;
+	}
+
+	if (layout->imm_count_vec4 > 0u) {
+		if (layout->imm_dword_count != layout->imm_count_vec4 * 4u || !layout->imm_dwords) {
+			if (err_buf && err_cap)
+				snprintf(err_buf, err_cap, "%s: imm_dwords buffer mismatch", stage_name);
+			return false;
+		}
+		if (layout->imm_base_vec4 < layout->max_const_offset_vec4 ||
+		    layout->imm_count_vec4 > constlen ||
+		    layout->imm_base_vec4 > constlen - layout->imm_count_vec4) {
+			if (err_buf && err_cap)
+				snprintf(err_buf, err_cap,
+					 "%s: imm [%u..%u) invalid vs max_const_offset=%u constlen=%u",
+					 stage_name, layout->imm_base_vec4,
+					 layout->imm_base_vec4 + layout->imm_count_vec4,
+					 layout->max_const_offset_vec4, constlen);
+			return false;
+		}
+		intervals[n_intervals].name = "immediates";
+		intervals[n_intervals].base = layout->imm_base_vec4;
+		intervals[n_intervals].end = layout->imm_base_vec4 + layout->imm_count_vec4;
+		n_intervals++;
+	} else if (layout->imm_dword_count != 0u) {
+		if (err_buf && err_cap)
+			snprintf(err_buf, err_cap, "%s: non-zero imm_dword_count with imm_count_vec4=0",
+				 stage_name);
+		return false;
+	}
+
+	for (uint32_t i = 0u; i < n_intervals; i++) {
+		for (uint32_t j = i + 1u; j < n_intervals; j++) {
+			if (intervals[i].end > intervals[j].base && intervals[j].end > intervals[i].base) {
+				if (err_buf && err_cap)
+					snprintf(err_buf, err_cap,
+						 "%s: const region overlap %s [%u,%u) vs %s [%u,%u)",
+						 stage_name,
+						 intervals[i].name, intervals[i].base, intervals[i].end,
+						 intervals[j].name, intervals[j].base, intervals[j].end);
+				return false;
+			}
+		}
+	}
+
+	return fuxi_probe_asm_check_stc_no_push_overlap(stage_name, asm_text,
+						     layout->push_consts_base_vec4 * 4u,
+						     layout->push_consts_dwords,
+						     err_buf, err_cap);
+}
+
 static bool fuxi_probe_verify_result(const struct fuxi_probe_result *res,
 				     char *err_buf, size_t err_cap)
 {
@@ -457,7 +772,38 @@ static bool fuxi_probe_verify_result(const struct fuxi_probe_result *res,
 			 res->fs.num_samp, res->fs.sp_tsize, ntex, nsamp);
 		return false;
 	}
+	if (!fuxi_probe_verify_const_layout_and_asm("VS", &res->vs.const_layout,
+						    res->vs.constlen, res->vs.asm_text,
+						    err_buf, err_cap))
+		return false;
+	if (!fuxi_probe_verify_const_layout_and_asm("FS", &res->fs.const_layout,
+						    res->fs.constlen, res->fs.asm_text,
+						    err_buf, err_cap))
+		return false;
 	return true;
+}
+
+static void emit_fuxi_imm_dwords_array(FILE *fp,
+				       const char *lower_stage,
+				       const char *upper_stage,
+				       const struct fuxi_probe_stage_const_layout *layout)
+{
+	fprintf(fp,
+		"__attribute__((unused)) static const uint32_t fuxi_pb_%s_imm_dwords["
+		"FUXI_PB_%s_IMM_DWORD_COUNT > 0u ? FUXI_PB_%s_IMM_DWORD_COUNT : 1u] = {\n",
+		lower_stage, upper_stage, upper_stage);
+	if (!layout || layout->imm_dword_count == 0u || !layout->imm_dwords) {
+		fprintf(fp, "\t0x00000000u\n");
+	} else {
+		for (uint32_t i = 0u; i < layout->imm_dword_count; i++) {
+			if ((i & 3u) == 0u)
+				fprintf(fp, "\t");
+			fprintf(fp, "0x%08xu%s", layout->imm_dwords[i],
+				(i + 1u < layout->imm_dword_count) ? (((i & 3u) == 3u) ? ",\n" : ", ") : "\n");
+		}
+	}
+	fprintf(fp, "};\n#define FUXI_PB_%s_IMM_DWORDS fuxi_pb_%s_imm_dwords\n\n",
+		upper_stage, lower_stage);
 }
 
 static bool emit_fuxi_gpu_composite_isa_header(const char *path,
@@ -501,7 +847,13 @@ static bool emit_fuxi_gpu_composite_isa_header(const char *path,
 		"#define FUXI_PB_VS_SP_OUTPUT_REG0           0x%08xu\n"
 		"#define FUXI_PB_VS_SP_VPC_DEST_REG0         0x%08xu\n"
 		"#define FUXI_PB_VS_VPC_VS_CNTL              0x%08xu\n"
-		"#define FUXI_PB_VS_PC_VS_CNTL               0x%08xu\n\n",
+		"#define FUXI_PB_VS_PC_VS_CNTL               0x%08xu\n"
+		"#define FUXI_PB_VS_PUSH_CONST_VEC4          %uu\n"
+		"#define FUXI_PB_VS_PREAMBLE_BASE_VEC4       %uu\n"
+		"#define FUXI_PB_VS_PREAMBLE_COUNT_VEC4      %uu\n"
+		"#define FUXI_PB_VS_IMM_BASE_VEC4            %uu\n"
+		"#define FUXI_PB_VS_IMM_COUNT_VEC4           %uu\n"
+		"#define FUXI_PB_VS_IMM_DWORD_COUNT          %uu\n\n",
 		res->chip_id, res->gen,
 		res->chip_id, res->gen, res->mesa_sha, res->combined_sha256_hex,
 		res->vs.insn_count, res->vs.padded_dword_count, res->vs.instrlen,
@@ -509,7 +861,13 @@ static bool emit_fuxi_gpu_composite_isa_header(const char *path,
 		res->vs.sp_ctrl_reg0, res->vs.sp_const_config, res->vs.sp_config,
 		res->vs.vertexid_regid, res->vs.pos_regid, res->vs.var0_regid,
 		res->vs.sp_output_reg0, res->vs.sp_vpc_dest_reg0,
-		res->vs.vpc_vs_cntl, res->vs.pc_vs_cntl);
+		res->vs.vpc_vs_cntl, res->vs.pc_vs_cntl,
+		res->vs.const_layout.push_consts_size_vec4,
+		res->vs.const_layout.preamble_base_vec4,
+		res->vs.const_layout.preamble_size_vec4,
+		res->vs.const_layout.imm_base_vec4,
+		res->vs.const_layout.imm_count_vec4,
+		res->vs.const_layout.imm_dword_count);
 
 	fprintf(fp,
 		"/* FS 指令、紋理綁定與插值輸出常數 */\n"
@@ -536,7 +894,13 @@ static bool emit_fuxi_gpu_composite_isa_header(const char *path,
 		"#define FUXI_PB_FS_SP_PS_CNTL_1             0x%08xu\n"
 		"#define FUXI_PB_FS_SP_PS_WAVE_CNTL          0x%08xu\n"
 		"#define FUXI_PB_FS_VPC_PS_CNTL              0x%08xu\n"
-		"#define FUXI_PB_FS_LM_DISABLE0              0x%08xu\n\n",
+		"#define FUXI_PB_FS_LM_DISABLE0              0x%08xu\n"
+		"#define FUXI_PB_FS_PUSH_CONST_VEC4          %uu\n"
+		"#define FUXI_PB_FS_PREAMBLE_BASE_VEC4       %uu\n"
+		"#define FUXI_PB_FS_PREAMBLE_COUNT_VEC4      %uu\n"
+		"#define FUXI_PB_FS_IMM_BASE_VEC4            %uu\n"
+		"#define FUXI_PB_FS_IMM_COUNT_VEC4           %uu\n"
+		"#define FUXI_PB_FS_IMM_DWORD_COUNT          %uu\n\n",
 		res->fs.insn_count, res->fs.padded_dword_count, res->fs.instrlen,
 		res->fs.fullregs, res->fs.halfregs, res->fs.mergedregs,
 		res->fs.double_threadsize, res->fs.constlen, res->fs.num_samp,
@@ -546,7 +910,13 @@ static bool emit_fuxi_gpu_composite_isa_header(const char *path,
 		res->fs.sp_tsize, res->fs.sp_initial_tex_load_cntl,
 		res->fs.sp_output_reg0, res->fs.sp_reg_prog_id_1,
 		res->fs.sp_ps_cntl_1, res->fs.sp_ps_wave_cntl,
-		res->fs.vpc_ps_cntl, res->fs.lm_disable0);
+		res->fs.vpc_ps_cntl, res->fs.lm_disable0,
+		res->fs.const_layout.push_consts_size_vec4,
+		res->fs.const_layout.preamble_base_vec4,
+		res->fs.const_layout.preamble_size_vec4,
+		res->fs.const_layout.imm_base_vec4,
+		res->fs.const_layout.imm_count_vec4,
+		res->fs.const_layout.imm_dword_count);
 
 	fprintf(fp, "__attribute__((unused)) static const uint32_t fuxi_pb_vs_dwords[FUXI_PB_VS_DWORD_COUNT] = {\n");
 	for (uint32_t i = 0u; i < res->vs.padded_dword_count; i++) {
@@ -564,7 +934,10 @@ static bool emit_fuxi_gpu_composite_isa_header(const char *path,
 		fprintf(fp, "0x%08xu%s", res->fs.dwords[i],
 			(i + 1u < res->fs.padded_dword_count) ? (((i & 3u) == 3u) ? ",\n" : ", ") : "\n");
 	}
-	fprintf(fp, "};\n\n#endif /* FUXI_GPU_COMPOSITE_ISA_H */\n");
+	fprintf(fp, "};\n\n");
+	emit_fuxi_imm_dwords_array(fp, "vs", "VS", &res->vs.const_layout);
+	emit_fuxi_imm_dwords_array(fp, "fs", "FS", &res->fs.const_layout);
+	fprintf(fp, "#endif /* FUXI_GPU_COMPOSITE_ISA_H */\n");
 
 	return fclose(fp) == 0;
 }
@@ -653,6 +1026,30 @@ static bool fuxi_write_probe_outputs(const char *out_dir,
 		"    \"instrlen\": %u,\n"
 		"    \"binary_bytes\": %u,\n"
 		"    \"constlen\": %u,\n"
+		"    \"push_const_vec4\": %u,\n"
+		"    \"preamble_base_vec4\": %u,\n"
+		"    \"preamble_count_vec4\": %u,\n"
+		"    \"imm_base_vec4\": %u,\n"
+		"    \"imm_count_vec4\": %u,\n"
+		"    \"imm_dwords\": [",
+		mode_name,
+		res->chip_id, res->chip_name, res->gen,
+		res->mesa_sha, res->combined_sha256_hex,
+		res->unknown_chip_refused ? "true" : "false",
+		res->asm_roundtrip ? "true" : "false",
+		res->gpu_executed ? "true" : "false",
+		res->vs.insn_count, res->vs.instrlen, res->vs.padded_dword_count * 4u,
+		res->vs.constlen,
+		res->vs.const_layout.push_consts_size_vec4,
+		res->vs.const_layout.preamble_base_vec4,
+		res->vs.const_layout.preamble_size_vec4,
+		res->vs.const_layout.imm_base_vec4,
+		res->vs.const_layout.imm_count_vec4);
+	for (uint32_t i = 0u; i < res->vs.const_layout.imm_dword_count && res->vs.const_layout.imm_dwords; i++) {
+		fprintf(fp, "%s\"0x%08x\"", i ? ", " : "", res->vs.const_layout.imm_dwords[i]);
+	}
+	fprintf(fp,
+		"],\n"
 		"    \"fullregs\": %u,\n"
 		"    \"halfregs\": %u,\n"
 		"    \"mergedregs\": %u,\n"
@@ -663,6 +1060,26 @@ static bool fuxi_write_probe_outputs(const char *out_dir,
 		"    \"instrlen\": %u,\n"
 		"    \"binary_bytes\": %u,\n"
 		"    \"constlen\": %u,\n"
+		"    \"push_const_vec4\": %u,\n"
+		"    \"preamble_base_vec4\": %u,\n"
+		"    \"preamble_count_vec4\": %u,\n"
+		"    \"imm_base_vec4\": %u,\n"
+		"    \"imm_count_vec4\": %u,\n"
+		"    \"imm_dwords\": [",
+		res->vs.fullregs, res->vs.halfregs, res->vs.mergedregs,
+		res->vs.sha256_hex,
+		res->fs.insn_count, res->fs.instrlen, res->fs.padded_dword_count * 4u,
+		res->fs.constlen,
+		res->fs.const_layout.push_consts_size_vec4,
+		res->fs.const_layout.preamble_base_vec4,
+		res->fs.const_layout.preamble_size_vec4,
+		res->fs.const_layout.imm_base_vec4,
+		res->fs.const_layout.imm_count_vec4);
+	for (uint32_t i = 0u; i < res->fs.const_layout.imm_dword_count && res->fs.const_layout.imm_dwords; i++) {
+		fprintf(fp, "%s\"0x%08x\"", i ? ", " : "", res->fs.const_layout.imm_dwords[i]);
+	}
+	fprintf(fp,
+		"],\n"
 		"    \"fullregs\": %u,\n"
 		"    \"halfregs\": %u,\n"
 		"    \"mergedregs\": %u,\n"
@@ -673,17 +1090,7 @@ static bool fuxi_write_probe_outputs(const char *out_dir,
 		"    \"sha256\": \"%s\"\n"
 		"  }\n"
 		"}\n",
-		mode_name,
-		res->chip_id, res->chip_name, res->gen,
-		res->mesa_sha, res->combined_sha256_hex,
-		res->unknown_chip_refused ? "true" : "false",
-		res->asm_roundtrip ? "true" : "false",
-		res->gpu_executed ? "true" : "false",
-		res->vs.insn_count, res->vs.instrlen, res->vs.padded_dword_count * 4u,
-		res->vs.constlen, res->vs.fullregs, res->vs.halfregs, res->vs.mergedregs,
-		res->vs.sha256_hex,
-		res->fs.insn_count, res->fs.instrlen, res->fs.padded_dword_count * 4u,
-		res->fs.constlen, res->fs.fullregs, res->fs.halfregs, res->fs.mergedregs,
+		res->fs.fullregs, res->fs.halfregs, res->fs.mergedregs,
 		res->fs.num_samp, res->fs.total_in, res->fs.prefetch_count,
 		res->fs.bindless_tex, res->fs.sha256_hex);
 	if (fclose(fp) != 0) {
@@ -808,11 +1215,17 @@ static nir_shader *fuxi_mesa_spirv_to_nir(struct ir3_compiler *compiler,
 	return nir;
 }
 
+_Static_assert((uint32_t)IR3_CONST_ALLOC_PUSH_CONSTS == FUXI_CONST_REGION_PUSH_CONSTS, "alloc enum mismatch");
+_Static_assert((uint32_t)IR3_CONST_ALLOC_PREAMBLE == FUXI_CONST_REGION_PREAMBLE, "alloc enum mismatch");
+_Static_assert((uint32_t)IR3_CONST_ALLOC_PRIMITIVE_PARAM == FUXI_CONST_REGION_PRIMITIVE_PARAM, "alloc enum mismatch");
+_Static_assert((uint32_t)IR3_CONST_ALLOC_MAX == FUXI_CONST_REGION_MAX, "alloc enum mismatch");
+
 static bool fuxi_mesa_finalize_and_compile(struct ir3_compiler *compiler,
 					   nir_shader *nir,
 					   uint32_t push_const_dwords,
 					   struct ir3_shader **out_shader,
-					   struct ir3_shader_variant **out_variant)
+					   struct ir3_shader_variant **out_variant,
+					   struct fuxi_probe_stage_const_layout *out_layout)
 {
 	nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
@@ -820,7 +1233,17 @@ static bool fuxi_mesa_finalize_and_compile(struct ir3_compiler *compiler,
 	ir3_finalize_nir(compiler, &nir_options, nir);
 	nir_validate_shader(nir, "fuxi-phaseb-gate2");
 
+	/* 對齊 tu_shader.cc:1270-1281：依 const_upload_unit 預留 push_consts vec4 槽位 */
 	struct ir3_const_allocations const_allocs = {0};
+	if (push_const_dwords > 0u) {
+		uint32_t unit = (uint32_t)compiler->const_upload_unit;
+		if (unit == 0u)
+			unit = 1u;
+		uint32_t raw_vec4 = (push_const_dwords + 3u) / 4u;
+		uint32_t push_consts_vec4 = ((raw_vec4 + unit - 1u) / unit) * unit;
+		ir3_const_alloc(&const_allocs, IR3_CONST_ALLOC_PUSH_CONSTS,
+				push_consts_vec4, unit);
+	}
 	const struct ir3_shader_options shader_options = {
 		.api_wavesize = IR3_SINGLE_OR_DOUBLE,
 		.real_wavesize = IR3_SINGLE_OR_DOUBLE,
@@ -841,6 +1264,61 @@ static bool fuxi_mesa_finalize_and_compile(struct ir3_compiler *compiler,
 		ir3_shader_destroy(sh);
 		return false;
 	}
+
+	if (out_layout) {
+		memset(out_layout, 0, sizeof(*out_layout));
+		const struct ir3_const_state *cs = ir3_const_state(v);
+		out_layout->push_consts_base_vec4 =
+			cs->allocs.consts[IR3_CONST_ALLOC_PUSH_CONSTS].offset_vec4;
+		out_layout->push_consts_size_vec4 =
+			cs->allocs.consts[IR3_CONST_ALLOC_PUSH_CONSTS].size_vec4;
+		out_layout->push_consts_dwords = push_const_dwords;
+		out_layout->preamble_base_vec4 =
+			cs->allocs.consts[IR3_CONST_ALLOC_PREAMBLE].offset_vec4;
+		out_layout->preamble_size_vec4 =
+			cs->allocs.consts[IR3_CONST_ALLOC_PREAMBLE].size_vec4;
+		out_layout->max_const_offset_vec4 = cs->allocs.max_const_offset_vec4;
+		out_layout->load_consts_via_preamble =
+			compiler->info->props.load_shader_consts_via_preamble ? 1u : 0u;
+		for (uint32_t t = 0u; t < (uint32_t)IR3_CONST_ALLOC_MAX; t++) {
+			uint32_t sz = cs->allocs.consts[t].size_vec4;
+			if (sz == 0u)
+				continue;
+			if (out_layout->region_count >= FUXI_PROBE_MAX_CONST_REGIONS) {
+				ir3_shader_destroy(sh);
+				return false;
+			}
+			struct fuxi_probe_const_region *r =
+				&out_layout->regions[out_layout->region_count++];
+			r->type = t;
+			snprintf(r->name, sizeof(r->name), "%s", fuxi_probe_const_region_name(t));
+			r->offset_vec4 = cs->allocs.consts[t].offset_vec4;
+			r->size_vec4 = sz;
+		}
+		out_layout->imm_base_vec4 = cs->allocs.max_const_offset_vec4;
+		out_layout->imm_raw_dword_count = (uint32_t)v->imm_state.count;
+		out_layout->imm_count_vec4 =
+			(!out_layout->load_consts_via_preamble && v->imm_state.count > 0u)
+				? ((uint32_t)(v->imm_state.count + 3u) / 4u)
+				: 0u;
+		out_layout->imm_dword_count = out_layout->imm_count_vec4 * 4u;
+		if (out_layout->imm_dword_count > 0u) {
+			out_layout->imm_dwords =
+				(uint32_t *)calloc(out_layout->imm_dword_count, sizeof(uint32_t));
+			if (!out_layout->imm_dwords) {
+				memset(out_layout, 0, sizeof(*out_layout));
+				ir3_shader_destroy(sh);
+				return false;
+			}
+			for (uint32_t i = 0u; i < out_layout->imm_dword_count; i++) {
+				out_layout->imm_dwords[i] =
+					(i < (uint32_t)v->imm_state.count && v->imm_state.values)
+						? v->imm_state.values[i]
+						: 0u;
+			}
+		}
+	}
+
 	*out_shader = sh;
 	*out_variant = v;
 	return true;
@@ -929,18 +1407,18 @@ int main(int argc, char **argv)
 	nir_opt_varyings_bulk(link_shaders, 2, true, UINT32_MAX, UINT32_MAX,
 			      fuxi_mesa_link_opts, compiler);
 
+	struct fuxi_probe_result res = {0};
 	struct ir3_shader *vs_sh = NULL, *fs_sh = NULL;
 	struct ir3_shader_variant *vs_v = NULL, *fs_v = NULL;
-	if (!fuxi_mesa_finalize_and_compile(compiler, vs_nir, 8u, &vs_sh, &vs_v) ||
-	    !fuxi_mesa_finalize_and_compile(compiler, fs_nir, 16u, &fs_sh, &fs_v)) {
+	if (!fuxi_mesa_finalize_and_compile(compiler, vs_nir, 8u, &vs_sh, &vs_v, &res.vs.const_layout) ||
+	    !fuxi_mesa_finalize_and_compile(compiler, fs_nir, 16u, &fs_sh, &fs_v, &res.fs.const_layout)) {
+		fuxi_probe_result_free(&res);
 		if (vs_sh) ir3_shader_destroy(vs_sh);
 		if (fs_sh) ir3_shader_destroy(fs_sh);
 		glsl_type_singleton_decref();
 		ir3_compiler_destroy(compiler);
 		return 7;
 	}
-
-	struct fuxi_probe_result res = {0};
 	res.chip_id = FUXI_PROBE_CHIP_ID_FD740;
 	res.gen = (uint32_t)fd_dev_gen(&id);
 	snprintf(res.chip_name, sizeof(res.chip_name), "%s", fd_dev_name(&id));
@@ -1489,6 +1967,19 @@ static char *mock_format_ir3_asm(const char *stage_tag,
 			   "; FUXI A740 (FD740) %s IR3 Assembly (mock_host)\n", stage_tag);
 	if (hdr > 0)
 		off += (size_t)hdr;
+	if (strcmp(stage_tag, "FS") == 0) {
+		int ph = snprintf(buf + off, cap - off,
+				  ";   preamble c4.x (4 vec4)\n"
+				  "@const(c8.x)\t0xc0000000, 0x40000000, 0x00000000, 0x3f800000\n"
+				  "stc.u32 c[16], r48.z, 1\n");
+		if (ph > 0)
+			off += (size_t)ph;
+	} else {
+		int ph = snprintf(buf + off, cap - off,
+				  ";   primitive_param c4.x (1 vec4)\n");
+		if (ph > 0)
+			off += (size_t)ph;
+	}
 	for (uint32_t i = 0u; i < count && off + 80u < cap; i++) {
 		uint64_t w = insns[i];
 		const char *op = "op";
@@ -1698,7 +2189,7 @@ static VkResult fuxi_mock_vkCreateGraphicsPipelines(
 			mock_fill_stat(&e->stats[s++], "instrlen", "Instruction blocks (16 insns/unit)", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR, e->instrlen);
 			mock_fill_stat(&e->stats[s++], "full", "Full-precision registers", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR, 3u);
 			mock_fill_stat(&e->stats[s++], "half", "Half-precision registers", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR, 0u);
-			mock_fill_stat(&e->stats[s++], "constlen", "Constant register vec4 units", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR, 4u);
+			mock_fill_stat(&e->stats[s++], "constlen", "Constant register vec4 units", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR, 8u);
 			mock_fill_stat(&e->stats[s++], "mergedregs", "Merged register file", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR, 1u);
 			e->stat_count = s;
 		}
@@ -1759,7 +2250,7 @@ static VkResult fuxi_mock_vkCreateGraphicsPipelines(
 			mock_fill_stat(&e->stats[s++], "instrlen", "Instruction blocks (16 insns/unit)", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR, e->instrlen);
 			mock_fill_stat(&e->stats[s++], "full", "Full-precision registers", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR, 9u);
 			mock_fill_stat(&e->stats[s++], "half", "Half-precision registers", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR, 0u);
-			mock_fill_stat(&e->stats[s++], "constlen", "Constant register vec4 units", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR, 4u);
+			mock_fill_stat(&e->stats[s++], "constlen", "Constant register vec4 units", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR, 12u);
 			mock_fill_stat(&e->stats[s++], "mergedregs", "Merged register file", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR, 1u);
 			mock_fill_stat(&e->stats[s++], "num_samp", "Bindful sampler/texture count", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR, 2u);
 			mock_fill_stat(&e->stats[s++], "total_in", "Varying scalar input components", VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR, 2u);
@@ -2097,8 +2588,30 @@ static bool mock_run_pipeline_probe_on_spv(const uint8_t *vs_spv, size_t vs_len,
 			out_res->vs.halfregs = (uint32_t)v_half;
 			out_res->vs.mergedregs = (uint32_t)v_merged;
 			out_res->vs.constlen = (uint32_t)v_const;
+			out_res->vs.const_layout.push_consts_base_vec4 = 0u;
+			out_res->vs.const_layout.push_consts_size_vec4 = 4u;
+			out_res->vs.const_layout.push_consts_dwords = 8u;
+			out_res->vs.const_layout.region_count = 2u;
+			out_res->vs.const_layout.regions[0] = (struct fuxi_probe_const_region){
+				.type = FUXI_CONST_REGION_PUSH_CONSTS,
+				.offset_vec4 = 0u,
+				.size_vec4 = 4u,
+			};
+			snprintf(out_res->vs.const_layout.regions[0].name,
+				 sizeof(out_res->vs.const_layout.regions[0].name),
+				 "%s", fuxi_probe_const_region_name(FUXI_CONST_REGION_PUSH_CONSTS));
+			out_res->vs.const_layout.regions[1] = (struct fuxi_probe_const_region){
+				.type = FUXI_CONST_REGION_PRIMITIVE_PARAM,
+				.offset_vec4 = 4u,
+				.size_vec4 = 1u,
+			};
+			snprintf(out_res->vs.const_layout.regions[1].name,
+				 sizeof(out_res->vs.const_layout.regions[1].name),
+				 "%s", fuxi_probe_const_region_name(FUXI_CONST_REGION_PRIMITIVE_PARAM));
+			out_res->vs.const_layout.max_const_offset_vec4 = 5u;
+			out_res->vs.const_layout.imm_base_vec4 = 5u;
 			out_res->vs.sp_ctrl_reg0 = (3u << 7) | (1u << 20);
-			out_res->vs.sp_const_config = 0x101u;
+			out_res->vs.sp_const_config = 0x100u | ((out_res->vs.constlen >> 2) & 0xffu);
 			out_res->vs.sp_config = 0x100u;
 			out_res->vs.vertexid_regid = 0x00u;
 			out_res->vs.pos_regid = 0x04u;
@@ -2127,6 +2640,43 @@ static bool mock_run_pipeline_probe_on_spv(const uint8_t *vs_spv, size_t vs_len,
 			out_res->fs.mergedregs = (uint32_t)v_merged;
 			out_res->fs.double_threadsize = 0u;
 			out_res->fs.constlen = (uint32_t)v_const;
+			out_res->fs.const_layout.push_consts_base_vec4 = 0u;
+			out_res->fs.const_layout.push_consts_size_vec4 = 4u;
+			out_res->fs.const_layout.push_consts_dwords = 16u;
+			out_res->fs.const_layout.preamble_base_vec4 = 4u;
+			out_res->fs.const_layout.preamble_size_vec4 = 4u;
+			out_res->fs.const_layout.region_count = 2u;
+			out_res->fs.const_layout.regions[0] = (struct fuxi_probe_const_region){
+				.type = FUXI_CONST_REGION_PUSH_CONSTS,
+				.name = "push_consts",
+				.offset_vec4 = 0u,
+				.size_vec4 = 4u,
+			};
+			out_res->fs.const_layout.regions[1] = (struct fuxi_probe_const_region){
+				.type = FUXI_CONST_REGION_PREAMBLE,
+				.name = "preamble",
+				.offset_vec4 = 4u,
+				.size_vec4 = 4u,
+			};
+			out_res->fs.const_layout.max_const_offset_vec4 = 8u;
+			out_res->fs.const_layout.imm_base_vec4 = 8u;
+			out_res->fs.const_layout.imm_raw_dword_count = 4u;
+			out_res->fs.const_layout.imm_count_vec4 = 1u;
+			out_res->fs.const_layout.imm_dword_count = 4u;
+			out_res->fs.const_layout.imm_dwords = (uint32_t *)calloc(4u, sizeof(uint32_t));
+			if (!out_res->fs.const_layout.imm_dwords) {
+				free(asm_copy);
+				free(stats);
+				fuxi_probe_result_free(out_res);
+				fuxi_mock_vkDestroyPipeline(NULL, pipe, NULL);
+				fuxi_mock_vkDestroyShaderModule(NULL, vs_mod, NULL);
+				fuxi_mock_vkDestroyShaderModule(NULL, fs_mod, NULL);
+				return false;
+			}
+			out_res->fs.const_layout.imm_dwords[0] = 0xc0000000u;
+			out_res->fs.const_layout.imm_dwords[1] = 0x40000000u;
+			out_res->fs.const_layout.imm_dwords[2] = 0x00000000u;
+			out_res->fs.const_layout.imm_dwords[3] = 0x3f800000u;
 			out_res->fs.num_samp = (uint32_t)v_nsamp;
 			out_res->fs.total_in = (uint32_t)v_totin;
 			out_res->fs.prefetch_count = (uint32_t)v_pref;
@@ -2134,7 +2684,7 @@ static bool mock_run_pipeline_probe_on_spv(const uint8_t *vs_spv, size_t vs_len,
 			out_res->fs.ij_persp_pixel_regid = 0x00u;
 			out_res->fs.out0_regid = 0x00u;
 			out_res->fs.sp_ctrl_reg0 = (9u << 7) | (1u << 22) | (1u << 24) | (1u << 31);
-			out_res->fs.sp_const_config = 0x101u;
+			out_res->fs.sp_const_config = 0x100u | ((out_res->fs.constlen >> 2) & 0xffu);
 			out_res->fs.sp_config = 0x100u | (2u << 9) | (2u << 17);
 			out_res->fs.sp_tsize = 2u;
 			out_res->fs.sp_initial_tex_load_cntl = (0x1ffu << 6) | (0x1ffu << 16);
@@ -2469,6 +3019,278 @@ static bool test_generated_header_roundtrip_c11(const char *out_dir)
 	return true;
 }
 
+static bool test_const_alloc_disjoint_positive(void)
+{
+	char err[256] = {0};
+	uint32_t fs_imm[4] = {0xc0000000u, 0x40000000u, 0x00000000u, 0x3f800000u};
+	struct fuxi_probe_stage_const_layout fs_layout = {
+		.push_consts_base_vec4 = 0u,
+		.push_consts_size_vec4 = 4u,
+		.push_consts_dwords = 16u,
+		.preamble_base_vec4 = 4u,
+		.preamble_size_vec4 = 4u,
+		.region_count = 2u,
+		.regions = {
+			{ FUXI_CONST_REGION_PUSH_CONSTS, "push_consts", 0u, 4u },
+			{ FUXI_CONST_REGION_PREAMBLE, "preamble", 4u, 4u },
+		},
+		.max_const_offset_vec4 = 8u,
+		.imm_base_vec4 = 8u,
+		.imm_raw_dword_count = 4u,
+		.imm_count_vec4 = 1u,
+		.imm_dword_count = 4u,
+		.imm_dwords = fs_imm,
+	};
+	const char *fs_asm =
+		"; offsets: preamble c4.x (4 vec4)\n"
+		"@const(c8.x)\t0xc0000000, 0x40000000, 0x00000000, 0x3f800000\n"
+		"shps #l10\n"
+		"stc.u32 c[16], r48.z, 1\n"
+		"(sy)(ss)shpe\n"
+		"l10:\n"
+		"end\n";
+	if (!fuxi_probe_verify_const_layout_and_asm("FS", &fs_layout, 12u, fs_asm, err, sizeof(err))) {
+		fprintf(stderr, "FS disjoint unexpected fail: %s\n", err);
+		return false;
+	}
+
+	struct fuxi_probe_stage_const_layout vs_layout = {
+		.push_consts_base_vec4 = 0u,
+		.push_consts_size_vec4 = 4u,
+		.push_consts_dwords = 8u,
+		.region_count = 2u,
+		.regions = {
+			{ FUXI_CONST_REGION_PUSH_CONSTS, "push_consts", 0u, 4u },
+			{ FUXI_CONST_REGION_PRIMITIVE_PARAM, "primitive_param", 4u, 1u },
+		},
+		.max_const_offset_vec4 = 5u,
+		.imm_base_vec4 = 5u,
+	};
+	const char *vs_asm = "; primitive_param c4.x (1 vec4)\nend\n";
+	if (!fuxi_probe_verify_const_layout_and_asm("VS", &vs_layout, 8u, vs_asm, err, sizeof(err))) {
+		fprintf(stderr, "VS disjoint unexpected fail: %s\n", err);
+		return false;
+	}
+	printf("[PASS] test_const_alloc_disjoint_positive (FS [0,4)+[4,8)+[8,9)<=12 & VS [0,4)+[4,5)<=8)\n");
+	return true;
+}
+
+static bool test_const_alloc_overlap_negative(void)
+{
+	char err[256] = {0};
+	uint32_t imm[4] = {0xc0000000u, 0x40000000u, 0x00000000u, 0x3f800000u};
+
+	/* Case 1: 重現 0818eec push_consts [0,4) 與 preamble [0,4) 重疊 */
+	struct fuxi_probe_stage_const_layout overlap_pre = {
+		.push_consts_base_vec4 = 0u,
+		.push_consts_size_vec4 = 4u,
+		.push_consts_dwords = 16u,
+		.preamble_base_vec4 = 0u,
+		.preamble_size_vec4 = 4u,
+		.region_count = 2u,
+		.regions = {
+			{ FUXI_CONST_REGION_PUSH_CONSTS, "push_consts", 0u, 4u },
+			{ FUXI_CONST_REGION_PREAMBLE, "preamble", 0u, 4u },
+		},
+		.max_const_offset_vec4 = 4u,
+		.imm_base_vec4 = 4u,
+		.imm_count_vec4 = 1u,
+		.imm_dword_count = 4u,
+		.imm_dwords = imm,
+	};
+	if (fuxi_probe_verify_const_layout_and_asm("FS", &overlap_pre, 8u, "end\n", err, sizeof(err)))
+		return false;
+
+	/* Case 2: preamble [4,8) 與 immediates [6,7) 重疊 */
+	struct fuxi_probe_stage_const_layout overlap_imm = {
+		.push_consts_base_vec4 = 0u,
+		.push_consts_size_vec4 = 4u,
+		.push_consts_dwords = 16u,
+		.preamble_base_vec4 = 4u,
+		.preamble_size_vec4 = 4u,
+		.region_count = 2u,
+		.regions = {
+			{ FUXI_CONST_REGION_PUSH_CONSTS, "push_consts", 0u, 4u },
+			{ FUXI_CONST_REGION_PREAMBLE, "preamble", 4u, 4u },
+		},
+		.max_const_offset_vec4 = 8u,
+		.imm_base_vec4 = 6u,
+		.imm_count_vec4 = 1u,
+		.imm_dword_count = 4u,
+		.imm_dwords = imm,
+	};
+	if (fuxi_probe_verify_const_layout_and_asm("FS", &overlap_imm, 12u, "end\n", err, sizeof(err)))
+		return false;
+
+	/* Case 3: imm_base + imm_count > constlen 越界 */
+	struct fuxi_probe_stage_const_layout oob_imm = {
+		.push_consts_base_vec4 = 0u,
+		.push_consts_size_vec4 = 4u,
+		.push_consts_dwords = 16u,
+		.preamble_base_vec4 = 4u,
+		.preamble_size_vec4 = 4u,
+		.region_count = 2u,
+		.regions = {
+			{ FUXI_CONST_REGION_PUSH_CONSTS, "push_consts", 0u, 4u },
+			{ FUXI_CONST_REGION_PREAMBLE, "preamble", 4u, 4u },
+		},
+		.max_const_offset_vec4 = 8u,
+		.imm_base_vec4 = 8u,
+		.imm_count_vec4 = 2u,
+		.imm_dword_count = 8u,
+		.imm_dwords = imm,
+	};
+	if (fuxi_probe_verify_const_layout_and_asm("FS", &oob_imm, 8u, "end\n", err, sizeof(err)))
+		return false;
+
+	/* Case 4: 未呼叫 ir3_const_alloc 預留 push_consts */
+	struct fuxi_probe_stage_const_layout missing_push = {
+		.push_consts_base_vec4 = 0u,
+		.push_consts_size_vec4 = 0u,
+		.push_consts_dwords = 16u,
+		.region_count = 1u,
+		.regions = {
+			{ FUXI_CONST_REGION_PREAMBLE, "preamble", 0u, 4u },
+		},
+		.max_const_offset_vec4 = 4u,
+	};
+	if (fuxi_probe_verify_const_layout_and_asm("FS", &missing_push, 8u, "end\n", err, sizeof(err)))
+		return false;
+
+	printf("[PASS] test_const_alloc_overlap_negative (rejected 0818eec overlap, imm overlap, constlen OOB, unreserved push)\n");
+	return true;
+}
+
+static bool test_asm_stc_push_const_guard(void)
+{
+	char err[256] = {0};
+	const char *bad_asms[] = {
+		"stc.u32 c[0], r48.z, 1\n",
+		"stc.f32 c[15], r0.x, 1\n",
+		"stc.u32 c[14], r0.x, 4\n",
+		"(ss)stc.u32 c[0], r48.z, 1\n",
+		"(sy)(ss)stc.u16 c[2], hr0.x, 1\n",
+		"stc.u32 c[a1.x], r0.x, 1\n",
+		"stc.u32 c[a1.x + 16], r0.x, 1\n",
+	};
+	for (size_t i = 0u; i < sizeof(bad_asms) / sizeof(bad_asms[0]); i++) {
+		if (fuxi_probe_asm_check_stc_no_push_overlap("FS", bad_asms[i], 0u, 16u, err, sizeof(err))) {
+			fprintf(stderr, "stc guard failed to reject bad case %zu: %s\n", i, bad_asms[i]);
+			return false;
+		}
+	}
+
+	const char *good_asm =
+		"; stc.u32 c[0], r48.z, 1\n"
+		"@const(c8.x)\t0xc0000000, 0x40000000, 0x00000000, 0x3f800000\n"
+		"(ss)stc.u32 c[16], r48.z, 1\n"
+		"stc.u32 c[17], r48.w, 3 ; trailing comment\n"
+		"end\n";
+	if (!fuxi_probe_asm_check_stc_no_push_overlap("FS", good_asm, 0u, 16u, err, sizeof(err))) {
+		fprintf(stderr, "stc guard rejected valid case: %s\n", err);
+		return false;
+	}
+	printf("[PASS] test_asm_stc_push_const_guard (7 negative stc patterns rejected, c[16]/comment allowed)\n");
+	return true;
+}
+
+static bool test_imm_header_export_and_contents(const char *out_dir)
+{
+	uint32_t spv[5];
+	make_minimal_valid_spv(spv);
+	struct fuxi_probe_result res;
+	char err[256] = {0};
+	if (!mock_run_pipeline_probe_on_spv((const uint8_t *)spv, sizeof(spv),
+					    (const uint8_t *)spv, sizeof(spv),
+					    FUXI_PROBE_CHIP_ID_FD740, true, &res, err, sizeof(err)))
+		return false;
+
+	if (!fuxi_probe_verify_result(&res, err, sizeof(err)) ||
+	    !fuxi_write_probe_outputs(out_dir, &res, "mock_host", err, sizeof(err))) {
+		fuxi_probe_result_free(&res);
+		return false;
+	}
+	fuxi_probe_result_free(&res);
+
+	char path[4096];
+	snprintf(path, sizeof(path), "%s/fuxi_gpu_composite_isa.h", out_dir);
+	uint8_t *bytes = NULL;
+	size_t len = 0u;
+	if (!fuxi_read_file_bytes(path, &bytes, &len))
+		return false;
+	for (size_t i = 0u; i < len; i++) {
+		if (bytes[i] == '\r') {
+			free(bytes);
+			return false;
+		}
+	}
+	char *hdr = (char *)malloc(len + 1u);
+	if (!hdr) {
+		free(bytes);
+		return false;
+	}
+	memcpy(hdr, bytes, len);
+	hdr[len] = '\0';
+	free(bytes);
+
+	const char *required_tokens[] = {
+		"#define FUXI_PB_VS_PUSH_CONST_VEC4",
+		"#define FUXI_PB_VS_PREAMBLE_BASE_VEC4",
+		"#define FUXI_PB_VS_PREAMBLE_COUNT_VEC4",
+		"#define FUXI_PB_VS_IMM_BASE_VEC4",
+		"#define FUXI_PB_VS_IMM_COUNT_VEC4",
+		"#define FUXI_PB_VS_IMM_DWORD_COUNT",
+		"#define FUXI_PB_FS_PUSH_CONST_VEC4          4u",
+		"#define FUXI_PB_FS_PREAMBLE_BASE_VEC4       4u",
+		"#define FUXI_PB_FS_PREAMBLE_COUNT_VEC4      4u",
+		"#define FUXI_PB_FS_IMM_BASE_VEC4            8u",
+		"#define FUXI_PB_FS_IMM_COUNT_VEC4           1u",
+		"#define FUXI_PB_FS_IMM_DWORD_COUNT          4u",
+		"fuxi_pb_vs_imm_dwords[FUXI_PB_VS_IMM_DWORD_COUNT > 0u ? FUXI_PB_VS_IMM_DWORD_COUNT : 1u]",
+		"fuxi_pb_fs_imm_dwords[FUXI_PB_FS_IMM_DWORD_COUNT > 0u ? FUXI_PB_FS_IMM_DWORD_COUNT : 1u]",
+		"#define FUXI_PB_VS_IMM_DWORDS fuxi_pb_vs_imm_dwords",
+		"#define FUXI_PB_FS_IMM_DWORDS fuxi_pb_fs_imm_dwords",
+		"0xc0000000u, 0x40000000u, 0x00000000u, 0x3f800000u",
+	};
+	for (size_t i = 0u; i < sizeof(required_tokens) / sizeof(required_tokens[0]); i++) {
+		if (!strstr(hdr, required_tokens[i])) {
+			fprintf(stderr, "missing header token: %s\n", required_tokens[i]);
+			free(hdr);
+			return false;
+		}
+	}
+	if (strstr(hdr, "float") != NULL || strstr(hdr, "double") != NULL) {
+		fprintf(stderr, "forbidden FP keyword found in header\n");
+		free(hdr);
+		return false;
+	}
+	free(hdr);
+
+	snprintf(path, sizeof(path), "%s/probe_report.json", out_dir);
+	if (!fuxi_read_file_bytes(path, &bytes, &len))
+		return false;
+	char *js = (char *)malloc(len + 1u);
+	if (!js) {
+		free(bytes);
+		return false;
+	}
+	memcpy(js, bytes, len);
+	js[len] = '\0';
+	free(bytes);
+	bool js_ok = (strstr(js, "\"push_const_vec4\": 4") != NULL &&
+		      strstr(js, "\"preamble_base_vec4\": 4") != NULL &&
+		      strstr(js, "\"imm_base_vec4\": 8") != NULL &&
+		      strstr(js, "\"imm_dwords\": [\"0xc0000000\", \"0x40000000\", \"0x00000000\", \"0x3f800000\"]") != NULL);
+	free(js);
+	if (!js_ok) {
+		fprintf(stderr, "probe_report.json missing imm/const layout fields\n");
+		return false;
+	}
+
+	printf("[PASS] test_imm_header_export_and_contents\n");
+	return true;
+}
+
 static bool test_sanitizer_clean_memory(void)
 {
 	/* 由 ASan + LSan + UBSan 在整個測試流程配置與釋放後檢查零洩漏 */
@@ -2484,8 +3306,12 @@ static int run_self_tests(const char *out_dir)
 	if (!test_register_and_constlen_constraints()) return 13;
 	if (!test_unknown_chip_and_roundtrip_guards()) return 14;
 	if (!test_generated_header_roundtrip_c11(out_dir)) return 15;
-	if (!test_sanitizer_clean_memory()) return 16;
-	printf("ALL 7 GATE2 MOCK_HOST SELF-TESTS PASSED\n");
+	if (!test_const_alloc_disjoint_positive()) return 16;
+	if (!test_const_alloc_overlap_negative()) return 17;
+	if (!test_asm_stc_push_const_guard()) return 18;
+	if (!test_imm_header_export_and_contents(out_dir)) return 19;
+	if (!test_sanitizer_clean_memory()) return 20;
+	printf("ALL 11 GATE2 MOCK_HOST SELF-TESTS PASSED\n");
 	return 0;
 }
 
