@@ -24,6 +24,13 @@ jobs:
         with:
           path: harness
           persist-credentials: false
+      - name: Seed pinned NativeMetal source cache
+        uses: actions/checkout@v4
+        with:
+          ref: vendor-nativemetal-a96fece
+          path: nativemetal-cache
+          persist-credentials: false
+          fetch-depth: 1
       - name: Fetch exact public source
         shell: bash
         run: |
@@ -111,6 +118,9 @@ jobs:
           cp harness/patches/metal2vulkan-fuxi-0028-turnip-native-color-resolve.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0029-bound-spares-command-pools.patch source/tools/patches/
           cp harness/patches/metal2vulkan-fuxi-0030-dont-care-preserve-and-diag.patch source/tools/patches/
+          (cd nativemetal-cache && shasum -a 256 -c SHA256SUMS)
+          mkdir -p source/deps/ci-downloads
+          cp nativemetal-cache/nativemetal-a96feceda55e8fed1e20c0a2998736cef7aab006-source-v1.tar.gz source/deps/ci-downloads/
       - name: Build and audit NativeMetal
         shell: bash
         run: |
