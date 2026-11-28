@@ -34,7 +34,7 @@ index f21e84e..77e0c2b 100644
  
     cs->entry_count = 0;
 diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
-index c19e10e..88d55c0 100644
+index c19e10e..1986112 100644
 --- a/src/freedreno/vulkan/tu_cs.h
 +++ b/src/freedreno/vulkan/tu_cs.h
 @@ -455,13 +455,61 @@ tu_cs_emit_write_reg(struct tu_cs *cs, uint16_t reg, uint32_t value)
@@ -100,14 +100,16 @@ index c19e10e..88d55c0 100644
     tu_cs_emit(cs, entry->size / sizeof(uint32_t));
  }
  
-@@ -469,9 +517,31 @@ tu_cs_emit_ib(struct tu_cs *cs, const struct tu_cs_entry *entry)
+@@ -469,9 +517,32 @@ tu_cs_emit_ib(struct tu_cs *cs, const struct tu_cs_entry *entry)
  static inline void
  tu_cs_emit_state_ib(struct tu_cs *cs, struct tu_draw_state state)
  {
+-   if (state.size) {
 +   if (unlikely(!cs || cs->error != VK_SUCCESS))
 +      return;
-    if (state.size) {
-+      if (unlikely(!state.iova || (state.iova & 3ull) != 0 || state.size > 0xfffffu)) {
++   const uint32_t state_dw = state.size;
++   if (state_dw) {
++      if (unlikely(!state.iova || (state.iova & 3ull) != 0 || state_dw > 0xfffffu)) {
 +         static uint32_t bad_state_ib_logs = 0;
 +         if (__atomic_fetch_add(&bad_state_ib_logs, 1u, __ATOMIC_RELAXED) < 16u) {
 +            mesa_loge("FUXI TURNIP OOM: tu_cs_emit_state_ib bad iova=0x%llx sz=0x%x",
@@ -172,7 +174,7 @@ index 82efb07..c7c2b97 100644
     *pFd = prime_fd;
  
 diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
-index a9c6751..99c2b08 100644
+index a9c6751..6041267 100644
 --- a/src/freedreno/vulkan/tu_knl_darwin.cc
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
 @@ -567,8 +567,19 @@ darwin_allocate_iova(struct tu_device *dev, uint64_t size, uint64_t client_iova,
@@ -257,7 +259,7 @@ index a9c6751..99c2b08 100644
           return darwin_map_failure(dev, reply.handle, iova, alloc_size, kr);
        }
        handle = reply.handle;
-@@ -936,7 +980,23 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+@@ -936,7 +980,46 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
  
     uint32_t gem_handle = (uint32_t)handle;
     struct tu_bo *bo = tu_device_lookup_bo(dev, gem_handle);
@@ -270,11 +272,34 @@ index a9c6751..99c2b08 100644
 +      }
 +      if (!reused) {
 +         NativeAdrenoAbiBoFree release = {.handle = handle};
-+         (void) dw_call(NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
-+         darwin_free_iova(dev, iova, alloc_size);
++         kern_return_t cleanup = dw_call(NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
++         if (cleanup == KERN_SUCCESS) {
++            darwin_free_iova(dev, iova, alloc_size);
++         } else {
++            pthread_mutex_lock(&retire->lock);
++            if (retire->failure == VK_SUCCESS)
++               retire->failure = tu_darwin_set_lost(dev, "bo slot collision cleanup failed: 0x%x; retaining native allocation and IOVA", cleanup);
++            pthread_mutex_unlock(&retire->lock);
++         }
 +      } else {
++         struct darwin_retired_bo ret_bo = {
++            .handle = handle,
++            .iova = iova,
++            .size = alloc_size,
++            .mapping = cached_mapping,
++            .token = cached_token,
++            .fence = 0,
++            .cacheable = cacheable,
++            .read_only = read_only,
++            .cached = cached,
++         };
 +         pthread_mutex_lock(&retire->lock);
-+         darwin_cache_put(dev, retire, handle, iova, alloc_size, cached_mapping, cached_token, read_only, cached);
++         if (!darwin_cache_put(dev, retire, &ret_bo) && retire->count < retire->capacity) {
++            unsigned slot = (retire->head + retire->count) % retire->capacity;
++            retire->entries[slot] = ret_bo;
++            ++retire->count;
++            ++retire->enqueued;
++         }
 +         pthread_mutex_unlock(&retire->lock);
 +      }
 +      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "bo slot collision handle=%u", gem_handle);
@@ -282,7 +307,7 @@ index a9c6751..99c2b08 100644
  
     name = tu_debug_bos_add(dev, size, name);
  
-@@ -1187,6 +1247,20 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -1187,6 +1270,20 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
        TU_RMV(bo_unmap, dev, bo);
     TU_RMV(bo_destroy, dev, bo);
  
@@ -303,7 +328,7 @@ index a9c6751..99c2b08 100644
     struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
     pthread_mutex_lock(&retire->lock);
     darwin_reap_locked(dev, retire);
-@@ -1208,8 +1282,7 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -1208,8 +1305,7 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
        uint32_t fence = dw.last_fence;
        pthread_mutex_unlock(&dw.lock);
        unsigned slot = (retire->head + retire->count) % retire->capacity;
@@ -313,7 +338,7 @@ index a9c6751..99c2b08 100644
        ++retire->count;
        ++retire->enqueued;
        darwin_reap_locked(dev, retire);
-@@ -1220,9 +1293,6 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -1220,9 +1316,6 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
     }
     pthread_mutex_unlock(&retire->lock);
  
@@ -323,7 +348,7 @@ index a9c6751..99c2b08 100644
     u_rwlock_rdunlock(&dev->dma_bo_lock);
  }
  
-@@ -1230,8 +1300,22 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -1230,8 +1323,22 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
  
  struct tu_darwin_queue_submit {
     struct util_dynarray commands; /* NativeAdrenoAbiSubmitBuffer */
@@ -346,7 +371,7 @@ index a9c6751..99c2b08 100644
  static void *
  darwin_submit_create(struct tu_device *device)
  {
-@@ -1252,14 +1336,48 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
+@@ -1252,14 +1359,48 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
                            struct tu_cs_entry *entries, unsigned num_entries)
  {
     struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
@@ -398,7 +423,7 @@ index a9c6751..99c2b08 100644
     }
  }
  
-@@ -1442,38 +1560,141 @@ darwin_note_fence(uint32_t fence)
+@@ -1442,38 +1583,141 @@ darwin_note_fence(uint32_t fence)
  
  /* One kernel submission of up to NativeAdrenoAbiMaxBuffers indirect buffers; waits for the oldest job when all eight kernel job slots
   * are taken. Fuxi keeps the bounded retries and waits UniXNU dropped (see darwin_wait_idle). */
@@ -548,7 +573,7 @@ index a9c6751..99c2b08 100644
  }
  
  static VkResult
-@@ -1485,6 +1706,16 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+@@ -1485,6 +1729,16 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
     struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
     struct tu_device *dev = queue->device;
  
