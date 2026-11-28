@@ -1,16 +1,59 @@
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+index f21e84e..bddfd4c 100644
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -142,6 +142,12 @@ tu_cs_fail(struct tu_cs *cs, VkResult err, uint32_t min_dwords)
+       err = VK_ERROR_DEVICE_LOST;
+ 
+    if (cs->error == VK_SUCCESS) {
++      static uint32_t cs_fail_logs = 0;
++      if (__atomic_fetch_add(&cs_fail_logs, 1u, __ATOMIC_RELAXED) < 16u) {
++         mesa_loge("FUXI TURNIP CS FAIL: err=%d mode=%d min_dw=%u entries=%u cmd=%p",
++                   (int) err, (int) cs->mode, min_dwords, cs->entry_count,
++                   (const void *) cs->vk_cmd);
++      }
+       cs->error = err;
+       if (cs->vk_cmd)
+          vk_command_buffer_set_error(cs->vk_cmd, err);
 diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
-index c19e10e..10d189a 100644
+index c19e10e..88d55c0 100644
 --- a/src/freedreno/vulkan/tu_cs.h
 +++ b/src/freedreno/vulkan/tu_cs.h
-@@ -455,13 +455,29 @@ tu_cs_emit_write_reg(struct tu_cs *cs, uint16_t reg, uint32_t value)
+@@ -455,13 +455,61 @@ tu_cs_emit_write_reg(struct tu_cs *cs, uint16_t reg, uint32_t value)
  static inline void
  tu_cs_emit_ib(struct tu_cs *cs, const struct tu_cs_entry *entry)
  {
++   if (unlikely(!cs || cs->error != VK_SUCCESS))
++      return;
++
++   /* C-10: 合法 mapped BO 的空項目 (size==0) 僅略過不發射 IB2，不可誤判為 OutOfMemory(Device) */
++   if (unlikely(entry && entry->bo && entry->bo->iova && !entry->size &&
++                entry->offset <= entry->bo->size &&
++                (entry->offset & (sizeof(uint32_t) - 1)) == 0)) {
++      static uint32_t empty_ib_logs = 0;
++      if (__atomic_fetch_add(&empty_ib_logs, 1u, __ATOMIC_RELAXED) < 8u) {
++         mesa_logi("FUXI TURNIP IB2 SKIP: empty valid entry iova=0x%llx off=0x%x bo_sz=0x%llx",
++                   (unsigned long long) entry->bo->iova, entry->offset,
++                   (unsigned long long) entry->bo->size);
++      }
++      return;
++   }
++
 +   if (unlikely(!entry || !entry->bo || !entry->bo->iova || !entry->size ||
 +                entry->offset > entry->bo->size ||
 +                entry->size > entry->bo->size - entry->offset ||
 +                ((entry->size | entry->offset) & (sizeof(uint32_t) - 1)) != 0 ||
 +                (entry->size / sizeof(uint32_t)) > 0xfffffu)) {
++      static uint32_t bad_ib_logs = 0;
++      if (__atomic_fetch_add(&bad_ib_logs, 1u, __ATOMIC_RELAXED) < 16u) {
++         mesa_loge("FUXI TURNIP OOM: tu_cs_emit_ib bad entry=%p bo=%p iova=0x%llx sz=0x%x off=0x%x bo_sz=0x%llx",
++                   (const void *) entry,
++                   entry ? (const void *) entry->bo : NULL,
++                   (entry && entry->bo) ? (unsigned long long) entry->bo->iova : 0ull,
++                   entry ? entry->size : 0u,
++                   entry ? entry->offset : 0u,
++                   (entry && entry->bo) ? (unsigned long long) entry->bo->size : 0ull);
++      }
 +      tu_cs_fail(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY, 0);
 +      return;
 +   }
@@ -18,6 +61,12 @@ index c19e10e..10d189a 100644
 +   uint64_t ib_iova = tu_iova32_check(
 +      cs ? cs->device : NULL, entry->bo->iova + entry->offset, "ib2", "tu_cs_emit_ib");
 +   if (unlikely(!ib_iova || (ib_iova & 3ull) != 0)) {
++      static uint32_t bad_ib_iova_logs = 0;
++      if (__atomic_fetch_add(&bad_ib_iova_logs, 1u, __ATOMIC_RELAXED) < 16u) {
++         mesa_loge("FUXI TURNIP OOM: tu_cs_emit_ib bad ib_iova=0x%llx raw=0x%llx off=0x%x",
++                   (unsigned long long) ib_iova,
++                   (unsigned long long) entry->bo->iova, entry->offset);
++      }
 +      tu_cs_fail(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY, 0);
 +      return;
 +   }
@@ -33,17 +82,30 @@ index c19e10e..10d189a 100644
     tu_cs_emit(cs, entry->size / sizeof(uint32_t));
  }
  
-@@ -470,8 +486,18 @@ static inline void
+@@ -469,9 +517,31 @@ tu_cs_emit_ib(struct tu_cs *cs, const struct tu_cs_entry *entry)
+ static inline void
  tu_cs_emit_state_ib(struct tu_cs *cs, struct tu_draw_state state)
  {
++   if (unlikely(!cs || cs->error != VK_SUCCESS))
++      return;
     if (state.size) {
 +      if (unlikely(!state.iova || (state.iova & 3ull) != 0 || state.size > 0xfffffu)) {
++         static uint32_t bad_state_ib_logs = 0;
++         if (__atomic_fetch_add(&bad_state_ib_logs, 1u, __ATOMIC_RELAXED) < 16u) {
++            mesa_loge("FUXI TURNIP OOM: tu_cs_emit_state_ib bad iova=0x%llx sz=0x%x",
++                      (unsigned long long) state.iova, state.size);
++         }
 +         tu_cs_fail(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY, 0);
 +         return;
 +      }
 +      uint64_t ib_iova = tu_iova32_check(
 +         cs ? cs->device : NULL, state.iova, "state_ib", "tu_cs_emit_state_ib");
 +      if (unlikely(!ib_iova || (ib_iova & 3ull) != 0)) {
++         static uint32_t bad_state_iova_logs = 0;
++         if (__atomic_fetch_add(&bad_state_iova_logs, 1u, __ATOMIC_RELAXED) < 16u) {
++            mesa_loge("FUXI TURNIP OOM: tu_cs_emit_state_ib bad ib_iova=0x%llx raw=0x%llx sz=0x%x",
++                      (unsigned long long) ib_iova, (unsigned long long) state.iova, state.size);
++         }
 +         tu_cs_fail(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY, 0);
 +         return;
 +      }
@@ -53,11 +115,131 @@ index c19e10e..10d189a 100644
        tu_cs_emit(cs, state.size);
     }
  }
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 82efb07..c7c2b97 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3653,8 +3653,15 @@ tu_AllocateMemory(VkDevice _device,
+ 
+    struct tu_memory_heap *mem_heap = &device->physical_device->heap;
+    uint64_t mem_heap_used = p_atomic_read(&mem_heap->used);
+-   if (mem_heap_used > mem_heap->size)
++   if (mem_heap_used > mem_heap->size) {
++      static uint32_t heap_oom_logs = 0;
++      if (__atomic_fetch_add(&heap_oom_logs, 1u, __ATOMIC_RELAXED) < 16u) {
++         mesa_loge("FUXI TURNIP OOM: tu_AllocateMemory heap exhausted used=0x%llx size=0x%llx req=0x%llx",
++                   (unsigned long long) mem_heap_used, (unsigned long long) mem_heap->size,
++                   (unsigned long long) pAllocateInfo->allocationSize);
++      }
+       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   }
+ 
+    mem = (struct tu_device_memory *) vk_device_memory_create(
+       &device->vk, pAllocateInfo, pAllocator, sizeof(*mem));
+@@ -4390,8 +4397,15 @@ tu_GetMemoryFdKHR(VkDevice _device,
+              VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+ 
+    int prime_fd = tu_bo_export_dmabuf(device, memory->bo);
+-   if (prime_fd < 0)
++   if (prime_fd < 0) {
++      static uint32_t export_oom_logs = 0;
++      if (__atomic_fetch_add(&export_oom_logs, 1u, __ATOMIC_RELAXED) < 16u) {
++         mesa_loge("FUXI TURNIP OOM: tu_GetMemoryFdKHR export failed bo=%p size=0x%llx",
++                   (const void *) memory->bo,
++                   memory->bo ? (unsigned long long) memory->bo->size : 0ull);
++      }
+       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   }
+ 
+    *pFd = prime_fd;
+ 
 diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
-index a9c6751..313cb67 100644
+index a9c6751..0f438b9 100644
 --- a/src/freedreno/vulkan/tu_knl_darwin.cc
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
-@@ -1230,8 +1230,22 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -567,8 +567,19 @@ darwin_allocate_iova(struct tu_device *dev, uint64_t size, uint64_t client_iova,
+    } else {
+       *iova = darwin_va_alloc(va, size, os_page_size, false);
+    }
++   uint64_t va_used = va->used, va_allocs = va->allocs, va_frees = va->frees;
+    mtx_unlock(&dev->vma_mutex);
+-   return *iova ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   if (!*iova) {
++      static uint32_t iova_oom_logs = 0;
++      if (__atomic_fetch_add(&iova_oom_logs, 1u, __ATOMIC_RELAXED) < 16u) {
++         mesa_loge("FUXI TURNIP OOM: darwin_allocate_iova exhausted size=0x%llx flags=0x%x used=0x%llx allocs=%llu frees=%llu",
++                   (unsigned long long) size, (unsigned) flags,
++                   (unsigned long long) va_used, (unsigned long long) va_allocs,
++                   (unsigned long long) va_frees);
++      }
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++   return VK_SUCCESS;
+ }
+ 
+ static void
+@@ -824,6 +835,11 @@ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+    kern_return_t cleanup = dw_call(NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
+    if (cleanup == KERN_SUCCESS) {
+       darwin_free_iova(dev, iova, size);
++      static uint32_t map_fail_logs = 0;
++      if (__atomic_fetch_add(&map_fail_logs, 1u, __ATOMIC_RELAXED) < 16u) {
++         mesa_loge("FUXI TURNIP OOM: BoMap failed kr=0x%x iova=0x%llx size=0x%llx",
++                   (unsigned) map_error, (unsigned long long) iova, (unsigned long long) size);
++      }
+       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoMap failed: 0x%x", map_error);
+    }
+    /* A failed map may have modified tables. Unknown cleanup never authorizes
+@@ -888,6 +904,7 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+       }
+    }
+ 
++   unsigned map_busy_retries = 0;
+    for (bool flushed = false; !reused;) {
+       VkResult result = darwin_allocate_iova(dev, alloc_size, client_iova, flags, &iova);
+       if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !flushed) {
+@@ -915,6 +932,11 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+             if (any)
+                continue;
+          }
++         static uint32_t alloc_fail_logs = 0;
++         if (__atomic_fetch_add(&alloc_fail_logs, 1u, __ATOMIC_RELAXED) < 16u) {
++            mesa_loge("FUXI TURNIP OOM: BoAlloc failed kr=0x%x size=0x%llx cached=%d flushed=%d",
++                      (unsigned) kr, (unsigned long long) alloc_size, (int) cached, (int) flushed);
++         }
+          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoAlloc failed: 0x%x", kr);
+       }
+ 
+@@ -928,6 +950,28 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+       NativeAdrenoAbiBoMapReply mapped = {};
+       kr = dw_call(NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
+       if (kr != KERN_SUCCESS) {
++         if (kr == kIOReturnBusy && map_busy_retries < 3u) {
++            NativeAdrenoAbiBoFree release = {.handle = reply.handle};
++            kern_return_t cleanup = dw_call(NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
++            if (cleanup != KERN_SUCCESS) {
++               pthread_mutex_lock(&retire->lock);
++               retire->failure = tu_darwin_set_lost(dev, "BoMap busy cleanup failed: 0x%x; retaining native allocation and IOVA", cleanup);
++               VkResult lost_res = retire->failure;
++               pthread_mutex_unlock(&retire->lock);
++               return lost_res;
++            }
++            darwin_free_iova(dev, iova, alloc_size);
++            (void) darwin_collect_retired(dev);
++            if (!flushed) {
++               flushed = true;
++               pthread_mutex_lock(&retire->lock);
++               (void) darwin_cache_flush(dev, retire);
++               pthread_mutex_unlock(&retire->lock);
++            }
++            map_busy_retries++;
++            usleep(1000u * map_busy_retries);
++            continue;
++         }
+          return darwin_map_failure(dev, reply.handle, iova, alloc_size, kr);
+       }
+       handle = reply.handle;
+@@ -1230,8 +1274,22 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
  
  struct tu_darwin_queue_submit {
     struct util_dynarray commands; /* NativeAdrenoAbiSubmitBuffer */
@@ -80,7 +262,7 @@ index a9c6751..313cb67 100644
  static void *
  darwin_submit_create(struct tu_device *device)
  {
-@@ -1252,14 +1266,48 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
+@@ -1252,14 +1310,48 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
                            struct tu_cs_entry *entries, unsigned num_entries)
  {
     struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
@@ -132,7 +314,7 @@ index a9c6751..313cb67 100644
     }
  }
  
-@@ -1442,38 +1490,120 @@ darwin_note_fence(uint32_t fence)
+@@ -1442,38 +1534,120 @@ darwin_note_fence(uint32_t fence)
  
  /* One kernel submission of up to NativeAdrenoAbiMaxBuffers indirect buffers; waits for the oldest job when all eight kernel job slots
   * are taken. Fuxi keeps the bounded retries and waits UniXNU dropped (see darwin_wait_idle). */
@@ -261,7 +443,7 @@ index a9c6751..313cb67 100644
  }
  
  static VkResult
-@@ -1485,6 +1615,16 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+@@ -1485,6 +1659,16 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
     struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
     struct tu_device *dev = queue->device;
  
