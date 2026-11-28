@@ -1,0 +1,362 @@
+diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
+index c19e10e..10d189a 100644
+--- a/src/freedreno/vulkan/tu_cs.h
++++ b/src/freedreno/vulkan/tu_cs.h
+@@ -455,13 +455,29 @@ tu_cs_emit_write_reg(struct tu_cs *cs, uint16_t reg, uint32_t value)
+ static inline void
+ tu_cs_emit_ib(struct tu_cs *cs, const struct tu_cs_entry *entry)
+ {
++   if (unlikely(!entry || !entry->bo || !entry->bo->iova || !entry->size ||
++                entry->offset > entry->bo->size ||
++                entry->size > entry->bo->size - entry->offset ||
++                ((entry->size | entry->offset) & (sizeof(uint32_t) - 1)) != 0 ||
++                (entry->size / sizeof(uint32_t)) > 0xfffffu)) {
++      tu_cs_fail(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY, 0);
++      return;
++   }
++
++   uint64_t ib_iova = tu_iova32_check(
++      cs ? cs->device : NULL, entry->bo->iova + entry->offset, "ib2", "tu_cs_emit_ib");
++   if (unlikely(!ib_iova || (ib_iova & 3ull) != 0)) {
++      tu_cs_fail(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY, 0);
++      return;
++   }
++
+    assert(entry->bo);
+    assert(entry->size && entry->offset + entry->size <= entry->bo->size);
+    assert(entry->size % sizeof(uint32_t) == 0);
+    assert(entry->offset % sizeof(uint32_t) == 0);
+ 
+    tu_cs_emit_pkt7(cs, CP_INDIRECT_BUFFER, 3);
+-   tu_cs_emit_iova(cs, entry->bo->iova + entry->offset, "ib2", "tu_cs_emit_ib");
++   tu_cs_emit_qw(cs, ib_iova);
+    tu_cs_emit(cs, entry->size / sizeof(uint32_t));
+ }
+ 
+@@ -470,8 +486,18 @@ static inline void
+ tu_cs_emit_state_ib(struct tu_cs *cs, struct tu_draw_state state)
+ {
+    if (state.size) {
++      if (unlikely(!state.iova || (state.iova & 3ull) != 0 || state.size > 0xfffffu)) {
++         tu_cs_fail(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY, 0);
++         return;
++      }
++      uint64_t ib_iova = tu_iova32_check(
++         cs ? cs->device : NULL, state.iova, "state_ib", "tu_cs_emit_state_ib");
++      if (unlikely(!ib_iova || (ib_iova & 3ull) != 0)) {
++         tu_cs_fail(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY, 0);
++         return;
++      }
+       tu_cs_emit_pkt7(cs, CP_INDIRECT_BUFFER, 3);
+-      tu_cs_emit_iova(cs, state.iova, "state_ib", "tu_cs_emit_state_ib");
++      tu_cs_emit_qw(cs, ib_iova);
+       tu_cs_emit(cs, state.size);
+    }
+ }
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index a9c6751..313cb67 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -1230,8 +1230,22 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ 
+ struct tu_darwin_queue_submit {
+    struct util_dynarray commands; /* NativeAdrenoAbiSubmitBuffer */
++   bool invalid_entry;
++   uint32_t invalid_index;
++   uint64_t invalid_handle;
++   uint64_t invalid_iova;
++   uint64_t invalid_bytes;
++   uint64_t invalid_bo_size;
+ };
+ 
++static bool
++darwin_submit_buffer_valid(const NativeAdrenoAbiSubmitBuffer *b)
++{
++   return b && b->handle && b->iova && b->bytes &&
++          ((b->iova | b->bytes) & 3ull) == 0 &&
++          (b->bytes >> 2) <= 0xfffffull;
++}
++
+ static void *
+ darwin_submit_create(struct tu_device *device)
+ {
+@@ -1252,14 +1266,48 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
+                           struct tu_cs_entry *entries, unsigned num_entries)
+ {
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
++   if (!num_entries)
++      return;
++   if (!entries) {
++      if (!submit->invalid_entry) {
++         submit->invalid_entry = true;
++         submit->invalid_index = 0;
++      }
++      return;
++   }
+    NativeAdrenoAbiSubmitBuffer *cmds = (NativeAdrenoAbiSubmitBuffer *)
+       util_dynarray_grow(&submit->commands, NativeAdrenoAbiSubmitBuffer, num_entries);
+    for (unsigned i = 0; i < num_entries; i++) {
++      const struct tu_bo *bo = entries[i].bo;
++      uint64_t offset = entries[i].offset;
++      uint64_t bytes = entries[i].size;
++      uint64_t handle = bo ? bo->darwin_handle : 0;
++      uint64_t bo_iova = bo ? bo->iova : 0;
++      uint64_t bo_size = bo ? bo->size : 0;
++      uint64_t iova = (bo && bo_iova && offset <= bo_size && bytes <= bo_size - offset)
++                         ? (bo_iova + offset) : 0;
+       cmds[i] = (NativeAdrenoAbiSubmitBuffer) {
+-         .handle = entries[i].bo->darwin_handle,
+-         .iova = entries[i].bo->iova + entries[i].offset,
+-         .bytes = entries[i].size,
++         .handle = handle,
++         .iova = iova,
++         .bytes = bytes,
+       };
++      if (unlikely(!bo || !bo->darwin_handle || !bo_iova ||
++                   offset > bo_size || bytes > bo_size - offset ||
++                   ((offset | bytes) & 3ull) != 0 ||
++                   !darwin_submit_buffer_valid(&cmds[i]))) {
++         if (!submit->invalid_entry) {
++            submit->invalid_entry = true;
++            submit->invalid_index = i;
++            submit->invalid_handle = handle;
++            submit->invalid_iova = iova;
++            submit->invalid_bytes = bytes;
++            submit->invalid_bo_size = bo_size;
++         }
++         mesa_loge("FUXI KMD: darwin_submit_add_entries invalid[%u] bo=%p handle=%llu iova=0x%llx off=%llu bytes=%llu bo_size=%llu",
++                   i, (const void *)bo, (unsigned long long)handle,
++                   (unsigned long long)iova, (unsigned long long)offset,
++                   (unsigned long long)bytes, (unsigned long long)bo_size);
++      }
+    }
+ }
+ 
+@@ -1442,38 +1490,120 @@ darwin_note_fence(uint32_t fence)
+ 
+ /* One kernel submission of up to NativeAdrenoAbiMaxBuffers indirect buffers; waits for the oldest job when all eight kernel job slots
+  * are taken. Fuxi keeps the bounded retries and waits UniXNU dropped (see darwin_wait_idle). */
++static void
++darwin_retire_inflight_locked(uint32_t fence)
++{
++   unsigned drop = 0;
++   while (drop < dw.inflight_count && (int32_t)(dw.inflight[drop] - fence) <= 0)
++      drop++;
++   if (drop > 0) {
++      unsigned rem = dw.inflight_count - drop;
++      if (rem)
++         memmove(dw.inflight, dw.inflight + drop, rem * sizeof(dw.inflight[0]));
++      dw.inflight_count = rem;
++   }
++}
++
++static uint64_t
++darwin_submit_busy_timeout_ns(void)
++{
++   uint64_t ms = 2500;
++   const char *env = getenv("TU_DARWIN_SUBMIT_BUSY_TIMEOUT_MS");
++   if (env && *env) {
++      char *end = NULL;
++      unsigned long v = strtoul(env, &end, 10);
++      if (end != env && *end == '\0') {
++         if (v < 10ul)
++            v = 10ul;
++         else if (v > 30000ul)
++            v = 30000ul;
++         ms = (uint64_t)v;
++      }
++   }
++   return ms * 1000000ull;
++}
++
+ static VkResult
+ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *entries,
+                     unsigned count, uint32_t *fence)
+ {
+    struct tu_device *dev = queue->device;
++   if (unlikely(!entries || !count || count > NativeAdrenoAbiMaxBuffers))
++      return tu_darwin_set_lost(dev, "submit invalid chunk count=%u", count);
++   for (unsigned i = 0; i < count; i++) {
++      if (unlikely(!darwin_submit_buffer_valid(&entries[i]))) {
++         return tu_darwin_set_lost(dev,
++                                   "submit invalid IB entry[%u]: handle=%llu iova=0x%llx bytes=%llu",
++                                   i, (unsigned long long)entries[i].handle,
++                                   (unsigned long long)entries[i].iova,
++                                   (unsigned long long)entries[i].bytes);
++      }
++   }
++
+    NativeAdrenoAbiSubmit req = {};
+    req.buffer_count = count;
+    req.queue = 0;
+    for (unsigned i = 0; i < count; i++)
+       req.buffers[i] = entries[i];
+ 
+-   for (unsigned attempt = 0; attempt < 64; attempt++) {
++   const uint64_t start_ns = os_time_get_nano();
++   const uint64_t deadline_ns = start_ns + darwin_submit_busy_timeout_ns();
++   useconds_t backoff_us = 200;
++   unsigned retries = 0;
++
++   for (;;) {
+       NativeAdrenoAbiSubmitReply reply = {};
+       kern_return_t kr = dw_call(NativeAdrenoMethodSubmit, &req, sizeof(req), &reply, sizeof(reply));
+       if (kr == KERN_SUCCESS) {
+-         mesa_logi("FUXI KMD: submit IBs %u fence %llu", count,
+-                   (unsigned long long)reply.fence);
++         if (retries > 0) {
++            uint64_t waited_ms = (os_time_get_nano() - start_ns) / 1000000ull;
++            mesa_logi("FUXI KMD: submit recovered from busy after %u retries (%llu ms) IBs %u fence %llu",
++                      retries, (unsigned long long)waited_ms, count,
++                      (unsigned long long)reply.fence);
++         } else {
++            mesa_logi("FUXI KMD: submit IBs %u fence %llu", count,
++                      (unsigned long long)reply.fence);
++         }
+          *fence = (uint32_t)reply.fence;
+          return VK_SUCCESS;
+       }
+       if (kr != kIOReturnBusy)
+          return tu_darwin_set_lost(dev, "submit failed: 0x%x", kr);
+ 
++      VkResult collect = darwin_collect_retired(dev);
++      if (collect != VK_SUCCESS)
++         return collect;
++
+       pthread_mutex_lock(&dw.lock);
+       uint32_t oldest = dw.inflight_count ? dw.inflight[0] : 0;
+       pthread_mutex_unlock(&dw.lock);
+-      if (!oldest)
+-         usleep(100);
+-      else if (dw_wait_fence_locked_free(dev, oldest, os_time_get_nano() + 5000000000ull) != VK_SUCCESS)
+-         return tu_darwin_set_lost(dev, "submit: GPU did not retire a job");
++
++      if (oldest) {
++         if (dw_wait_fence_locked_free(dev, oldest, deadline_ns) != VK_SUCCESS)
++            return tu_darwin_set_lost(dev, "submit: GPU did not retire a job");
++         pthread_mutex_lock(&dw.lock);
++         darwin_retire_inflight_locked(oldest);
++         pthread_mutex_unlock(&dw.lock);
++         retries++;
++         if (os_time_get_nano() >= deadline_ns)
++            break;
++         continue;
++      }
++
++      if (os_time_get_nano() >= deadline_ns)
++         break;
++      usleep(backoff_us);
++      if (backoff_us < 500)
++         backoff_us = 500;
++      else if (backoff_us < 1000)
++         backoff_us = 1000;
++      else
++         backoff_us = 2000;
++      retries++;
+    }
+-   return tu_darwin_set_lost(dev, "submit: no free job slot");
++   uint64_t waited_ms = (os_time_get_nano() - start_ns) / 1000000ull;
++   return tu_darwin_set_lost(dev, "submit: no free job slot (waited %llu ms, retries=%u)",
++                             (unsigned long long)waited_ms, retries);
+ }
+ 
+ static VkResult
+@@ -1485,6 +1615,16 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
+    struct tu_device *dev = queue->device;
+ 
++   if (unlikely(submit->invalid_entry)) {
++      return tu_darwin_set_lost(dev,
++                                "submit invalid IB entry[%u]: handle=%llu iova=0x%llx bytes=%llu bo_size=%llu",
++                                submit->invalid_index,
++                                (unsigned long long)submit->invalid_handle,
++                                (unsigned long long)submit->invalid_iova,
++                                (unsigned long long)submit->invalid_bytes,
++                                (unsigned long long)submit->invalid_bo_size);
++   }
++
+    /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
+    for (uint32_t i = 0; i < wait_count; i++) {
+       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
+diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
+index e06cd57..5ae782a 100644
+--- a/src/freedreno/vulkan/tu_queue.cc
++++ b/src/freedreno/vulkan/tu_queue.cc
+@@ -285,6 +285,17 @@ resolve_vis_stream_patchpoints(struct tu_queue *queue,
+          tu_cs_emit(&sub_cs, 1);
+ 
+          struct tu_cs_entry entry = tu_cs_end_sub_stream(&cs, &sub_cs);
++         if (unlikely(cs.error != VK_SUCCESS || sub_cs.error != VK_SUCCESS ||
++                      !entry.bo || !entry.bo->iova || !entry.size ||
++                      entry.offset > entry.bo->size ||
++                      entry.size > entry.bo->size - entry.offset)) {
++            mesa_loge("FUXI TURNIP: reject invalid vis-patch IB entry (cs=%d sub=%d bo=%p iova=0x%llx size=%u)",
++                      cs.error, sub_cs.error, (const void *)entry.bo,
++                      (unsigned long long)(entry.bo ? entry.bo->iova : 0),
++                      entry.size);
++            return cs.error != VK_SUCCESS ? cs.error :
++                   (sub_cs.error != VK_SUCCESS ? sub_cs.error : VK_ERROR_OUT_OF_DEVICE_MEMORY);
++         }
+          submit_add_entries(queue->device, submit, dump_cmds, &entry, 1);
+       }
+ 
+@@ -458,16 +469,57 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+    if (!submit)
+       goto fail_create_submit;
+ 
++   for (uint32_t i = 0; i < cmdbuf_count; i++) {
++      struct tu_cmd_buffer *cmd_buffer = cmd_buffers[i];
++      if (unlikely(cmd_buffer->vk.record_result != VK_SUCCESS ||
++                   cmd_buffer->cs.error != VK_SUCCESS ||
++                   cmd_buffer->draw_cs.error != VK_SUCCESS ||
++                   cmd_buffer->tile_store_cs.error != VK_SUCCESS ||
++                   cmd_buffer->draw_epilogue_cs.error != VK_SUCCESS ||
++                   cmd_buffer->sub_cs.error != VK_SUCCESS ||
++                   cmd_buffer->pre_chain.draw_cs.error != VK_SUCCESS ||
++                   cmd_buffer->pre_chain.draw_epilogue_cs.error != VK_SUCCESS)) {
++         result = cmd_buffer->vk.record_result != VK_SUCCESS ?
++            cmd_buffer->vk.record_result : VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         mesa_loge("FUXI TURNIP: reject submit cmdbuf[%u] recording/cs error (%d)", i, result);
++         pthread_mutex_unlock(&device->submit_mutex);
++         util_dynarray_fini(&dump_cmds);
++         goto out;
++      }
++      struct tu_cs *cs = &cmd_buffer->cs;
++      for (uint32_t j = 0; j < cs->entry_count; j++) {
++         const struct tu_cs_entry *e = &cs->entries[j];
++         if (unlikely(!e->bo || !e->bo->iova || !e->size ||
++                      e->offset > e->bo->size || e->size > e->bo->size - e->offset ||
++                      ((e->size | e->offset) & (sizeof(uint32_t) - 1)) != 0 ||
++                      (e->size / sizeof(uint32_t)) > 0xfffffu)) {
++            mesa_loge("FUXI TURNIP: reject invalid IB entry cmdbuf[%u][%u] (bo=%p iova=0x%llx off=%u size=%u)",
++                      i, j, (const void *)e->bo,
++                      (unsigned long long)(e->bo ? e->bo->iova : 0), e->offset, e->size);
++            result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++            pthread_mutex_unlock(&device->submit_mutex);
++            util_dynarray_fini(&dump_cmds);
++            goto out;
++         }
++      }
++   }
++
+    result = resolve_vis_stream_patchpoints(queue, submit, &dump_cmds,
+                                            cmd_buffers, cmdbuf_count);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      pthread_mutex_unlock(&device->submit_mutex);
++      util_dynarray_fini(&dump_cmds);
+       goto out;
++   }
+ 
+    result = resolve_cb_control_patchpoints(queue, submit, &dump_cmds,
+                                            cmd_buffers, cmdbuf_count);
+ 
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      pthread_mutex_unlock(&device->submit_mutex);
++      util_dynarray_fini(&dump_cmds);
+       goto out;
++   }
+ 
+    if (has_trace_points) {
+       tu_u_trace_submission_data_create(
