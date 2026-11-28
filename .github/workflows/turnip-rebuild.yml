@@ -76,12 +76,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s nullglob
+          raw_hyb=(harness/patches/mesa-hyb-*.patch)
+          hyb_patches=()
+          if (( ${#raw_hyb[@]} )); then
+            while IFS= read -r p; do
+              [[ -n "$p" ]] && hyb_patches+=("$p")
+            done < <(LC_ALL=C printf '%s\n' "${raw_hyb[@]}" | LC_ALL=C sort)
+            mkdir -p source/tools/out/ci/mesa/patches
+            cp "${hyb_patches[@]}" source/tools/out/ci/mesa/patches/
+          fi
+          extra_args=()
+          for p in ${hyb_patches[@]+"${hyb_patches[@]}"}; do
+            if [[ "$(basename "$p")" != "mesa-hyb-hostimport-reclaim.patch" ]]; then
+              extra_args+=(--extra-patch "$p")
+            fi
+          done
           python3 harness/tests/test-turnip-import-reclaim.py \
             --turnip-inputs source/tools/out/ci/mesa/patches \
             --patch harness/patches/mesa-hyb-hostimport-reclaim.patch \
+            ${extra_args[@]+"${extra_args[@]}"} \
             --abi source/xnu/fuxi-adreno \
             --source source/deps/ci-work-mesa/mesa/src/freedreno/vulkan/tu_knl_darwin.cc
-          cp harness/patches/mesa-hyb-*.patch source/tools/out/ci/mesa/patches/
       - name: Compare with the deployed dylib
         shell: bash
         run: |

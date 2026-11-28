@@ -1,0 +1,131 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -86,6 +86,7 @@
+ };
+ struct darwin_bo_cache_stats {
+    uint64_t lookups, hits, inserts, evictions, flushes, bytes_peak;
++   uint64_t zeroed_reuses, zeroed_bytes, zeroed_mapped_on_reuse, zeroed_map_failures;
+ };
+ 
+ /* The GPU address space as two red-black trees over the free holes (Mesa's rb_tree, the same algorithm as XNU's libkern/tree.h): by
+@@ -136,6 +137,56 @@
+    out[6] = retire->cache_stats.bytes_peak;
+    out[7] = retire->va.holes;
+    pthread_mutex_unlock(&retire->lock);
++}
++
++extern "C" __attribute__((visibility("default"))) void tu_darwin_bo_cache_zero_stats(uint64_t out[4]);
++extern "C" __attribute__((visibility("default"))) void
++tu_darwin_bo_cache_zero_stats(uint64_t out[4])
++{
++   struct darwin_retire_state *retire = darwin_stats_state;
++   memset(out, 0, 4 * sizeof(uint64_t));
++   if (!retire)
++      return;
++   pthread_mutex_lock(&retire->lock);
++   out[0] = retire->cache_stats.zeroed_reuses;
++   out[1] = retire->cache_stats.zeroed_bytes;
++   out[2] = retire->cache_stats.zeroed_mapped_on_reuse;
++   out[3] = retire->cache_stats.zeroed_map_failures;
++   pthread_mutex_unlock(&retire->lock);
++}
++
++static bool
++darwin_zero_cache_bo_str_ieq(const char *a, const char *b)
++{
++   while (*a && *b) {
++      unsigned char ca = (unsigned char)*a++;
++      unsigned char cb = (unsigned char)*b++;
++      if (ca >= 'A' && ca <= 'Z')
++         ca += 'a' - 'A';
++      if (cb >= 'A' && cb <= 'Z')
++         cb += 'a' - 'A';
++      if (ca != cb)
++         return false;
++   }
++   return *a == '\0' && *b == '\0';
++}
++
++static bool
++darwin_zero_cache_bo_enabled(void)
++{
++   const char *env = getenv("FUXI_TURNIP_ZERO_CACHE_BO");
++   if (!env || !*env)
++      return false;
++   if (strcmp(env, "1") == 0 ||
++       darwin_zero_cache_bo_str_ieq(env, "true") ||
++       darwin_zero_cache_bo_str_ieq(env, "yes") ||
++       darwin_zero_cache_bo_str_ieq(env, "on")) {
++      static bool logged_once = false;
++      if (!__atomic_exchange_n(&logged_once, true, __ATOMIC_ACQ_REL))
++         mesa_logi("FUXI TURNIP BO CACHE: zero-on-reuse enabled (FUXI_TURNIP_ZERO_CACHE_BO=1)");
++      return true;
++   }
++   return false;
+ }
+ 
+ static kern_return_t
+@@ -540,6 +591,11 @@
+            (unsigned long long)(st->hits * 1000 / st->lookups % 10), (unsigned long long)retire->cache_count,
+            (unsigned long long)(retire->cache_bytes >> 20), (unsigned long long)st->evictions, (unsigned long long)st->flushes,
+            (unsigned long long)retire->va.holes);
++   if (st->zeroed_reuses || st->zeroed_mapped_on_reuse || st->zeroed_map_failures) {
++      fprintf(stderr, "NativeAdreno BO cache zero-on-reuse: reuses=%llu bytes=%llu mapped_on_reuse=%llu map_failures=%llu\n",
++              (unsigned long long)st->zeroed_reuses, (unsigned long long)st->zeroed_bytes,
++              (unsigned long long)st->zeroed_mapped_on_reuse, (unsigned long long)st->zeroed_map_failures);
++   }
+ }
+ 
+ /* Drops the cache entry at the index for real. VK_NOT_READY keeps it. */
+@@ -744,6 +800,9 @@
+ 
+ /* ---- buffer objects ---- */
+ 
++static VkResult darwin_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr);
++static void darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo);
++
+ static VkResult
+ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+                struct tu_bo **out_bo, uint64_t size, uint64_t client_iova,
+@@ -762,6 +821,7 @@
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    /* TU_DARWIN_BO_CACHE=0 turns the cache off (the host checks of the release paths need every free to reach the kernel). */
+    static const bool cache_enabled = debug_get_bool_option("TU_DARWIN_BO_CACHE", true);
++   const bool zero_cache_bo = darwin_zero_cache_bo_enabled();
+    const bool cacheable = cache_enabled && !(flags & TU_BO_ALLOC_REPLAYABLE);
+    const bool read_only = !!(flags & TU_BO_ALLOC_GPU_READ_ONLY);
+    /* The HOST_CACHED type exists only when the kernel reported NativeAdrenoDeviceCachedCoherent (its coherent-import self-test
+@@ -864,6 +924,32 @@
+ 
+    tu_dump_bo_init(dev, bo);
+    TU_RMV(bo_allocate, dev, bo);
++
++   if (reused && zero_cache_bo && !(flags & TU_BO_ALLOC_INTERNAL_RESOURCE)) {
++      bool mapped_on_reuse = false;
++      if (!bo->map) {
++         VkResult map_res = darwin_bo_map(dev, bo, NULL);
++         if (map_res != VK_SUCCESS || !bo->map) {
++            pthread_mutex_lock(&retire->lock);
++            ++retire->cache_stats.zeroed_map_failures;
++            pthread_mutex_unlock(&retire->lock);
++            mesa_loge("NativeAdreno BO cache: zero-on-reuse map failed (%d) size=%llu",
++                      map_res, (unsigned long long)size);
++            darwin_bo_finish(dev, bo);
++            *out_bo = NULL;
++            return map_res != VK_SUCCESS ? map_res : VK_ERROR_MEMORY_MAP_FAILED;
++         }
++         mapped_on_reuse = true;
++      }
++      if (size > 0)
++         memset(bo->map, 0, size);
++      pthread_mutex_lock(&retire->lock);
++      ++retire->cache_stats.zeroed_reuses;
++      retire->cache_stats.zeroed_bytes += size;
++      if (mapped_on_reuse)
++         ++retire->cache_stats.zeroed_mapped_on_reuse;
++      pthread_mutex_unlock(&retire->lock);
++   }
+ 
+    *out_bo = bo;
+    if (flags & TU_BO_ALLOC_INTERNAL_RESOURCE) {

@@ -1,0 +1,613 @@
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index 1d33085..1a8d4d1 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -5768,7 +5768,12 @@ tu_load_gmem_attachment(struct tu_cmd_buffer *cmd,
+        cmd->state.pass->has_fdm ||
+        /* Replicating unresolve seems to not work and the blob never uses it.
+         */
+-       (a != gmem_a)) {
++       (a != gmem_a) ||
++       /* Linear views without tail padding (e.g. DRM_FORMAT_MOD_LINEAR host
++        * import) cannot safely use BLIT_EVENT_LOAD with align_scissor=true
++        * because aligning y2 up to gmem_align_h over-reads past the backing.
++        */
++       iview->view.need_y2_align) {
+       if (load_common || load_stencil)
+          tu_disable_draw_states(cmd, cs);
+ 
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 60ad3a8..c1c2bed 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1111,6 +1111,9 @@ tu6_emit_blit_scissor(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+    uint32_t y2 = y1 + render_area->extent.height - 1;
+ 
+    if (align) {
++      /* Aligning y2 up to gmem_align_h is unsafe for linear views with
++       * need_y2_align; those loads/stores must take the 3D/CP path instead.
++       */
+       x1 = x1 & ~(phys_dev->info->gmem_align_w - 1);
+       y1 = y1 & ~(phys_dev->info->gmem_align_h - 1);
+       x2 = ALIGN_POT(x2 + 1, phys_dev->info->gmem_align_w) - 1;
+@@ -1268,11 +1271,16 @@ tu_cs_emit_draw_state(struct tu_cs *cs, uint32_t id, struct tu_draw_state state)
+        state.writeable)
+       enable_mask |= CP_SET_DRAW_STATE__0_DIRTY;
+ 
++   uint64_t state_iova = state.iova;
++   if (state.size && state_iova) {
++      state_iova = tu_iova32_check(cs ? cs->device : NULL, state_iova,
++                                   "draw_state", "tu_cs_emit_draw_state");
++   }
+    tu_cs_emit(cs, CP_SET_DRAW_STATE__0_COUNT(state.size) |
+                   enable_mask |
+                   CP_SET_DRAW_STATE__0_GROUP_ID(id) |
+-                  COND(!state.size || !state.iova, CP_SET_DRAW_STATE__0_DISABLE));
+-   tu_cs_emit_qw(cs, state.iova);
++                  COND(!state.size || !state_iova, CP_SET_DRAW_STATE__0_DISABLE));
++   tu_cs_emit_qw(cs, state_iova);
+ }
+ 
+ template <chip CHIP>
+@@ -4552,15 +4560,20 @@ tu_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer,
+          cmd->state.vb[firstBinding + i].size = 0;
+       } else {
+          struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);
+-         cmd->state.vb[firstBinding + i].base = vk_buffer_address(&buf->vk, pOffsets[i]);
++         cmd->state.vb[firstBinding + i].base = tu_iova32_check(
++            cmd->device, vk_buffer_address(&buf->vk, pOffsets[i]),
++            "vbo_bind", "tu_CmdBindVertexBuffers2");
+          cmd->state.vb[firstBinding + i].size =
+             vk_buffer_range(&buf->vk, pOffsets[i], pSizes ? pSizes[i] : VK_WHOLE_SIZE);
+       }
+    }
+ 
+    for (uint32_t i = 0; i < cmd->state.max_vbs_bound; i++) {
++      uint64_t vb_base = tu_iova32_check(
++         cmd->device, cmd->state.vb[i].base,
++         "vbo_emit", "tu_CmdBindVertexBuffers2");
+       tu_cs_emit_regs(&cs,
+-                      A6XX_VFD_VERTEX_BUFFER_BASE(i, .qword = cmd->state.vb[i].base),
++                      A6XX_VFD_VERTEX_BUFFER_BASE(i, .qword = vb_base),
+                       A6XX_VFD_VERTEX_BUFFER_SIZE(i, cmd->state.vb[i].size));
+    }
+ 
+@@ -4605,7 +4618,9 @@ tu_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
+       if (cmd->state.index_size != index_size)
+          tu_cs_emit_regs(&cmd->draw_cs, PC_RESTART_INDEX(CHIP, restart_index));
+ 
+-      cmd->state.index_va = vk_buffer_address(&buf->vk, offset);
++      cmd->state.index_va = tu_iova32_check(
++         cmd->device, vk_buffer_address(&buf->vk, offset),
++         "index_buffer", "tu_CmdBindIndexBuffer2KHR");
+       cmd->state.max_index_count = size >> index_shift;
+       cmd->state.index_size = index_size;
+    } else {
+@@ -4737,8 +4752,10 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
+       VK_FROM_HANDLE(tu_descriptor_set, set, info->pDescriptorSets[i]);
+ 
+       descriptors_state->sets[idx] = set;
++      uint64_t set_va = set ? tu_iova32_check(
++         cmd->device, set->va, "desc_set", "tu_bind_descriptor_sets") : 0;
+       descriptors_state->set_iova[idx] = set ?
+-         (set->va | BINDLESS_DESCRIPTOR_64B) : 0;
++         (set_va | BINDLESS_DESCRIPTOR_64B) : 0;
+ 
+       if (cmd->device->physical_device->enable_ssbo_emulation)
+          cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
+@@ -4765,13 +4782,16 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
+                memcpy(dst, src, binding->size);
+ 
+                if (binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
+-                  /* Note: we can assume here that the addition won't roll
+-                   * over and change the SIZE field.
++                  /* Extract BASE_HI separately so A6XX_UBO_1_SIZE is preserved
++                   * and never misclassified as an upper-32 IOVA fault.
+                    */
+-                  uint64_t va = src[0] | ((uint64_t)src[1] << 32);
+-                  va += offset;
+-                  dst[0] = va;
+-                  dst[1] = va >> 32;
++                  uint64_t base_va = src[0] |
++                     ((uint64_t) pkt_field_get(A6XX_UBO_1_BASE_HI, src[1]) << 32);
++                  uint64_t va = tu_iova32_check(
++                     cmd->device, base_va + offset,
++                     "ubo_dynamic", "tu_bind_descriptor_sets");
++                  dst[0] = (uint32_t) va;
++                  dst[1] = pkt_field_set(A6XX_UBO_1_BASE_HI, src[1], va >> 32);
+                } else {
+                   uint32_t *dst_desc = dst;
+                   for (unsigned i = 0;
+@@ -4783,7 +4803,9 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
+                          * the STARTOFFSETTEXELS field no longer exists.
+                          * So no further munging required:
+                          */
+-                        va += offset;
++                        va = tu_iova32_check(cmd->device, va + offset,
++                                             "ssbo_dynamic",
++                                             "tu_bind_descriptor_sets");
+                      } else {
+                         uint32_t desc_offset = pkt_field_get(
+                            A6XX_TEX_MEMOBJ_2_STARTOFFSETTEXELS, dst_desc[2]);
+@@ -4807,7 +4829,9 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
+                         }
+ 
+                         va += desc_offset << offset_shift;
+-                        va += offset;
++                        va = tu_iova32_check(cmd->device, va + offset,
++                                             "ssbo_dynamic",
++                                             "tu_bind_descriptor_sets");
+ 
+                         if (cmd->device->physical_device->enable_ssbo_emulation) {
+                            dst_desc[11] = va;
+@@ -4855,7 +4879,10 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
+       memcpy(dynamic_desc_set.map, descriptors_state->dynamic_descriptors,
+              descriptors_state->max_dynamic_offset_size);
+       assert(reserved_set_idx >= 0); /* reserved set must be bound */
+-      descriptors_state->set_iova[reserved_set_idx] = dynamic_desc_set.iova | BINDLESS_DESCRIPTOR_64B;
++      uint64_t dyn_va = tu_iova32_check(
++         cmd->device, dynamic_desc_set.iova,
++         "dyn_desc_set", "tu_bind_descriptor_sets");
++      descriptors_state->set_iova[reserved_set_idx] = dyn_va | BINDLESS_DESCRIPTOR_64B;
+    }
+ 
+    tu_dirty_desc_sets(cmd, bind_point);
+@@ -6604,7 +6631,11 @@ tu_emit_subpass_begin_gmem(struct tu_cmd_buffer *cmd, struct tu_resolve_group *r
+    for (uint32_t i = 0; i < cmd->state.pass->attachment_count; ++i) {
+       struct tu_render_pass_attachment *att = &cmd->state.pass->attachments[i];
+       if ((att->load || att->load_stencil) && att->first_subpass_idx == subpass_idx) {
+-         if (!emitted_scissor && !per_layer_render_area) {
++         const struct tu_image_view *iview = cmd->state.attachments[i];
++         bool uses_3d_load = TU_DEBUG(3D_LOAD) ||
++                             cmd->state.pass->has_fdm ||
++                             (iview && iview->view.need_y2_align);
++         if (!emitted_scissor && !per_layer_render_area && !uses_3d_load) {
+             tu6_emit_blit_scissor(cmd, cs, 0, true);
+             emitted_scissor = true;
+          }
+@@ -6623,14 +6654,19 @@ tu_emit_subpass_begin_gmem(struct tu_cmd_buffer *cmd, struct tu_resolve_group *r
+       if (a == VK_ATTACHMENT_UNUSED)
+          continue;
+ 
+-      if (!emitted_scissor && !per_layer_render_area) {
++      uint32_t gmem_a =
++         tu_subpass_get_attachment_to_unresolve(cmd->state.subpass, i);
++      const struct tu_image_view *iview = cmd->state.attachments[a];
++      bool uses_3d_load = TU_DEBUG(3D_LOAD) ||
++                          cmd->state.pass->has_fdm ||
++                          (a != gmem_a) ||
++                          (iview && iview->view.need_y2_align);
++
++      if (!emitted_scissor && !per_layer_render_area && !uses_3d_load) {
+          tu6_emit_blit_scissor(cmd, cs, 0, true);
+          emitted_scissor = true;
+       }
+ 
+-      uint32_t gmem_a =
+-         tu_subpass_get_attachment_to_unresolve(cmd->state.subpass, i);
+-
+       tu_load_gmem_attachment<CHIP>(cmd, cs, resolve_group, a, gmem_a,
+                                     per_layer_render_area,
+                                     cond_load_allowed, true);
+@@ -7560,7 +7596,7 @@ tu7_emit_inline_ubo(struct tu_cs *cs,
+    tu_cs_emit(cs, CP_LOAD_STATE6_1_EXT_SRC_ADDR(0));
+    tu_cs_emit(cs, CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(0));
+    int size_vec4s = DIV_ROUND_UP(const_state->num_inline_ubos * 2, 4);
+-   tu_cs_emit_qw(cs, iova | ((uint64_t)A6XX_UBO_1_SIZE(size_vec4s) << 32));
++   tu_cs_emit_ubo_iova(cs, iova, size_vec4s, "inline_ubo", "tu7_emit_inline_ubo");
+ }
+ 
+ static void
+@@ -7725,7 +7761,7 @@ tu7_emit_bindless_base_addresses(struct tu_cs *cs,
+             CP_LOAD_STATE6_0_NUM_UNIT(1));
+    tu_cs_emit(cs, CP_LOAD_STATE6_1_EXT_SRC_ADDR(0));
+    tu_cs_emit(cs, CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(0));
+-   tu_cs_emit_qw(cs, iova | ((uint64_t) A6XX_UBO_1_SIZE(size_vec4s) << 32));
++   tu_cs_emit_ubo_iova(cs, iova, size_vec4s, "bindless_base", "tu7_emit_bindless_base_addresses");
+ }
+ 
+ static void
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+index 47e1939..58021f6 100644
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -5,10 +5,116 @@
+ 
+ #include "tu_cs.h"
+ 
++#include <inttypes.h>
++
+ #include "tu_device.h"
+ #include "tu_rmv.h"
+ #include "tu_suballoc.h"
+ 
++static bool
++tu_debug_str_has_token(const char *s, const char *tok)
++{
++   if (!s || !tok)
++      return false;
++   size_t tok_len = strlen(tok);
++   const char *p = s;
++   while (*p) {
++      while (*p == ',' || *p == ' ' || *p == '\t' || *p == ';')
++         p++;
++      if (!*p)
++         break;
++      const char *end = p;
++      while (*end && *end != ',' && *end != ' ' && *end != '\t' && *end != ';')
++         end++;
++      if ((size_t) (end - p) == tok_len && strncmp(p, tok, tok_len) == 0)
++         return true;
++      p = end;
++   }
++   return false;
++}
++
++static int
++tu_iova32_guard_mode(void)
++{
++   const char *env = getenv("FUXI_TURNIP_IOVA32_GUARD");
++   if (env && *env) {
++      if (strcmp(env, "0") == 0 || strcmp(env, "off") == 0 ||
++          strcmp(env, "disable") == 0 || strcmp(env, "none") == 0)
++         return 0;
++      if (strcmp(env, "1") == 0 || strcmp(env, "log") == 0 ||
++          strcmp(env, "warn") == 0)
++         return 1;
++      if (strcmp(env, "2") == 0 || strcmp(env, "lost") == 0 ||
++          strcmp(env, "fatal") == 0)
++         return 2;
++      if (strcmp(env, "3") == 0 || strcmp(env, "zero") == 0 ||
++          strcmp(env, "clamp") == 0 || strcmp(env, "drop") == 0)
++         return 3;
++   }
++
++   const char *tu_dbg = getenv("TU_DEBUG");
++   if (tu_dbg && *tu_dbg) {
++      if (tu_debug_str_has_token(tu_dbg, "noiova32"))
++         return 0;
++      if (tu_debug_str_has_token(tu_dbg, "iova32zero"))
++         return 3;
++      if (tu_debug_str_has_token(tu_dbg, "iova32lost"))
++         return 2;
++   }
++
++   return 1;
++}
++
++static uint32_t
++tu_iova32_guard_log_limit(void)
++{
++   const char *env = getenv("FUXI_TURNIP_IOVA32_GUARD_LIMIT");
++   if (env && *env) {
++      if (strcmp(env, "all") == 0)
++         return 0;
++      long v = strtol(env, NULL, 10);
++      if (v <= 0)
++         return 0;
++      return (uint32_t) v;
++   }
++   return 64;
++}
++
++uint64_t
++tu_iova32_guard_slow(const struct tu_device *device,
++                      uint64_t addr,
++                      const char *source,
++                      const char *site)
++{
++   int mode = tu_iova32_guard_mode();
++   if (mode <= 0)
++      return addr;
++
++   const char *src = source ? source : "unknown";
++   const char *loc = site ? site : "unknown";
++   static uint32_t log_count = 0;
++   uint32_t limit = tu_iova32_guard_log_limit();
++   uint32_t seq = (uint32_t) p_atomic_inc_return(&log_count);
++   if (limit == 0 || seq <= limit) {
++      mesa_loge("FUXI TURNIP IOVA32 GUARD: upper32 non-zero addr=0x%016" PRIx64
++                " (hi=0x%08x lo=0x%08x) source=%s site=%s mode=%d seq=%u",
++                addr, (uint32_t) (addr >> 32), (uint32_t) addr,
++                src, loc, mode, seq);
++   }
++
++   if (mode >= 2 && device) {
++      vk_device_set_lost(const_cast<struct vk_device *>(&device->vk),
++                         "FUXI TURNIP IOVA32 GUARD: addr=0x%016" PRIx64
++                         " source=%s site=%s",
++                         addr, src, loc);
++   }
++
++   if (mode >= 3)
++      return 0;
++
++   return addr;
++}
++
+ /* There is a limit to IB size supported by HW,
+  * which appears to be 0x0fffff.
+  */
+diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
+index 6a66de1..eb538f5 100644
+--- a/src/freedreno/vulkan/tu_cs.h
++++ b/src/freedreno/vulkan/tu_cs.h
+@@ -367,6 +367,33 @@ tu_cs_emit_qw(struct tu_cs *cs, uint64_t value)
+    tu_cs_emit(cs, (uint32_t) (value >> 32));
+ }
+ 
++uint64_t
++tu_iova32_guard_slow(const struct tu_device *device,
++                      uint64_t addr,
++                      const char *source,
++                      const char *site);
++
++static inline uint64_t
++tu_iova32_check(const struct tu_device *device,
++                uint64_t addr,
++                const char *source,
++                const char *site)
++{
++   if (unlikely((addr >> 32) != 0))
++      return tu_iova32_guard_slow(device, addr, source, site);
++   return addr;
++}
++
++static inline void
++tu_cs_emit_iova(struct tu_cs *cs,
++                uint64_t addr,
++                const char *source,
++                const char *site)
++{
++   addr = tu_iova32_check(cs ? cs->device : NULL, addr, source, site);
++   tu_cs_emit_qw(cs, addr);
++}
++
+ static inline void
+ tu_cs_emit_write_reg(struct tu_cs *cs, uint16_t reg, uint32_t value)
+ {
+@@ -386,7 +413,7 @@ tu_cs_emit_ib(struct tu_cs *cs, const struct tu_cs_entry *entry)
+    assert(entry->offset % sizeof(uint32_t) == 0);
+ 
+    tu_cs_emit_pkt7(cs, CP_INDIRECT_BUFFER, 3);
+-   tu_cs_emit_qw(cs, entry->bo->iova + entry->offset);
++   tu_cs_emit_iova(cs, entry->bo->iova + entry->offset, "ib2", "tu_cs_emit_ib");
+    tu_cs_emit(cs, entry->size / sizeof(uint32_t));
+ }
+ 
+@@ -396,7 +423,7 @@ tu_cs_emit_state_ib(struct tu_cs *cs, struct tu_draw_state state)
+ {
+    if (state.size) {
+       tu_cs_emit_pkt7(cs, CP_INDIRECT_BUFFER, 3);
+-      tu_cs_emit_qw(cs, state.iova);
++      tu_cs_emit_iova(cs, state.iova, "state_ib", "tu_cs_emit_state_ib");
+       tu_cs_emit(cs, state.size);
+    }
+ }
+@@ -610,6 +637,17 @@ struct tu_reg_value {
+ #include "a6xx-pack.xml.h"
+ #include "adreno-pm4-pack.xml.h"
+ 
++static inline void
++tu_cs_emit_ubo_iova(struct tu_cs *cs,
++                    uint64_t iova,
++                    uint32_t size_vec4s,
++                    const char *source,
++                    const char *site)
++{
++   iova = tu_iova32_check(cs ? cs->device : NULL, iova, source, site);
++   tu_cs_emit_qw(cs, iova | ((uint64_t) A6XX_UBO_1_SIZE(size_vec4s) << 32));
++}
++
+ #define __assert_eq(a, b)                                               \
+    do {                                                                 \
+       if ((a) != (b)) {                                                 \
+diff --git a/src/freedreno/vulkan/tu_descriptor_set.cc b/src/freedreno/vulkan/tu_descriptor_set.cc
+index 2ff6826..7e7db5f 100644
+--- a/src/freedreno/vulkan/tu_descriptor_set.cc
++++ b/src/freedreno/vulkan/tu_descriptor_set.cc
+@@ -671,7 +671,9 @@ tu_descriptor_set_create(struct tu_device *device,
+       }
+ 
+       set->mapped_ptr = (uint32_t*)(pool_base(pool) + current_offset);
+-      set->va = pool->host_bo ? 0 : pool->bo->iova + current_offset;
++      uint64_t set_va = pool->host_bo ? 0 : pool->bo->iova + current_offset;
++      set->va = tu_iova32_check(device, set_va,
++                                "desc_pool", "tu_descriptor_set_create");
+    }
+ 
+    if (layout->has_immutable_samplers) {
+@@ -1134,7 +1136,10 @@ write_buffer_descriptor_addr(const struct tu_device *device,
+    enum fdl_ssbo_emulation_mode ssbo_emulation_mode =
+       device->physical_device->enable_ssbo_emulation ? FDL_SSBO_EMULATION_ENABLED : FDL_SSBO_EMULATION_DISABLED;
+ 
+-   uint64_t va = buffer_info->address;
++   uint64_t va = tu_iova32_check(device, buffer_info->address,
++                                 "ssbo_desc", "write_buffer_descriptor_addr");
++   if (va == 0)
++      return;
+    uint32_t range = buffer_info->range;
+ 
+    if (info->props.storage_16bit) {
+@@ -1167,7 +1172,8 @@ write_buffer_descriptor(const struct tu_device *device,
+ }
+ 
+ static void
+-write_ubo_descriptor_addr(uint32_t *dst,
++write_ubo_descriptor_addr(const struct tu_device *device,
++                          uint32_t *dst,
+                           const VkDescriptorAddressInfoEXT *buffer_info)
+ {
+    if (!buffer_info) {
+@@ -1175,7 +1181,8 @@ write_ubo_descriptor_addr(uint32_t *dst,
+       return;
+    }
+ 
+-   uint64_t va = buffer_info->address;
++   uint64_t va = tu_iova32_check(device, buffer_info->address,
++                                 "ubo_desc", "write_ubo_descriptor_addr");
+    /* The HW range is in vec4 units */
+    uint32_t range = va ? DIV_ROUND_UP(buffer_info->range, 16) : 0;
+    dst[0] = A6XX_UBO_0_BASE_LO(va);
+@@ -1186,14 +1193,17 @@ write_ubo_descriptor_addr(uint32_t *dst,
+ }
+ 
+ static void
+-write_ubo_descriptor(uint32_t *dst, const VkDescriptorBufferInfo *buffer_info)
++write_ubo_descriptor(const struct tu_device *device,
++                     uint32_t *dst,
++                     const VkDescriptorBufferInfo *buffer_info)
+ {
+    VkDescriptorAddressInfoEXT addr = buffer_info_to_address(buffer_info);
+-   write_ubo_descriptor_addr(dst, &addr);
++   write_ubo_descriptor_addr(device, dst, &addr);
+ }
+ 
+ static void
+-write_image_descriptor(uint32_t *dst,
++write_image_descriptor(const struct tu_device *device,
++                       uint32_t *dst,
+                        VkDescriptorType descriptor_type,
+                        const VkDescriptorImageInfo *image_info)
+ {
+@@ -1204,6 +1214,23 @@ write_image_descriptor(uint32_t *dst,
+ 
+    VK_FROM_HANDLE(tu_image_view, iview, image_info->imageView);
+ 
++   uint64_t base_addr = tu_iova32_check(
++      device, iview->view.base_addr,
++      "image_desc_base", "write_image_descriptor");
++   if (base_addr == 0 && iview->view.base_addr != 0) {
++      memset(dst, 0, FDL6_TEX_CONST_DWORDS * sizeof(uint32_t));
++      return;
++   }
++   if (iview->view.ubwc_addr) {
++      uint64_t ubwc_addr = tu_iova32_check(
++         device, iview->view.ubwc_addr,
++         "image_desc_ubwc", "write_image_descriptor");
++      if (ubwc_addr == 0) {
++         memset(dst, 0, FDL6_TEX_CONST_DWORDS * sizeof(uint32_t));
++         return;
++      }
++   }
++
+    if (descriptor_type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+       memcpy(dst, iview->view.storage_descriptor, sizeof(iview->view.storage_descriptor));
+    } else {
+@@ -1212,13 +1239,14 @@ write_image_descriptor(uint32_t *dst,
+ }
+ 
+ static void
+-write_combined_image_sampler_descriptor(uint32_t *dst,
++write_combined_image_sampler_descriptor(const struct tu_device *device,
++                                        uint32_t *dst,
+                                         VkDescriptorType descriptor_type,
+                                         const VkDescriptorImageInfo *image_info,
+                                         bool write_sampler,
+                                         const struct tu_sampler *immutable_sampler)
+ {
+-   write_image_descriptor(dst, descriptor_type, image_info);
++   write_image_descriptor(device, dst, descriptor_type, image_info);
+ 
+    /* copy over sampler state */
+    if (write_sampler) {
+@@ -1244,7 +1272,7 @@ write_combined_image_sampler_descriptor(uint32_t *dst,
+          .range =
+             iview->vk.layer_count * sizeof(struct tu_subsampled_metadata),
+       };
+-      write_ubo_descriptor_addr(dst + 2 * FDL6_TEX_CONST_DWORDS, &info);
++      write_ubo_descriptor_addr(device, dst + 2 * FDL6_TEX_CONST_DWORDS, &info);
+    }
+ }
+ 
+@@ -1292,7 +1320,7 @@ tu_GetDescriptorEXT(
+ 
+    switch (pDescriptorInfo->type) {
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+-      write_ubo_descriptor_addr(dest, pDescriptorInfo->data.pUniformBuffer);
++      write_ubo_descriptor_addr(device, dest, pDescriptorInfo->data.pUniformBuffer);
+       break;
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+       write_buffer_descriptor_addr<CHIP>(device, dest, pDescriptorInfo->data.pStorageBuffer);
+@@ -1308,17 +1336,17 @@ tu_GetDescriptorEXT(
+       }
+       break;
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+-      write_image_descriptor(dest, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
++      write_image_descriptor(device, dest, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                              pDescriptorInfo->data.pSampledImage);
+       break;
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+-      write_image_descriptor(dest, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
++      write_image_descriptor(device, dest, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                              pDescriptorInfo->data.pStorageImage);
+       break;
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
+       VK_FROM_HANDLE(tu_sampler, sampler,
+                      pDescriptorInfo->data.pCombinedImageSampler->sampler);
+-      write_combined_image_sampler_descriptor(dest,
++      write_combined_image_sampler_descriptor(device, dest,
+                                               VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                               pDescriptorInfo->data.pCombinedImageSampler,
+                                               true, sampler);
+@@ -1337,7 +1365,7 @@ tu_GetDescriptorEXT(
+       break;
+    }
+    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+-      write_image_descriptor(dest, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
++      write_image_descriptor(device, dest, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+                              pDescriptorInfo->data.pInputAttachmentImage);
+       break;
+    default:
+@@ -1427,7 +1455,7 @@ tu_update_descriptor_sets(const struct tu_device *device,
+          switch(writeset->descriptorType) {
+          case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+          case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+-            write_ubo_descriptor(ptr, writeset->pBufferInfo + j);
++            write_ubo_descriptor(device, ptr, writeset->pBufferInfo + j);
+             break;
+          case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+          case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+@@ -1448,10 +1476,10 @@ tu_update_descriptor_sets(const struct tu_device *device,
+          case VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM:
+          case VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM:
+          case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+-            write_image_descriptor(ptr, writeset->descriptorType, writeset->pImageInfo + j);
++            write_image_descriptor(device, ptr, writeset->descriptorType, writeset->pImageInfo + j);
+             break;
+          case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+-            write_combined_image_sampler_descriptor(ptr,
++            write_combined_image_sampler_descriptor(device, ptr,
+                                                     writeset->descriptorType,
+                                                     writeset->pImageInfo + j,
+                                                     !samplers,
+@@ -1772,12 +1800,12 @@ tu_update_descriptor_set_with_template(
+          switch(templ->entry[i].descriptor_type) {
+          case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: {
+             assert(!(set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR));
+-            write_ubo_descriptor(set->dynamic_descriptors + dst_offset,
++            write_ubo_descriptor(device, set->dynamic_descriptors + dst_offset,
+                                  (const VkDescriptorBufferInfo *) src);
+             break;
+          }
+          case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+-            write_ubo_descriptor(ptr, (const VkDescriptorBufferInfo *) src);
++            write_ubo_descriptor(device, ptr, (const VkDescriptorBufferInfo *) src);
+             break;
+          case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
+             assert(!(set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR));
+@@ -1804,12 +1832,12 @@ tu_update_descriptor_set_with_template(
+          case VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM:
+          case VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM:
+          case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: {
+-            write_image_descriptor(ptr, templ->entry[i].descriptor_type,
++            write_image_descriptor(device, ptr, templ->entry[i].descriptor_type,
+                                    (const VkDescriptorImageInfo *) src);
+             break;
+          }
+          case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+-            write_combined_image_sampler_descriptor(ptr,
++            write_combined_image_sampler_descriptor(device, ptr,
+                                                     templ->entry[i].descriptor_type,
+                                                     (const VkDescriptorImageInfo *) src,
+                                                     !samplers,

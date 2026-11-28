@@ -1,0 +1,865 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 60ad3a8..1d56561 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -2420,6 +2420,34 @@ tu_init_hw_rp(struct tu_cs *cs)
+ }
+ TU_GENX(tu_init_hw_rp);
+ 
++static inline bool
++tu_cmd_buffer_has_error(const struct tu_cmd_buffer *cmd)
++{
++   return cmd->vk.record_result != VK_SUCCESS;
++}
++
++static inline VkResult
++tu_cmd_buffer_sync_error(struct tu_cmd_buffer *cmd)
++{
++   if (cmd->cs.error != VK_SUCCESS && cmd->vk.record_result == VK_SUCCESS)
++      vk_command_buffer_set_error(&cmd->vk, cmd->cs.error);
++   if (cmd->draw_cs.error != VK_SUCCESS && cmd->vk.record_result == VK_SUCCESS)
++      vk_command_buffer_set_error(&cmd->vk, cmd->draw_cs.error);
++   if (cmd->tile_store_cs.error != VK_SUCCESS && cmd->vk.record_result == VK_SUCCESS)
++      vk_command_buffer_set_error(&cmd->vk, cmd->tile_store_cs.error);
++   if (cmd->draw_epilogue_cs.error != VK_SUCCESS && cmd->vk.record_result == VK_SUCCESS)
++      vk_command_buffer_set_error(&cmd->vk, cmd->draw_epilogue_cs.error);
++   if (cmd->sub_cs.error != VK_SUCCESS && cmd->vk.record_result == VK_SUCCESS)
++      vk_command_buffer_set_error(&cmd->vk, cmd->sub_cs.error);
++   if (cmd->pre_chain.draw_cs.error != VK_SUCCESS && cmd->vk.record_result == VK_SUCCESS)
++      vk_command_buffer_set_error(&cmd->vk, cmd->pre_chain.draw_cs.error);
++   if (cmd->pre_chain.draw_epilogue_cs.error != VK_SUCCESS && cmd->vk.record_result == VK_SUCCESS)
++      vk_command_buffer_set_error(&cmd->vk, cmd->pre_chain.draw_epilogue_cs.error);
++   if (cmd->vk.record_result == VK_SUCCESS && vk_device_is_lost(&cmd->device->vk))
++      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_DEVICE_LOST);
++   return cmd->vk.record_result;
++}
++
+ template <chip CHIP>
+ static void
+ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+@@ -2427,6 +2455,13 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+    struct tu_device *dev = cmd->device;
+    const struct tu_physical_device *phys_dev = dev->physical_device;
+ 
++   if (unlikely(tu_cmd_buffer_sync_error(cmd) != VK_SUCCESS ||
++                cs->error != VK_SUCCESS)) {
++      if (cs->error != VK_SUCCESS && !tu_cmd_buffer_has_error(cmd))
++         vk_command_buffer_set_error(&cmd->vk, cs->error);
++      return;
++   }
++
+    if (CHIP == A6XX) {
+       tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
+    } else {
+@@ -2439,6 +2474,9 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+       tu_cs_emit_wfi(cs);
+    }
+ 
++   if (unlikely(cs->error != VK_SUCCESS))
++      return;
++
+    tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP,
+          .vs_state = true,
+          .hs_state = true,
+@@ -2500,6 +2538,9 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+       if (cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)
+          tu_cs_set_writeable(cs, false);
+ 
++      if (unlikely(cs->error != VK_SUCCESS))
++         return;
++
+       tu7_set_thread_br_patchpoint(cmd, cs, false);
+    }
+ 
+@@ -3923,6 +3964,12 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+    tu6_emit_tile_store_cs<CHIP>(cmd, &cmd->tile_store_cs);
+    tu_cs_end(&cmd->tile_store_cs);
+ 
++   if (unlikely(tu_cmd_buffer_sync_error(cmd) != VK_SUCCESS)) {
++      tu_cs_discard_entries(&cmd->tile_store_cs);
++      free(tiles);
++      return;
++   }
++
+    tu6_tile_render_begin<CHIP>(cmd, &cmd->cs, rp_ctx, fdm_offsets);
+ 
+    /* Note: we reverse the order of walking the pipes and tiles on every
+@@ -4044,6 +4091,13 @@ void
+ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
+               const VkOffset2D *fdm_offsets)
+ {
++   if (unlikely(tu_cmd_buffer_sync_error(cmd_buffer) != VK_SUCCESS ||
++                !cmd_buffer->state.pass || !cmd_buffer->state.tiling)) {
++      if (!tu_cmd_buffer_has_error(cmd_buffer))
++         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_DEVICE_LOST);
++      return;
++   }
++
+    if (cmd_buffer->state.rp.has_tess)
+       tu6_lazy_emit_tessfactor_addr<CHIP>(cmd_buffer);
+ 
+@@ -4139,6 +4193,14 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
+    tu_cs_init(&cmd_buffer->pre_chain.draw_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw cs");
+    tu_cs_init(&cmd_buffer->pre_chain.draw_epilogue_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw epiligoue cs");
+ 
++   cmd_buffer->cs.vk_cmd = &cmd_buffer->vk;
++   cmd_buffer->draw_cs.vk_cmd = &cmd_buffer->vk;
++   cmd_buffer->tile_store_cs.vk_cmd = &cmd_buffer->vk;
++   cmd_buffer->draw_epilogue_cs.vk_cmd = &cmd_buffer->vk;
++   cmd_buffer->sub_cs.vk_cmd = &cmd_buffer->vk;
++   cmd_buffer->pre_chain.draw_cs.vk_cmd = &cmd_buffer->vk;
++   cmd_buffer->pre_chain.draw_epilogue_cs.vk_cmd = &cmd_buffer->vk;
++
+    for (unsigned i = 0; i < MAX_BIND_POINTS; i++)
+       cmd_buffer->descriptors[i].push_set.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET;
+ 
+@@ -4369,7 +4431,7 @@ tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
+ 
+    tu_cmd_buffer_status_gpu_write(cmd_buffer, TU_CMD_BUFFER_STATUS_ACTIVE);
+ 
+-   return VK_SUCCESS;
++   return tu_cmd_buffer_sync_error(cmd_buffer);
+ }
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
+@@ -4386,6 +4448,8 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+       switch (cmd_buffer->queue_family_index) {
+       case TU_QUEUE_GENERAL:
+          TU_CALLX(cmd_buffer->device, tu_init_hw)(cmd_buffer, &cmd_buffer->cs);
++         if (unlikely(tu_cmd_buffer_sync_error(cmd_buffer) != VK_SUCCESS))
++            return cmd_buffer->vk.record_result;
+          break;
+       default:
+          break;
+@@ -4482,7 +4546,7 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+       }
+    }
+ 
+-   return VK_SUCCESS;
++   return tu_cmd_buffer_sync_error(cmd_buffer);
+ }
+ 
+ static struct tu_cs
+@@ -5304,6 +5368,13 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
+ {
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
+ 
++   if (unlikely(tu_cmd_buffer_sync_error(cmd_buffer) != VK_SUCCESS)) {
++      tu_cs_end(&cmd_buffer->cs);
++      tu_cs_end(&cmd_buffer->draw_cs);
++      tu_cs_end(&cmd_buffer->draw_epilogue_cs);
++      return vk_command_buffer_end(&cmd_buffer->vk);
++   }
++
+    /* We currently flush CCU at the end of the command buffer, like
+     * what the blob does. There's implicit synchronization around every
+     * vkQueueSubmit, but the kernel only flushes the UCHE, and we don't
+@@ -5462,6 +5533,9 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_pipeline, pipeline, _pipeline);
+ 
++   if (unlikely(tu_cmd_buffer_sync_error(cmd) != VK_SUCCESS))
++      return;
++
+    if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
+       cmd->state.shaders[MESA_SHADER_COMPUTE] =
+          pipeline->shaders[MESA_SHADER_COMPUTE];
+@@ -6932,6 +7006,9 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+       return;
+    }
+ 
++   if (unlikely(tu_cmd_buffer_sync_error(cmd) != VK_SUCCESS))
++      return;
++
+    VK_FROM_HANDLE(tu_render_pass, pass, pRenderPassBegin->renderPass);
+    VK_FROM_HANDLE(tu_framebuffer, fb, pRenderPassBegin->framebuffer);
+ 
+@@ -6954,6 +7031,11 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+                         pass->attachment_count);
+       if (!vk_multialloc_alloc(&ma, &cmd->vk.pool->alloc,
+                                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT)) {
++         cmd->state.pass = NULL;
++         cmd->state.subpass = NULL;
++         cmd->state.framebuffer = NULL;
++         cmd->state.attachments = NULL;
++         cmd->state.clear_values = NULL;
+          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+          return;
+       }
+@@ -7030,6 +7112,9 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+ 
++   if (unlikely(tu_cmd_buffer_sync_error(cmd) != VK_SUCCESS))
++      return;
++
+    tu_setup_dynamic_render_pass(cmd, pRenderingInfo);
+    tu_setup_dynamic_framebuffer(cmd, pRenderingInfo);
+ 
+@@ -7153,6 +7238,11 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
+ 
+    VkResult result = tu_setup_dynamic_msrtss(cmd);
+    if (result != VK_SUCCESS) {
++      cmd->state.pass = NULL;
++      cmd->state.subpass = NULL;
++      cmd->state.framebuffer = NULL;
++      cmd->state.attachments = NULL;
++      cmd->state.clear_values = NULL;
+       vk_command_buffer_set_error(&cmd->vk, result);
+       return;
+    }
+@@ -9709,6 +9799,17 @@ tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
+       return;
+    }
+ 
++   if (unlikely(tu_cmd_buffer_sync_error(cmd_buffer) != VK_SUCCESS ||
++                !cmd_buffer->state.pass || !cmd_buffer->state.tiling)) {
++      if (!tu_cmd_buffer_has_error(cmd_buffer))
++         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_DEVICE_LOST);
++      tu_cs_end(&cmd_buffer->draw_cs);
++      tu_cs_end(&cmd_buffer->draw_epilogue_cs);
++      vk_free(&cmd_buffer->vk.pool->alloc, cmd_buffer->state.attachments);
++      tu_reset_render_pass(cmd_buffer);
++      return;
++   }
++
+    const VkRenderPassFragmentDensityMapOffsetEndInfoEXT *fdm_offset_info =
+       vk_find_struct_const(pSubpassEndInfo->pNext,
+                            RENDER_PASS_FRAGMENT_DENSITY_MAP_OFFSET_END_INFO_EXT);
+@@ -9730,9 +9831,11 @@ tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
+    tu_cs_end(&cmd_buffer->draw_epilogue_cs);
+    TU_CALLX(cmd_buffer->device, tu_cmd_render)(cmd_buffer, fdm_offsets);
+ 
+-   cmd_buffer->state.cache.pending_flush_bits |=
+-      cmd_buffer->state.renderpass_cache.pending_flush_bits;
+-   TU_CALLX(cmd_buffer->device, tu_subpass_barrier)(cmd_buffer, &cmd_buffer->state.pass->end_barrier, true);
++   if (likely(tu_cmd_buffer_sync_error(cmd_buffer) == VK_SUCCESS)) {
++      cmd_buffer->state.cache.pending_flush_bits |=
++         cmd_buffer->state.renderpass_cache.pending_flush_bits;
++      TU_CALLX(cmd_buffer->device, tu_subpass_barrier)(cmd_buffer, &cmd_buffer->state.pass->end_barrier, true);
++   }
+ 
+    vk_free(&cmd_buffer->vk.pool->alloc, cmd_buffer->state.attachments);
+ 
+@@ -9747,6 +9850,19 @@ tu_CmdEndRendering2EXT(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
+ 
++   if (unlikely(tu_cmd_buffer_sync_error(cmd_buffer) != VK_SUCCESS ||
++                !cmd_buffer->state.pass ||
++                (!cmd_buffer->state.suspending &&
++                 cmd_buffer->state.suspend_resume != SR_IN_PRE_CHAIN &&
++                 !cmd_buffer->state.tiling))) {
++      if (!tu_cmd_buffer_has_error(cmd_buffer))
++         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_DEVICE_LOST);
++      tu_cs_end(&cmd_buffer->draw_cs);
++      tu_cs_end(&cmd_buffer->draw_epilogue_cs);
++      tu_reset_render_pass(cmd_buffer);
++      return;
++   }
++
+    if (cmd_buffer->state.suspending) {
+       cmd_buffer->state.suspended_pass.lrz = cmd_buffer->state.lrz;
+       /* We cannot pass LRZ state to next resuming renderpass, so we have to
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+index 47e1939..c880fb9 100644
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -18,6 +18,65 @@ tu_sanitize_ib_size(uint32_t size)
+    return MIN2(size, 0x0fffff);
+ }
+ 
++static inline uint32_t *
++tu_cs_error_buf(struct tu_cs *cs, uint32_t *cap_out)
++{
++   if (cs->error_scratch && cs->error_scratch_size) {
++      *cap_out = cs->error_scratch_size;
++      return cs->error_scratch;
++   }
++   *cap_out = ARRAY_SIZE(cs->error_scratch_inline);
++   return cs->error_scratch_inline;
++}
++
++void
++tu_cs_fail(struct tu_cs *cs, VkResult err, uint32_t min_dwords)
++{
++   if (err == VK_SUCCESS)
++      err = VK_ERROR_DEVICE_LOST;
++
++   if (cs->error == VK_SUCCESS) {
++      cs->error = err;
++      if (cs->vk_cmd)
++         vk_command_buffer_set_error(cs->vk_cmd, err);
++   }
++
++   for (uint32_t i = 0; i < TU_COND_EXEC_STACK_SIZE; i++)
++      cs->cond_dwords[i] = NULL;
++
++   uint32_t inline_cap = ARRAY_SIZE(cs->error_scratch_inline);
++   uint32_t *buf = cs->error_scratch_inline;
++   uint32_t cap = inline_cap;
++
++   if (cs->mode != TU_CS_MODE_EXTERNAL && min_dwords > inline_cap) {
++      if (cs->error_scratch_size >= min_dwords && cs->error_scratch) {
++         buf = cs->error_scratch;
++         cap = cs->error_scratch_size;
++      } else {
++         uint32_t target = MAX2(256u, min_dwords);
++         uint32_t *new_buf = (uint32_t *) realloc(cs->error_scratch,
++                                                  (size_t) target * sizeof(uint32_t));
++         if (new_buf) {
++            cs->error_scratch = new_buf;
++            cs->error_scratch_size = target;
++            buf = new_buf;
++            cap = target;
++         } else if (cs->error_scratch && cs->error_scratch_size) {
++            buf = cs->error_scratch;
++            cap = cs->error_scratch_size;
++         }
++      }
++   } else if (cs->error_scratch && cs->error_scratch_size) {
++      buf = cs->error_scratch;
++      cap = cs->error_scratch_size;
++   }
++
++   cs->start = buf;
++   cs->cur = buf;
++   cs->end = buf + cap;
++   cs->reserved_end = buf + MIN2(min_dwords ? min_dwords : cap, cap);
++}
++
+ /**
+  * Initialize a command stream.
+  */
+@@ -96,6 +155,9 @@ tu_cs_finish(struct tu_cs *cs)
+    free(cs->entries);
+    free(cs->read_only.bos);
+    free(cs->read_write.bos);
++   free(cs->error_scratch);
++   cs->error_scratch = NULL;
++   cs->error_scratch_size = 0;
+ }
+ 
+ static struct tu_bo *
+@@ -128,8 +190,13 @@ tu_cs_get_offset(const struct tu_cs *cs)
+ uint64_t
+ tu_cs_get_cur_iova(const struct tu_cs *cs)
+ {
++   if (unlikely(cs->error != VK_SUCCESS))
++      return 0;
+    if (cs->mode == TU_CS_MODE_EXTERNAL)
+       return cs->external_iova + ((char *) cs->cur - (char *) cs->start);
++   const struct tu_bo_array *bos = cs->writeable ? &cs->read_write : &cs->read_only;
++   if (unlikely(!cs->refcount_bo && bos->bo_count == 0))
++      return 0;
+    return tu_cs_current_bo(cs)->iova + ((char *) cs->cur - (char *) tu_cs_current_bo(cs)->map);
+ }
+ 
+@@ -256,13 +323,22 @@ tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target)
+    assert(cs->mode == TU_CS_MODE_GROW);
+    assert(target->mode == TU_CS_MODE_GROW);
+ 
++   if (unlikely(cs->error != VK_SUCCESS))
++      return cs->error;
++   if (unlikely(target->error != VK_SUCCESS)) {
++      tu_cs_fail(cs, target->error, 0);
++      return target->error;
++   }
++
+    if (!tu_cs_is_empty(cs))
+       tu_cs_add_entry(cs);
+ 
+    for (unsigned i = 0; i < target->entry_count; i++) {
+       result = tu_cs_reserve_entry(cs);
+-      if (result != VK_SUCCESS)
++      if (result != VK_SUCCESS) {
++         tu_cs_fail(cs, result, 0);
+          return result;
++      }
+       cs->entries[cs->entry_count++] = target->entries[i];
+    }
+ 
+@@ -277,6 +353,8 @@ void
+ tu_cs_begin(struct tu_cs *cs)
+ {
+    assert(cs->mode != TU_CS_MODE_SUB_STREAM);
++   if (unlikely(cs->error != VK_SUCCESS))
++      return;
+    assert(tu_cs_is_empty(cs));
+ }
+ 
+@@ -288,6 +366,8 @@ void
+ tu_cs_end(struct tu_cs *cs)
+ {
+    assert(cs->mode != TU_CS_MODE_SUB_STREAM);
++   if (unlikely(cs->error != VK_SUCCESS))
++      return;
+ 
+    if (cs->mode == TU_CS_MODE_GROW && !tu_cs_is_empty(cs))
+       tu_cs_add_entry(cs);
+@@ -298,6 +378,11 @@ tu_cs_set_writeable(struct tu_cs *cs, bool writeable)
+ {
+    assert(cs->mode == TU_CS_MODE_GROW || cs->mode == TU_CS_MODE_SUB_STREAM);
+ 
++   if (unlikely(cs->error != VK_SUCCESS)) {
++      cs->writeable = writeable;
++      return;
++   }
++
+    if (cs->writeable != writeable) {
+       assert(!cs->cond_stack_depth);
+       if (cs->mode == TU_CS_MODE_GROW && !tu_cs_is_empty(cs))
+@@ -334,6 +419,14 @@ tu_cs_begin_sub_stream_aligned(struct tu_cs *cs, uint32_t count,
+    assert(cs->mode == TU_CS_MODE_SUB_STREAM);
+    assert(size);
+ 
++   if (unlikely(cs->error != VK_SUCCESS)) {
++      tu_cs_init_external(sub_cs, cs->device,
++                          sub_cs->error_scratch_inline,
++                          sub_cs->error_scratch_inline, 0, cs->writeable);
++      tu_cs_fail(sub_cs, cs->error, count * size);
++      return cs->error;
++   }
++
+    VkResult result;
+    if (tu_cs_get_space(cs) < count * size) {
+       /* When we have to allocate a new BO, assume that the alignment of the
+@@ -342,10 +435,16 @@ tu_cs_begin_sub_stream_aligned(struct tu_cs *cs, uint32_t count,
+       result = tu_cs_reserve_space(cs, count * size);
+    } else {
+       result = tu_cs_reserve_space(cs, count * size + (size - tu_cs_get_offset(cs)) % size);
+-      cs->start += (size - tu_cs_get_offset(cs)) % size;
++      if (likely(result == VK_SUCCESS))
++         cs->start += (size - tu_cs_get_offset(cs)) % size;
+    }
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      tu_cs_init_external(sub_cs, cs->device,
++                          sub_cs->error_scratch_inline,
++                          sub_cs->error_scratch_inline, 0, cs->writeable);
++      tu_cs_fail(sub_cs, result, count * size);
+       return result;
++   }
+ 
+    cs->cur = cs->start;
+ 
+@@ -382,11 +481,22 @@ tu_cs_alloc(struct tu_cs *cs,
+       return VK_SUCCESS;
+    }
+ 
++   if (unlikely(cs->error != VK_SUCCESS)) {
++      memory->map = NULL;
++      memory->iova = 0;
++      memory->writeable = false;
++      return cs->error;
++   }
++
+    /* TODO: smarter way to deal with alignment? */
+ 
+    VkResult result = tu_cs_reserve_space(cs, count * size + (size-1));
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      memory->map = NULL;
++      memory->iova = 0;
++      memory->writeable = false;
+       return result;
++   }
+ 
+    struct tu_bo *bo = tu_cs_current_bo(cs);
+    size_t offset = align(tu_cs_get_offset(cs), size);
+@@ -411,6 +521,11 @@ struct tu_cs_entry
+ tu_cs_end_sub_stream(struct tu_cs *cs, struct tu_cs *sub_cs)
+ {
+    assert(cs->mode == TU_CS_MODE_SUB_STREAM);
++   if (unlikely(cs->error != VK_SUCCESS || sub_cs->error != VK_SUCCESS)) {
++      if (cs->error == VK_SUCCESS && sub_cs->error != VK_SUCCESS)
++         tu_cs_fail(cs, sub_cs->error, 0);
++      return (struct tu_cs_entry) {};
++   }
+    assert(sub_cs->start == cs->cur && sub_cs->end == cs->reserved_end);
+    tu_cs_sanity_check(sub_cs);
+ 
+@@ -436,12 +551,32 @@ tu_cs_end_sub_stream(struct tu_cs *cs, struct tu_cs *sub_cs)
+ VkResult
+ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+ {
++   if (unlikely(cs->error != VK_SUCCESS)) {
++      uint32_t cap = 0;
++      uint32_t *buf = tu_cs_error_buf(cs, &cap);
++      if (cs->mode != TU_CS_MODE_EXTERNAL && reserved_size > cap) {
++         tu_cs_fail(cs, cs->error, reserved_size);
++         return cs->error;
++      }
++      if (!cs->cur || !cs->end || cs->cur < buf || cs->cur > buf + cap ||
++          (size_t)(cs->end - cs->cur) < reserved_size) {
++         cs->start = buf;
++         cs->cur = buf;
++         cs->end = buf + cap;
++      }
++      uint32_t avail = (uint32_t)(cs->end - cs->cur);
++      cs->reserved_end = cs->cur + MIN2(reserved_size ? reserved_size : avail, avail);
++      return cs->error;
++   }
++
+    if (tu_cs_get_space(cs) < reserved_size) {
+       if (cs->mode == TU_CS_MODE_EXTERNAL) {
+          UNREACHABLE("cannot grow external buffer");
+          return VK_ERROR_OUT_OF_HOST_MEMORY;
+       }
+ 
++      uint32_t orig_reserved_size = reserved_size;
++
+       /* add an entry for the exiting command packets */
+       if (!tu_cs_is_empty(cs)) {
+          /* no direct command packet for TU_CS_MODE_SUB_STREAM */
+@@ -452,7 +587,8 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+ 
+       for (uint32_t i = 0; i < cs->cond_stack_depth; i++) {
+          /* Subtract one here to account for the DWORD field itself. */
+-         *cs->cond_dwords[i] = cs->cur - cs->cond_dwords[i] - 1;
++         if (cs->cond_dwords[i])
++            *cs->cond_dwords[i] = cs->cur - cs->cond_dwords[i] - 1;
+ 
+          /* space for CP_COND_REG_EXEC in next bo */
+          reserved_size += 3;
+@@ -461,8 +597,10 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+       /* switch to a new BO */
+       uint32_t new_size = MAX2(cs->next_bo_size, reserved_size);
+       VkResult result = tu_cs_add_bo(cs, new_size);
+-      if (result != VK_SUCCESS)
++      if (result != VK_SUCCESS) {
++         tu_cs_fail(cs, result, orig_reserved_size);
+          return result;
++      }
+ 
+       if (cs->cond_stack_depth) {
+          cs->reserved_end = cs->cur + reserved_size;
+@@ -490,7 +628,11 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+ 
+    if (cs->mode == TU_CS_MODE_GROW) {
+       /* reserve an entry for the next call to this function or tu_cs_end */
+-      return tu_cs_reserve_entry(cs);
++      VkResult result = tu_cs_reserve_entry(cs);
++      if (unlikely(result != VK_SUCCESS)) {
++         tu_cs_fail(cs, result, reserved_size);
++         return result;
++      }
+    }
+ 
+    return VK_SUCCESS;
+@@ -503,6 +645,13 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+ void
+ tu_cs_reset(struct tu_cs *cs)
+ {
++   bool had_error = cs->error != VK_SUCCESS;
++   cs->error = VK_SUCCESS;
++   cs->cond_stack_depth = 0;
++   memset(cs->cond_flags, 0, sizeof(cs->cond_flags));
++   memset(cs->cond_dwords, 0, sizeof(cs->cond_dwords));
++   cs->pkt = NULL;
++
+    if (cs->mode == TU_CS_MODE_EXTERNAL) {
+       assert(!cs->read_only.bo_count && !cs->read_write.bo_count &&
+              !cs->refcount_bo && !cs->entry_count);
+@@ -520,7 +669,10 @@ tu_cs_reset(struct tu_cs *cs)
+       tu_bo_finish(cs->device, cs->read_write.bos[i]);
+    }
+ 
+-   assert(!cs->writeable);
++   assert(!cs->writeable || had_error);
++   cs->writeable = false;
++   cs->read_only.start = NULL;
++   cs->read_write.start = NULL;
+ 
+    if (cs->read_only.bo_count) {
+       cs->read_only.bos[0] = cs->read_only.bos[cs->read_only.bo_count - 1];
+@@ -529,6 +681,8 @@ tu_cs_reset(struct tu_cs *cs)
+       cs->start = cs->cur = cs->reserved_end = (uint32_t *) cs->read_only.bos[0]->map;
+       cs->end = cs->start + tu_sanitize_ib_size(cs->read_only.bos[0]->size /
+                                                 sizeof(uint32_t));
++   } else {
++      cs->start = cs->cur = cs->reserved_end = cs->end = NULL;
+    }
+ 
+    if (cs->read_write.bo_count) {
+@@ -548,6 +702,10 @@ tu_cs_emit_data_nop(struct tu_cs *cs,
+    uint32_t total_size = size + (align_dwords - 1);
+    tu_cs_emit_pkt7(cs, CP_NOP, total_size);
+ 
++   if (unlikely(cs->error != VK_SUCCESS || !cs->cur || !cs->end ||
++                (size_t)(cs->end - cs->cur) < total_size))
++      return 0;
++
+    uint64_t iova = tu_cs_get_cur_iova(cs);
+    uint64_t iova_aligned = align64(iova, align_dwords * sizeof(uint32_t));
+    size_t offset = (iova_aligned - iova) / sizeof(uint32_t);
+diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
+index 6a66de1..a0ca7f0 100644
+--- a/src/freedreno/vulkan/tu_cs.h
++++ b/src/freedreno/vulkan/tu_cs.h
+@@ -117,9 +117,18 @@ struct tu_cs
+ 
+    tu_pkt *pkt;
+ 
++   VkResult error;
++   struct vk_command_buffer *vk_cmd;
++   uint32_t *error_scratch;
++   uint32_t error_scratch_size;
++   uint32_t error_scratch_inline[64];
++
+    tu_crb crb(uint32_t nregs);
+ };
+ 
++void
++tu_cs_fail(struct tu_cs *cs, VkResult err, uint32_t min_dwords);
++
+ void
+ tu_breadcrumbs_init(struct tu_device *device);
+ 
+@@ -177,6 +186,8 @@ static inline struct tu_draw_state
+ tu_cs_end_draw_state(struct tu_cs *cs, struct tu_cs *sub_cs)
+ {
+    struct tu_cs_entry entry = tu_cs_end_sub_stream(cs, sub_cs);
++   if (unlikely(!entry.bo))
++      return (struct tu_draw_state) {};
+    return (struct tu_draw_state) {
+       .iova = entry.bo->iova + entry.offset,
+       .size = entry.size / sizeof(uint32_t),
+@@ -193,10 +204,21 @@ tu_cs_get_cur_iova(const struct tu_cs *cs);
+ static inline struct tu_draw_state
+ tu_cs_draw_state(struct tu_cs *sub_cs, struct tu_cs *cs, uint32_t size)
+ {
+-   struct tu_cs_memory memory;
++   struct tu_cs_memory memory = {};
+ 
+    /* TODO: clean this up */
+-   tu_cs_alloc(sub_cs, size, 1, &memory);
++   VkResult result = tu_cs_alloc(sub_cs, size, 1, &memory);
++   if (unlikely(result != VK_SUCCESS || sub_cs->error != VK_SUCCESS ||
++                (size && !memory.map))) {
++      tu_cs_init_external(cs, sub_cs->device,
++                          cs->error_scratch_inline,
++                          cs->error_scratch_inline, 0, false);
++      tu_cs_fail(cs, result != VK_SUCCESS ? result :
++                     (sub_cs->error != VK_SUCCESS ? sub_cs->error :
++                                                    VK_ERROR_OUT_OF_DEVICE_MEMORY),
++                 size);
++      return (struct tu_draw_state) {};
++   }
+    tu_cs_init_external(cs, sub_cs->device, memory.map, memory.map + size,
+                        memory.iova, memory.writeable);
+    tu_cs_begin(cs);
+@@ -222,6 +244,8 @@ tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target);
+ static inline uint32_t
+ tu_cs_get_size(const struct tu_cs *cs)
+ {
++   if (unlikely(!cs->cur || !cs->start))
++      return 0;
+    return cs->cur - cs->start;
+ }
+ 
+@@ -277,7 +301,14 @@ tu_cs_emit_sync_breadcrumb(struct tu_cs *cs, uint8_t opcode, uint16_t cnt);
+ static inline void
+ tu_cs_emit(struct tu_cs *cs, uint32_t value)
+ {
++   if (unlikely(cs->error != VK_SUCCESS)) {
++      if (unlikely(!cs->cur || !cs->reserved_end || cs->cur >= cs->reserved_end ||
++                   !cs->end || cs->cur >= cs->end))
++         return;
++   }
+    assert(cs->cur < cs->reserved_end);
++   if (unlikely(!cs->cur || !cs->end || cs->cur >= cs->end))
++      return;
+    *cs->cur = value;
+    ++cs->cur;
+ 
+@@ -294,7 +325,17 @@ tu_cs_emit(struct tu_cs *cs, uint32_t value)
+ static inline void
+ tu_cs_emit_array(struct tu_cs *cs, const uint32_t *values, uint32_t length)
+ {
++   if (unlikely(!length))
++      return;
++   if (unlikely(cs->error != VK_SUCCESS)) {
++      if (unlikely(!cs->cur || !cs->reserved_end || !cs->end ||
++                   (size_t)(cs->reserved_end - cs->cur) < length ||
++                   (size_t)(cs->end - cs->cur) < length))
++         return;
++   }
+    assert(cs->cur + length <= cs->reserved_end);
++   if (unlikely(!cs->cur || !cs->end || (size_t)(cs->end - cs->cur) < length))
++      return;
+    memcpy(cs->cur, values, sizeof(uint32_t) * length);
+    cs->cur += length;
+ }
+@@ -305,12 +346,19 @@ tu_cs_emit_array(struct tu_cs *cs, const uint32_t *values, uint32_t length)
+ static inline uint32_t
+ tu_cs_get_space(const struct tu_cs *cs)
+ {
++   if (unlikely(!cs->end || !cs->cur))
++      return 0;
+    return cs->end - cs->cur;
+ }
+ 
+ static inline void
+ tu_cs_reserve(struct tu_cs *cs, uint32_t reserved_size)
+ {
++   if (unlikely(cs->error != VK_SUCCESS)) {
++      tu_cs_reserve_space(cs, reserved_size);
++      return;
++   }
++
+    if (cs->mode != TU_CS_MODE_GROW) {
+       assert(tu_cs_get_space(cs) >= reserved_size);
+       assert(cs->reserved_end == cs->end);
+@@ -323,9 +371,9 @@ tu_cs_reserve(struct tu_cs *cs, uint32_t reserved_size)
+       return;
+    }
+ 
+-   ASSERTED VkResult result = tu_cs_reserve_space(cs, reserved_size);
+-   /* TODO: set this error in tu_cs and use it */
+-   assert(result == VK_SUCCESS);
++   VkResult result = tu_cs_reserve_space(cs, reserved_size);
++   if (unlikely(result != VK_SUCCESS && cs->error == VK_SUCCESS))
++      tu_cs_fail(cs, result, reserved_size);
+ }
+ 
+ /**
+@@ -409,6 +457,8 @@ static inline void
+ tu_cs_emit_call(struct tu_cs *cs, const struct tu_cs *target)
+ {
+    assert(target->mode == TU_CS_MODE_GROW);
++   if (unlikely(cs->error != VK_SUCCESS || target->error != VK_SUCCESS))
++      return;
+    for (uint32_t i = 0; i < target->entry_count; i++)
+       tu_cs_emit_ib(cs, target->entries + i);
+ }
+@@ -469,7 +519,7 @@ tu_cs_patchable_start(struct tu_cs *cs, uint32_t reserved_size)
+    uint32_t *nop_header = cs->cur;
+    tu_cs_emit_pkt7(cs, CP_NOP, 0);
+    return (struct tu_cs_patchable_state) {
+-      .nop_header = nop_header,
++      .nop_header = (cs->error == VK_SUCCESS) ? nop_header : NULL,
+       .dwords = 0,
+       .enable_patch = pm4_pkt7_hdr(CP_NOP, 0),
+       .disable_patch = 0,
+@@ -482,6 +532,12 @@ tu_cs_patchable_end(struct tu_cs *cs,
+                     bool enabled_by_default,
+                     struct tu_cs_patchable_state *state)
+ {
++   if (unlikely(cs->error != VK_SUCCESS || !state->nop_header || !cs->cur ||
++                !cs->start || cs->end != state->_end ||
++                state->nop_header < cs->start ||
++                cs->cur <= state->nop_header || cs->cur > cs->end)) {
++      return;
++   }
+    assert(cs->end == state->_end);
+    state->dwords = cs->cur - state->nop_header - 1;
+    state->disable_patch = pm4_pkt7_hdr(CP_NOP, state->dwords);
+@@ -505,7 +561,8 @@ tu_cond_exec_start(struct tu_cs *cs, uint32_t cond_flags)
+    tu_cs_emit(cs, cond_flags);
+ 
+    cs->cond_flags[cs->cond_stack_depth] = cond_flags;
+-   cs->cond_dwords[cs->cond_stack_depth] = cs->cur;
++   cs->cond_dwords[cs->cond_stack_depth] =
++      (cs->error == VK_SUCCESS) ? cs->cur : NULL;
+ 
+    /* Emit dummy DWORD field here */
+    tu_cs_emit(cs, RENDER_MODE_CP_COND_REG_EXEC_1_DWORDS(0));
+@@ -524,10 +581,17 @@ tu_cond_exec_end(struct tu_cs *cs)
+    cs->cond_stack_depth--;
+ 
+    cs->cond_flags[cs->cond_stack_depth] = 0;
++   uint32_t *cond_dword = cs->cond_dwords[cs->cond_stack_depth];
++   cs->cond_dwords[cs->cond_stack_depth] = NULL;
++   if (unlikely(cs->error != VK_SUCCESS || !cond_dword || !cs->cur ||
++                !cs->start || !cs->end || cond_dword < cs->start ||
++                cs->cur <= cond_dword || cs->cur > cs->end)) {
++      return;
++   }
+    /* Subtract one here to account for the DWORD field itself. */
+-   uint32_t cond_len = cs->cur - cs->cond_dwords[cs->cond_stack_depth] - 1;
++   uint32_t cond_len = cs->cur - cond_dword - 1;
+    if (cond_len) {
+-      *cs->cond_dwords[cs->cond_stack_depth] = cond_len;
++      *cond_dword = cond_len;
+    } else {
+       /* rewind the CS to drop the empty cond reg packet. */
+       cs->cur = cs->cur - 3;
+@@ -650,23 +714,26 @@ struct tu_reg_value {
+                                                         \
+    tu_cs_emit_pkt4((cs), regs[0].reg, count);             \
+    uint32_t *p = (cs)->cur;                               \
+-   __ONE_REG( 0, regs);                                 \
+-   __ONE_REG( 1, regs);                                 \
+-   __ONE_REG( 2, regs);                                 \
+-   __ONE_REG( 3, regs);                                 \
+-   __ONE_REG( 4, regs);                                 \
+-   __ONE_REG( 5, regs);                                 \
+-   __ONE_REG( 6, regs);                                 \
+-   __ONE_REG( 7, regs);                                 \
+-   __ONE_REG( 8, regs);                                 \
+-   __ONE_REG( 9, regs);                                 \
+-   __ONE_REG(10, regs);                                 \
+-   __ONE_REG(11, regs);                                 \
+-   __ONE_REG(12, regs);                                 \
+-   __ONE_REG(13, regs);                                 \
+-   __ONE_REG(14, regs);                                 \
+-   __ONE_REG(15, regs);                                 \
+-   (cs)->cur = p;                                         \
++   uint32_t *p_end = (cs)->end;                           \
++   if (likely(p && p_end && (size_t)(p_end - p) >= count)) { \
++      __ONE_REG( 0, regs);                                 \
++      __ONE_REG( 1, regs);                                 \
++      __ONE_REG( 2, regs);                                 \
++      __ONE_REG( 3, regs);                                 \
++      __ONE_REG( 4, regs);                                 \
++      __ONE_REG( 5, regs);                                 \
++      __ONE_REG( 6, regs);                                 \
++      __ONE_REG( 7, regs);                                 \
++      __ONE_REG( 8, regs);                                 \
++      __ONE_REG( 9, regs);                                 \
++      __ONE_REG(10, regs);                                 \
++      __ONE_REG(11, regs);                                 \
++      __ONE_REG(12, regs);                                 \
++      __ONE_REG(13, regs);                                 \
++      __ONE_REG(14, regs);                                 \
++      __ONE_REG(15, regs);                                 \
++      (cs)->cur = p;                                       \
++   }                                                       \
+    } while (0)
+ 
+ /**
+@@ -675,11 +742,12 @@ struct tu_reg_value {
+ struct tu_pkt {
+  protected:
+    tu_pkt(tu_cs *cs, enum adreno_pm4_type3_packets pkt, unsigned ndwords)
+-       : cs(cs), pkt(pkt)
++       : cs(cs), pkt(pkt), start(NULL)
+    {
+       tu_cs_reserve(cs, ndwords + 1);
+-      start = cs->cur;
+-      cs->cur++; /* Leave a slot for the packet header when we're done. */
++      start = (cs->error == VK_SUCCESS) ? cs->cur : NULL;
++      if (likely(cs->cur && cs->end && cs->cur < cs->end))
++         cs->cur++; /* Leave a slot for the packet header when we're done. */
+       assert(!cs->pkt);
+ #if !defined(__clang__)
+ #pragma GCC diagnostic push
+@@ -722,9 +790,16 @@ struct tu_pkt {
+          return;
+       }
+ 
+-      assert(start);
+       assert(cs->pkt == this);
+ 
++      if (unlikely(cs->error != VK_SUCCESS || !start || !cs->cur || !cs->start ||
++                   !cs->end || start < cs->start || cs->cur <= start ||
++                   cs->cur > cs->end)) {
++         cs->pkt = NULL;
++         cs = NULL;
++         return;
++      }
++
+       unsigned cnt = cs->cur - start - 1;
+ 
+       if (skip_empty && !cnt) {

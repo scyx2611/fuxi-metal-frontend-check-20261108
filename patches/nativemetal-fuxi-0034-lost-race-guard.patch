@@ -1,0 +1,506 @@
+diff --git a/FuxiLostRaceGuard.h b/FuxiLostRaceGuard.h
+new file mode 100644
+index 0000000..b8448ec
+--- /dev/null
++++ b/FuxiLostRaceGuard.h
+@@ -0,0 +1,210 @@
++// SPDX-License-Identifier: MIT
++// Device-lost race guard for NativeBridgeMetalFrontend (nativemetal patch 0034).
++// Pure C++17 so Linux/macOS host ASan/UBSan unit tests can compile and verify
++// the exact production logic for NBBuffer::contents, newBuffer* failure/lost
++// reporting, and fuxihyb=8 commitAndWaitUntilSubmitted async window safety.
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++
++struct FuxiLostLatch {
++    std::mutex logMu;
++    std::atomic<bool> logged{false};
++    std::atomic<bool> failureNotified{false};
++
++    void resetForTest() {
++        std::lock_guard<std::mutex> guard(logMu);
++        logged.store(false, std::memory_order_release);
++        failureNotified.store(false, std::memory_order_release);
++    }
++};
++
++struct FuxiLostRaceOps {
++    void *ctx = nullptr;
++    bool (*isDeviceLost)(void *ctx) = nullptr;
++    size_t (*firstLostReport)(void *ctx, char *out, size_t size) = nullptr;
++    const char *(*lastError)(void *ctx) = nullptr;
++    void (*logFirstLost)(void *ctx, const char *where, const char *report) = nullptr;
++    void (*signalFailure)(void *ctx, const char *reason) = nullptr;
++};
++
++inline void fuxiCopySummaryLine(const char *src, char *out, size_t outSize) {
++    if (!out || outSize == 0) return;
++    out[0] = '\0';
++    if (!src || !*src) return;
++    size_t j = 0;
++    for (size_t i = 0; src[i] != '\0' && j + 1 < outSize; ++i) {
++        char c = src[i];
++        if (c == '\r' || c == '\n') {
++            if (j > 0 && out[j - 1] != ' ') {
++                out[j++] = ' ';
++            }
++        } else {
++            out[j++] = c;
++        }
++    }
++    while (j > 0 && out[j - 1] == ' ') {
++        --j;
++    }
++    out[j] = '\0';
++}
++
++inline void fuxiEmitFirstLostOnceLocked(
++    FuxiLostLatch &latch,
++    const FuxiLostRaceOps &ops,
++    const char *tag,
++    const char *report) {
++    if (latch.logged.load(std::memory_order_acquire)) {
++        return;
++    }
++    std::lock_guard<std::mutex> guard(latch.logMu);
++    if (!latch.logged.load(std::memory_order_relaxed)) {
++        if (ops.logFirstLost != nullptr) {
++            ops.logFirstLost(ops.ctx, tag, report);
++        }
++        latch.logged.store(true, std::memory_order_release);
++    }
++}
++
++inline bool fuxiNoteFirstLostOnce(
++    FuxiLostLatch &latch,
++    const FuxiLostRaceOps &ops,
++    const char *where,
++    char *reasonOut,
++    size_t reasonOutSize) {
++    if (reasonOut && reasonOutSize > 0) {
++        reasonOut[0] = '\0';
++    }
++    const char *tag = (where && *where) ? where : "unknown";
++    const bool devLost = (ops.isDeviceLost != nullptr && ops.isDeviceLost(ops.ctx));
++
++    char report[2048] = {};
++    size_t reportLen = 0;
++    if (ops.firstLostReport != nullptr) {
++        reportLen = ops.firstLostReport(ops.ctx, report, sizeof(report));
++        report[sizeof(report) - 1] = '\0';
++    }
++    const bool hasReport = (reportLen > 0 && report[0] != '\0');
++    if (!hasReport && !devLost) {
++        return false;
++    }
++
++    if (hasReport) {
++        fuxiEmitFirstLostOnceLocked(latch, ops, tag, report);
++        if (reasonOut && reasonOutSize > 0) {
++            fuxiCopySummaryLine(report, reasonOut, reasonOutSize);
++        }
++        return true;
++    }
++
++    char fallback[256] = {};
++    const char *err = (ops.lastError != nullptr) ? ops.lastError(ops.ctx) : nullptr;
++    if (err && *err) {
++        std::snprintf(fallback, sizeof(fallback), "device lost (%s): %s", tag, err);
++    } else {
++        std::snprintf(fallback, sizeof(fallback), "device lost (%s)", tag);
++    }
++    fuxiEmitFirstLostOnceLocked(latch, ops, tag, fallback);
++    if (reasonOut && reasonOutSize > 0) {
++        fuxiCopySummaryLine(fallback, reasonOut, reasonOutSize);
++    }
++    return true;
++}
++
++inline bool fuxiRecordLostIfDeviceLost(
++    FuxiLostLatch &latch,
++    const FuxiLostRaceOps &ops,
++    const char *where) {
++    if (ops.isDeviceLost == nullptr || !ops.isDeviceLost(ops.ctx)) {
++        return false;
++    }
++    if (latch.logged.load(std::memory_order_acquire) &&
++        latch.failureNotified.load(std::memory_order_acquire)) {
++        return true;
++    }
++    char reason[512] = {};
++    (void)fuxiNoteFirstLostOnce(latch, ops, where, reason, sizeof(reason));
++    if (!reason[0]) {
++        const char *tag = (where && *where) ? where : "unknown";
++        std::snprintf(reason, sizeof(reason), "device lost (%s)", tag);
++    }
++    if (ops.signalFailure != nullptr) {
++        ops.signalFailure(ops.ctx, reason);
++    }
++    latch.failureNotified.store(true, std::memory_order_release);
++    return true;
++}
++
++inline void fuxiRecordFailureWithLostContext(
++    FuxiLostLatch &latch,
++    const FuxiLostRaceOps &ops,
++    const char *where,
++    const char *detail) {
++    const bool devLost = (ops.isDeviceLost != nullptr && ops.isDeviceLost(ops.ctx));
++    if (devLost &&
++        latch.logged.load(std::memory_order_acquire) &&
++        latch.failureNotified.load(std::memory_order_acquire)) {
++        return;
++    }
++    char lostReason[512] = {};
++    const bool isLost = fuxiNoteFirstLostOnce(latch, ops, where, lostReason, sizeof(lostReason));
++    const char *tag = (where && *where) ? where : "native-metal failure";
++    const char *msg = (isLost && lostReason[0]) ? lostReason : ((detail && *detail) ? detail : tag);
++    if (ops.signalFailure != nullptr) {
++        ops.signalFailure(ops.ctx, msg);
++    }
++    if (isLost) {
++        latch.failureNotified.store(true, std::memory_order_release);
++    }
++}
++
++inline void *fuxiGuardBufferContents(
++    FuxiLostLatch &latch,
++    const FuxiLostRaceOps &ops,
++    bool hasHandle,
++    bool isPrivateStorage,
++    void *rawContents) {
++    const bool devLost = (ops.isDeviceLost != nullptr && ops.isDeviceLost(ops.ctx));
++    const bool unexpectedNull = (!hasHandle || (rawContents == nullptr && !isPrivateStorage));
++    if (devLost || unexpectedNull) {
++        const char *where = devLost ? "buffer_contents_lost" : "buffer_contents_null";
++        const char *detail = !hasHandle
++            ? "NBBuffer missing handle"
++            : (devLost ? "NBBuffer contents queried after device lost" : "NBBuffer contents is null for non-private storage");
++        fuxiRecordFailureWithLostContext(latch, ops, where, detail);
++    }
++    return rawContents;
++}
++
++inline bool fuxiGuardCommitAndWait(
++    FuxiLostLatch &latch,
++    const FuxiLostRaceOps &ops,
++    bool failedLocally,
++    bool hasEncodeFailure,
++    bool blocked,
++    bool overlapPending,
++    bool isNoop,
++    bool statusIsError,
++    const char *cbErrorText,
++    const char *encodeFailureText) {
++    const bool devLost = (ops.isDeviceLost != nullptr && ops.isDeviceLost(ops.ctx));
++    const bool asyncErr = (!overlapPending && !isNoop && statusIsError);
++    if (!failedLocally && !hasEncodeFailure && !blocked && !devLost && !asyncErr) {
++        return true;
++    }
++    const char *where = devLost ? "commitAndWaitUntilSubmitted_lost"
++                      : asyncErr ? "commitAndWaitUntilSubmitted_error"
++                      : hasEncodeFailure ? "commitAndWaitUntilSubmitted_refused"
++                      : blocked ? "commitAndWaitUntilSubmitted_blocked"
++                      : "commitAndWaitUntilSubmitted_failed";
++    const char *detail = (cbErrorText && *cbErrorText) ? cbErrorText
++                       : (encodeFailureText && *encodeFailureText) ? encodeFailureText
++                       : (blocked ? "command buffer blocked after device failure" : "command buffer commit failed");
++    fuxiRecordFailureWithLostContext(latch, ops, where, detail);
++    return false;
++}
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index c51ad77..817fea4 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -37,6 +37,7 @@
+ #include "NativeBridgeMetalFrontend.h"
+ #include "FuxiNativeABI.h"
+ #include <exception>
++#include "FuxiLostRaceGuard.h"
+ extern "C" void _objc_msgForward(void);
+ static FuxiNativeHooks gFuxiHooks={};
+ extern "C" void fuxi_native_metal_set_hooks(const FuxiNativeHooks *hooks){gFuxiHooks=*hooks;}
+@@ -335,14 +336,28 @@ static CommitRecord gCommitRing[32];
+ static std::mutex gCommitLock;
+ static std::mutex gProblemLock;
+ static char gLastProblems[2][200];
++static FuxiLostLatch gLostLatch;
++static bool fuxiOpsIsDeviceLost(void *) {return gDevice && nmb_device_is_lost(gDevice);}
++static size_t fuxiOpsFirstLostReport(void *,char *out,size_t size) {
++ return gDevice?nmb_device_first_lost_report(gDevice,out,size):0;
++}
++static const char *fuxiOpsLastError(void *) {return nmb_last_error();}
++static void fuxiOpsLogFirstLost(void *,const char *where,const char *report) {
++ fprintf(stderr,"FUXI MTL FIRST LOST (%s): %.200s\n",where?where:"unknown",report?report:"");
++}
++static void fuxiOpsSignalFailure(void *,const char *reason) {fuxiFailure(reason);}
++static FuxiLostRaceOps fuxiLostOps() {
++ return {nullptr,fuxiOpsIsDeviceLost,fuxiOpsFirstLostReport,fuxiOpsLastError,fuxiOpsLogFirstLost,fuxiOpsSignalFailure};
++}
+ static void noteFirstLostOnce(const char *where) {
+  if(!gDevice)return;
+- static std::atomic<bool> logged{false};
+- if(logged.load(std::memory_order_acquire))return;
+- char report[2048]={};
+- if(nmb_device_first_lost_report(gDevice,report,sizeof report)>0 && !logged.exchange(true,std::memory_order_acq_rel)) {
+-  fprintf(stderr,"FUXI MTL FIRST LOST (%s): %.200s\n",where?where:"unknown",report);
+- }
++ (void)fuxiNoteFirstLostOnce(gLostLatch,fuxiLostOps(),where,nullptr,0);
++}
++static bool fuxiRecordLostIfDeviceLost(const char *where) {
++ return fuxiRecordLostIfDeviceLost(gLostLatch,fuxiLostOps(),where);
++}
++static void fuxiRecordLostOrFailure(const char *where,const char *detail) {
++ fuxiRecordFailureWithLostContext(gLostLatch,fuxiLostOps(),where,detail);
+ }
+ static void noteProblem(NSString *what) {
+  noteFirstLostOnce("problem");
+@@ -543,7 +558,11 @@ static void releaseSurface(void *context,void *,uint64_t) {gSurfaceImportsReleas
+  nmb_buffer_release(_handle);
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (NSUInteger)length { try { @try {return nmb_buffer_length(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+-- (void *)contents { try { @try {return nmb_buffer_contents(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void *)contents { try { @try {
++ void *ptr=_handle?nmb_buffer_contents(_handle):nullptr;
++ const bool isPrivate=((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift)==MTLStorageModePrivate;
++ return fuxiGuardBufferContents(gLostLatch,fuxiLostOps(),_handle!=nullptr,isPrivate,ptr);
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (uint64_t)gpuAddress { try { @try {return nmb_buffer_gpu_address(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (MTLResourceOptions)resourceOptions { try { @try {return _options;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (MTLStorageMode)storageMode { try { @try {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -756,14 +775,16 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  }
+  if(hit)return hit;
+  gSurfaceImportMisses++;
++ if(fuxiRecordLostIfDeviceLost("surfaceBuffer")){NBLOG(@"native-metal: surface import refused: device lost");return nil;}
+  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
+  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
+  if(!handle) {
+   CFRelease(surface);
++  if(fuxiRecordLostIfDeviceLost("surfaceBuffer")){NBLOG(@"native-metal: surface import refused: device lost");return nil;}
+   trimHeldImports(true);
+   if(gDevice)(void)nmb_device_release_kept_memory(gDevice);
+   handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
+-  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
++  if(!handle){CFRelease(surface);const char *err=nmb_last_error();fuxiRecordLostOrFailure("surfaceBuffer",err);NBLOG(@"native-metal: surface import refused: %s",err?err:"");return nil;}
+  }
+  gSurfaceImportsMade++;NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.importedSurface=surface;
+  if(key) {
+@@ -2077,7 +2098,19 @@ static void overlapCommitted(void *context,const char *why);
+   if(fuxiOverlapReason==1)gOverlapWaitHandlers++;else if(fuxiOverlapReason==2)gOverlapWaitOther++;else gOverlapWaitDirect++;
+   [self waitUntilScheduled];
+  }
+- [self fuxiWaitStoredSurface];return !self.failedLocally;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++ [self fuxiWaitStoredSurface];
++ char cbErr[512]={};
++ const bool overlapPending=self.fuxiOverlapPending;
++ const bool isNoop=self.fuxiNoop;
++ const bool statusErr=(!overlapPending && !isNoop && _handle && nmb_command_buffer_status(_handle)==MTLCommandBufferStatusError);
++ if(statusErr)nmb_command_buffer_error(_handle,cbErr,sizeof cbErr);
++ const char *encErr=self.encodeFailure?self.encodeFailure.UTF8String:nullptr;
++ if(!fuxiGuardCommitAndWait(gLostLatch,fuxiLostOps(),self.failedLocally,self.encodeFailure!=nil,fuxiBlocked(),
++                            overlapPending,isNoop,statusErr,cbErr[0]?cbErr:nullptr,encErr)) {
++  self.failedLocally=YES;
++  return NO;
++ }
++ return YES;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (CFTimeInterval)GPUStartTime { try { @try {return nmb_command_buffer_gpu_time(_handle,false);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (CFTimeInterval)GPUEndTime { try { @try {return nmb_command_buffer_gpu_time(_handle,true);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // Patch 0016: before an encoder opens, the part encoded since the last split goes to the GPU where it has run for fuxisplit us
+@@ -2376,6 +2409,7 @@ static void overlapCommitted(void *context,const char *why);
+ // Patch 0020: queue the registrations and the commit on the bridge's worker (gOverlapCommits); NO where it commits as before.
+ // context is the completion's reference, taken by commit; the worker's own goes back in overlapCommitted.
+ - (BOOL)fuxiCommitOverlapped:(void *)context { try { @try {
++ if(fuxiRecordLostIfDeviceLost("commit_overlapped"))return NO;
+  if(!nmb_command_buffer_commit_deferrable() || ![self fuxiTakeLeases])return NO;
+  BOOL handlers=NO;@synchronized(self){handlers=_scheduledHandlers.count!=0;}
+  fuxiOverlapReason=fuxiOtherWork?2:handlers?1:0;
+@@ -2391,7 +2425,12 @@ static void overlapCommitted(void *context,const char *why);
+  self.fuxiOverlapPending=NO;self.fuxiOverlapped=NO;fuxiOverlapReason=0;
+  CFRelease(context);
+  [self fuxiDropLeases];
+- if(queued<0){gOverlapRefused++;NBLOG(@"native-metal: overlapped commit refused: %@",lastError());}
++ if(queued<0){
++  gOverlapRefused++;
++  const char *err=nmb_last_error();
++  fuxiRecordLostOrFailure("commit_overlapped",err);
++  NBLOG(@"native-metal: overlapped commit refused: %s",err?err:"");
++ }
+  return NO;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)commit { try { @try {
+@@ -2419,6 +2458,9 @@ static void overlapCommitted(void *context,const char *why);
+   [self didSchedule];
+   dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[self finish];});return;
+  }
++ if(!self.encodeFailure && fuxiRecordLostIfDeviceLost("commit")) {
++  [self refuse:@"commit: device lost"];
++ }
+  if(!self.encodeFailure) {
+   flushSurfaces(_surfaces);
+   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
+@@ -2427,7 +2469,9 @@ static void overlapCommitted(void *context,const char *why);
+   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
+      nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle))return;
+   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
+-  [self refuse:[@"commit: " stringByAppendingString:lastError()]];
++  const char *err=nmb_last_error();
++  fuxiRecordLostOrFailure("commit",err);
++  [self refuse:[NSString stringWithFormat:@"commit: %s",err?err:""]];
+  }
+  self.failedLocally=YES;gCommitFailures++;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[self finish];});
+@@ -2436,7 +2480,15 @@ static void overlapCommitted(void *context,const char *why);
+ - (void)fuxiWaitStoredSurface { try { @try {
+  if(!self.committed || self.failedLocally || self.fuxiNoop || !encodedWork.storedSurface || !fuxiSwapWaitEnabled())return;
+  const uint64_t began=nowUs();
+- if(nmb_command_buffer_wait(_handle,0)!=0){gSwapWaitRefused++;NBLOG(@"native-metal: swap wait refused: %@",lastError());return;}
++ if(nmb_command_buffer_wait(_handle,0)!=0){
++  gSwapWaitRefused++;
++  const char *err=nmb_last_error();
++  fuxiRecordLostOrFailure("wait_stored_surface",err);
++  NBLOG(@"native-metal: swap wait refused: %s",err?err:"");
++  if((gDevice && nmb_device_is_lost(gDevice)) || (_handle && nmb_command_buffer_status(_handle)==MTLCommandBufferStatusError))
++   self.failedLocally=YES;
++  return;
++ }
+  gTimeSwapWait.add(began);
+  const uint64_t n=gTimeSwapWait.count.load();
+  if(n==1 || n%600==0)fprintf(stderr,"FUXI MTL: native swap wait n=%llu avg_us=%llu max_us=%llu refused=%llu\n",(unsigned long long)n,
+@@ -2481,14 +2533,21 @@ static void overlapCommitted(void *context,const char *why) {
+    NBCommandBuffer *commandBuffer=(__bridge NBCommandBuffer *)context;
+    if(why) {
+     gOverlapRefused++;
++    fuxiRecordLostOrFailure("overlap_committed",why);
+     NSString *text=[NSString stringWithUTF8String:why]?:@"(unprintable)";
+-    [commandBuffer refuse:[@"commit: " stringByAppendingString:text]];
+     commandBuffer.failedLocally=YES;gCommitFailures++;
++    [commandBuffer refuse:[@"commit: " stringByAppendingString:text]];
+     [commandBuffer fuxiDropLeases];
+     commandBuffer.fuxiOverlapPending=NO;
+     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[commandBuffer finish];});
+     CFRelease(context);   // the completion's: a refused registration or commit runs no handler
+-   }else commandBuffer.fuxiOverlapPending=NO;
++   }else{
++    if(gDevice && nmb_device_is_lost(gDevice)) {
++     (void)fuxiRecordLostIfDeviceLost("overlap_committed_lost");
++     commandBuffer.failedLocally=YES;
++    }
++    commandBuffer.fuxiOverlapPending=NO;
++   }
+   } @catch(NSException *e) {fuxiFailure(e.reason.UTF8String);}
+   CFRelease(context);   // the worker's
+  }
+@@ -2498,11 +2557,14 @@ static void completed(void *context) {
+  gCompleted++;
+  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
+  if(nmb_command_buffer_status(commandBuffer.handle)==MTLCommandBufferStatusError){
+-  noteFirstLostOnce("completed");
++  commandBuffer.failedLocally=YES;
+   char text[512]={};nmb_command_buffer_error(commandBuffer.handle,text,sizeof(text));
+   // Patch 0014: only a relayed failure has a description; name the rest instead of reporting an empty reason.
+   if(!text[0])snprintf(text,sizeof(text),"native-metal: command buffer completed with an error and no description (last: %s)",nmb_last_error());
+-  fuxiFailure(text);
++  fuxiRecordLostOrFailure("completed",text);
++ }else if(gDevice && nmb_device_is_lost(gDevice)){
++  commandBuffer.failedLocally=YES;
++  (void)fuxiRecordLostIfDeviceLost("completed_device_lost");
+  }else if(gFuxiHooks.completed){
+   // Report actual completion counters; only stored IOSurface passes qualify the gate.
+   // Patch 0016: the parts' GPU times added up (end less start where nothing split).
+@@ -2848,8 +2910,9 @@ static void fuxiPrewarmLibrary(NBLibrary *library) {
+  return (MTLPurgeableState)answer;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset { try { @try {
++ if(fuxiRecordLostIfDeviceLost("heapBufferWithLength")){NBLOG(@"native-metal: heap buffer refused: device lost");return nil;}
+  FrameMake make(&FrameMakes::buffers);NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
+- if(!handle){NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
++ if(!handle){const char *err=nmb_last_error();fuxiRecordLostOrFailure("heapBufferWithLength",err);NBLOG(@"native-metal: heap buffer refused: %s",err?err:"");return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
+  buffer.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLBuffer>)buffer;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+@@ -3075,22 +3138,27 @@ static BOOL supportsFamilyImpl(id self,MTLGPUFamily family,const void *caller);
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count { try { @try {(void)count;return [(id<MTLDevice>)self newCommandQueue];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options { try { @try {
++ if(fuxiRecordLostIfDeviceLost("newBufferWithLength")){NBLOG(@"native-metal: buffer refused: device lost");return nil;}
+  FrameMake make(&FrameMakes::buffers);NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
+- if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
++ if(!handle){const char *err=nmb_last_error();fuxiRecordLostOrFailure("newBufferWithLength",err);NBLOG(@"native-metal: buffer refused: %s",err?err:"");return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options { try { @try {
++ if(fuxiRecordLostIfDeviceLost("newBufferWithBytes")){NBLOG(@"native-metal: buffer refused: device lost");return nil;}
+  if(!bytes){noteProblem(@"missing library or buffer bytes");return nil;}
+  FrameMake make(&FrameMakes::buffers);NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,bytes);
+- if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
++ if(!handle){const char *err=nmb_last_error();fuxiRecordLostOrFailure("newBufferWithBytes",err);NBLOG(@"native-metal: buffer refused: %s",err?err:"");return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+ } @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator { try { @try {
++ if(fuxiRecordLostIfDeviceLost("newBufferWithBytesNoCopy")){NBLOG(@"native-metal: no-copy buffer refused: device lost");return nil;}
+  void *context=deallocator?(__bridge_retained void *)[deallocator copy]:nullptr;
+  FrameMake make(&FrameMakes::buffers);NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,pointer,length,options,context?releaseBlock:nullptr,context);
+  if(!handle) {
+   if(context)(void)(__bridge_transfer id)context;
+-  NBLOG(@"native-metal: no-copy buffer refused: %@",lastError());return nil;
++  const char *err=nmb_last_error();
++  fuxiRecordLostOrFailure("newBufferWithBytesNoCopy",err);
++  NBLOG(@"native-metal: no-copy buffer refused: %s",err?err:"");return nil;
+  }
+  gNoCopyAll++;if(context)gNoCopyMade++;
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index 3d7d6c0..4ef76fa 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -65,6 +65,7 @@ size_t nmb_device_family_waivers(const NmbDevice *, char *out, size_t size); /*
+ uint64_t nmb_device_linear_bytes_per_row(const NmbDevice *, uint64_t format, uint64_t width); /* 0: refused */
+ size_t nmb_device_release_kept_memory(const NmbDevice *);
+ size_t nmb_device_first_lost_report(const NmbDevice *, char *out, size_t size);
++bool nmb_device_is_lost(const NmbDevice *);
+ 
+ typedef struct NmbBinaryArchive NmbBinaryArchive;
+ NmbBinaryArchive *nmb_binary_archive_new(NmbDevice *, const char *path /* NULL: empty */);
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 17bccbd..8d947dc 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -887,6 +887,31 @@ pub extern "C" fn nmb_device_first_lost_report(device: *const NmbDevice, out: *m
+     })
+ }
+ 
++/// Returns whether device loss has been latched on `device` without draining deferred work.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_device_is_lost(device: *const NmbDevice) -> bool {
++    guard_free(false, || {
++        if device.is_null() {
++            return Ok(false);
++        }
++        let dev = get(device)?;
++        Ok(dev.0.first_loss_report().is_some() || dev.5.load(Ordering::Acquire))
++    })
++}
++
++#[cfg(test)]
++mod lost_race_tests {
++    use super::*;
++
++    #[test]
++    fn null_device_is_lost_returns_false_without_error() {
++        set_error(String::new());
++        assert!(!nmb_device_is_lost(std::ptr::null()));
++        let err = unsafe { CStr::from_ptr(nmb_last_error()) }.to_str().unwrap();
++        assert_eq!(err, "");
++    }
++}
++
+ // ---- buffers ----
+ 
+ pub struct NmbBuffer(Buffer);

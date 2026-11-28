@@ -28,6 +28,7 @@ constexpr int TU_BO_ALLOC_NO_FLAGS=0;
 static VkResult vk_errorf(const void *,VkResult result,const char *,...) { return result; }
 static VkResult vk_device_set_lost(int *,const char *,...) { return VK_ERROR_DEVICE_LOST; }
 struct tu_device { int vk; void *darwin_retire; };
+static VkResult tu_darwin_set_lost(struct tu_device *, const char *, ...) { return VK_ERROR_DEVICE_LOST; }
 struct tu_bo {
  uint32_t gem_handle; uint64_t size,iova; const char *name; int refcnt;
  uint64_t unique_id,darwin_handle; uint32_t darwin_token; void *map; bool never_unmap;
@@ -180,6 +181,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--turnip-inputs', type=Path, required=True)
     parser.add_argument('--patch', type=Path, required=True)
+    parser.add_argument('--extra-patch', action='append', type=Path, default=[])
     parser.add_argument('--abi', type=Path, required=True)
     parser.add_argument('--source', type=Path)
     parser.add_argument('--without-fix', action='store_true')
@@ -205,8 +207,15 @@ def main():
         for name in stack:
             subprocess.run(command + [str(inputs / name)], cwd=directory, check=True)
         if not arguments.without_fix:
-            subprocess.run(command + ['--check', str(arguments.patch.resolve())], cwd=directory, check=True)
-            subprocess.run(command + [str(arguments.patch.resolve())], cwd=directory, check=True)
+            patch_path = arguments.patch.resolve()
+            subprocess.run(command + ['--check', str(patch_path)], cwd=directory, check=True)
+            subprocess.run(command + [str(patch_path)], cwd=directory, check=True)
+            for extra_patch in arguments.extra_patch:
+                extra_path = extra_patch.resolve()
+                if extra_path == patch_path:
+                    continue
+                subprocess.run(command + ['--check', str(extra_path)], cwd=directory, check=True)
+                subprocess.run(command + [str(extra_path)], cwd=directory, check=True)
         source = target.read_text()
         if arguments.source and arguments.source.read_text() != source:
             raise ValueError('Built KMD differs from the tested production patch stack')
