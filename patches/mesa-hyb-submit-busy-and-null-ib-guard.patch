@@ -1,5 +1,5 @@
 diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
-index f21e84e..bddfd4c 100644
+index f21e84e..77e0c2b 100644
 --- a/src/freedreno/vulkan/tu_cs.cc
 +++ b/src/freedreno/vulkan/tu_cs.cc
 @@ -142,6 +142,12 @@ tu_cs_fail(struct tu_cs *cs, VkResult err, uint32_t min_dwords)
@@ -15,6 +15,24 @@ index f21e84e..bddfd4c 100644
        cs->error = err;
        if (cs->vk_cmd)
           vk_command_buffer_set_error(cs->vk_cmd, err);
+@@ -784,7 +790,8 @@ tu_cs_reset(struct tu_cs *cs)
+       cs->read_only.bos[0] = cs->read_only.bos[cs->read_only.bo_count - 1];
+       cs->read_only.bo_count = 1;
+ 
+-      cs->start = cs->cur = cs->reserved_end = (uint32_t *) cs->read_only.bos[0]->map;
++      cs->read_only.start = (uint32_t *) cs->read_only.bos[0]->map;
++      cs->start = cs->cur = cs->reserved_end = cs->read_only.start;
+       cs->end = cs->start + tu_sanitize_ib_size(cs->read_only.bos[0]->size /
+                                                 sizeof(uint32_t));
+    } else {
+@@ -794,6 +801,7 @@ tu_cs_reset(struct tu_cs *cs)
+    if (cs->read_write.bo_count) {
+       cs->read_write.bos[0] = cs->read_write.bos[cs->read_write.bo_count - 1];
+       cs->read_write.bo_count = 1;
++      cs->read_write.start = (uint32_t *) cs->read_write.bos[0]->map;
+    }
+ 
+    cs->entry_count = 0;
 diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
 index c19e10e..88d55c0 100644
 --- a/src/freedreno/vulkan/tu_cs.h
@@ -154,7 +172,7 @@ index 82efb07..c7c2b97 100644
     *pFd = prime_fd;
  
 diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
-index a9c6751..0f438b9 100644
+index a9c6751..99c2b08 100644
 --- a/src/freedreno/vulkan/tu_knl_darwin.cc
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
 @@ -567,8 +567,19 @@ darwin_allocate_iova(struct tu_device *dev, uint64_t size, uint64_t client_iova,
@@ -239,7 +257,73 @@ index a9c6751..0f438b9 100644
           return darwin_map_failure(dev, reply.handle, iova, alloc_size, kr);
        }
        handle = reply.handle;
-@@ -1230,8 +1274,22 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -936,7 +980,23 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+ 
+    uint32_t gem_handle = (uint32_t)handle;
+    struct tu_bo *bo = tu_device_lookup_bo(dev, gem_handle);
+-   assert(bo && bo->gem_handle == 0);
++   if (unlikely(!bo || bo->gem_handle != 0)) {
++      static uint32_t bo_slot_logs = 0;
++      if (__atomic_fetch_add(&bo_slot_logs, 1u, __ATOMIC_RELAXED) < 16u) {
++         mesa_loge("FUXI TURNIP OOM: darwin_bo_init handle=%u slot collision bo=%p cur_gem=%u ref=%d",
++                   gem_handle, (const void *) bo, bo ? bo->gem_handle : 0u, bo ? bo->refcnt : 0);
++      }
++      if (!reused) {
++         NativeAdrenoAbiBoFree release = {.handle = handle};
++         (void) dw_call(NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
++         darwin_free_iova(dev, iova, alloc_size);
++      } else {
++         pthread_mutex_lock(&retire->lock);
++         darwin_cache_put(dev, retire, handle, iova, alloc_size, cached_mapping, cached_token, read_only, cached);
++         pthread_mutex_unlock(&retire->lock);
++      }
++      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "bo slot collision handle=%u", gem_handle);
++   }
+ 
+    name = tu_debug_bos_add(dev, size, name);
+ 
+@@ -1187,6 +1247,20 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+       TU_RMV(bo_unmap, dev, bo);
+    TU_RMV(bo_destroy, dev, bo);
+ 
++   /* C-11: Snapshot native BO fields and zero the sparse-array slot BEFORE enqueuing/reaping
++    * the handle into retire->cache or calling BoFree. Otherwise another thread in darwin_bo_init()
++    * can receive the same gem_handle/struct tu_bo* after retire->lock unlock and have its live
++    * bo->iova/size/map wiped to 0 by the trailing memset(). */
++   const uint64_t r_handle = bo->darwin_handle;
++   const uint64_t r_iova = bo->iova;
++   const uint64_t r_size = bo->darwin_alloc_size ? bo->darwin_alloc_size : bo->size;
++   void * const r_map = bo->map;
++   const uint32_t r_token = bo->darwin_token;
++   const bool r_cacheable = bo->darwin_alloc_size != 0;
++   const bool r_read_only = bo->darwin_read_only;
++   const bool r_cached = bo->darwin_cached;
++   memset(bo, 0, sizeof(*bo));
++
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    pthread_mutex_lock(&retire->lock);
+    darwin_reap_locked(dev, retire);
+@@ -1208,8 +1282,7 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+       uint32_t fence = dw.last_fence;
+       pthread_mutex_unlock(&dw.lock);
+       unsigned slot = (retire->head + retire->count) % retire->capacity;
+-      retire->entries[slot] = {bo->darwin_handle, bo->iova, bo->darwin_alloc_size ? bo->darwin_alloc_size : bo->size, bo->map,
+-                               bo->darwin_token, fence, bo->darwin_alloc_size != 0, bo->darwin_read_only, bo->darwin_cached};
++      retire->entries[slot] = {r_handle, r_iova, r_size, r_map, r_token, fence, r_cacheable, r_read_only, r_cached};
+       ++retire->count;
+       ++retire->enqueued;
+       darwin_reap_locked(dev, retire);
+@@ -1220,9 +1293,6 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+    }
+    pthread_mutex_unlock(&retire->lock);
+ 
+-   /* The BO structs live in a sparse array: zero the entry to mark it free. */
+-   memset(bo, 0, sizeof(*bo));
+-
+    u_rwlock_rdunlock(&dev->dma_bo_lock);
+ }
+ 
+@@ -1230,8 +1300,22 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
  
  struct tu_darwin_queue_submit {
     struct util_dynarray commands; /* NativeAdrenoAbiSubmitBuffer */
@@ -262,7 +346,7 @@ index a9c6751..0f438b9 100644
  static void *
  darwin_submit_create(struct tu_device *device)
  {
-@@ -1252,14 +1310,48 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
+@@ -1252,14 +1336,48 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
                            struct tu_cs_entry *entries, unsigned num_entries)
  {
     struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
@@ -314,7 +398,7 @@ index a9c6751..0f438b9 100644
     }
  }
  
-@@ -1442,38 +1534,120 @@ darwin_note_fence(uint32_t fence)
+@@ -1442,38 +1560,141 @@ darwin_note_fence(uint32_t fence)
  
  /* One kernel submission of up to NativeAdrenoAbiMaxBuffers indirect buffers; waits for the oldest job when all eight kernel job slots
   * are taken. Fuxi keeps the bounded retries and waits UniXNU dropped (see darwin_wait_idle). */
@@ -376,7 +460,9 @@ index a9c6751..0f438b9 100644
  
 -   for (unsigned attempt = 0; attempt < 64; attempt++) {
 +   const uint64_t start_ns = os_time_get_nano();
-+   const uint64_t deadline_ns = start_ns + darwin_submit_busy_timeout_ns();
++   const uint64_t base_timeout_ns = darwin_submit_busy_timeout_ns();
++   uint64_t deadline_ns = start_ns + base_timeout_ns;
++   bool grace_extended = false;
 +   useconds_t backoff_us = 200;
 +   unsigned retries = 0;
 +
@@ -425,8 +511,27 @@ index a9c6751..0f438b9 100644
 +         continue;
 +      }
 +
-+      if (os_time_get_nano() >= deadline_ns)
++      uint64_t now_ns = os_time_get_nano();
++      if (now_ns >= deadline_ns) {
++         if (!grace_extended) {
++            NativeAdrenoAbiStatus status_reply = {};
++            kern_return_t skr = dw_call(NativeAdrenoMethodGetStatus, NULL, 0, &status_reply, sizeof(status_reply));
++            if (skr == kIOReturnUnsupported || (skr == KERN_SUCCESS && status_reply.faults == dev->fault_count)) {
++               grace_extended = true;
++               deadline_ns = now_ns + base_timeout_ns;
++               static uint32_t grace_logs = 0;
++               if (__atomic_fetch_add(&grace_logs, 1u, __ATOMIC_RELAXED) < 16u) {
++                  mesa_logi("FUXI KMD: submit extending busy grace (+%llu ms) retries=%u faults=%llu",
++                            (unsigned long long)(base_timeout_ns / 1000000ull), retries,
++                            (unsigned long long)status_reply.faults);
++               }
++               usleep(backoff_us);
++               retries++;
++               continue;
++            }
++         }
 +         break;
++      }
 +      usleep(backoff_us);
 +      if (backoff_us < 500)
 +         backoff_us = 500;
@@ -443,7 +548,7 @@ index a9c6751..0f438b9 100644
  }
  
  static VkResult
-@@ -1485,6 +1659,16 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+@@ -1485,6 +1706,16 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
     struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
     struct tu_device *dev = queue->device;
  
